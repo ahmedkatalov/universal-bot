@@ -161,8 +161,12 @@ func (b *Bot) handleEvent(evt interface{}) {
 	if !msg.Info.IsGroup {
 		// Личный чат с номером бота — если настроен Claude, отвечаем как
 		// персональный ассистент; иначе просто игнорируем.
+		fmt.Printf("Личное сообщение от %s (chat=%s, fromMe=%v): %q\n",
+			msg.Info.Sender, msg.Info.Chat, msg.Info.IsFromMe, extractText(msg.Message))
 		if b.assistant != nil {
 			b.handlePrivateMessage(ctx, msg)
+		} else {
+			fmt.Println("Ассистент не настроен (нет OPENROUTER_API_KEY) — сообщение проигнорировано")
 		}
 		return
 	}
@@ -284,11 +288,13 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	text := extractText(msg.Message)
 	if text == "" {
+		fmt.Println("Личное сообщение без текста (фото/стикер/реакция?) — пропускаю")
 		return
 	}
 
 	sender := msg.Info.Sender.String()
 	chat := msg.Info.Chat
+	fmt.Println("Спрашиваю ассистента (OpenRouter)...")
 
 	b.historyMu.Lock()
 	history := append([]ai.Turn(nil), b.history[sender]...)
@@ -312,9 +318,12 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.history[sender] = updated
 	b.historyMu.Unlock()
 
-	if reply != "" {
-		b.sendText(chat, reply)
+	if reply == "" {
+		fmt.Println("Ассистент вернул пустой ответ — ничего не отправляю")
+		return
 	}
+	fmt.Println("Ответ ассистента:", reply)
+	b.sendText(chat, reply)
 }
 
 // buildAssistantSystemPrompt формирует системный промпт со сводкой по сбору
