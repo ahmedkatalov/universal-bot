@@ -24,7 +24,11 @@ services:
       - postgres
     environment:
       DATABASE_URL: postgres://financebot:${POSTGRES_PASSWORD}@postgres:5432/finance
-      WHATSAPP_GROUP_JID: ${WHATSAPP_GROUP_JID}
+      # Пусто/не задано => бот учитывает ВСЕ группы, в которых состоит номер.
+      # Чтобы ограничить конкретными группами — перечисли JID через запятую:
+      # WHATSAPP_GROUP_JIDS: "120363...1@g.us,120363...2@g.us"
+      WHATSAPP_GROUP_JIDS: ${WHATSAPP_GROUP_JIDS:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}

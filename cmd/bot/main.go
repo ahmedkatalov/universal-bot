@@ -5,8 +5,10 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
+	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/bot"
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/ocr"
@@ -28,11 +30,32 @@ func envOr(key, def string) string {
 	return def
 }
 
+// parseGroupJIDs разбирает список JID групп через запятую. Пустая строка
+// означает "без ограничений" — бот учитывает все группы, в которых состоит
+// его номер.
+func parseGroupJIDs(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 func main() {
 	ctx := context.Background()
 
-	pgConn := mustEnv("DATABASE_URL")         // например: postgres://user:pass@localhost:5432/finance
-	groupJID := mustEnv("WHATSAPP_GROUP_JID") // например: 120363000000000000@g.us
+	pgConn := mustEnv("DATABASE_URL") // например: postgres://user:pass@localhost:5432/finance
+	// WHATSAPP_GROUP_JIDS — необязательный список групп через запятую
+	// (120363...1@g.us,120363...2@g.us). Не задан — бот учитывает ВСЕ группы,
+	// в которых состоит номер. WHATSAPP_GROUP_JID оставлен для обратной
+	// совместимости со старыми .env (один JID).
+	groupJIDs := parseGroupJIDs(envOr("WHATSAPP_GROUP_JIDS", os.Getenv("WHATSAPP_GROUP_JID")))
 	sessionPath := envOr("SESSION_DB_PATH", "./data/session.db")
 	fontDir := envOr("FONT_DIR", "./assets/fonts")
 	reportDir := envOr("REPORT_DIR", "./data/reports")
@@ -60,7 +83,15 @@ func main() {
 		log.Fatalf("не удалось настроить OCR: %v", err)
 	}
 
-	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, groupJID, fontDir, reportDir)
+	var assistant *ai.Assistant
+	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
+		assistant = ai.New(apiKey)
+		log.Println("Личный ассистент (Claude) включён — отвечаю на сообщения в личку номеру бота")
+	} else {
+		log.Println("ANTHROPIC_API_KEY не задан — бот не будет отвечать в личных сообщениях")
+	}
+
+	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, fontDir, reportDir)
 	if err != nil {
 		log.Fatalf("не удалось создать бота: %v", err)
 	}
@@ -70,7 +101,11 @@ func main() {
 	}
 	defer b.Disconnect()
 
-	log.Println("Бот запущен. Ждём сообщения из группы", groupJID)
+	if len(groupJIDs) == 0 {
+		log.Println("Бот запущен. Учитываю ВСЕ группы, в которых состоит номер")
+	} else {
+		log.Println("Бот запущен. Учитываю группы:", strings.Join(groupJIDs, ", "))
+	}
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)

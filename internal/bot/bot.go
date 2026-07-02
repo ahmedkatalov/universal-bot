@@ -1,13 +1,18 @@
 // Package bot подключается к WhatsApp через whatsmeow, слушает сообщения
-// целевой группы, парсит их и сохраняет транзакции в БД. Также умеет
-// отвечать на команду "/отчет" готовым PDF.
+// рабочих групп (по умолчанию — всех групп, в которых состоит номер),
+// парсит их и сохраняет транзакции в БД. Умеет отвечать на команду "/отчет"
+// готовым PDF в группе и отвечать в личных сообщениях через Claude,
+// включая формирование отчёта за произвольный период по запросу.
 package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"time"
 
 	"go.mau.fi/whatsmeow"
@@ -23,25 +28,39 @@ import (
 	"github.com/mdp/qrterminal/v3"
 	"google.golang.org/protobuf/proto"
 
+	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/ocr"
 	"whatsapp-bot/internal/parser"
 	"whatsapp-bot/internal/report"
 )
 
+// maxPrivateHistory — сколько последних реплик личного диалога держим в
+// памяти как контекст для Claude. История не переживает рестарт бота —
+// это не журнал операций (тот в БД), а просто продолжение разговора.
+const maxPrivateHistory = 20
+
 type Bot struct {
-	client    *whatsmeow.Client
-	db        *db.DB
-	aliases   *parser.AliasMap
-	ocr       ocr.Extractor
-	groupJID  types.JID
-	fontDir   string
-	reportDir string
+	client        *whatsmeow.Client
+	db            *db.DB
+	aliases       *parser.AliasMap
+	ocr           ocr.Extractor
+	assistant     *ai.Assistant
+	allowedGroups map[types.JID]bool // пусто/nil => разрешены все группы, в которых состоит номер
+	fontDir       string
+	reportDir     string
+
+	historyMu sync.Mutex
+	history   map[string][]ai.Turn // sender JID -> личная переписка с ассистентом
 }
 
 // New создаёт клиент whatsmeow. sessionDBPath — путь к SQLite-файлу сессии,
 // сохраняется между рестартами, чтобы не сканировать QR каждый раз.
-func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, groupJIDStr, fontDir, reportDir string) (*Bot, error) {
+// assistant может быть nil — тогда бот не отвечает в личных сообщениях
+// (например, если не задан ANTHROPIC_API_KEY). groupJIDs — список JID групп,
+// которые нужно учитывать; пустой список означает "все группы, в которых
+// состоит номер бота".
+func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, fontDir, reportDir string) (*Bot, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -66,19 +85,28 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		fmt.Println("WhatsApp-трафик пойдёт через прокси:", proxyAddr)
 	}
 
-	groupJID, err := types.ParseJID(groupJIDStr)
-	if err != nil {
-		return nil, fmt.Errorf("неверный group JID %q: %w", groupJIDStr, err)
+	var allowedGroups map[types.JID]bool
+	if len(groupJIDs) > 0 {
+		allowedGroups = make(map[types.JID]bool, len(groupJIDs))
+		for _, s := range groupJIDs {
+			jid, err := types.ParseJID(s)
+			if err != nil {
+				return nil, fmt.Errorf("неверный group JID %q: %w", s, err)
+			}
+			allowedGroups[jid] = true
+		}
 	}
 
 	b := &Bot{
-		client:    client,
-		db:        database,
-		aliases:   aliases,
-		ocr:       ocrClient,
-		groupJID:  groupJID,
-		fontDir:   fontDir,
-		reportDir: reportDir,
+		client:        client,
+		db:            database,
+		aliases:       aliases,
+		ocr:           ocrClient,
+		assistant:     assistant,
+		allowedGroups: allowedGroups,
+		fontDir:       fontDir,
+		reportDir:     reportDir,
+		history:       make(map[string][]ai.Turn),
 	}
 
 	client.AddEventHandler(b.handleEvent)
@@ -112,16 +140,44 @@ func (b *Bot) Disconnect() {
 	b.client.Disconnect()
 }
 
+// isAllowedGroup решает, нужно ли учитывать сообщения из этой группы.
+// Если список групп не задан при старте — учитываем ВСЕ группы, в которых
+// состоит номер бота (это позволяет вести общий сбор сразу по нескольким
+// чатам без перечисления JID вручную).
+func (b *Bot) isAllowedGroup(jid types.JID) bool {
+	if b.allowedGroups == nil {
+		return true
+	}
+	return b.allowedGroups[jid]
+}
+
 func (b *Bot) handleEvent(evt interface{}) {
 	msg, ok := evt.(*events.Message)
 	if !ok {
 		return
 	}
-	if msg.Info.Chat != b.groupJID {
-		return // сообщение не из целевой группы — игнорируем
+	ctx := context.Background()
+
+	if !msg.Info.IsGroup {
+		// Личный чат с номером бота — если настроен Claude, отвечаем как
+		// персональный ассистент; иначе просто игнорируем.
+		if b.assistant != nil {
+			b.handlePrivateMessage(ctx, msg)
+		}
+		return
 	}
 
-	ctx := context.Background()
+	if !b.isAllowedGroup(msg.Info.Chat) {
+		return
+	}
+
+	b.handleGroupMessage(ctx, msg)
+}
+
+// handleGroupMessage разбирает сообщение из рабочей группы (сбор средств,
+// чеки, команда /отчет). Работает одинаково для любой группы из
+// allowedGroups (или для всех групп, если ограничение не задано).
+func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	senderName := msg.Info.PushName
 	if senderName == "" {
 		senderName = msg.Info.Sender.User
@@ -218,6 +274,173 @@ func (b *Bot) handleEvent(evt interface{}) {
 	}
 
 	_ = b.db.MarkMessageParsed(ctx, rawID)
+}
+
+// handlePrivateMessage отвечает на сообщение, присланное прямо номеру бота
+// (не в рабочую группу), через Claude — с учётом сводки по текущему сбору
+// и с доступом к инструменту "отчёт за произвольный период", чтобы владелец
+// мог просто написать, например, "сколько собрали 3 и 4 июля", и получить
+// ответ текстом или PDF-файлом — как попросит.
+func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
+	text := extractText(msg.Message)
+	if text == "" {
+		return
+	}
+
+	sender := msg.Info.Sender.String()
+	chat := msg.Info.Chat
+
+	b.historyMu.Lock()
+	history := append([]ai.Turn(nil), b.history[sender]...)
+	b.historyMu.Unlock()
+
+	system := b.buildAssistantSystemPrompt(ctx)
+	tools := []ai.Tool{b.reportTool(chat)}
+
+	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
+	if err != nil {
+		fmt.Println("Ошибка ответа Claude:", err)
+		b.sendText(chat, "Не получилось ответить: "+err.Error())
+		return
+	}
+
+	updated := append(history, ai.Turn{FromUser: true, Text: text}, ai.Turn{FromUser: false, Text: reply})
+	if len(updated) > maxPrivateHistory {
+		updated = updated[len(updated)-maxPrivateHistory:]
+	}
+	b.historyMu.Lock()
+	b.history[sender] = updated
+	b.historyMu.Unlock()
+
+	if reply != "" {
+		b.sendText(chat, reply)
+	}
+}
+
+// buildAssistantSystemPrompt формирует системный промпт со сводкой по сбору
+// за текущий месяц (по всем группам сразу) и с сегодняшней датой, чтобы
+// ассистент правильно понимал относительные даты ("сегодня", "3 июля" и т.п.).
+func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
+	now := time.Now()
+	from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
+
+	var summaryText string
+	summaries, err := b.db.SummaryForPeriod(ctx, from, from.AddDate(0, 1, 0))
+	switch {
+	case err != nil:
+		summaryText = "(не удалось загрузить сводку: " + err.Error() + ")"
+	case len(summaries) == 0:
+		summaryText = "За текущий месяц данных пока нет."
+	default:
+		var sb strings.Builder
+		var total float64
+		for _, s := range summaries {
+			fmt.Fprintf(&sb, "- %s: %.0f ₽ (%d платежей)\n", s.CanonicalName, s.Total, s.Count)
+			total += s.Total
+		}
+		fmt.Fprintf(&sb, "Итого за месяц: %.0f ₽", total)
+		summaryText = sb.String()
+	}
+
+	return "Ты — личный ассистент владельца WhatsApp-бота учёта финансов. Бот ведёт единый учёт " +
+		"по всем WhatsApp-группам, в которых состоит его номер. Отвечай кратко и по делу, на русском языке.\n\n" +
+		"Сегодняшняя дата: " + now.Format("02.01.2006") + ".\n\n" +
+		"Сводка по сбору средств за текущий месяц (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
+		summaryText +
+		"\n\nИспользуй эти данные для быстрых вопросов про текущий месяц. " +
+		"Если владелец спрашивает про сбор за конкретные даты, диапазон дат или просит отчёт/документ за период " +
+		"(например \"сколько собрали 3 и 4 июля\", \"скинь отчёт за неделю\", \"пришли пдф за июнь\") — " +
+		"обязательно вызови инструмент send_finance_report с точными датами (переведи относительные даты и " +
+		"названия месяцев в конкретные YYYY-MM-DD, используя сегодняшнюю дату как точку отсчёта). " +
+		"Выбирай format=\"pdf\", если явно просят файл/документ/пдф/отчёт, и format=\"text\", если просто " +
+		"спрашивают цифры в переписке. После вызова инструмента кратко прокомментируй результат своими словами."
+}
+
+// reportTool — инструмент Claude для отчёта за произвольный период. При
+// format="pdf" сразу отправляет PDF-документ в чат и возвращает модели
+// короткое подтверждение; при format="text" возвращает текстовую сводку,
+// которую модель сама превратит в ответ пользователю.
+func (b *Bot) reportTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "send_finance_report",
+		Description: "Формирует отчёт по сбору средств за указанный период (по всем группам сразу) " +
+			"и либо отправляет его как PDF-документ в чат, либо возвращает текстовую сводку для ответа. " +
+			"Вызывай, когда пользователь спрашивает про суммы/сбор за конкретные даты или период, " +
+			"или явно просит отчёт/документ.",
+		InputSchema: map[string]any{
+			"properties": map[string]any{
+				"from_date": map[string]any{
+					"type":        "string",
+					"description": "Начало периода включительно, формат YYYY-MM-DD",
+				},
+				"to_date": map[string]any{
+					"type":        "string",
+					"description": "Конец периода включительно, формат YYYY-MM-DD (для одного дня равен from_date)",
+				},
+				"format": map[string]any{
+					"type":        "string",
+					"enum":        []string{"pdf", "text"},
+					"description": "\"pdf\" — прислать файл-документ; \"text\" — вернуть цифры для текстового ответа",
+				},
+			},
+			"required": []string{"from_date", "to_date", "format"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Format   string `json:"format"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			return b.buildReportForAssistant(ctx, chat, args.FromDate, args.ToDate, args.Format)
+		},
+	}
+}
+
+// buildReportForAssistant — общая логика инструмента send_finance_report:
+// достаёт сводку за период из БД и либо отправляет PDF, либо возвращает
+// текст для финального ответа модели.
+func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromStr, toStr, format string) (string, error) {
+	from, err := time.Parse("2006-01-02", fromStr)
+	if err != nil {
+		return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", fromStr)
+	}
+	toDay, err := time.Parse("2006-01-02", toStr)
+	if err != nil {
+		return "", fmt.Errorf("неверная дата конца периода %q, нужен формат YYYY-MM-DD", toStr)
+	}
+	to := toDay.AddDate(0, 0, 1) // конец периода включительно -> верхняя граница исключительно
+
+	periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
+
+	summaries, err := b.db.SummaryForPeriod(ctx, from, to)
+	if err != nil {
+		return "", fmt.Errorf("ошибка при выборке данных: %w", err)
+	}
+	if len(summaries) == 0 {
+		return fmt.Sprintf("За период %s данных нет.", periodLabel), nil
+	}
+
+	if format == "pdf" {
+		outPath := fmt.Sprintf("%s/report_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
+		if err := report.Generate(summaries, periodLabel, b.fontDir, outPath); err != nil {
+			return "", fmt.Errorf("ошибка генерации PDF: %w", err)
+		}
+		fileName := "Отчёт_" + from.Format("2006-01-02") + "_" + toDay.Format("2006-01-02") + ".pdf"
+		b.sendDocument(chat, outPath, fileName)
+		return "PDF-отчёт за " + periodLabel + " отправлен в чат.", nil
+	}
+
+	var sb strings.Builder
+	var total float64
+	for _, s := range summaries {
+		fmt.Fprintf(&sb, "%s: %.0f ₽ (%d платежей)\n", s.CanonicalName, s.Total, s.Count)
+		total += s.Total
+	}
+	fmt.Fprintf(&sb, "Итого за %s: %.0f ₽", periodLabel, total)
+	return sb.String(), nil
 }
 
 // saveMediaFile сохраняет фото чека на диск для ручной проверки/аудита,
