@@ -235,16 +235,15 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 // (например, кто-то по ошибке переслал одно и то же фото дважды).
 const DuplicateWindow = 5 * time.Minute
 
-// FindDuplicateReceipt проверяет, не встречался ли уже такой же чек.
-//
-// Если у чека есть надёжный ID операции (номер документа или код авторизации),
-// дубль определяется ТОЛЬКО по точному совпадению этого ID. Нечёткое сравнение
-// по сумме+времени в этом случае НЕ применяется: у банковских чеков номер
-// документа уникален для каждой операции, поэтому разные переводы с разными
-// номерами — это разные операции, даже если сумма и время близки. Так мы не
-// ругаемся "дубль" на два реально разных платежа одному человеку.
-// Нечёткое сравнение (сумма + получатель + время в пределах DuplicateWindow)
-// используется только для чеков БЕЗ номера документа и кода авторизации.
+// FindDuplicateReceipt проверяет, не встречался ли уже такой же чек — по
+// совокупности всех параметров сразу:
+//   - получатель (сопоставленный контакт, а если он не определён — ФИО как в чеке);
+//   - сумма (точное совпадение);
+//   - время операции (в пределах DuplicateWindow);
+//   - номер документа / код авторизации НЕ противоречат: либо совпадают, либо
+//     у одного из чеков их нет. Разные номера = разные операции, поэтому два
+//     реально разных перевода одному человеку на одну сумму дублем не станут,
+//     даже если совпали по времени.
 //
 // Оригиналом считается только ЖИВАЯ запись: не помеченная сама дублем, не
 // исключённая вручную и не из удалённого в WhatsApp сообщения — иначе чек,
@@ -255,29 +254,6 @@ const DuplicateWindow = 5 * time.Minute
 // НЕ дубль. Пустой groupJID = поиск по всем группам (для информационной
 // проверки чеков из лички).
 func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
-	if docNumber != "" || authCode != "" {
-		var existing time.Time
-		err := d.pool.QueryRow(ctx, `
-			SELECT br.tx_date FROM bank_receipts br
-			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-			WHERE (($1 <> '' AND br.doc_number = $1) OR ($2 <> '' AND br.auth_code = $2))
-			  AND ($3 = '' OR br.group_jid = $3)
-			  AND br.is_duplicate = false
-			  AND br.ignored = false
-			  AND COALESCE(rm.deleted, false) = false
-			ORDER BY br.tx_date
-			LIMIT 1
-		`, docNumber, authCode, groupJID).Scan(&existing)
-		if err == nil {
-			return true, existing, nil
-		}
-		if errors.Is(err, pgx.ErrNoRows) {
-			return false, time.Time{}, nil // есть надёжный ID, совпадения нет -> это другая операция
-		}
-		return false, time.Time{}, err
-	}
-
-	// Ни номера документа, ни кода авторизации — полагаемся на эвристику.
 	var existing time.Time
 	err := d.pool.QueryRow(ctx, `
 		SELECT br.tx_date FROM bank_receipts br
@@ -292,11 +268,13 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 		  AND br.is_duplicate = false
 		  AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
-		  AND COALESCE(br.doc_number, '') = ''
-		  AND COALESCE(br.auth_code, '') = ''
+		  -- номер документа не противоречит: совпадает, либо у одного из чеков его нет
+		  AND (COALESCE(br.doc_number, '') = '' OR $7 = '' OR br.doc_number = $7)
+		  -- код авторизации не противоречит
+		  AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8)
 		ORDER BY br.tx_date
 		LIMIT 1
-	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID).Scan(&existing)
+	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode).Scan(&existing)
 	if err == nil {
 		return true, existing, nil
 	}
