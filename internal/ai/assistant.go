@@ -1,25 +1,30 @@
-// Package ai отвечает на личные сообщения владельцу через Claude API —
+// Package ai отвечает на личные сообщения владельцу через OpenRouter
+// (OpenAI-совместимый API, https://openrouter.ai/api/v1/chat/completions) —
 // когда пишут не в рабочую группу, а напрямую номеру бота. Поддерживает
-// tool use: Claude сама решает, когда нужно свериться с данными бота
-// (например, сформировать отчёт за произвольный период) и вызывает
-// соответствующий инструмент.
+// tool use (function calling): модель сама решает, когда нужно свериться
+// с данными бота (например, сформировать отчёт за произвольный период)
+// и вызывает соответствующий инструмент.
 package ai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"strings"
-
-	"github.com/anthropics/anthropic-sdk-go"
-	"github.com/anthropics/anthropic-sdk-go/option"
+	"time"
 )
 
-const model = anthropic.ModelClaudeOpus4_8
+const (
+	defaultBaseURL = "https://openrouter.ai/api/v1"
+	defaultModel   = "~anthropic/claude-sonnet-latest" // алиас OpenRouter на последнюю версию Sonnet
 
-// maxToolIterations — предохранитель от зацикливания, если модель почему-то
-// продолжает звать инструменты бесконечно.
-const maxToolIterations = 5
+	// maxToolIterations — предохранитель от зацикливания, если модель
+	// почему-то продолжает звать инструменты бесконечно.
+	maxToolIterations = 5
+)
 
 // Turn — одна реплика в истории личного диалога.
 type Turn struct {
@@ -27,7 +32,7 @@ type Turn struct {
 	Text     string
 }
 
-// Tool — инструмент, который может вызвать Claude. Handle выполняется
+// Tool — инструмент, который может вызвать модель. Handle выполняется
 // синхронно на стороне бота (доступ к БД, отправка сообщений в WhatsApp и т.п.)
 // и должен вернуть текстовый результат, который увидит модель.
 type Tool struct {
@@ -38,12 +43,76 @@ type Tool struct {
 }
 
 type Assistant struct {
-	client anthropic.Client
+	apiKey  string
+	model   string
+	baseURL string
+	http    *http.Client
 }
 
-// New создаёт клиента Claude. apiKey — значение ANTHROPIC_API_KEY.
-func New(apiKey string) *Assistant {
-	return &Assistant{client: anthropic.NewClient(option.WithAPIKey(apiKey))}
+// New создаёт клиента OpenRouter. apiKey — значение OPENROUTER_API_KEY.
+// model — id модели в каталоге OpenRouter (например, "anthropic/claude-sonnet-4.6");
+// пусто -> берётся defaultModel. baseURL — обычно оставляют пустым
+// (используется https://openrouter.ai/api/v1), задаётся отдельно только
+// если стоит прокси/самостоятельный gateway с тем же протоколом.
+func New(apiKey, model, baseURL string) *Assistant {
+	if model == "" {
+		model = defaultModel
+	}
+	if baseURL == "" {
+		baseURL = defaultBaseURL
+	}
+	return &Assistant{
+		apiKey:  apiKey,
+		model:   model,
+		baseURL: strings.TrimRight(baseURL, "/"),
+		http:    &http.Client{Timeout: 60 * time.Second},
+	}
+}
+
+type chatMessage struct {
+	Role       string     `json:"role"`
+	Content    string     `json:"content"`
+	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
+	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+type toolCall struct {
+	ID       string       `json:"id"`
+	Type     string       `json:"type"`
+	Function toolCallFunc `json:"function"`
+}
+
+type toolCallFunc struct {
+	Name      string `json:"name"`
+	Arguments string `json:"arguments"`
+}
+
+type toolDef struct {
+	Type     string      `json:"type"`
+	Function toolFuncDef `json:"function"`
+}
+
+type toolFuncDef struct {
+	Name        string         `json:"name"`
+	Description string         `json:"description"`
+	Parameters  map[string]any `json:"parameters"`
+}
+
+type chatRequest struct {
+	Model     string        `json:"model"`
+	Messages  []chatMessage `json:"messages"`
+	Tools     []toolDef     `json:"tools,omitempty"`
+	MaxTokens int           `json:"max_tokens,omitempty"`
+}
+
+type chatResponse struct {
+	Choices []struct {
+		Message      chatMessage `json:"message"`
+		FinishReason string      `json:"finish_reason"`
+	} `json:"choices"`
+	Error *struct {
+		Message string `json:"message"`
+	} `json:"error"`
 }
 
 // Reply отвечает на сообщение владельца с учётом системного контекста,
@@ -51,100 +120,110 @@ func New(apiKey string) *Assistant {
 // инструмент, Reply выполняет его через tool.Handle и отдаёт результат
 // обратно модели, пока не получит финальный текстовый ответ.
 func (a *Assistant) Reply(ctx context.Context, systemPrompt string, tools []Tool, history []Turn, userText string) (string, error) {
-	messages := make([]anthropic.MessageParam, 0, len(history)+1)
+	messages := make([]chatMessage, 0, len(history)+2)
+	messages = append(messages, chatMessage{Role: "system", Content: systemPrompt})
 	for _, t := range history {
-		block := anthropic.NewTextBlock(t.Text)
+		role := "assistant"
 		if t.FromUser {
-			messages = append(messages, anthropic.NewUserMessage(block))
-		} else {
-			messages = append(messages, anthropic.NewAssistantMessage(block))
+			role = "user"
 		}
+		messages = append(messages, chatMessage{Role: role, Content: t.Text})
 	}
-	messages = append(messages, anthropic.NewUserMessage(anthropic.NewTextBlock(userText)))
+	messages = append(messages, chatMessage{Role: "user", Content: userText})
 
-	toolParams := make([]anthropic.ToolUnionParam, 0, len(tools))
+	toolDefs := make([]toolDef, 0, len(tools))
 	for _, t := range tools {
-		toolParams = append(toolParams, anthropic.ToolUnionParam{OfTool: &anthropic.ToolParam{
-			Name:        t.Name,
-			Description: anthropic.String(t.Description),
-			InputSchema: anthropic.ToolInputSchemaParam{
-				Properties: t.InputSchema["properties"],
-				Required:   toStringSlice(t.InputSchema["required"]),
+		toolDefs = append(toolDefs, toolDef{
+			Type: "function",
+			Function: toolFuncDef{
+				Name:        t.Name,
+				Description: t.Description,
+				Parameters:  t.InputSchema,
 			},
-		}})
+		})
 	}
 
 	for i := 0; i < maxToolIterations; i++ {
-		resp, err := a.client.Messages.New(ctx, anthropic.MessageNewParams{
-			Model:     model,
-			MaxTokens: 1024,
-			System:    []anthropic.TextBlockParam{{Text: systemPrompt}},
-			Messages:  messages,
-			Tools:     toolParams,
-		})
+		respMsg, finishReason, err := a.chat(ctx, messages, toolDefs)
 		if err != nil {
-			return "", fmt.Errorf("claude: %w", err)
+			return "", err
+		}
+		messages = append(messages, respMsg)
+
+		if finishReason != "tool_calls" || len(respMsg.ToolCalls) == 0 {
+			return respMsg.Content, nil
 		}
 
-		messages = append(messages, resp.ToParam())
-
-		if resp.StopReason != anthropic.StopReasonToolUse {
-			return extractText(resp), nil
+		for _, call := range respMsg.ToolCalls {
+			result := runTool(ctx, tools, call)
+			messages = append(messages, chatMessage{
+				Role:       "tool",
+				ToolCallID: call.ID,
+				Content:    result,
+			})
 		}
-
-		var toolResults []anthropic.ContentBlockParamUnion
-		for _, block := range resp.Content {
-			toolUse, ok := block.AsAny().(anthropic.ToolUseBlock)
-			if !ok {
-				continue
-			}
-			result, isErr := runTool(ctx, tools, toolUse)
-			toolResults = append(toolResults, anthropic.NewToolResultBlock(toolUse.ID, result, isErr))
-		}
-		messages = append(messages, anthropic.NewUserMessage(toolResults...))
 	}
 
-	return "", fmt.Errorf("claude: превышен лимit вызовов инструментов")
+	return "", fmt.Errorf("openrouter: превышен лимит вызовов инструментов")
 }
 
-func runTool(ctx context.Context, tools []Tool, use anthropic.ToolUseBlock) (result string, isErr bool) {
+func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {
+	payload, err := json.Marshal(chatRequest{
+		Model:     a.model,
+		Messages:  messages,
+		Tools:     tools,
+		MaxTokens: 1024,
+	})
+	if err != nil {
+		return chatMessage{}, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return chatMessage{}, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.apiKey)
+
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return chatMessage{}, "", fmt.Errorf("openrouter: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return chatMessage{}, "", fmt.Errorf("openrouter: чтение ответа: %w", err)
+	}
+
+	var parsed chatResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return chatMessage{}, "", fmt.Errorf("openrouter: не удалось разобрать ответ (%d): %s", resp.StatusCode, string(body))
+	}
+	if parsed.Error != nil {
+		return chatMessage{}, "", fmt.Errorf("openrouter: %s", parsed.Error.Message)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return chatMessage{}, "", fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
+	}
+	if len(parsed.Choices) == 0 {
+		return chatMessage{}, "", fmt.Errorf("openrouter: пустой ответ")
+	}
+
+	choice := parsed.Choices[0]
+	return choice.Message, choice.FinishReason, nil
+}
+
+func runTool(ctx context.Context, tools []Tool, call toolCall) string {
 	for _, t := range tools {
-		if t.Name != use.Name {
+		if t.Name != call.Function.Name {
 			continue
 		}
-		out, err := t.Handle(ctx, use.Input)
+		out, err := t.Handle(ctx, json.RawMessage(call.Function.Arguments))
 		if err != nil {
-			return err.Error(), true
+			return "Ошибка: " + err.Error()
 		}
-		return out, false
+		return out
 	}
-	return fmt.Sprintf("неизвестный инструмент %q", use.Name), true
-}
-
-func extractText(resp *anthropic.Message) string {
-	var sb strings.Builder
-	for _, block := range resp.Content {
-		if tb, ok := block.AsAny().(anthropic.TextBlock); ok {
-			sb.WriteString(tb.Text)
-		}
-	}
-	return sb.String()
-}
-
-func toStringSlice(v any) []string {
-	list, ok := v.([]string)
-	if ok {
-		return list
-	}
-	anyList, ok := v.([]any)
-	if !ok {
-		return nil
-	}
-	out := make([]string, 0, len(anyList))
-	for _, item := range anyList {
-		if s, ok := item.(string); ok {
-			out = append(out, s)
-		}
-	}
-	return out
+	return fmt.Sprintf("неизвестный инструмент %q", call.Function.Name)
 }

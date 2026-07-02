@@ -83,12 +83,18 @@ func main() {
 		log.Fatalf("не удалось настроить OCR: %v", err)
 	}
 
+	// Личный ассистент идёт через OpenRouter (OpenAI-совместимый API).
+	// OPENAI_API_KEY/OPENAI_MODEL поддержаны как синонимы для удобства,
+	// если переменные уже заведены в таком виде в другом окружении.
 	var assistant *ai.Assistant
-	if apiKey := os.Getenv("ANTHROPIC_API_KEY"); apiKey != "" {
-		assistant = ai.New(apiKey)
-		log.Println("Личный ассистент (Claude) включён — отвечаю на сообщения в личку номеру бота")
+	apiKey := envOr("OPENROUTER_API_KEY", os.Getenv("OPENAI_API_KEY"))
+	if apiKey != "" {
+		model := envOr("OPENROUTER_MODEL", os.Getenv("OPENAI_MODEL"))
+		baseURL := envOr("OPENROUTER_BASE_URL", "")
+		assistant = ai.New(apiKey, model, baseURL)
+		log.Println("Личный ассистент (OpenRouter) включён — отвечаю на сообщения в личку номеру бота")
 	} else {
-		log.Println("ANTHROPIC_API_KEY не задан — бот не будет отвечать в личных сообщениях")
+		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
 	}
 
 	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, fontDir, reportDir)

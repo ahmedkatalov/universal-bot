@@ -28,7 +28,10 @@ services:
       # Чтобы ограничить конкретными группами — перечисли JID через запятую:
       # WHATSAPP_GROUP_JIDS: "120363...1@g.us,120363...2@g.us"
       WHATSAPP_GROUP_JIDS: ${WHATSAPP_GROUP_JIDS:-}
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # Личный ассистент идёт через OpenRouter (OpenAI-совместимый API).
+      # Пусто => бот не отвечает в личных сообщениях, вся остальная логика работает как обычно.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-~anthropic/claude-sonnet-latest}
       OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
