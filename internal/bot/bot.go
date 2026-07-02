@@ -287,8 +287,23 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 // ответ текстом или PDF-файлом — как попросит.
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	text := extractText(msg.Message)
+
+	// Фото в личке: распознаём как чек и отдаём ассистенту как контекст.
+	// В учёт НЕ добавляем — источник учёта это рабочие группы, иначе один
+	// чек посчитался бы дважды (в группе и в личке). Но проверить на дубль
+	// и рассказать, что на чеке, можем.
+	if imgMsg := msg.Message.GetImageMessage(); imgMsg != nil {
+		receiptCtx := b.describePrivatePhoto(ctx, imgMsg)
+		if receiptCtx != "" {
+			if text != "" {
+				text += "\n\n"
+			}
+			text += receiptCtx
+		}
+	}
+
 	if text == "" {
-		fmt.Println("Личное сообщение без текста (фото/стикер/реакция?) — пропускаю")
+		fmt.Println("Личное сообщение без текста (стикер/реакция?) — пропускаю")
 		return
 	}
 
@@ -324,6 +339,83 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 	fmt.Println("Ответ ассистента:", reply)
 	b.sendText(chat, reply)
+}
+
+// describePrivatePhoto скачивает фото из личного сообщения, прогоняет через
+// OCR и, если это банковский чек, возвращает разобранную информацию (плюс
+// результат проверки на дубль) в виде текстового блока для контекста
+// ассистента. Возвращает "" если фото не удалось скачать/распознать.
+func (b *Bot) describePrivatePhoto(ctx context.Context, imgMsg *waProto.ImageMessage) string {
+	imgBytes, err := b.client.Download(ctx, imgMsg)
+	if err != nil {
+		fmt.Println("Ошибка скачивания фото из лички:", err)
+		return "[Пользователь прислал фото, но его не удалось скачать.]"
+	}
+	ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
+	if err != nil {
+		fmt.Println("Ошибка OCR фото из лички:", err)
+		return "[Пользователь прислал фото, но текст на нём распознать не удалось.]"
+	}
+	ocrText = strings.TrimSpace(ocrText)
+	if ocrText == "" {
+		return "[Пользователь прислал фото без распознаваемого текста.]"
+	}
+
+	if !parser.LooksLikeBankReceipt(ocrText) {
+		return "[Пользователь прислал фото. Распознанный текст с фото]:\n" + ocrText
+	}
+
+	rd := parser.ParseReceipt(ocrText)
+	var sb strings.Builder
+	sb.WriteString("[Пользователь прислал фото банковского чека. Распознанные данные]:\n")
+	if rd.Bank != "" {
+		fmt.Fprintf(&sb, "Банк: %s\n", rd.Bank)
+	}
+	if rd.Recipient != "" {
+		canonical, matched := b.aliases.ResolveName(rd.Recipient)
+		if matched {
+			fmt.Fprintf(&sb, "Получатель: %s (это %s)\n", rd.Recipient, canonical)
+		} else {
+			fmt.Fprintf(&sb, "Получатель: %s\n", rd.Recipient)
+		}
+	}
+	if rd.Sender != "" {
+		fmt.Fprintf(&sb, "Отправитель: %s\n", rd.Sender)
+	}
+	if rd.Amount > 0 {
+		fmt.Fprintf(&sb, "Сумма: %.2f ₽\n", rd.Amount)
+	}
+	if rd.HasTxTime {
+		fmt.Fprintf(&sb, "Дата и время операции: %s\n", rd.TxTime.Format("02.01.2006 15:04:05"))
+	}
+	if rd.DocNumber != "" {
+		fmt.Fprintf(&sb, "Номер документа: %s\n", rd.DocNumber)
+	}
+
+	// Проверяем, есть ли такой чек уже в учёте (из рабочих групп).
+	if rd.Amount > 0 && rd.Recipient != "" {
+		txTime := rd.TxTime
+		if !rd.HasTxTime {
+			txTime = time.Now()
+		}
+		var contactIDPtr *int
+		if canonical, matched := b.aliases.ResolveName(rd.Recipient); matched {
+			if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+				contactIDPtr = &id
+			}
+		}
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime)
+		switch {
+		case err != nil:
+			fmt.Println("Ошибка проверки дубля чека из лички:", err)
+		case isDup:
+			fmt.Fprintf(&sb, "Статус в учёте: этот чек УЖЕ УЧТЁН в базе (запись от %s).\n", dupTime.Format("02.01.2006 15:04"))
+		default:
+			sb.WriteString("Статус в учёте: такого чека в базе НЕТ — он не проходил через рабочие группы.\n")
+		}
+	}
+	sb.WriteString("(Чеки из личных сообщений в учёт не добавляются — учёт ведётся по рабочим группам. Это только информация для ответа.)")
+	return sb.String()
 }
 
 // buildAssistantSystemPrompt формирует системный промпт со сводкой по сбору
@@ -362,7 +454,11 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"обязательно вызови инструмент send_finance_report с точными датами (переведи относительные даты и " +
 		"названия месяцев в конкретные YYYY-MM-DD, используя сегодняшнюю дату как точку отсчёта). " +
 		"Выбирай format=\"pdf\", если явно просят файл/документ/пдф/отчёт, и format=\"text\", если просто " +
-		"спрашивают цифры в переписке. После вызова инструмента кратко прокомментируй результат своими словами."
+		"спрашивают цифры в переписке. После вызова инструмента кратко прокомментируй результат своими словами.\n\n" +
+		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках " +
+		"([Пользователь прислал фото банковского чека...]) — используй эти данные в ответе: скажи, от кого чек, " +
+		"на какую сумму, когда была операция и учтён ли он уже в базе. Учёт пополняется только из рабочих групп; " +
+		"чек, присланный сюда в личку, в суммы не добавляется — при необходимости напомни переслать его в группу."
 }
 
 // reportTool — инструмент Claude для отчёта за произвольный период. При
@@ -501,8 +597,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 		return
 	}
 
-	canonical := b.aliases.Resolve(rd.Recipient)
-	needsReview := canonical == rd.Recipient // алиас не нашёлся — новое/незнакомое имя
+	// ResolveName умеет сопоставлять полные ФИО с чеков ("Милана Нажудовна К.")
+	// с короткими алиасами ("Милана") — по словам, а не только точным совпадением.
+	canonical, matched := b.aliases.ResolveName(rd.Recipient)
+	needsReview := !matched // не нашли уверенного совпадения — на ручную проверку
 
 	var contactIDPtr *int
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)

@@ -106,6 +106,31 @@ func TestAliasResolution(t *testing.T) {
 	}
 }
 
+func TestResolveNameFIO(t *testing.T) {
+	// Банки печатают на чеке полное ФИО ("Милана Нажудовна К."), а в алиасах
+	// у нас только имена — ResolveName должен сопоставлять по словам.
+	am := NewAliasMap()
+
+	cases := []struct {
+		raw     string
+		want    string
+		matched bool
+	}{
+		{"Милана Нажудовна К.", "Милана", true},
+		{"Ахмед Нажудович К", "Ахмед", true},
+		{"Хадижат Имрановна С.", "Хадижат", true},
+		{"Милана", "Милана", true},                      // точное совпадение тоже работает
+		{"Иван Иванович И.", "Иван Иванович И.", false}, // незнакомое ФИО — на проверку
+		{"К.", "К.", false}, // одни инициалы — не сопоставляем
+	}
+	for _, c := range cases {
+		got, matched := am.ResolveName(c.raw)
+		if got != c.want || matched != c.matched {
+			t.Errorf("ResolveName(%q): ожидали (%q, %v), получили (%q, %v)", c.raw, c.want, c.matched, got, matched)
+		}
+	}
+}
+
 func TestExpenseListFormat(t *testing.T) {
 	// Формат из твоего сообщения про расходы кофейни: "Имя Сумма" в одной строке.
 	msg := `Расходы

@@ -11,6 +11,7 @@ RUN CGO_ENABLED=1 GOOS=linux go build -o /bot ./cmd/bot
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    tzdata \
     tesseract-ocr \
     tesseract-ocr-rus \
     tesseract-ocr-eng \

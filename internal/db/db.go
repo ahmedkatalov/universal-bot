@@ -219,6 +219,47 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, docNumber, authCode strin
 	return false, time.Time{}, err
 }
 
+// UnresolvedReceipt — чек, получателя которого не удалось сопоставить
+// с контактом при первичной обработке (needs_review = true).
+type UnresolvedReceipt struct {
+	ID           int
+	RecipientRaw string
+}
+
+// UnresolvedReceipts возвращает чеки на ручной проверке, у которых есть
+// распознанный получатель и сумма — кандидаты на повторное сопоставление
+// после обновления логики алиасов или добавления новых алиасов в БД.
+func (d *DB) UnresolvedReceipts(ctx context.Context) ([]UnresolvedReceipt, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, recipient_raw FROM bank_receipts
+		WHERE needs_review = true AND recipient_raw IS NOT NULL AND amount > 0
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []UnresolvedReceipt
+	for rows.Next() {
+		var r UnresolvedReceipt
+		if err := rows.Scan(&r.ID, &r.RecipientRaw); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// AssignReceiptContact привязывает чек к контакту и снимает пометку
+// ручной проверки — вызывается, когда получателя удалось сопоставить
+// при повторном проходе.
+func (d *DB) AssignReceiptContact(ctx context.Context, receiptID, contactID int) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET contact_id = $2, needs_review = false WHERE id = $1
+	`, receiptID, contactID)
+	return err
+}
+
 // ---- Сводки ----
 
 // ContactSummary — агрегированная сумма по одному контакту за период.

@@ -78,6 +78,35 @@ func main() {
 		log.Printf("предупреждение: не удалось загрузить алиасы из БД: %v", err)
 	}
 
+	// Повторно сопоставляем чеки, зависшие на ручной проверке: логика
+	// алиасов могла улучшиться (например, теперь понимаем полные ФИО
+	// "Милана Нажудовна К."), или владелец добавил новые алиасы в БД —
+	// такие чеки автоматически возвращаются в общий учёт.
+	if unresolved, err := database.UnresolvedReceipts(ctx); err != nil {
+		log.Printf("предупреждение: не удалось загрузить чеки на проверке: %v", err)
+	} else {
+		fixed := 0
+		for _, r := range unresolved {
+			canonical, matched := aliasMap.ResolveName(r.RecipientRaw)
+			if !matched {
+				continue
+			}
+			contactID, err := database.GetOrCreateContact(ctx, canonical)
+			if err != nil {
+				log.Printf("предупреждение: контакт для чека %d: %v", r.ID, err)
+				continue
+			}
+			if err := database.AssignReceiptContact(ctx, r.ID, contactID); err != nil {
+				log.Printf("предупреждение: привязка чека %d: %v", r.ID, err)
+				continue
+			}
+			fixed++
+		}
+		if fixed > 0 {
+			log.Printf("Повторное сопоставление: %d чек(ов) с ручной проверки возвращены в учёт", fixed)
+		}
+	}
+
 	ocrClient, err := ocr.NewFromEnv()
 	if err != nil {
 		log.Fatalf("не удалось настроить OCR: %v", err)

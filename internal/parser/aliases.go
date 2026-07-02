@@ -44,6 +44,40 @@ func (am *AliasMap) Resolve(rawName string) string {
 	return strings.TrimSpace(rawName)
 }
 
+// ResolveName — умное сопоставление для ФИО с банковских чеков вида
+// "Милана Нажудовна К." или "Ахмед Нажудович К": сначала пробует точное
+// совпадение всей строки, затем каждое слово ФИО по отдельности (банки
+// печатают имя + отчество + первую букву фамилии, а в алиасах у нас
+// обычно только имя). Возвращает (каноничное имя, true), если нашлось
+// РОВНО одно совпадение; при нуле или нескольких разных кандидатах —
+// (исходная строка, false), чтобы спорный чек ушёл на ручную проверку,
+// а не записался не на того человека.
+func (am *AliasMap) ResolveName(rawName string) (string, bool) {
+	if canonical, ok := am.toCanonical[normalize(rawName)]; ok {
+		return canonical, true
+	}
+
+	found := ""
+	for _, word := range strings.Fields(rawName) {
+		word = strings.Trim(word, ".,")
+		if len([]rune(word)) < 3 {
+			continue // инициалы ("К.") и предлоги не сравниваем
+		}
+		canonical, ok := am.toCanonical[normalize(word)]
+		if !ok {
+			continue
+		}
+		if found != "" && found != canonical {
+			return strings.TrimSpace(rawName), false // двусмысленно — на ручную проверку
+		}
+		found = canonical
+	}
+	if found != "" {
+		return found, true
+	}
+	return strings.TrimSpace(rawName), false
+}
+
 func normalize(s string) string {
 	return strings.ToLower(strings.TrimSpace(s))
 }
