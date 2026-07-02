@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // ReceiptData — то, что удалось извлечь со скриншота банковского перевода.
@@ -25,6 +26,13 @@ type ReceiptData struct {
 	AuthCode   string  // код авторизации
 	Status     string  // "Выполнено", "Отклонено" и т.п.
 	RawText    string  // исходный текст для отладки/ручной проверки
+
+	// TxTime — дата и время операции, как указано на самом чеке (не время
+	// получения сообщения в WhatsApp). Заполняется, только если на чеке
+	// нашлась распознаваемая дата/время (HasTxTime = true) — иначе вызывающий
+	// код должен использовать время получения сообщения как приближение.
+	TxTime    time.Time
+	HasTxTime bool
 }
 
 // Известные банки — по характерным словам на скриншоте.
@@ -123,6 +131,78 @@ var fieldRules = []fieldRule{
 
 var moneyRe = regexp.MustCompile(`\d[\d\s.,]*\d|\d`)
 
+// Дата/время операции на чеке — два реальных формата:
+//
+//	"26 июня 2026 22:58:35 (МСК)"   — день + название месяца (родительный падеж) + год + время
+//	"27.06.2026 11:43:33" / "20.06.2026, 16:04" — числовой формат, с запятой перед временем или без,
+//	с секундами или без.
+var (
+	namedDateTimeRe   = regexp.MustCompile(`(?i)(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?`)
+	numericDateTimeRe = regexp.MustCompile(`(\d{2})\.(\d{2})\.(\d{4}),?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?`)
+
+	monthGenitive = map[string]time.Month{
+		"января": time.January, "февраля": time.February, "марта": time.March,
+		"апреля": time.April, "мая": time.May, "июня": time.June,
+		"июля": time.July, "августа": time.August, "сентября": time.September,
+		"октября": time.October, "ноября": time.November, "декабря": time.December,
+	}
+)
+
+// detectTxTime ищет дату/время операции построчно. Строки с явным словом
+// "дата" проверяются в первую очередь — это надёжнее, чем случайное первое
+// совпадение шаблона где-то ещё на чеке.
+func detectTxTime(lines []string) (time.Time, bool) {
+	for _, l := range lines {
+		if strings.Contains(strings.ToLower(l), "дата") {
+			if t, ok := parseDateTimeFromLine(l); ok {
+				return t, true
+			}
+		}
+	}
+	for _, l := range lines {
+		if t, ok := parseDateTimeFromLine(l); ok {
+			return t, true
+		}
+	}
+	return time.Time{}, false
+}
+
+func parseDateTimeFromLine(line string) (time.Time, bool) {
+	if m := namedDateTimeRe.FindStringSubmatch(line); m != nil {
+		day, _ := strconv.Atoi(m[1])
+		month, ok := monthGenitive[strings.ToLower(m[2])]
+		if !ok {
+			return time.Time{}, false
+		}
+		year, _ := strconv.Atoi(m[3])
+		hour, min, sec := 0, 0, 0
+		if m[4] != "" {
+			hour, _ = strconv.Atoi(m[4])
+			min, _ = strconv.Atoi(m[5])
+		}
+		if m[6] != "" {
+			sec, _ = strconv.Atoi(m[6])
+		}
+		return time.Date(year, month, day, hour, min, sec, 0, time.Local), true
+	}
+	if m := numericDateTimeRe.FindStringSubmatch(line); m != nil {
+		day, _ := strconv.Atoi(m[1])
+		monthNum, _ := strconv.Atoi(m[2])
+		if monthNum < 1 || monthNum > 12 {
+			return time.Time{}, false
+		}
+		year, _ := strconv.Atoi(m[3])
+		hour, _ := strconv.Atoi(m[4])
+		min, _ := strconv.Atoi(m[5])
+		sec := 0
+		if m[6] != "" {
+			sec, _ = strconv.Atoi(m[6])
+		}
+		return time.Date(year, time.Month(monthNum), day, hour, min, sec, 0, time.Local), true
+	}
+	return time.Time{}, false
+}
+
 // LooksLikeBankReceipt — быстрая проверка, стоит ли вообще пытаться
 // разобрать текст как банковский чек (иначе он уйдёт в обычный ParseMessage).
 func LooksLikeBankReceipt(text string) bool {
@@ -146,6 +226,11 @@ func ParseReceipt(text string) ReceiptData {
 	rd := ReceiptData{RawText: text}
 
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+
+	if t, ok := detectTxTime(lines); ok {
+		rd.TxTime = t
+		rd.HasTxTime = true
+	}
 
 	// Банк ищем СНАЧАЛА в шапке чека (первые непустые строки): на чеке ВТБ
 	// внизу есть поле "Банк получателя: Т-Банк", и поиск по всему тексту

@@ -1,6 +1,9 @@
 package parser
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestParseAlfaBankReceipt(t *testing.T) {
 	// Текст воссоздан по структуре скриншота Альфа-Банка, который прислал Ахмед.
@@ -488,5 +491,139 @@ ID операции в СБП А6171130440642120В1006001
 	}
 	if rd.Amount != 20500 {
 		t.Errorf("Amount: ожидали 20500, получили %.0f", rd.Amount)
+	}
+}
+
+// ==== Извлечение реального времени операции с чека (не времени получения
+// сообщения в WhatsApp) — нужно, чтобы отчёт "скинь чеки за 2 июля" смотрел
+// на дату/время самой операции, а не на то, когда фото переслали в чат.
+
+func TestParseTxTimeSberSBP(t *testing.T) {
+	text := `СБЕРБАНК
+Чек по операции
+26 июня 2026 22:58:35 (МСК)
+
+Операция
+Перевод по СБП
+
+ФИО получателя перевода
+Ахмед Нажудович К`
+
+	rd := ParseReceipt(text)
+	if !rd.HasTxTime {
+		t.Fatal("ожидали, что время операции будет распознано")
+	}
+	want := time.Date(2026, time.June, 26, 22, 58, 35, 0, time.Local)
+	if !rd.TxTime.Equal(want) {
+		t.Errorf("TxTime: ожидали %v, получили %v", want, rd.TxTime)
+	}
+}
+
+func TestParseTxTimeRealVTB(t *testing.T) {
+	text := `ВТБ
+Исходящий перевод СБП
+Яхит К.
+Статус Выполнено
+Дата операции 20.06.2026, 16:04
+Получатель Яхит К.
+Сумма операции 20 500 ₽`
+
+	rd := ParseReceipt(text)
+	if !rd.HasTxTime {
+		t.Fatal("ожидали, что время операции будет распознано")
+	}
+	want := time.Date(2026, time.June, 20, 16, 4, 0, 0, time.Local)
+	if !rd.TxTime.Equal(want) {
+		t.Errorf("TxTime: ожидали %v, получили %v", want, rd.TxTime)
+	}
+}
+
+func TestParseTxTimeRealPSB(t *testing.T) {
+	text := `ПСБ
+Чек по операции
+Итого 3 000 р.
+Получатель перевода Ахмед Нажудович К.
+Дата операции 27.06.2026 11:43:33
+ПАО «Банк ПСБ»`
+
+	rd := ParseReceipt(text)
+	if !rd.HasTxTime {
+		t.Fatal("ожидали, что время операции будет распознано")
+	}
+	want := time.Date(2026, time.June, 27, 11, 43, 33, 0, time.Local)
+	if !rd.TxTime.Equal(want) {
+		t.Errorf("TxTime: ожидали %v, получили %v", want, rd.TxTime)
+	}
+}
+
+func TestParseTxTimeRealRSHB(t *testing.T) {
+	text := `РСХБ
+Перевод по номеру телефона через СБП
+Исполнен
+18000 ₽
+02.06.2026, 14:12
+Получатель
+Ахмед Нажудович К`
+
+	rd := ParseReceipt(text)
+	if !rd.HasTxTime {
+		t.Fatal("ожидали, что время операции будет распознано")
+	}
+	want := time.Date(2026, time.June, 2, 14, 12, 0, 0, time.Local)
+	if !rd.TxTime.Equal(want) {
+		t.Errorf("TxTime: ожидали %v, получили %v", want, rd.TxTime)
+	}
+}
+
+func TestParseTxTimeRealOzon(t *testing.T) {
+	text := `ozon банк
+Перевод 26.06.2026 12:51
+Итого 40 000 ₽
+Получатель Ахмед Нажудович К.`
+
+	rd := ParseReceipt(text)
+	if !rd.HasTxTime {
+		t.Fatal("ожидали, что время операции будет распознано")
+	}
+	want := time.Date(2026, time.June, 26, 12, 51, 0, 0, time.Local)
+	if !rd.TxTime.Equal(want) {
+		t.Errorf("TxTime: ожидали %v, получили %v", want, rd.TxTime)
+	}
+}
+
+func TestParseTxTimeRealTBank(t *testing.T) {
+	text := `Квитанция
+22.06.2026 23:03:45
+Итого 19 000 ₽
+Получатель Яхит К.`
+
+	rd := ParseReceipt(text)
+	if !rd.HasTxTime {
+		t.Fatal("ожидали, что время операции будет распознано")
+	}
+	want := time.Date(2026, time.June, 22, 23, 3, 45, 0, time.Local)
+	if !rd.TxTime.Equal(want) {
+		t.Errorf("TxTime: ожидали %v, получили %v", want, rd.TxTime)
+	}
+}
+
+func TestParseTxTimeAbsentWhenNoDateOnReceipt(t *testing.T) {
+	// Альфа-Банк и часть чеков вообще не печатают дату/время на скриншоте —
+	// в этом случае HasTxTime должен остаться false, а не подхватить
+	// случайное число похожее на дату.
+	text := `Альфа-Банк
+
+Получатель
+Хадижат Имрановна С.
+
+Сколько
+30 000 Р
+
+Номер документа
+20260630151235bbbbef30812e14c5c9fd5b`
+
+	rd := ParseReceipt(text)
+	if rd.HasTxTime {
+		t.Errorf("не ожидали найти время операции, получили %v", rd.TxTime)
 	}
 }

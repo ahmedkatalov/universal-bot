@@ -246,7 +246,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Если фото похоже на скриншот банковского перевода — разбираем отдельным
 	// парсером с полями (Получатель/Сколько/Статус), а не обычным построчным.
 	if hasMedia && parser.LooksLikeBankReceipt(text) {
-		b.handleBankReceipt(ctx, text, rawID, msg.Info.Timestamp)
+		b.handleBankReceipt(ctx, msg.Info.Chat, text, rawID, msg.Info.Timestamp)
 		return
 	}
 
@@ -473,8 +473,15 @@ func (b *Bot) saveMediaFile(waMessageID string, data []byte) string {
 // и сохраняет его в bank_receipts. Если получателя не удалось уверенно
 // сопоставить с известным контактом (алиас не найден и это выглядит как новое
 // имя) — помечает needs_review = true, чтобы владелец мог проверить вручную.
-func (b *Bot) handleBankReceipt(ctx context.Context, text string, rawID int, txDate time.Time) {
+// receivedAt — время получения сообщения в WhatsApp, используется как
+// запасной вариант, если на самом чеке не удалось распознать дату/время операции.
+func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string, rawID int, receivedAt time.Time) {
 	rd := parser.ParseReceipt(text)
+
+	txDate := receivedAt
+	if rd.HasTxTime {
+		txDate = rd.TxTime
+	}
 
 	if rd.Amount == 0 || rd.Recipient == "" {
 		fmt.Printf("Чек (сообщение %d): не удалось распознать сумму/получателя, нужна ручная проверка\n", rawID)
@@ -505,6 +512,14 @@ func (b *Bot) handleBankReceipt(ctx context.Context, text string, rawID int, txD
 		contactIDPtr = &contactID
 	}
 
+	// Проверяем, не тот же самый чек уже присылали (по номеру операции/коду
+	// авторизации, либо по совпадению получателя+суммы+времени в пределах
+	// db.DuplicateWindow) — до вставки, иначе новая запись найдёт сама себя.
+	isDuplicate, dupTxDate, err := b.db.FindDuplicateReceipt(ctx, rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate)
+	if err != nil {
+		fmt.Println("Ошибка проверки дубля чека:", err)
+	}
+
 	err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 		RawMessageID: rawID,
 		Bank:         rd.Bank,
@@ -517,6 +532,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, text string, rawID int, txD
 		AuthCode:     rd.AuthCode,
 		Status:       rd.Status,
 		NeedsReview:  needsReview,
+		IsDuplicate:  isDuplicate,
 		TxDate:       txDate,
 	})
 	if err != nil {
@@ -524,6 +540,13 @@ func (b *Bot) handleBankReceipt(ctx context.Context, text string, rawID int, txD
 	}
 	if needsReview {
 		fmt.Printf("Чек (сообщение %d): получатель %q не найден в списке известных — нужна проверка\n", rawID, rd.Recipient)
+	}
+	if isDuplicate {
+		fmt.Printf("Чек (сообщение %d): похоже на повтор чека от %s на %.0f ₽ (первый раз был %s) — не учитываю в сумме\n",
+			rawID, canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"))
+		b.sendText(chat, fmt.Sprintf(
+			"⚠️ Похоже, этот чек уже присылали: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.",
+			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04")))
 	}
 }
 

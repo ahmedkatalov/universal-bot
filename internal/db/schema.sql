@@ -61,12 +61,18 @@ CREATE TABLE IF NOT EXISTS bank_receipts (
     auth_code       TEXT,
     status          TEXT,
     needs_review    BOOLEAN NOT NULL DEFAULT false, -- true если сумму/получателя не удалось распознать уверенно
-    tx_date         DATE NOT NULL,
+    is_duplicate    BOOLEAN NOT NULL DEFAULT false, -- true если это повторно присланный чек (см. FindDuplicateReceipt)
+    -- Дата И ВРЕМЯ операции (не время получения сообщения в WhatsApp) —
+    -- берётся с самого чека, когда OCR смог его распознать; иначе время
+    -- получения сообщения используется как приближение. Точное время нужно
+    -- и для отчётов за конкретный день, и для детекта дублей чеков.
+    tx_date         TIMESTAMPTZ NOT NULL,
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_contact ON bank_receipts(contact_id);
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_review ON bank_receipts(needs_review);
+CREATE INDEX IF NOT EXISTS idx_bank_receipts_duplicate ON bank_receipts(is_duplicate);
 
 -- Стартовый набор контактов и алиасов на основе твоих реальных сообщений.
 INSERT INTO contacts (canonical_name) VALUES
