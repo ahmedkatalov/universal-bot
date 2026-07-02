@@ -152,6 +152,15 @@ func (b *Bot) isAllowedGroup(jid types.JID) bool {
 }
 
 func (b *Bot) handleEvent(evt interface{}) {
+	if _, ok := evt.(*events.Connected); ok {
+		// Отмечаемся "онлайн" — без этого WhatsApp не показывает собеседникам
+		// ни статус "печатает…", ни имя бота (pushname).
+		if err := b.client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
+			fmt.Println("Не удалось отправить presence:", err)
+		}
+		return
+	}
+
 	msg, ok := evt.(*events.Message)
 	if !ok {
 		return
@@ -293,12 +302,25 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 // ответ текстом или PDF-файлом — как попросит.
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	text := extractText(msg.Message)
+	imgMsg := msg.Message.GetImageMessage()
+
+	if text == "" && imgMsg == nil {
+		fmt.Println("Личное сообщение без текста и фото (стикер/реакция?) — пропускаю")
+		return
+	}
+
+	chat := msg.Info.Chat
+
+	// Показываем "печатает…", пока распознаём фото и ждём ответ ИИ —
+	// чтобы было видно, что бот работает, а не завис.
+	stopTyping := b.startTyping(chat)
+	defer stopTyping()
 
 	// Фото в личке: распознаём как чек и отдаём ассистенту как контекст.
 	// В учёт НЕ добавляем — источник учёта это рабочие группы, иначе один
 	// чек посчитался бы дважды (в группе и в личке). Но проверить на дубль
 	// и рассказать, что на чеке, можем.
-	if imgMsg := msg.Message.GetImageMessage(); imgMsg != nil {
+	if imgMsg != nil {
 		receiptCtx := b.describePrivatePhoto(ctx, imgMsg)
 		if receiptCtx != "" {
 			if text != "" {
@@ -309,12 +331,10 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	if text == "" {
-		fmt.Println("Личное сообщение без текста (стикер/реакция?) — пропускаю")
 		return
 	}
 
 	sender := msg.Info.Sender.String()
-	chat := msg.Info.Chat
 	fmt.Println("Спрашиваю ассистента (OpenRouter)...")
 
 	b.historyMu.Lock()
@@ -345,6 +365,33 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 	fmt.Println("Ответ ассистента:", reply)
 	b.sendText(chat, reply)
+}
+
+// startTyping включает в чате статус "печатает…" и обновляет его каждые
+// несколько секунд (WhatsApp сам скрывает статус по таймауту ~10 секунд,
+// а ответ ИИ может занимать заметно дольше). Возвращает функцию остановки,
+// которая убирает статус — вызывать через defer.
+func (b *Bot) startTyping(chat types.JID) func() {
+	ctx, cancel := context.WithCancel(context.Background())
+	if err := b.client.SendChatPresence(ctx, chat, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
+		fmt.Println("Не удалось включить статус 'печатает…':", err)
+	}
+	go func() {
+		ticker := time.NewTicker(8 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				_ = b.client.SendChatPresence(context.Background(), chat, types.ChatPresenceComposing, types.ChatPresenceMediaText)
+			}
+		}
+	}()
+	return func() {
+		cancel()
+		_ = b.client.SendChatPresence(context.Background(), chat, types.ChatPresencePaused, types.ChatPresenceMediaText)
+	}
 }
 
 // describePrivatePhoto скачивает фото из личного сообщения, прогоняет через
@@ -706,6 +753,9 @@ func isReportCommand(text string) bool {
 }
 
 func (b *Bot) sendMonthlyReport(ctx context.Context, chat types.JID) {
+	stopTyping := b.startTyping(chat)
+	defer stopTyping()
+
 	now := time.Now()
 	from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	to := from.AddDate(0, 1, 0)
