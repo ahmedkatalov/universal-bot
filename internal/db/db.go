@@ -77,6 +77,30 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_group ON bank_receipts(group_jid)`); err != nil {
 		return fmt.Errorf("создание индекса group_jid: %w", err)
 	}
+
+	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
+	// чек, легально пересланный из группы СБ в основную, помечался дублем.
+	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
+	// Идемпотентно: у настоящих внутригрупповых дублей оригинал есть, флаг
+	// остаётся. Запускается при каждом старте, на малых объёмах это дёшево.
+	if _, err := pool.Exec(ctx, `
+		UPDATE bank_receipts br SET is_duplicate = false
+		WHERE br.is_duplicate = true
+		  AND NOT EXISTS (
+			SELECT 1 FROM bank_receipts o
+			WHERE o.id <> br.id
+			  AND o.is_duplicate = false
+			  AND COALESCE(o.group_jid, '') = COALESCE(br.group_jid, '')
+			  AND (
+				(br.doc_number IS NOT NULL AND br.doc_number <> '' AND o.doc_number = br.doc_number) OR
+				(br.auth_code IS NOT NULL AND br.auth_code <> '' AND o.auth_code = br.auth_code) OR
+				(o.contact_id = br.contact_id AND o.amount = br.amount
+				 AND abs(extract(epoch FROM o.tx_date - br.tx_date)) <= 300)
+			  )
+		  )
+	`); err != nil {
+		return fmt.Errorf("починка ложных дублей: %w", err)
+	}
 	return nil
 }
 
@@ -203,15 +227,22 @@ const DuplicateWindow = 5 * time.Minute
 // (это ID самой банковской операции, самый надёжный признак). Если их нет
 // или совпадения не нашлось — по получателю, сумме и времени операции
 // в пределах DuplicateWindow. Возвращает true и время найденного оригинала.
-func (d *DB) FindDuplicateReceipt(ctx context.Context, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
+//
+// groupJID ограничивает проверку одной группой: рабочий процесс владельца —
+// работники кидают чеки в одну группу, оттуда их пересылают в другую, и это
+// НЕ дубль. Дубль — только повтор того же чека в той же группе. Пустой
+// groupJID означает поиск по всем группам (используется для информационной
+// проверки чеков, присланных в личку).
+func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
 	if docNumber != "" || authCode != "" {
 		var existing time.Time
 		err := d.pool.QueryRow(ctx, `
 			SELECT tx_date FROM bank_receipts
-			WHERE ($1 <> '' AND doc_number = $1) OR ($2 <> '' AND auth_code = $2)
+			WHERE (($1 <> '' AND doc_number = $1) OR ($2 <> '' AND auth_code = $2))
+			  AND ($3 = '' OR group_jid = $3)
 			ORDER BY tx_date
 			LIMIT 1
-		`, docNumber, authCode).Scan(&existing)
+		`, docNumber, authCode, groupJID).Scan(&existing)
 		if err == nil {
 			return true, existing, nil
 		}
@@ -229,9 +260,10 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, docNumber, authCode strin
 		    ($4::int IS NOT NULL AND contact_id = $4) OR
 		    ($4::int IS NULL AND recipient_raw = $5)
 		  )
+		  AND ($6 = '' OR group_jid = $6)
 		ORDER BY tx_date
 		LIMIT 1
-	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw).Scan(&existing)
+	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID).Scan(&existing)
 	if err == nil {
 		return true, existing, nil
 	}
@@ -298,18 +330,24 @@ type ContactSummary struct {
 // ручной проверки — needs_review = false — и не помечен как дубль другого
 // уже учтённого чека — is_duplicate = false).
 // groupJID — необязательный фильтр по группе: пустая строка = все группы.
+//
+// Один и тот же чек может легально лежать в двух группах (работники кидают
+// в группу СБ, владельцы пересылают в основную) — при сводке по всем группам
+// такие копии схлопываются в одну операцию через DISTINCT ON по номеру
+// документа (а без него — по контакту+сумме+времени операции).
 func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT c.canonical_name, t.card_to, t.amount
+		(SELECT c.canonical_name, t.card_to, t.amount
 		FROM transactions t
 		JOIN contacts c ON c.id = t.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
-		  AND ($3 = '' OR rm.wa_group_jid = $3)
+		  AND ($3 = '' OR rm.wa_group_jid = $3))
 
 		UNION ALL
 
-		SELECT c.canonical_name, COALESCE(br.bank, 'банк не указан'), br.amount
+		(SELECT DISTINCT ON (COALESCE(NULLIF(br.doc_number, ''), br.contact_id::text || '|' || br.amount::text || '|' || br.tx_date::text))
+			c.canonical_name, COALESCE(br.bank, 'банк не указан'), br.amount
 		FROM bank_receipts br
 		JOIN contacts c ON c.id = br.contact_id
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
@@ -317,6 +355,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID 
 		  AND br.is_duplicate = false
 		  AND br.contact_id IS NOT NULL
 		  AND ($3 = '' OR br.group_jid = $3)
+		ORDER BY COALESCE(NULLIF(br.doc_number, ''), br.contact_id::text || '|' || br.amount::text || '|' || br.tx_date::text))
 	`, from, to, groupJID)
 	if err != nil {
 		return nil, err
