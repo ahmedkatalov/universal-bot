@@ -214,6 +214,12 @@ func (b *Bot) handleEvent(evt interface{}) {
 	}
 	ctx := context.Background()
 
+	// Собственные сообщения бота (в т.ч. пересланные им чеки) не обрабатываем —
+	// они записываются в учёт напрямую при пересылке; иначе возможны петли.
+	if msg.Info.IsFromMe {
+		return
+	}
+
 	// Пользователь удалил сообщение ("Удалить у всех") — если к нему были
 	// привязаны платежи/чеки, они выпадают из учёта, а бот подтверждает
 	// это в чате, чтобы было видно, что отчёт обновился.
@@ -266,24 +272,33 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		senderName = msg.Info.Sender.User
 	}
 
-	imgMsg := msg.Message.GetImageMessage()
 	caption := extractText(msg.Message)
 
 	var (
-		text      string
-		hasMedia  bool
-		mediaPath string
+		text       string
+		hasMedia   bool
+		mediaPath  string
+		mediaBytes []byte
+		mediaExt   string
 	)
 
-	if imgMsg != nil {
+	// Чеки приходят и фотографиями, и PDF-документами (Сбер/ВТБ/РСХБ шлют
+	// PDF) — оба типа скачиваем и распознаём в текст.
+	imgMsg := msg.Message.GetImageMessage()
+	docMsg := msg.Message.GetDocumentMessage()
+	isPDF := docMsg != nil && isPDFDocument(docMsg.GetMimetype(), docMsg.GetFileName())
+
+	switch {
+	case imgMsg != nil:
 		hasMedia = true
+		mediaExt = ".jpg"
 		imgBytes, err := b.client.Download(ctx, imgMsg)
 		if err != nil {
 			fmt.Println("Ошибка скачивания фото:", err)
-			// сохраняем хотя бы подпись, если она есть
-			text = caption
+			text = caption // сохраняем хотя бы подпись, если она есть
 		} else {
-			mediaPath = b.saveMediaFile(msg.Info.ID, imgBytes)
+			mediaBytes = imgBytes
+			mediaPath = b.saveMediaFile(msg.Info.ID, imgBytes, mediaExt)
 			ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
 			if err != nil {
 				fmt.Println("Ошибка OCR:", err)
@@ -296,12 +311,39 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 				}
 			}
 		}
-	} else {
+	case isPDF:
+		hasMedia = true
+		mediaExt = ".pdf"
+		pdfBytes, err := b.client.Download(ctx, docMsg)
+		if err != nil {
+			fmt.Println("Ошибка скачивания PDF:", err)
+			text = caption
+		} else {
+			mediaBytes = pdfBytes
+			mediaPath = b.saveMediaFile(msg.Info.ID, pdfBytes, mediaExt)
+			pdfText, err := b.extractPDFText(ctx, pdfBytes)
+			if err != nil {
+				fmt.Println("Ошибка извлечения текста из PDF:", err)
+				text = caption
+			} else {
+				text = pdfText
+				if caption != "" {
+					text = caption + "\n" + pdfText
+				}
+			}
+		}
+	default:
 		text = extractText(msg.Message)
 	}
 
 	if text == "" && !hasMedia {
 		return
+	}
+
+	// Пересылка чеков между чатами по активным правилам ("все чеки из группы
+	// оплата клиентов скидывай в оплата клнт") — в фоне, не мешая учёту.
+	if hasMedia && mediaBytes != nil {
+		go b.applyForwardRules(context.Background(), msg.Info.Chat.String(), senderName, msg.Info.ID, mediaBytes, mediaExt, text, msg.Info.Timestamp)
 	}
 
 	// Обращение к боту по имени ("Джарвис скинь отчет") — отвечаем ассистентом
@@ -382,30 +424,68 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	text := extractText(msg.Message)
 	imgMsg := msg.Message.GetImageMessage()
+	docMsg := msg.Message.GetDocumentMessage()
+	isPDF := docMsg != nil && isPDFDocument(docMsg.GetMimetype(), docMsg.GetFileName())
 
-	if text == "" && imgMsg == nil {
-		fmt.Println("Личное сообщение без текста и фото (стикер/реакция?) — пропускаю")
+	if text == "" && imgMsg == nil && !isPDF {
+		fmt.Println("Личное сообщение без текста и вложений (стикер/реакция?) — пропускаю")
 		return
 	}
 
 	chat := msg.Info.Chat
 
-	// Показываем "печатает…", пока распознаём фото и ждём ответ ИИ —
+	// Показываем "печатает…", пока распознаём вложение и ждём ответ ИИ —
 	// чтобы было видно, что бот работает, а не завис.
 	stopTyping := b.startTyping(chat)
 	defer stopTyping()
 
-	// Фото в личке: распознаём как чек и отдаём ассистенту как контекст.
-	// Сразу в учёт НЕ добавляем (источник учёта — рабочие группы), но
-	// запоминаем как "ожидающий" чек: если владелец скажет "запомни их
-	// для группы такой-то" (дозагрузка пропущенных дней), ассистент
-	// сохранит их инструментом save_pending_receipts.
-	if imgMsg != nil {
-		receiptCtx, summary := b.describePrivatePhoto(ctx, msg, imgMsg)
+	// Вложение в личке (фото или PDF-чек): распознаём и отдаём ассистенту
+	// как контекст. Сразу в учёт НЕ добавляем (источник учёта — рабочие
+	// группы), но запоминаем как "ожидающий" чек: если владелец скажет
+	// "запомни их для группы такой-то", ассистент сохранит их инструментом
+	// save_pending_receipts.
+	if imgMsg != nil || isPDF {
+		var (
+			mediaBytes []byte
+			mediaText  string
+			mediaExt   string
+			err        error
+		)
+		if imgMsg != nil {
+			mediaExt = ".jpg"
+			mediaBytes, err = b.client.Download(ctx, imgMsg)
+			if err == nil {
+				mediaText, err = b.ocr.ExtractText(ctx, mediaBytes)
+			}
+		} else {
+			mediaExt = ".pdf"
+			mediaBytes, err = b.client.Download(ctx, docMsg)
+			if err == nil {
+				mediaText, err = b.extractPDFText(ctx, mediaBytes)
+			}
+		}
+		if err != nil {
+			fmt.Println("Ошибка обработки вложения из лички:", err)
+		}
 
-		// Фото без подписи — тихий приём: короткое подтверждение без вызова
-		// ИИ. Так можно массово переслать десятки/сотни старых чеков с
-		// другого телефона, не получая развёрнутый ответ на каждый.
+		// Пересылка чеков из лички по правилу source='dm' ("все чеки, что
+		// мне присылают, скидывай в группу такую-то").
+		if mediaBytes != nil && strings.TrimSpace(mediaText) != "" {
+			senderName := msg.Info.PushName
+			if senderName == "" {
+				senderName = msg.Info.Sender.User
+			}
+			go b.applyForwardRules(context.Background(), "dm", senderName, msg.Info.ID, mediaBytes, mediaExt, mediaText, msg.Info.Timestamp)
+		}
+
+		receiptCtx, summary := "", ""
+		if mediaBytes != nil {
+			receiptCtx, summary = b.describePrivateMedia(ctx, msg, mediaBytes, mediaText, mediaExt)
+		}
+
+		// Вложение без подписи — тихий приём: короткое подтверждение без
+		// вызова ИИ. Так можно массово переслать десятки/сотни старых чеков
+		// с другого телефона, не получая развёрнутый ответ на каждый.
 		if text == "" {
 			if summary != "" {
 				b.pendingMu.Lock()
@@ -413,7 +493,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 				b.pendingMu.Unlock()
 				b.sendText(chat, fmt.Sprintf("📥 Чек распознан: %s. Ожидают сохранения: %d. Когда пришлёшь все — напиши, для какой группы их запомнить.", summary, waiting))
 			} else {
-				b.sendText(chat, "Не смог распознать чек на этом фото — попробуй прислать более чёткий снимок.")
+				b.sendText(chat, "Не смог распознать чек в этом вложении — попробуй прислать более чёткий файл или фото.")
 			}
 			return
 		}
@@ -435,7 +515,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.savePendingTool(chat), b.correctionTool(""), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat)}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.savePendingTool(chat), b.correctionTool(""), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat), b.forwardingTool()}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -515,7 +595,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты,
 	// статистика по отправителям и корректировки (по умолчанию — в этой группе).
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.correctionTool(chat.String()), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat)}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.correctionTool(chat.String()), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat), b.forwardingTool()}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
 	if err != nil {
@@ -619,32 +699,23 @@ func (b *Bot) startTyping(chat types.JID) func() {
 	}
 }
 
-// describePrivatePhoto скачивает фото из личного сообщения, прогоняет через
-// OCR и, если это банковский чек, возвращает разобранную информацию (плюс
-// результат проверки на дубль) в виде текстового блока для контекста
-// ассистента. Распознанный чек дополнительно запоминается как "ожидающий"
-// (pending) — на случай, если владелец попросит добавить его в учёт.
+// describePrivateMedia разбирает уже скачанный файл из личного сообщения
+// (фото или PDF) с уже извлечённым текстом и, если это банковский чек,
+// возвращает разобранную информацию (плюс результат проверки на дубль)
+// в виде текстового блока для контекста ассистента. Распознанный чек
+// дополнительно запоминается как "ожидающий" (pending) — на случай, если
+// владелец попросит добавить его в учёт.
 // Второе возвращаемое значение — короткая сводка ("Милана, 29 400 ₽ от
 // 02.07.2026") для тихого подтверждения при массовой пересылке; пустая
 // строка, если чек не распознался.
-func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, imgMsg *waProto.ImageMessage) (string, string) {
-	imgBytes, err := b.client.Download(ctx, imgMsg)
-	if err != nil {
-		fmt.Println("Ошибка скачивания фото из лички:", err)
-		return "[Пользователь прислал фото, но его не удалось скачать.]", ""
-	}
-	ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
-	if err != nil {
-		fmt.Println("Ошибка OCR фото из лички:", err)
-		return "[Пользователь прислал фото, но текст на нём распознать не удалось.]", ""
-	}
+func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, mediaBytes []byte, ocrText, ext string) (string, string) {
 	ocrText = strings.TrimSpace(ocrText)
 	if ocrText == "" {
-		return "[Пользователь прислал фото без распознаваемого текста.]", ""
+		return "[Пользователь прислал файл без распознаваемого текста.]", ""
 	}
 
 	if !parser.LooksLikeBankReceipt(ocrText) {
-		return "[Пользователь прислал фото. Распознанный текст с фото]:\n" + ocrText, ""
+		return "[Пользователь прислал файл. Распознанный текст]:\n" + ocrText, ""
 	}
 
 	rd := parser.ParseReceipt(ocrText)
@@ -677,9 +748,9 @@ func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, img
 	}
 
 	// Сохраняем сообщение в БД (нужен id для возможной дозагрузки в учёт)
-	// и фото на диск, затем запоминаем чек как ожидающий команду владельца.
+	// и файл на диск, затем запоминаем чек как ожидающий команду владельца.
 	if rd.Amount > 0 && rd.Recipient != "" {
-		mediaPath := b.saveMediaFile(msg.Info.ID, imgBytes)
+		mediaPath := b.saveMediaFile(msg.Info.ID, mediaBytes, ext)
 		senderName := msg.Info.PushName
 		if senderName == "" {
 			senderName = msg.Info.Sender.User
@@ -807,6 +878,15 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		peopleList = strings.Join(contacts, ", ")
 	}
 
+	forwardingList := "нет"
+	if rules, err := b.db.ListForwardRules(ctx); err == nil && len(rules) > 0 {
+		var parts []string
+		for _, r := range rules {
+			parts = append(parts, fmt.Sprintf("из %q в %q", r.SourceName, r.TargetName))
+		}
+		forwardingList = strings.Join(parts, "; ")
+	}
+
 	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. Тебя зовут " + b.botName + " — " +
 		"в группах к тебе обращаются по этому имени. " +
 		"Общайся свободно и по-человечески на любые темы: можешь поболтать, ответить на общие вопросы, " +
@@ -850,7 +930,11 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"отчётов проще использовать их, а make_custom_pdf нужен для нестандартной таблицы, которую попросил владелец.\n" +
 		"7. delete_my_messages — удалить (отозвать 'у всех') последние собственные сообщения бота в этом чате. " +
 		"Вызывай, когда просят 'удали своё сообщение', 'убери это предупреждение'. Ты УМЕЕШЬ это делать — " +
-		"не отвечай, что не можешь удалять сообщения.\n\n" +
+		"не отвечай, что не можешь удалять сообщения.\n" +
+		"8. manage_receipt_forwarding — автоматическая пересылка чеков между чатами. 'Давай все чеки из группы " +
+		"оплата клиентов скидывай в оплата клнт' -> action=set; 'пересылай чеки из лички в ...' -> from='личка'; " +
+		"'хватит пересылать' -> action=stop. Пересланные чеки сразу записываются в учёт целевой группы. " +
+		"Сейчас активные правила пересылки: " + forwardingList + ".\n\n" +
 		"Также знай: если сообщение с платежом/чеком УДАЛИЛИ в WhatsApp, бот автоматически убирает его из учёта " +
 		"и пишет об этом в чат — отчёты всегда отражают актуальное состояние.\n\n" +
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
@@ -1161,6 +1245,125 @@ func sanitizeFileName(s string) string {
 		s = "Отчёт"
 	}
 	return s
+}
+
+// forwardingTool — управление правилами пересылки чеков между чатами:
+// "все чеки из группы оплата клиентов скидывай в оплата клнт" / "хватит
+// пересылать". Правила хранятся в БД и переживают рестарт бота.
+func (b *Bot) forwardingTool() ai.Tool {
+	return ai.Tool{
+		Name: "manage_receipt_forwarding",
+		Description: "Управляет автоматической пересылкой чеков между чатами. " +
+			"action=set: все чеки (фото и PDF), приходящие в чат from, бот будет автоматически пересылать " +
+			"в группу to и сразу записывать их в учёт целевой группы. from — название группы или 'личка' " +
+			"(чеки, присланные боту в личные сообщения). " +
+			"action=stop: выключить пересылку из from (или ВСЕ правила, если from не указан). " +
+			"action=list: показать активные правила. " +
+			"Вызывай при командах вроде 'давай все чеки из группы оплата клиентов скидывай в оплата клнт', " +
+			"'пересылай чеки из лички в основную группу', 'хватит пересылать чеки', 'останови пересылку из ...'.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action": map[string]any{
+					"type":        "string",
+					"enum":        []string{"set", "stop", "list"},
+					"description": "set — включить пересылку; stop — выключить; list — показать правила",
+				},
+				"from": map[string]any{
+					"type":        "string",
+					"description": "Источник: название группы или 'личка'. Для stop можно не указывать (выключит все)",
+				},
+				"to": map[string]any{
+					"type":        "string",
+					"description": "Название целевой группы (обязательно для set)",
+				},
+			},
+			"required": []string{"action"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Action string `json:"action"`
+				From   string `json:"from"`
+				To     string `json:"to"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+
+			switch args.Action {
+			case "list":
+				rules, err := b.db.ListForwardRules(ctx)
+				if err != nil {
+					return "", err
+				}
+				if len(rules) == 0 {
+					return "Активных правил пересылки нет.", nil
+				}
+				var sb strings.Builder
+				sb.WriteString("Активные правила пересылки чеков:\n")
+				for _, r := range rules {
+					fmt.Fprintf(&sb, "- из %q -> в %q\n", r.SourceName, r.TargetName)
+				}
+				return sb.String(), nil
+
+			case "stop":
+				source := ""
+				label := "все правила"
+				if s := strings.TrimSpace(args.From); s != "" {
+					src, srcName, err := b.resolveForwardSource(ctx, s)
+					if err != nil {
+						return "", err
+					}
+					source, label = src, "пересылку из "+srcName
+				}
+				n, err := b.db.DeleteForwardRule(ctx, source)
+				if err != nil {
+					return "", err
+				}
+				if n == 0 {
+					return "Подходящих правил пересылки не было — ничего не выключал.", nil
+				}
+				return fmt.Sprintf("Выключил %s (удалено правил: %d).", label, n), nil
+
+			case "set":
+				if strings.TrimSpace(args.From) == "" || strings.TrimSpace(args.To) == "" {
+					return "", fmt.Errorf("для включения пересылки нужны и источник (from), и целевая группа (to)")
+				}
+				source, sourceName, err := b.resolveForwardSource(ctx, args.From)
+				if err != nil {
+					return "", err
+				}
+				targetJID, targetName, err := b.resolveGroup(ctx, args.To)
+				if err != nil {
+					return "", err
+				}
+				if source == targetJID.String() {
+					return "", fmt.Errorf("источник и целевая группа совпадают")
+				}
+				if err := b.db.SetForwardRule(ctx, source, sourceName, targetJID.String(), targetName); err != nil {
+					return "", err
+				}
+				return fmt.Sprintf("Включил: все чеки из %q теперь пересылаются в %q и записываются в её учёт. Скажи 'останови пересылку', когда надо будет выключить.", sourceName, targetName), nil
+
+			default:
+				return "", fmt.Errorf("неизвестное действие %q", args.Action)
+			}
+		},
+	}
+}
+
+// resolveForwardSource переводит человекочитаемый источник пересылки в ключ
+// правила: 'личка'/'лс'/'dm' -> "dm", иначе — JID группы по названию.
+func (b *Bot) resolveForwardSource(ctx context.Context, from string) (source, name string, err error) {
+	switch strings.ToLower(strings.TrimSpace(from)) {
+	case "личка", "лс", "dm", "личные", "личные чаты", "личные сообщения":
+		return "dm", "личных сообщений", nil
+	}
+	jid, gname, err := b.resolveGroup(ctx, from)
+	if err != nil {
+		return "", "", err
+	}
+	return jid.String(), gname, nil
 }
 
 // deleteMessagesTool — отзыв собственных сообщений бота по просьбе владельца
@@ -1600,20 +1803,63 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 	return sb.String(), nil
 }
 
-// saveMediaFile сохраняет фото чека на диск для ручной проверки/аудита,
-// возвращает путь к файлу или пустую строку при ошибке.
-func (b *Bot) saveMediaFile(waMessageID string, data []byte) string {
+// saveMediaFile сохраняет файл чека (фото или PDF) на диск для ручной
+// проверки/аудита, возвращает путь к файлу или пустую строку при ошибке.
+func (b *Bot) saveMediaFile(waMessageID string, data []byte, ext string) string {
 	dir := filepath.Join(b.reportDir, "..", "receipts")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		fmt.Println("Ошибка создания папки receipts:", err)
 		return ""
 	}
-	path := filepath.Join(dir, waMessageID+".jpg")
+	path := filepath.Join(dir, waMessageID+ext)
 	if err := os.WriteFile(path, data, 0o644); err != nil {
-		fmt.Println("Ошибка сохранения фото:", err)
+		fmt.Println("Ошибка сохранения файла чека:", err)
 		return ""
 	}
 	return path
+}
+
+// applyForwardRules пересылает файл чека (фото/PDF) в целевые группы по
+// активным правилам и сразу записывает его в учёт целевой группы —
+// дальше он там живёт как обычный чек (с проверкой дублей внутри группы).
+func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, origMsgID string, media []byte, ext, text string, ts time.Time) {
+	rules, err := b.db.ListForwardRules(ctx)
+	if err != nil {
+		fmt.Println("Ошибка чтения правил пересылки:", err)
+		return
+	}
+	for _, rule := range rules {
+		if rule.Source != sourceKey {
+			continue
+		}
+		if rule.TargetJID == sourceKey {
+			continue // защита от пересылки группы в саму себя
+		}
+		targetJID, err := types.ParseJID(rule.TargetJID)
+		if err != nil {
+			fmt.Println("Правило пересылки с кривым JID:", rule.TargetJID, err)
+			continue
+		}
+
+		if ext == ".pdf" {
+			b.sendDocumentBytes(targetJID, media, "чек_"+ts.Format("2006-01-02_15-04")+".pdf", "application/pdf")
+		} else {
+			b.sendImageBytes(targetJID, media)
+		}
+		fmt.Printf("Чек из %s переслан в %s (%s)\n", sourceKey, rule.TargetName, rule.TargetJID)
+
+		// Записываем чек в учёт целевой группы. Синтетический ID сообщения,
+		// чтобы не конфликтовать с исходным по уникальности.
+		if parser.LooksLikeBankReceipt(text) {
+			rawID, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
+				"bot-forward", senderName, text, true, "", ts)
+			if err != nil {
+				fmt.Println("Ошибка сохранения пересланного чека:", err)
+				continue
+			}
+			b.handleBankReceipt(ctx, targetJID, text, rawID, ts)
+		}
+	}
 }
 
 // handleBankReceipt разбирает распознанный текст скриншота банковского перевода
@@ -1827,6 +2073,60 @@ func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) int 
 		deleted++
 	}
 	return deleted
+}
+
+// sendImageBytes отправляет фото (например, пересланный чек) в чат.
+func (b *Bot) sendImageBytes(chat types.JID, data []byte) {
+	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaImage)
+	if err != nil {
+		fmt.Println("Ошибка загрузки фото в WhatsApp:", err)
+		return
+	}
+	msg := &waProto.Message{
+		ImageMessage: &waProto.ImageMessage{
+			URL:           proto.String(uploaded.URL),
+			Mimetype:      proto.String("image/jpeg"),
+			FileLength:    proto.Uint64(uploaded.FileLength),
+			FileSHA256:    uploaded.FileSHA256,
+			FileEncSHA256: uploaded.FileEncSHA256,
+			MediaKey:      uploaded.MediaKey,
+			DirectPath:    proto.String(uploaded.DirectPath),
+		},
+	}
+	resp, err := b.client.SendMessage(context.Background(), chat, msg)
+	if err != nil {
+		fmt.Println("Ошибка отправки фото:", err)
+		return
+	}
+	b.rememberSent(chat, resp.ID)
+}
+
+// sendDocumentBytes отправляет документ (PDF-чек) из памяти.
+func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype string) {
+	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaDocument)
+	if err != nil {
+		fmt.Println("Ошибка загрузки документа в WhatsApp:", err)
+		return
+	}
+	msg := &waProto.Message{
+		DocumentMessage: &waProto.DocumentMessage{
+			URL:           proto.String(uploaded.URL),
+			Mimetype:      proto.String(mimetype),
+			Title:         proto.String(fileName),
+			FileName:      proto.String(fileName),
+			FileLength:    proto.Uint64(uploaded.FileLength),
+			FileSHA256:    uploaded.FileSHA256,
+			FileEncSHA256: uploaded.FileEncSHA256,
+			MediaKey:      uploaded.MediaKey,
+			DirectPath:    proto.String(uploaded.DirectPath),
+		},
+	}
+	resp, err := b.client.SendMessage(context.Background(), chat, msg)
+	if err != nil {
+		fmt.Println("Ошибка отправки документа:", err)
+		return
+	}
+	b.rememberSent(chat, resp.ID)
 }
 
 func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) {

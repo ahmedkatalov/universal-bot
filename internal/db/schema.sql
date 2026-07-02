@@ -86,6 +86,17 @@ CREATE INDEX IF NOT EXISTS idx_bank_receipts_review ON bank_receipts(needs_revie
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_duplicate ON bank_receipts(is_duplicate);
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_group ON bank_receipts(group_jid);
 
+-- Правила пересылки чеков между чатами: "все чеки из группы X скидывай в Y".
+-- source — JID группы-источника или 'dm' (все личные чаты боту).
+CREATE TABLE IF NOT EXISTS forward_rules (
+    id          SERIAL PRIMARY KEY,
+    source      TEXT NOT NULL UNIQUE,
+    source_name TEXT,               -- человекочитаемое название источника (для ассистента)
+    target_jid  TEXT NOT NULL,
+    target_name TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
 -- Стартовый набор контактов и алиасов на основе твоих реальных сообщений.
 INSERT INTO contacts (canonical_name) VALUES
     ('Наличка'), ('Ахмед'), ('Милана'), ('Яхита'), ('Нажуд'),

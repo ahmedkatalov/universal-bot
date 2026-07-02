@@ -91,6 +91,20 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("добавление колонки bank_receipts.ignored: %w", err)
 	}
 
+	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS forward_rules (
+			id          SERIAL PRIMARY KEY,
+			source      TEXT NOT NULL UNIQUE,
+			source_name TEXT,
+			target_jid  TEXT NOT NULL,
+			target_name TEXT,
+			created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы forward_rules: %w", err)
+	}
+
 	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
 	// чек, легально пересланный из группы СБ в основную, помечался дублем.
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
@@ -447,6 +461,61 @@ func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignor
 	}
 	_, err := d.pool.Exec(ctx, `UPDATE `+table+` SET ignored = $2 WHERE id = $1`, id, ignored)
 	return err
+}
+
+// ForwardRule — правило пересылки чеков: все чеки из source идут в target.
+// source — JID группы или 'dm' (личные чаты боту).
+type ForwardRule struct {
+	Source     string
+	SourceName string
+	TargetJID  string
+	TargetName string
+}
+
+// SetForwardRule включает пересылку чеков из source в target (замещает
+// существующее правило для этого источника).
+func (d *DB) SetForwardRule(ctx context.Context, source, sourceName, targetJID, targetName string) error {
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO forward_rules (source, source_name, target_jid, target_name)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (source) DO UPDATE SET target_jid = $3, target_name = $4
+	`, source, sourceName, targetJID, targetName)
+	return err
+}
+
+// DeleteForwardRule выключает пересылку из указанного источника. Пустой
+// source удаляет ВСЕ правила. Возвращает, сколько правил удалено.
+func (d *DB) DeleteForwardRule(ctx context.Context, source string) (int, error) {
+	if source == "" {
+		res, err := d.pool.Exec(ctx, `DELETE FROM forward_rules`)
+		if err != nil {
+			return 0, err
+		}
+		return int(res.RowsAffected()), nil
+	}
+	res, err := d.pool.Exec(ctx, `DELETE FROM forward_rules WHERE source = $1`, source)
+	if err != nil {
+		return 0, err
+	}
+	return int(res.RowsAffected()), nil
+}
+
+// ListForwardRules возвращает все активные правила пересылки.
+func (d *DB) ListForwardRules(ctx context.Context) ([]ForwardRule, error) {
+	rows, err := d.pool.Query(ctx, `SELECT source, COALESCE(source_name,''), target_jid, COALESCE(target_name,'') FROM forward_rules ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ForwardRule
+	for rows.Next() {
+		var r ForwardRule
+		if err := rows.Scan(&r.Source, &r.SourceName, &r.TargetJID, &r.TargetName); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // ListContacts возвращает все каноничные имена из учёта — ассистент подмешивает
