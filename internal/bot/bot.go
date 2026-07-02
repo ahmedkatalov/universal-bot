@@ -353,7 +353,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 
 	return "Ты — личный ассистент владельца WhatsApp-бота учёта финансов. Бот ведёт единый учёт " +
 		"по всем WhatsApp-группам, в которых состоит его номер. Отвечай кратко и по делу, на русском языке.\n\n" +
-		"Сегодняшняя дата: " + now.Format("02.01.2006") + ".\n\n" +
+		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
 		"Сводка по сбору средств за текущий месяц (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
 		summaryText +
 		"\n\nИспользуй эти данные для быстрых вопросов про текущий месяц. " +
@@ -377,6 +377,7 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 			"Вызывай, когда пользователь спрашивает про суммы/сбор за конкретные даты или период, " +
 			"или явно просит отчёт/документ.",
 		InputSchema: map[string]any{
+			"type": "object",
 			"properties": map[string]any{
 				"from_date": map[string]any{
 					"type":        "string",
