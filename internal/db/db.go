@@ -247,13 +247,22 @@ const DuplicateWindow = 5 * time.Minute
 // groupJID означает поиск по всем группам (используется для информационной
 // проверки чеков, присланных в личку).
 func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
+	// Оригиналом для проверки считается только ЖИВАЯ запись: не помеченная
+	// сама дублем, не исключённая вручную и не из удалённого в WhatsApp
+	// сообщения. Иначе чек, который уже убрали из учёта (удалили сообщение
+	// или исключили через ассистента), продолжал бы блокировать повторную
+	// отправку как "дубль".
 	if docNumber != "" || authCode != "" {
 		var existing time.Time
 		err := d.pool.QueryRow(ctx, `
-			SELECT tx_date FROM bank_receipts
-			WHERE (($1 <> '' AND doc_number = $1) OR ($2 <> '' AND auth_code = $2))
-			  AND ($3 = '' OR group_jid = $3)
-			ORDER BY tx_date
+			SELECT br.tx_date FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE (($1 <> '' AND br.doc_number = $1) OR ($2 <> '' AND br.auth_code = $2))
+			  AND ($3 = '' OR br.group_jid = $3)
+			  AND br.is_duplicate = false
+			  AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			ORDER BY br.tx_date
 			LIMIT 1
 		`, docNumber, authCode, groupJID).Scan(&existing)
 		if err == nil {
@@ -266,15 +275,19 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 
 	var existing time.Time
 	err := d.pool.QueryRow(ctx, `
-		SELECT tx_date FROM bank_receipts
-		WHERE amount = $1
-		  AND tx_date BETWEEN $2 AND $3
+		SELECT br.tx_date FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.amount = $1
+		  AND br.tx_date BETWEEN $2 AND $3
 		  AND (
-		    ($4::int IS NOT NULL AND contact_id = $4) OR
-		    ($4::int IS NULL AND recipient_raw = $5)
+		    ($4::int IS NOT NULL AND br.contact_id = $4) OR
+		    ($4::int IS NULL AND br.recipient_raw = $5)
 		  )
-		  AND ($6 = '' OR group_jid = $6)
-		ORDER BY tx_date
+		  AND ($6 = '' OR br.group_jid = $6)
+		  AND br.is_duplicate = false
+		  AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		ORDER BY br.tx_date
 		LIMIT 1
 	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID).Scan(&existing)
 	if err == nil {
