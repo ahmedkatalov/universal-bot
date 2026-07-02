@@ -48,6 +48,7 @@ type Bot struct {
 	ocr           ocr.Extractor
 	assistant     *ai.Assistant
 	allowedGroups map[types.JID]bool // пусто/nil => разрешены все группы, в которых состоит номер
+	botName       string             // обращение в группах: "Джарвис скинь отчет"
 	fontDir       string
 	reportDir     string
 
@@ -77,10 +78,10 @@ type pendingReceipt struct {
 // New создаёт клиент whatsmeow. sessionDBPath — путь к SQLite-файлу сессии,
 // сохраняется между рестартами, чтобы не сканировать QR каждый раз.
 // assistant может быть nil — тогда бот не отвечает в личных сообщениях
-// (например, если не задан ANTHROPIC_API_KEY). groupJIDs — список JID групп,
+// (например, если не задан OPENROUTER_API_KEY). groupJIDs — список JID групп,
 // которые нужно учитывать; пустой список означает "все группы, в которых
-// состоит номер бота".
-func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, fontDir, reportDir string) (*Bot, error) {
+// состоит номер бота". botName — имя, по которому к боту обращаются в группах.
+func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, botName, fontDir, reportDir string) (*Bot, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -124,6 +125,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		ocr:           ocrClient,
 		assistant:     assistant,
 		allowedGroups: allowedGroups,
+		botName:       botName,
 		fontDir:       fontDir,
 		reportDir:     reportDir,
 		history:       make(map[string][]ai.Turn),
@@ -254,6 +256,16 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 
 	if text == "" && !hasMedia {
 		return
+	}
+
+	// Обращение к боту по имени ("Джарвис скинь отчет") — отвечаем ассистентом
+	// прямо в группе, в учёт такое сообщение не идёт. В фоне, чтобы не
+	// блокировать разбор остальных сообщений.
+	if !hasMedia && b.assistant != nil {
+		if query, ok := b.stripBotName(text); ok {
+			go b.handleGroupAssistant(context.Background(), msg, query)
+			return
+		}
 	}
 
 	rawID, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
@@ -387,6 +399,83 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 	fmt.Println("Ответ ассистента:", reply)
 	b.sendText(chat, reply)
+}
+
+// stripBotName проверяет, начинается ли сообщение с имени бота
+// ("Джарвис скинь отчет", "джарвис, какой сбор?"), и возвращает текст
+// без обращения. Сравнение по рунам без учёта регистра.
+func (b *Bot) stripBotName(text string) (string, bool) {
+	if b.botName == "" {
+		return "", false
+	}
+	trimmed := strings.TrimSpace(text)
+	runes := []rune(trimmed)
+	name := []rune(b.botName)
+	if len(runes) < len(name) {
+		return "", false
+	}
+	if !strings.EqualFold(string(runes[:len(name)]), b.botName) {
+		return "", false
+	}
+	rest := strings.TrimLeft(string(runes[len(name):]), " \t,:;!?-—.")
+	// "Джарвисом" и т.п. — не обращение: после имени должна идти граница слова.
+	if len(runes) > len(name) {
+		next := runes[len(name)]
+		if next != ' ' && next != ',' && next != ':' && next != ';' && next != '!' && next != '?' && next != '-' && next != '—' && next != '.' && next != '\t' {
+			return "", false
+		}
+	}
+	if rest == "" {
+		rest = "Привет!"
+	}
+	return rest, true
+}
+
+// handleGroupAssistant отвечает на обращение к боту по имени прямо в группе.
+// История такого диалога общая на группу (ключ — JID группы).
+func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, query string) {
+	chat := msg.Info.Chat
+
+	stopTyping := b.startTyping(chat)
+	defer stopTyping()
+
+	key := chat.String()
+	b.historyMu.Lock()
+	history := append([]ai.Turn(nil), b.history[key]...)
+	b.historyMu.Unlock()
+
+	system := b.buildAssistantSystemPrompt(ctx) +
+		"\n\nСейчас к тебе обратились по имени ПРЯМО В РАБОЧЕЙ ГРУППЕ — твой ответ увидят все участники. " +
+		"Отвечай коротко и по делу. Инструмент save_pending_receipts здесь недоступен."
+
+	senderName := msg.Info.PushName
+	if senderName == "" {
+		senderName = msg.Info.Sender.User
+	}
+	userText := senderName + ": " + query
+
+	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты
+	// и статистика по отправителям.
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx)}
+
+	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
+	if err != nil {
+		fmt.Println("Ошибка ответа ассистента в группе:", err)
+		b.sendText(chat, "Не получилось ответить: "+err.Error())
+		return
+	}
+
+	updated := append(history, ai.Turn{FromUser: true, Text: userText}, ai.Turn{FromUser: false, Text: reply})
+	if len(updated) > maxPrivateHistory {
+		updated = updated[len(updated)-maxPrivateHistory:]
+	}
+	b.historyMu.Lock()
+	b.history[key] = updated
+	b.historyMu.Unlock()
+
+	if reply != "" {
+		b.sendText(chat, reply)
+	}
 }
 
 // joinedGroups возвращает список групп бота (JID -> название) с кэшем на
@@ -641,7 +730,8 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		groupsList = strings.Join(names, "; ")
 	}
 
-	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. " +
+	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. Тебя зовут " + b.botName + " — " +
+		"в группах к тебе обращаются по этому имени. " +
 		"Общайся свободно и по-человечески на любые темы: можешь поболтать, ответить на общие вопросы, " +
 		"помочь советом, пошутить — ты не ограничен только финансами. Отвечай на русском, живо и без канцелярита, " +
 		"но без лишней воды.\n\n" +

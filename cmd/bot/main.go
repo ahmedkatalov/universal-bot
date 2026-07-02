@@ -56,6 +56,7 @@ func main() {
 	// в которых состоит номер. WHATSAPP_GROUP_JID оставлен для обратной
 	// совместимости со старыми .env (один JID).
 	groupJIDs := parseGroupJIDs(envOr("WHATSAPP_GROUP_JIDS", os.Getenv("WHATSAPP_GROUP_JID")))
+	botName := envOr("BOT_NAME", "Джарвис") // обращение в группах: "Джарвис скинь отчет"
 	sessionPath := envOr("SESSION_DB_PATH", "./data/session.db")
 	fontDir := envOr("FONT_DIR", "./assets/fonts")
 	reportDir := envOr("REPORT_DIR", "./data/reports")
@@ -126,7 +127,7 @@ func main() {
 		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
 	}
 
-	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, fontDir, reportDir)
+	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, botName, fontDir, reportDir)
 	if err != nil {
 		log.Fatalf("не удалось создать бота: %v", err)
 	}
