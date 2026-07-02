@@ -1,0 +1,40 @@
+version: "3.8"
+
+# Все секреты и настройки — в файле .env рядом (см. .env.example).
+# .env НЕ коммитится в git (закрыт через .gitignore).
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: financebot
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: finance
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./internal/db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    ports:
+      - "127.0.0.1:5433:5432" # только локально, наружу не открываем
+
+  bot:
+    build: .
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    environment:
+      DATABASE_URL: postgres://financebot:${POSTGRES_PASSWORD}@postgres:5432/finance
+      WHATSAPP_GROUP_JID: ${WHATSAPP_GROUP_JID}
+      OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
+      YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
+      YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
+      WHATSAPP_PROXY: ${WHATSAPP_PROXY:-}
+    volumes:
+      - bot_data:/app/data
+    # При первом запуске QR-код печатается в логи контейнера:
+    #   docker compose logs -f bot   (или docker-compose на старых версиях)
+    # его нужно отсканировать с телефона (WhatsApp -> Связанные устройства)
+
+volumes:
+  pg_data:
+  bot_data:
