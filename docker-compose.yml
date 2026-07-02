@@ -37,6 +37,9 @@ services:
       OPENROUTER_MODEL: ${OPENROUTER_MODEL:-~anthropic/claude-sonnet-latest}
       # Имя, по которому к боту обращаются в группах: "Джарвис скинь отчет"
       BOT_NAME: ${BOT_NAME:-Джарвис}
+      # Кто может писать боту в личку (ассистент, дозагрузка чеков) — номера
+      # через запятую без плюса: "79370000000,79280000000". Пусто = все.
+      OWNER_NUMBERS: ${OWNER_NUMBERS:-}
       OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}

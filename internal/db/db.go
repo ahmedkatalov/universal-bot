@@ -424,6 +424,92 @@ func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignor
 	return err
 }
 
+// ListContacts возвращает все каноничные имена из учёта — ассистент подмешивает
+// их в промпт, чтобы исправлять опечатки в запросах ("ахмет каталов" -> "Ахмед").
+func (d *DB) ListContacts(ctx context.Context) ([]string, error) {
+	rows, err := d.pool.Query(ctx, `SELECT canonical_name FROM contacts ORDER BY canonical_name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// PersonStats — сводка по одному человеку: сколько чеков на его имя (карту)
+// и сколько текстовых платежей, с общими суммами и границами периода.
+type PersonStats struct {
+	Name         string
+	ReceiptCount int
+	ReceiptTotal float64
+	PaymentCount int
+	PaymentTotal float64
+	FirstOp      *time.Time
+	LastOp       *time.Time
+}
+
+// PersonReport ищет людей по подстроке имени (без учёта регистра) и для
+// каждого считает чеки и текстовые платежи. from/to — необязательные границы
+// периода, groupJID — необязательный фильтр по группе. До 5 совпадений.
+func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *time.Time, groupJID string) ([]PersonStats, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT c.canonical_name,
+			COALESCE(r.cnt, 0), COALESCE(r.total, 0),
+			COALESCE(t.cnt, 0), COALESCE(t.total, 0),
+			LEAST(r.first_op, t.first_op), GREATEST(r.last_op, t.last_op)
+		FROM contacts c
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS cnt, SUM(br.amount) AS total,
+			       MIN(br.tx_date) AS first_op, MAX(br.tx_date) AS last_op
+			FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE br.contact_id = c.id
+			  AND br.is_duplicate = false AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND ($2::timestamptz IS NULL OR br.tx_date >= $2)
+			  AND ($3::timestamptz IS NULL OR br.tx_date < $3)
+			  AND ($4 = '' OR br.group_jid = $4)
+		) r ON true
+		LEFT JOIN LATERAL (
+			SELECT COUNT(*) AS cnt, SUM(tx.amount) AS total,
+			       MIN(tx.tx_date)::timestamptz AS first_op, MAX(tx.tx_date)::timestamptz AS last_op
+			FROM transactions tx
+			LEFT JOIN raw_messages rm ON rm.id = tx.raw_message_id
+			WHERE tx.contact_id = c.id
+			  AND tx.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND ($2::timestamptz IS NULL OR tx.tx_date >= $2)
+			  AND ($3::timestamptz IS NULL OR tx.tx_date < $3)
+			  AND ($4 = '' OR rm.wa_group_jid = $4)
+		) t ON true
+		WHERE c.canonical_name ILIKE '%' || $1 || '%'
+		  AND (COALESCE(r.cnt, 0) > 0 OR COALESCE(t.cnt, 0) > 0)
+		ORDER BY COALESCE(r.total, 0) + COALESCE(t.total, 0) DESC
+		LIMIT 5
+	`, personQuery, from, to, groupJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []PersonStats
+	for rows.Next() {
+		var p PersonStats
+		if err := rows.Scan(&p.Name, &p.ReceiptCount, &p.ReceiptTotal, &p.PaymentCount, &p.PaymentTotal, &p.FirstOp, &p.LastOp); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ---- Сводки ----
 
 // ContactSummary — агрегированная сумма по одному контакту за период.

@@ -48,6 +48,7 @@ type Bot struct {
 	ocr           ocr.Extractor
 	assistant     *ai.Assistant
 	allowedGroups map[types.JID]bool // пусто/nil => разрешены все группы, в которых состоит номер
+	ownerNumbers  map[string]bool    // пусто/nil => ассистент в личке отвечает всем; иначе только этим номерам
 	botName       string             // обращение в группах: "Джарвис скинь отчет"
 	fontDir       string
 	reportDir     string
@@ -81,7 +82,9 @@ type pendingReceipt struct {
 // (например, если не задан OPENROUTER_API_KEY). groupJIDs — список JID групп,
 // которые нужно учитывать; пустой список означает "все группы, в которых
 // состоит номер бота". botName — имя, по которому к боту обращаются в группах.
-func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, botName, fontDir, reportDir string) (*Bot, error) {
+// ownerNumbers — номера (только цифры), которым разрешена личка с ассистентом;
+// пустой список = отвечаем всем.
+func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, ownerNumbers []string, botName, fontDir, reportDir string) (*Bot, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -118,6 +121,14 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		}
 	}
 
+	var owners map[string]bool
+	if len(ownerNumbers) > 0 {
+		owners = make(map[string]bool, len(ownerNumbers))
+		for _, n := range ownerNumbers {
+			owners[strings.TrimLeft(strings.TrimSpace(n), "+")] = true
+		}
+	}
+
 	b := &Bot{
 		client:        client,
 		db:            database,
@@ -125,6 +136,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		ocr:           ocrClient,
 		assistant:     assistant,
 		allowedGroups: allowedGroups,
+		ownerNumbers:  owners,
 		botName:       botName,
 		fontDir:       fontDir,
 		reportDir:     reportDir,
@@ -181,6 +193,12 @@ func (b *Bot) handleEvent(evt interface{}) {
 		if err := b.client.SendPresence(context.Background(), types.PresenceAvailable); err != nil {
 			fmt.Println("Не удалось отправить presence:", err)
 		}
+		// Печатаем группы с JID — удобно для настройки WHATSAPP_GROUP_JIDS.
+		go func() {
+			for jid, name := range b.joinedGroups(context.Background()) {
+				fmt.Printf("Группа: %q — %s\n", name, jid)
+			}
+		}()
 		return
 	}
 
@@ -214,6 +232,10 @@ func (b *Bot) handleEvent(evt interface{}) {
 		// и он не должен блокировать разбор сообщений из групп.
 		fmt.Printf("Личное сообщение от %s (chat=%s, fromMe=%v): %q\n",
 			msg.Info.Sender, msg.Info.Chat, msg.Info.IsFromMe, extractText(msg.Message))
+		if b.ownerNumbers != nil && !b.ownerNumbers[msg.Info.Sender.User] {
+			fmt.Println("Отправитель не в списке OWNER_NUMBERS — личка проигнорирована")
+			return
+		}
 		if b.assistant != nil {
 			go b.handlePrivateMessage(ctx, msg)
 		} else {
@@ -373,12 +395,25 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	// для группы такой-то" (дозагрузка пропущенных дней), ассистент
 	// сохранит их инструментом save_pending_receipts.
 	if imgMsg != nil {
-		receiptCtx := b.describePrivatePhoto(ctx, msg, imgMsg)
-		if receiptCtx != "" {
-			if text != "" {
-				text += "\n\n"
+		receiptCtx, summary := b.describePrivatePhoto(ctx, msg, imgMsg)
+
+		// Фото без подписи — тихий приём: короткое подтверждение без вызова
+		// ИИ. Так можно массово переслать десятки/сотни старых чеков с
+		// другого телефона, не получая развёрнутый ответ на каждый.
+		if text == "" {
+			if summary != "" {
+				b.pendingMu.Lock()
+				waiting := len(b.pending[chat.String()])
+				b.pendingMu.Unlock()
+				b.sendText(chat, fmt.Sprintf("📥 Чек распознан: %s. Ожидают сохранения: %d. Когда пришлёшь все — напиши, для какой группы их запомнить.", summary, waiting))
+			} else {
+				b.sendText(chat, "Не смог распознать чек на этом фото — попробуй прислать более чёткий снимок.")
 			}
-			text += receiptCtx
+			return
+		}
+
+		if receiptCtx != "" {
+			text += "\n\n" + receiptCtx
 		}
 	}
 
@@ -394,7 +429,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.savePendingTool(chat), b.correctionTool("")}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.savePendingTool(chat), b.correctionTool(""), b.personTool()}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -474,7 +509,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты,
 	// статистика по отправителям и корректировки (по умолчанию — в этой группе).
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.correctionTool(chat.String())}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.correctionTool(chat.String()), b.personTool()}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
 	if err != nil {
@@ -583,24 +618,27 @@ func (b *Bot) startTyping(chat types.JID) func() {
 // результат проверки на дубль) в виде текстового блока для контекста
 // ассистента. Распознанный чек дополнительно запоминается как "ожидающий"
 // (pending) — на случай, если владелец попросит добавить его в учёт.
-func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, imgMsg *waProto.ImageMessage) string {
+// Второе возвращаемое значение — короткая сводка ("Милана, 29 400 ₽ от
+// 02.07.2026") для тихого подтверждения при массовой пересылке; пустая
+// строка, если чек не распознался.
+func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, imgMsg *waProto.ImageMessage) (string, string) {
 	imgBytes, err := b.client.Download(ctx, imgMsg)
 	if err != nil {
 		fmt.Println("Ошибка скачивания фото из лички:", err)
-		return "[Пользователь прислал фото, но его не удалось скачать.]"
+		return "[Пользователь прислал фото, но его не удалось скачать.]", ""
 	}
 	ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
 	if err != nil {
 		fmt.Println("Ошибка OCR фото из лички:", err)
-		return "[Пользователь прислал фото, но текст на нём распознать не удалось.]"
+		return "[Пользователь прислал фото, но текст на нём распознать не удалось.]", ""
 	}
 	ocrText = strings.TrimSpace(ocrText)
 	if ocrText == "" {
-		return "[Пользователь прислал фото без распознаваемого текста.]"
+		return "[Пользователь прислал фото без распознаваемого текста.]", ""
 	}
 
 	if !parser.LooksLikeBankReceipt(ocrText) {
-		return "[Пользователь прислал фото. Распознанный текст с фото]:\n" + ocrText
+		return "[Пользователь прислал фото. Распознанный текст с фото]:\n" + ocrText, ""
 	}
 
 	rd := parser.ParseReceipt(ocrText)
@@ -652,9 +690,10 @@ func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, img
 				rd:         rd,
 				receivedAt: msg.Info.Timestamp,
 			})
-			// Защита от бесконечного накопления: держим максимум 50 последних.
-			if len(b.pending[chatKey]) > 50 {
-				b.pending[chatKey] = b.pending[chatKey][len(b.pending[chatKey])-50:]
+			// Защита от бесконечного накопления. Лимит с запасом на массовую
+			// пересылку истории чеков с другого телефона.
+			if len(b.pending[chatKey]) > 300 {
+				b.pending[chatKey] = b.pending[chatKey][len(b.pending[chatKey])-300:]
 			}
 			b.pendingMu.Unlock()
 		}
@@ -710,7 +749,16 @@ func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, img
 	}
 	sb.WriteString("(Чек запомнен как ожидающий. В учёт он попадёт, только если владелец попросит сохранить — " +
 		"тогда вызови инструмент save_pending_receipts с названием группы, к которой относятся чеки.)")
-	return sb.String()
+
+	summary := ""
+	if rd.Amount > 0 && rd.Recipient != "" {
+		name, _ := b.aliases.ResolveName(rd.Recipient)
+		summary = fmt.Sprintf("%s, %.0f ₽", name, rd.Amount)
+		if rd.HasTxTime {
+			summary += ", операция " + rd.TxTime.Format("02.01.2006 15:04")
+		}
+	}
+	return sb.String(), summary
 }
 
 // buildAssistantSystemPrompt формирует системный промпт со сводкой по сбору
@@ -748,6 +796,11 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		groupsList = strings.Join(names, "; ")
 	}
 
+	peopleList := "(не удалось загрузить)"
+	if contacts, err := b.db.ListContacts(ctx); err == nil && len(contacts) > 0 {
+		peopleList = strings.Join(contacts, ", ")
+	}
+
 	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. Тебя зовут " + b.botName + " — " +
 		"в группах к тебе обращаются по этому имени. " +
 		"Общайся свободно и по-человечески на любые темы: можешь поболтать, ответить на общие вопросы, " +
@@ -759,6 +812,10 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"почему чек не распознался или что-то посчиталось не так — объясняй и подсказывай, как поправить.\n\n" +
 		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
 		"Группы, в которых состоит бот: " + groupsList + ".\n\n" +
+		"Известные люди в учёте: " + peopleList + ". " +
+		"Пользователь может писать имена с опечатками или в другой форме ('ахмет каталов', 'миланка') — " +
+		"сам сопоставь с ближайшим известным именем и используй точное имя из списка при вызовах инструментов; " +
+		"если сомневаешься, к кому относится запрос, — переспроси.\n\n" +
 		"Сводка по сбору средств за текущий месяц по всем группам (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
 		summaryText +
 		"\n\nТвои инструменты:\n" +
@@ -776,7 +833,9 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"(включая год), так что чеки лягут на свои реальные даты. Дубли пропускаются автоматически.\n" +
 		"4. correct_operation — исключить ошибочную операцию из учёта или вернуть обратно. Вызывай, когда говорят " +
 		"'тот чек на 5000 был по ошибке, не считай', 'убери платёж Миланы на 3000', 'верни тот чек'. " +
-		"Если инструмент вернул несколько кандидатов — покажи их и уточни, какую операцию имели в виду.\n\n" +
+		"Если инструмент вернул несколько кандидатов — покажи их и уточни, какую операцию имели в виду.\n" +
+		"5. person_report — вся статистика по одному человеку: сколько чеков на его имя и платежей, суммы, " +
+		"первая/последняя операции. Вызывай при 'сколько чеков у Ахмеда', 'что там по Милане'. Период необязателен.\n\n" +
 		"Также знай: если сообщение с платежом/чеком УДАЛИЛИ в WhatsApp, бот автоматически убирает его из учёта " +
 		"и пишет об этом в чат — отчёты всегда отражают актуальное состояние.\n\n" +
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
@@ -924,6 +983,99 @@ func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
 				totalSum += s.Total
 			}
 			fmt.Fprintf(&sb, "Итого: %d чек(ов) на %.0f ₽", totalCount, totalSum)
+			return sb.String(), nil
+		},
+	}
+}
+
+// personTool — сводка по конкретному человеку: сколько чеков на его имя
+// и текстовых платежей, за всё время или за период.
+func (b *Bot) personTool() ai.Tool {
+	return ai.Tool{
+		Name: "person_report",
+		Description: "Показывает всю статистику по конкретному человеку: сколько чеков на его имя (переводы на его " +
+			"карту), сколько текстовых платежей, общие суммы, первая и последняя операции. " +
+			"Вызывай при вопросах вроде 'сколько чеков у Ахмеда Каталова', 'что там по Милане', 'сводка по Хадижат'. " +
+			"Период необязателен — без него считает за всё время. " +
+			"Имя пиши как в списке известных людей (исправь опечатки пользователя сам).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"person": map[string]any{
+					"type":        "string",
+					"description": "Имя человека (из списка известных людей в учёте)",
+				},
+				"from_date": map[string]any{
+					"type":        "string",
+					"description": "Начало периода YYYY-MM-DD; пусто = за всё время",
+				},
+				"to_date": map[string]any{
+					"type":        "string",
+					"description": "Конец периода включительно YYYY-MM-DD; пусто = до сегодня",
+				},
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы, если нужна статистика только по ней",
+				},
+			},
+			"required": []string{"person"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Person   string `json:"person"`
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Group    string `json:"group"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			if strings.TrimSpace(args.Person) == "" {
+				return "", fmt.Errorf("нужно имя человека")
+			}
+
+			var fromPtr, toPtr *time.Time
+			if args.FromDate != "" {
+				t, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
+				if err != nil {
+					return "", fmt.Errorf("неверная дата %q", args.FromDate)
+				}
+				fromPtr = &t
+			}
+			if args.ToDate != "" {
+				t, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
+				if err != nil {
+					return "", fmt.Errorf("неверная дата %q", args.ToDate)
+				}
+				next := t.AddDate(0, 0, 1)
+				toPtr = &next
+			}
+			groupJID := ""
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID = jid.String()
+			}
+
+			stats, err := b.db.PersonReport(ctx, strings.TrimSpace(args.Person), fromPtr, toPtr, groupJID)
+			if err != nil {
+				return "", fmt.Errorf("ошибка выборки: %w", err)
+			}
+			if len(stats) == 0 {
+				return fmt.Sprintf("По имени %q операций не нашёл. Проверь имя — известные люди перечислены в твоём контексте.", args.Person), nil
+			}
+			var sb strings.Builder
+			for _, p := range stats {
+				fmt.Fprintf(&sb, "%s:\n", p.Name)
+				fmt.Fprintf(&sb, "- чеков: %d на %.0f ₽\n", p.ReceiptCount, p.ReceiptTotal)
+				fmt.Fprintf(&sb, "- текстовых платежей: %d на %.0f ₽\n", p.PaymentCount, p.PaymentTotal)
+				fmt.Fprintf(&sb, "- всего: %.0f ₽\n", p.ReceiptTotal+p.PaymentTotal)
+				if p.FirstOp != nil && p.LastOp != nil {
+					fmt.Fprintf(&sb, "- операции с %s по %s\n", p.FirstOp.Format("02.01.2006"), p.LastOp.Format("02.01.2006"))
+				}
+			}
 			return sb.String(), nil
 		},
 	}
