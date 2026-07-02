@@ -58,6 +58,25 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_duplicate ON bank_receipts(is_duplicate)`); err != nil {
 		return fmt.Errorf("создание индекса is_duplicate: %w", err)
 	}
+
+	// Привязка чека к группе и (для дозагруженных через личку) к отправителю.
+	// Старые строки дозаполняем группой из исходного сообщения.
+	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS group_jid TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки group_jid: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS submitted_by TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки submitted_by: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE bank_receipts br SET group_jid = rm.wa_group_jid
+		FROM raw_messages rm
+		WHERE br.group_jid IS NULL AND rm.id = br.raw_message_id
+	`); err != nil {
+		return fmt.Errorf("дозаполнение group_jid: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_group ON bank_receipts(group_jid)`); err != nil {
+		return fmt.Errorf("создание индекса group_jid: %w", err)
+	}
 	return nil
 }
 
@@ -158,16 +177,19 @@ type BankReceiptInput struct {
 	Status       string
 	NeedsReview  bool
 	IsDuplicate  bool
+	GroupJID     string    // группа, к которой относится чек (для дозагрузки из лички — целевая группа)
+	SubmittedBy  string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
 	TxDate       time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO bank_receipts
-			(raw_message_id, bank, recipient_raw, sender_raw, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+			(raw_message_id, bank, recipient_raw, sender_raw, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate, group_jid, submitted_by, tx_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.SenderRaw), r.ContactID, r.Amount, r.Commission,
-		nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status), r.NeedsReview, r.IsDuplicate, r.TxDate)
+		nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status), r.NeedsReview, r.IsDuplicate,
+		nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate)
 	return err
 }
 
@@ -275,12 +297,15 @@ type ContactSummary struct {
 // (только те, где получатель уверенно сопоставлен с контактом, не требует
 // ручной проверки — needs_review = false — и не помечен как дубль другого
 // уже учтённого чека — is_duplicate = false).
-func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time) ([]ContactSummary, error) {
+// groupJID — необязательный фильтр по группе: пустая строка = все группы.
+func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT c.canonical_name, t.card_to, t.amount
 		FROM transactions t
 		JOIN contacts c ON c.id = t.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		  AND ($3 = '' OR rm.wa_group_jid = $3)
 
 		UNION ALL
 
@@ -291,7 +316,8 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time) ([]Contac
 		  AND br.needs_review = false
 		  AND br.is_duplicate = false
 		  AND br.contact_id IS NOT NULL
-	`, from, to)
+		  AND ($3 = '' OR br.group_jid = $3)
+	`, from, to, groupJID)
 	if err != nil {
 		return nil, err
 	}
@@ -327,4 +353,52 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time) ([]Contac
 		result = append(result, *byName[name])
 	}
 	return result, rows.Err()
+}
+
+// SenderStat — статистика по одному отправителю чеков: сколько чеков он
+// прислал в группу и на какую общую сумму (это его "сбор").
+type SenderStat struct {
+	Name  string // имя в WhatsApp (pushname) или переопределение из submitted_by; "" если неизвестно
+	Phone string // номер телефона (из JID отправителя)
+	Count int
+	Total float64
+}
+
+// SenderStats возвращает статистику по отправителям чеков за период [from, to):
+// кто сколько чеков прислал и на какую сумму. Дубли не считаются.
+// groupJID — фильтр по группе (пусто = все), senderQuery — фильтр по человеку:
+// подстрока имени или номера телефона (пусто = все отправители).
+func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, senderQuery string) ([]SenderStat, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT s.sender_name, s.phone, COUNT(*), COALESCE(SUM(s.amount), 0)
+		FROM (
+			SELECT
+				COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+				br.amount
+			FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE br.tx_date >= $1 AND br.tx_date < $2
+			  AND br.is_duplicate = false
+			  AND br.amount > 0
+			  AND ($3 = '' OR br.group_jid = $3)
+		) s
+		WHERE ($4 = '' OR s.sender_name ILIKE '%' || $4 || '%' OR s.phone LIKE '%' || $4 || '%')
+		GROUP BY s.sender_name, s.phone
+		ORDER BY 4 DESC
+	`, from, to, groupJID, senderQuery)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []SenderStat
+	for rows.Next() {
+		var s SenderStat
+		if err := rows.Scan(&s.Name, &s.Phone, &s.Count, &s.Total); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
+	}
+	return out, rows.Err()
 }

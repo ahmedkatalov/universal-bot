@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,6 +53,25 @@ type Bot struct {
 
 	historyMu sync.Mutex
 	history   map[string][]ai.Turn // sender JID -> личная переписка с ассистентом
+
+	// Чеки, присланные в личку и ещё не сохранённые в учёт: владелец сначала
+	// кидает фото, потом говорит "запомни их для группы такой-то" (дозагрузка
+	// пропущенных дней, когда бота ещё не было в группе).
+	pendingMu sync.Mutex
+	pending   map[string][]pendingReceipt // chat JID -> распознанные чеки
+
+	// Кэш списка групп (JID -> название), чтобы ассистент мог работать
+	// с группами по-человечески ("группа сб оплата клиентов").
+	groupsMu      sync.Mutex
+	groupsCache   map[types.JID]string
+	groupsFetched time.Time
+}
+
+// pendingReceipt — распознанный чек из лички, ожидающий команды "запомнить".
+type pendingReceipt struct {
+	rawID      int
+	rd         parser.ReceiptData
+	receivedAt time.Time
 }
 
 // New создаёт клиент whatsmeow. sessionDBPath — путь к SQLite-файлу сессии,
@@ -107,6 +127,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		fontDir:       fontDir,
 		reportDir:     reportDir,
 		history:       make(map[string][]ai.Turn),
+		pending:       make(map[string][]pendingReceipt),
 	}
 
 	client.AddEventHandler(b.handleEvent)
@@ -317,11 +338,12 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	defer stopTyping()
 
 	// Фото в личке: распознаём как чек и отдаём ассистенту как контекст.
-	// В учёт НЕ добавляем — источник учёта это рабочие группы, иначе один
-	// чек посчитался бы дважды (в группе и в личке). Но проверить на дубль
-	// и рассказать, что на чеке, можем.
+	// Сразу в учёт НЕ добавляем (источник учёта — рабочие группы), но
+	// запоминаем как "ожидающий" чек: если владелец скажет "запомни их
+	// для группы такой-то" (дозагрузка пропущенных дней), ассистент
+	// сохранит их инструментом save_pending_receipts.
 	if imgMsg != nil {
-		receiptCtx := b.describePrivatePhoto(ctx, imgMsg)
+		receiptCtx := b.describePrivatePhoto(ctx, msg, imgMsg)
 		if receiptCtx != "" {
 			if text != "" {
 				text += "\n\n"
@@ -342,7 +364,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat)}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.savePendingTool(chat)}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -365,6 +387,61 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 	fmt.Println("Ответ ассистента:", reply)
 	b.sendText(chat, reply)
+}
+
+// joinedGroups возвращает список групп бота (JID -> название) с кэшем на
+// 5 минут, чтобы не дёргать WhatsApp на каждое сообщение.
+func (b *Bot) joinedGroups(ctx context.Context) map[types.JID]string {
+	b.groupsMu.Lock()
+	defer b.groupsMu.Unlock()
+
+	if b.groupsCache != nil && time.Since(b.groupsFetched) < 5*time.Minute {
+		return b.groupsCache
+	}
+	groups, err := b.client.GetJoinedGroups(ctx)
+	if err != nil {
+		fmt.Println("Не удалось получить список групп:", err)
+		if b.groupsCache != nil {
+			return b.groupsCache // отдаём устаревший кэш, это лучше, чем ничего
+		}
+		return map[types.JID]string{}
+	}
+	cache := make(map[types.JID]string, len(groups))
+	for _, g := range groups {
+		cache[g.JID] = g.Name
+	}
+	b.groupsCache = cache
+	b.groupsFetched = time.Now()
+	return cache
+}
+
+// resolveGroup ищет группу по названию (без учёта регистра, по подстроке).
+// Возвращает JID и точное название. Если совпадений нет или их несколько —
+// ошибка с пояснением, чтобы ассистент мог переспросить владельца.
+func (b *Bot) resolveGroup(ctx context.Context, name string) (types.JID, string, error) {
+	name = strings.ToLower(strings.TrimSpace(name))
+	if name == "" {
+		return types.JID{}, "", fmt.Errorf("название группы пустое")
+	}
+	var (
+		foundJID  types.JID
+		foundName string
+		matches   []string
+	)
+	for jid, gname := range b.joinedGroups(ctx) {
+		if strings.Contains(strings.ToLower(gname), name) {
+			foundJID, foundName = jid, gname
+			matches = append(matches, gname)
+		}
+	}
+	switch len(matches) {
+	case 0:
+		return types.JID{}, "", fmt.Errorf("группа %q не найдена среди групп бота", name)
+	case 1:
+		return foundJID, foundName, nil
+	default:
+		return types.JID{}, "", fmt.Errorf("под %q подходит несколько групп: %s — уточни название", name, strings.Join(matches, "; "))
+	}
 }
 
 // startTyping включает в чате статус "печатает…" и обновляет его каждые
@@ -397,8 +474,9 @@ func (b *Bot) startTyping(chat types.JID) func() {
 // describePrivatePhoto скачивает фото из личного сообщения, прогоняет через
 // OCR и, если это банковский чек, возвращает разобранную информацию (плюс
 // результат проверки на дубль) в виде текстового блока для контекста
-// ассистента. Возвращает "" если фото не удалось скачать/распознать.
-func (b *Bot) describePrivatePhoto(ctx context.Context, imgMsg *waProto.ImageMessage) string {
+// ассистента. Распознанный чек дополнительно запоминается как "ожидающий"
+// (pending) — на случай, если владелец попросит добавить его в учёт.
+func (b *Bot) describePrivatePhoto(ctx context.Context, msg *events.Message, imgMsg *waProto.ImageMessage) string {
 	imgBytes, err := b.client.Download(ctx, imgMsg)
 	if err != nil {
 		fmt.Println("Ошибка скачивания фото из лички:", err)
@@ -419,6 +497,61 @@ func (b *Bot) describePrivatePhoto(ctx context.Context, imgMsg *waProto.ImageMes
 	}
 
 	rd := parser.ParseReceipt(ocrText)
+
+	// Парсер не справился — пробуем доразобрать через ИИ (как в группах).
+	if rd.Amount == 0 || rd.Recipient == "" {
+		if rec, ok := b.aiRescueReceipt(ctx, ocrText); ok {
+			if rd.Recipient == "" {
+				rd.Recipient = strings.TrimSpace(rec.Recipient)
+			}
+			if rd.Sender == "" {
+				rd.Sender = strings.TrimSpace(rec.Sender)
+			}
+			if rd.Amount == 0 {
+				rd.Amount = rec.Amount
+			}
+			if rd.Bank == "" {
+				rd.Bank = rec.Bank
+			}
+			if rd.DocNumber == "" {
+				rd.DocNumber = rec.DocNumber
+			}
+			if !rd.HasTxTime {
+				if t, ok := parseAIDatetime(rec.Datetime); ok {
+					rd.TxTime = t
+					rd.HasTxTime = true
+				}
+			}
+		}
+	}
+
+	// Сохраняем сообщение в БД (нужен id для возможной дозагрузки в учёт)
+	// и фото на диск, затем запоминаем чек как ожидающий команду владельца.
+	if rd.Amount > 0 && rd.Recipient != "" {
+		mediaPath := b.saveMediaFile(msg.Info.ID, imgBytes)
+		senderName := msg.Info.PushName
+		if senderName == "" {
+			senderName = msg.Info.Sender.User
+		}
+		rawID, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
+			senderName, ocrText, true, mediaPath, msg.Info.Timestamp)
+		if err != nil {
+			fmt.Println("Ошибка сохранения фото-сообщения из лички:", err)
+		} else {
+			chatKey := msg.Info.Chat.String()
+			b.pendingMu.Lock()
+			b.pending[chatKey] = append(b.pending[chatKey], pendingReceipt{
+				rawID:      rawID,
+				rd:         rd,
+				receivedAt: msg.Info.Timestamp,
+			})
+			// Защита от бесконечного накопления: держим максимум 50 последних.
+			if len(b.pending[chatKey]) > 50 {
+				b.pending[chatKey] = b.pending[chatKey][len(b.pending[chatKey])-50:]
+			}
+			b.pendingMu.Unlock()
+		}
+	}
 	var sb strings.Builder
 	sb.WriteString("[Пользователь прислал фото банковского чека. Распознанные данные]:\n")
 	if rd.Bank != "" {
@@ -467,7 +600,8 @@ func (b *Bot) describePrivatePhoto(ctx context.Context, imgMsg *waProto.ImageMes
 			sb.WriteString("Статус в учёте: такого чека в базе НЕТ — он не проходил через рабочие группы.\n")
 		}
 	}
-	sb.WriteString("(Чеки из личных сообщений в учёт не добавляются — учёт ведётся по рабочим группам. Это только информация для ответа.)")
+	sb.WriteString("(Чек запомнен как ожидающий. В учёт он попадёт, только если владелец попросит сохранить — " +
+		"тогда вызови инструмент save_pending_receipts с названием группы, к которой относятся чеки.)")
 	return sb.String()
 }
 
@@ -479,7 +613,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 	from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 
 	var summaryText string
-	summaries, err := b.db.SummaryForPeriod(ctx, from, from.AddDate(0, 1, 0))
+	summaries, err := b.db.SummaryForPeriod(ctx, from, from.AddDate(0, 1, 0), "")
 	switch {
 	case err != nil:
 		summaryText = "(не удалось загрузить сводку: " + err.Error() + ")"
@@ -496,29 +630,44 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		summaryText = sb.String()
 	}
 
+	groupsList := "(не удалось получить список групп)"
+	if groups := b.joinedGroups(ctx); len(groups) > 0 {
+		var names []string
+		for _, name := range groups {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		groupsList = strings.Join(names, "; ")
+	}
+
 	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. " +
 		"Общайся свободно и по-человечески на любые темы: можешь поболтать, ответить на общие вопросы, " +
 		"помочь советом, пошутить — ты не ограничен только финансами. Отвечай на русском, живо и без канцелярита, " +
 		"но без лишней воды.\n\n" +
 		"При этом ты «мозг» этого бота и знаешь, как он устроен: бот собирает платежи из рабочих WhatsApp-групп " +
-		"(суммы из текстовых сообщений и банковские чеки с фото через OCR), ведёт единый учёт по всем группам, " +
-		"замечает дубли чеков и умеет строить отчёты. Если владелец спрашивает, как что-то работает, почему чек " +
-		"не распознался или что-то посчиталось не так — объясняй и подсказывай, как поправить (например, добавить " +
-		"алиас имени или переслать чек в рабочую группу).\n\n" +
+		"(суммы из текстовых сообщений и банковские чеки с фото через OCR), помнит, из какой группы и от кого " +
+		"пришёл каждый чек, замечает дубли и умеет строить отчёты. Если владелец спрашивает, как что-то работает, " +
+		"почему чек не распознался или что-то посчиталось не так — объясняй и подсказывай, как поправить.\n\n" +
 		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
-		"Сводка по сбору средств за текущий месяц (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
+		"Группы, в которых состоит бот: " + groupsList + ".\n\n" +
+		"Сводка по сбору средств за текущий месяц по всем группам (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
 		summaryText +
-		"\n\nИспользуй эти данные для быстрых вопросов про текущий месяц. " +
-		"Если владелец спрашивает про сбор за конкретные даты, диапазон дат или просит отчёт/документ за период " +
-		"(например \"сколько собрали 3 и 4 июля\", \"скинь отчёт за неделю\", \"пришли пдф за июнь\") — " +
-		"обязательно вызови инструмент send_finance_report с точными датами (переведи относительные даты и " +
-		"названия месяцев в конкретные YYYY-MM-DD, используя сегодняшнюю дату как точку отсчёта). " +
-		"Выбирай format=\"pdf\", если явно просят файл/документ/пдф/отчёт, и format=\"text\", если просто " +
-		"спрашивают цифры в переписке. После вызова инструмента кратко прокомментируй результат своими словами.\n\n" +
-		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках " +
-		"([Пользователь прислал фото банковского чека...]) — используй эти данные в ответе: скажи, от кого чек, " +
-		"на какую сумму, когда была операция и учтён ли он уже в базе. Учёт пополняется только из рабочих групп; " +
-		"чек, присланный сюда в личку, в суммы не добавляется — при необходимости напомни переслать его в группу."
+		"\n\nТвои инструменты:\n" +
+		"1. send_finance_report — отчёт по сбору за период (текстом или PDF). Вызывай при вопросах про суммы " +
+		"за даты/период или просьбах прислать отчёт. Переводи относительные даты и названия месяцев в YYYY-MM-DD " +
+		"от сегодняшней даты. format=\"pdf\" если просят файл/документ/пдф, иначе \"text\". " +
+		"Если названа конкретная группа — передай её название в group.\n" +
+		"2. senders_report — кто сколько чеков отправил и на какую сумму (сбор по сотрудникам). Вызывай при " +
+		"вопросах вроде 'какой сотрудник сколько чеков скинул в группе сб оплата клиентов', 'сколько чеков сделал " +
+		"Расул за июль'. Можно фильтровать по группе и по человеку (имя или номер телефона).\n" +
+		"3. save_pending_receipts — дозагрузка чеков в учёт. Когда бота не было в группе (добавили с опозданием), " +
+		"владелец присылает пропущенные чеки сюда в личку и просит их запомнить, указывая группу. Каждое фото чека " +
+		"уже распознано и ждёт; вызывай инструмент ТОЛЬКО после явной просьбы сохранить/запомнить/учесть, " +
+		"с названием группы (переспроси, если владелец её не назвал). Дата операции берётся с самого чека " +
+		"(включая год), так что чеки лягут на свои реальные даты. Дубли пропускаются автоматически.\n\n" +
+		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
+		"расскажи, что на чеке (от кого, сумма, дата операции, учтён ли уже). В учёт чек попадает только " +
+		"через save_pending_receipts по явной просьбе, либо когда его присылают в рабочую группу."
 }
 
 // reportTool — инструмент Claude для отчёта за произвольный период. При
@@ -528,10 +677,11 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 func (b *Bot) reportTool(chat types.JID) ai.Tool {
 	return ai.Tool{
 		Name: "send_finance_report",
-		Description: "Формирует отчёт по сбору средств за указанный период (по всем группам сразу) " +
+		Description: "Формирует отчёт по сбору средств за указанный период " +
 			"и либо отправляет его как PDF-документ в чат, либо возвращает текстовую сводку для ответа. " +
 			"Вызывай, когда пользователь спрашивает про суммы/сбор за конкретные даты или период, " +
-			"или явно просит отчёт/документ.",
+			"или явно просит отчёт/документ. По умолчанию считает по всем группам сразу; " +
+			"если пользователь назвал конкретную группу — передай её название в параметре group.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -548,6 +698,10 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 					"enum":        []string{"pdf", "text"},
 					"description": "\"pdf\" — прислать файл-документ; \"text\" — вернуть цифры для текстового ответа",
 				},
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы (как в списке групп бота), если нужен отчёт только по ней. Пусто — по всем группам.",
+				},
 			},
 			"required": []string{"from_date", "to_date", "format"},
 		},
@@ -556,19 +710,229 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 				FromDate string `json:"from_date"`
 				ToDate   string `json:"to_date"`
 				Format   string `json:"format"`
+				Group    string `json:"group"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
 			}
-			return b.buildReportForAssistant(ctx, chat, args.FromDate, args.ToDate, args.Format)
+			groupJID, groupName := "", ""
+			if strings.TrimSpace(args.Group) != "" {
+				jid, name, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID, groupName = jid.String(), name
+			}
+			return b.buildReportForAssistant(ctx, chat, args.FromDate, args.ToDate, args.Format, groupJID, groupName)
 		},
 	}
+}
+
+// sendersTool — статистика "кто сколько чеков прислал": для групп, где
+// работники кидают чеки (их сбор считается по отправленным чекам).
+func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
+	return ai.Tool{
+		Name: "senders_report",
+		Description: "Показывает, кто сколько чеков отправил и на какую сумму за период — по отправителям " +
+			"сообщений с чеками. Используй, когда спрашивают 'какой сотрудник сколько чеков скинул', " +
+			"'сколько чеков и какой сбор сделал Расул', 'проверь по группе сб оплата клиентов кто сколько отправил' " +
+			"и т.п. Если у отправителя не сохранено имя в WhatsApp, он будет показан по номеру телефона.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from_date": map[string]any{
+					"type":        "string",
+					"description": "Начало периода включительно, формат YYYY-MM-DD",
+				},
+				"to_date": map[string]any{
+					"type":        "string",
+					"description": "Конец периода включительно, формат YYYY-MM-DD",
+				},
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы, если нужна статистика только по ней. Пусто — по всем группам.",
+				},
+				"sender": map[string]any{
+					"type":        "string",
+					"description": "Имя или номер телефона конкретного человека, если спрашивают про одного (например 'расул' или '7937...'). Пусто — по всем отправителям.",
+				},
+			},
+			"required": []string{"from_date", "to_date"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Group    string `json:"group"`
+				Sender   string `json:"sender"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			from, err := time.Parse("2006-01-02", args.FromDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", args.FromDate)
+			}
+			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата конца периода %q, нужен формат YYYY-MM-DD", args.ToDate)
+			}
+			groupJID, groupLabel := "", "все группы"
+			if strings.TrimSpace(args.Group) != "" {
+				jid, name, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID, groupLabel = jid.String(), name
+			}
+
+			stats, err := b.db.SenderStats(ctx, from, toDay.AddDate(0, 0, 1), groupJID, strings.TrimSpace(args.Sender))
+			if err != nil {
+				return "", fmt.Errorf("ошибка выборки: %w", err)
+			}
+			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
+			if len(stats) == 0 {
+				return fmt.Sprintf("За период %s (%s) чеков не найдено.", periodLabel, groupLabel), nil
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Чеки по отправителям за %s (%s):\n", periodLabel, groupLabel)
+			var totalCount int
+			var totalSum float64
+			for _, s := range stats {
+				label := s.Name
+				if label == "" {
+					label = "+" + s.Phone
+				} else if s.Phone != "" {
+					label += " (+" + s.Phone + ")"
+				}
+				fmt.Fprintf(&sb, "- %s: %d чек(ов), %.0f ₽\n", label, s.Count, s.Total)
+				totalCount += s.Count
+				totalSum += s.Total
+			}
+			fmt.Fprintf(&sb, "Итого: %d чек(ов) на %.0f ₽", totalCount, totalSum)
+			return sb.String(), nil
+		},
+	}
+}
+
+// savePendingTool сохраняет в учёт чеки, присланные владельцем в личку —
+// дозагрузка пропущенных дней, когда бота ещё не было в группе. Дата каждого
+// чека берётся с самого чека (включая год), так что "июльские" чеки лягут
+// на июль, даже если их прислали позже.
+func (b *Bot) savePendingTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "save_pending_receipts",
+		Description: "Сохраняет в учёт чеки, присланные фото в этот личный чат и ещё не сохранённые. " +
+			"Вызывай ТОЛЬКО когда владелец явно просит их запомнить/добавить/учесть " +
+			"(например 'запомни эти чеки, это для группы оплата клиентов', 'тебя не было в группе 1-2 июля, вот пропущенные чеки'). " +
+			"Обязательно нужна группа, к которой отнести чеки. Дата операции берётся с самого чека. " +
+			"Дубли уже учтённых чеков автоматически пропускаются.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы, к которой относятся чеки (например 'оплата клиентов')",
+				},
+				"sender": map[string]any{
+					"type":        "string",
+					"description": "Кто изначально прислал/собрал эти чеки, если владелец указал (например 'Расул'). Пусто, если не указано.",
+				},
+			},
+			"required": []string{"group"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Group  string `json:"group"`
+				Sender string `json:"sender"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			return b.savePendingReceipts(ctx, chat, args.Group, strings.TrimSpace(args.Sender))
+		},
+	}
+}
+
+// savePendingReceipts — реализация save_pending_receipts: переносит ожидающие
+// чеки из лички в учёт с привязкой к группе, проверяя каждый на дубль.
+func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName, sender string) (string, error) {
+	groupJID, groupLabel, err := b.resolveGroup(ctx, groupName)
+	if err != nil {
+		return "", err
+	}
+
+	chatKey := chat.String()
+	b.pendingMu.Lock()
+	receipts := b.pending[chatKey]
+	delete(b.pending, chatKey)
+	b.pendingMu.Unlock()
+
+	if len(receipts) == 0 {
+		return "Ожидающих чеков нет — сначала пришли фото чеков в этот чат.", nil
+	}
+
+	var sb strings.Builder
+	saved, skipped := 0, 0
+	for _, pr := range receipts {
+		rd := pr.rd
+		txDate := pr.receivedAt
+		if rd.HasTxTime {
+			txDate = rd.TxTime
+		}
+
+		canonical, matched := b.aliases.ResolveName(rd.Recipient)
+		var contactIDPtr *int
+		if contactID, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			contactIDPtr = &contactID
+		}
+
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate)
+		if err != nil {
+			fmt.Println("Ошибка проверки дубля при дозагрузке:", err)
+		}
+		if isDup {
+			skipped++
+			fmt.Fprintf(&sb, "- ПРОПУЩЕН (дубль, уже учтён %s): %s, %.0f ₽\n", dupTime.Format("02.01.2006 15:04"), canonical, rd.Amount)
+			continue
+		}
+
+		err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
+			RawMessageID: pr.rawID,
+			Bank:         rd.Bank,
+			RecipientRaw: rd.Recipient,
+			SenderRaw:    rd.Sender,
+			ContactID:    contactIDPtr,
+			Amount:       rd.Amount,
+			Commission:   rd.Commission,
+			DocNumber:    rd.DocNumber,
+			AuthCode:     rd.AuthCode,
+			Status:       rd.Status,
+			NeedsReview:  !matched,
+			GroupJID:     groupJID.String(),
+			SubmittedBy:  sender,
+			TxDate:       txDate,
+		})
+		if err != nil {
+			fmt.Fprintf(&sb, "- ОШИБКА сохранения: %s, %.0f ₽ (%v)\n", canonical, rd.Amount, err)
+			continue
+		}
+		saved++
+		dateLabel := txDate.Format("02.01.2006 15:04")
+		if !rd.HasTxTime {
+			dateLabel += " (дата с чека не распозналась — взято время получения)"
+		}
+		fmt.Fprintf(&sb, "- Сохранён: %s, %.0f ₽, операция %s\n", canonical, rd.Amount, dateLabel)
+	}
+
+	header := fmt.Sprintf("Группа: %s. Сохранено %d, пропущено дублей %d.\n", groupLabel, saved, skipped)
+	return header + sb.String(), nil
 }
 
 // buildReportForAssistant — общая логика инструмента send_finance_report:
 // достаёт сводку за период из БД и либо отправляет PDF, либо возвращает
 // текст для финального ответа модели.
-func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromStr, toStr, format string) (string, error) {
+func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromStr, toStr, format, groupJID, groupName string) (string, error) {
 	from, err := time.Parse("2006-01-02", fromStr)
 	if err != nil {
 		return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", fromStr)
@@ -580,8 +944,11 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 	to := toDay.AddDate(0, 0, 1) // конец периода включительно -> верхняя граница исключительно
 
 	periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
+	if groupName != "" {
+		periodLabel += " (группа: " + groupName + ")"
+	}
 
-	summaries, err := b.db.SummaryForPeriod(ctx, from, to)
+	summaries, err := b.db.SummaryForPeriod(ctx, from, to, groupJID)
 	if err != nil {
 		return "", fmt.Errorf("ошибка при выборке данных: %w", err)
 	}
@@ -688,6 +1055,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 			AuthCode:     rd.AuthCode,
 			Status:       rd.Status,
 			NeedsReview:  true,
+			GroupJID:     chat.String(),
 			TxDate:       txDate,
 		})
 		return
@@ -727,6 +1095,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 		Status:       rd.Status,
 		NeedsReview:  needsReview,
 		IsDuplicate:  isDuplicate,
+		GroupJID:     chat.String(),
 		TxDate:       txDate,
 	})
 	if err != nil {
@@ -760,7 +1129,9 @@ func (b *Bot) sendMonthlyReport(ctx context.Context, chat types.JID) {
 	from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 	to := from.AddDate(0, 1, 0)
 
-	summaries, err := b.db.SummaryForPeriod(ctx, from, to)
+	// "/отчет" в группе показывает общий сбор по всем группам (единый учёт);
+	// отчёт по конкретной группе можно спросить у ассистента в личке.
+	summaries, err := b.db.SummaryForPeriod(ctx, from, to, "")
 	if err != nil {
 		b.sendText(chat, "Ошибка при формировании отчёта: "+err.Error())
 		return

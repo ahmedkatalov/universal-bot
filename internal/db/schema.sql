@@ -62,6 +62,14 @@ CREATE TABLE IF NOT EXISTS bank_receipts (
     status          TEXT,
     needs_review    BOOLEAN NOT NULL DEFAULT false, -- true если сумму/получателя не удалось распознать уверенно
     is_duplicate    BOOLEAN NOT NULL DEFAULT false, -- true если это повторно присланный чек (см. FindDuplicateReceipt)
+    -- Группа, к которой относится чек. Обычно совпадает с raw_messages.wa_group_jid,
+    -- но для чеков, дозагруженных владельцем через личку ("бота не было в группе
+    -- 1-2 июля, вот пропущенные чеки"), здесь целевая группа, а не JID лички.
+    group_jid       TEXT,
+    -- Кто отправил чек. Для чеков из групп берётся из raw_messages (sender),
+    -- здесь заполняется только при дозагрузке через личку, если владелец
+    -- указал, от кого эти чеки (например, "это чеки Расула").
+    submitted_by    TEXT,
     -- Дата И ВРЕМЯ операции (не время получения сообщения в WhatsApp) —
     -- берётся с самого чека, когда OCR смог его распознать; иначе время
     -- получения сообщения используется как приближение. Точное время нужно
@@ -73,6 +81,7 @@ CREATE TABLE IF NOT EXISTS bank_receipts (
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_contact ON bank_receipts(contact_id);
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_review ON bank_receipts(needs_review);
 CREATE INDEX IF NOT EXISTS idx_bank_receipts_duplicate ON bank_receipts(is_duplicate);
+CREATE INDEX IF NOT EXISTS idx_bank_receipts_group ON bank_receipts(group_jid);
 
 -- Стартовый набор контактов и алиасов на основе твоих реальных сообщений.
 INSERT INTO contacts (canonical_name) VALUES
