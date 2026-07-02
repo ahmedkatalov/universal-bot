@@ -67,6 +67,11 @@ type Bot struct {
 	groupsMu      sync.Mutex
 	groupsCache   map[types.JID]string
 	groupsFetched time.Time
+
+	// ID последних сообщений, отправленных самим ботом в каждый чат —
+	// чтобы по просьбе "удали своё сообщение" бот мог их отозвать.
+	sentMu   sync.Mutex
+	sentMsgs map[string][]string // chat JID -> последние отправленные IDs
 }
 
 // pendingReceipt — распознанный чек из лички, ожидающий команды "запомнить".
@@ -142,6 +147,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		reportDir:     reportDir,
 		history:       make(map[string][]ai.Turn),
 		pending:       make(map[string][]pendingReceipt),
+		sentMsgs:      make(map[string][]string),
 	}
 
 	client.AddEventHandler(b.handleEvent)
@@ -429,7 +435,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.savePendingTool(chat), b.correctionTool(""), b.personTool(), b.customPDFTool(chat)}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.savePendingTool(chat), b.correctionTool(""), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat)}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -509,7 +515,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты,
 	// статистика по отправителям и корректировки (по умолчанию — в этой группе).
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.correctionTool(chat.String()), b.personTool(), b.customPDFTool(chat)}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.correctionTool(chat.String()), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat)}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
 	if err != nil {
@@ -841,7 +847,10 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"или из того, что пользователь явно назвал — НЕ выдумывай цифры. Если для отчёта нужны данные — сначала " +
 		"вызови нужный инструмент (senders_report/person_report/send_finance_report), потом оформи в make_custom_pdf. " +
 		"Учти: senders_report и send_finance_report сами умеют присылать PDF (format=\"pdf\") — для стандартных " +
-		"отчётов проще использовать их, а make_custom_pdf нужен для нестандартной таблицы, которую попросил владелец.\n\n" +
+		"отчётов проще использовать их, а make_custom_pdf нужен для нестандартной таблицы, которую попросил владелец.\n" +
+		"7. delete_my_messages — удалить (отозвать 'у всех') последние собственные сообщения бота в этом чате. " +
+		"Вызывай, когда просят 'удали своё сообщение', 'убери это предупреждение'. Ты УМЕЕШЬ это делать — " +
+		"не отвечай, что не можешь удалять сообщения.\n\n" +
 		"Также знай: если сообщение с платежом/чеком УДАЛИЛИ в WhatsApp, бот автоматически убирает его из учёта " +
 		"и пишет об этом в чат — отчёты всегда отражают актуальное состояние.\n\n" +
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
@@ -1154,6 +1163,56 @@ func sanitizeFileName(s string) string {
 	return s
 }
 
+// deleteMessagesTool — отзыв собственных сообщений бота по просьбе владельца
+// ("удали своё последнее сообщение", "убери свои предупреждения из чата").
+func (b *Bot) deleteMessagesTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "delete_my_messages",
+		Description: "Удаляет (отзывает 'у всех') последние сообщения, которые отправил сам бот. " +
+			"Вызывай, когда владелец просит удалить твоё сообщение/сообщения, убрать предупреждение и т.п. " +
+			"По умолчанию удаляет в текущем чате; если владелец указал группу ('удали своё сообщение в группе " +
+			"оплата клнт') — передай её название в group. count — сколько последних сообщений (по умолчанию 1). " +
+			"Чужие сообщения удалять нельзя.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"count": map[string]any{
+					"type":        "integer",
+					"description": "Сколько последних сообщений бота удалить (по умолчанию 1)",
+				},
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы, если удалять надо в ней, а не в текущем чате",
+				},
+			},
+			"required": []string{},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Count int    `json:"count"`
+				Group string `json:"group"`
+			}
+			_ = json.Unmarshal(input, &args)
+			if args.Count <= 0 {
+				args.Count = 1
+			}
+			target := chat
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				target = jid
+			}
+			deleted := b.deleteOwnMessages(ctx, target, args.Count)
+			if deleted == 0 {
+				return "Нечего удалять — я не находил своих недавних сообщений там.", nil
+			}
+			return fmt.Sprintf("Удалил свои последние сообщения: %d.", deleted), nil
+		},
+	}
+}
+
 // personTool — сводка по конкретному человеку: сколько чеков на его имя
 // и текстовых платежей, за всё время или за период.
 func (b *Bot) personTool() ai.Tool {
@@ -1255,19 +1314,19 @@ func (b *Bot) personTool() ai.Tool {
 func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 	return ai.Tool{
 		Name: "correct_operation",
-		Description: "Исключает операцию (платёж или чек) из учёта или возвращает её обратно. " +
-			"Вызывай, когда пользователь говорит, что запись ошибочная/не должна считаться " +
-			"('тот чек на 5000 скинули по ошибке, убери его', 'не считай платёж Миланы на 3000') " +
-			"или просит вернуть ранее исключённую ('верни тот чек на 5000'). " +
-			"Если под описание подходит несколько операций, инструмент вернёт список — уточни у пользователя " +
-			"дату или имя и вызови снова с уточнением.",
+		Description: "Исключает операцию (платёж или чек) из учёта, возвращает её обратно, или снимает ошибочную " +
+			"пометку 'дубль'. Вызывай, когда пользователь говорит: запись ошибочная/не должна считаться " +
+			"('тот чек на 5000 скинули по ошибке, убери его') → action=exclude; вернуть исключённую " +
+			"('верни тот чек на 5000') → action=restore; чек ошибочно посчитан дублем и его надо засчитать " +
+			"('это не дубль, засчитай чек Миланы на 25000') → action=not_duplicate. " +
+			"Если под описание подходит несколько операций, инструмент вернёт список — уточни дату или имя.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"action": map[string]any{
 					"type":        "string",
-					"enum":        []string{"exclude", "restore"},
-					"description": "exclude — исключить из учёта; restore — вернуть обратно",
+					"enum":        []string{"exclude", "restore", "not_duplicate"},
+					"description": "exclude — исключить из учёта; restore — вернуть исключённую; not_duplicate — снять ошибочную пометку дубля и засчитать",
 				},
 				"amount": map[string]any{
 					"type":        "number",
@@ -1310,6 +1369,19 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 					return "", err
 				}
 				groupJID = jid.String()
+			}
+
+			// "Это не дубль" — снимаем пометку дубля с последнего такого чека.
+			if args.Action == "not_duplicate" {
+				found, name, txDate, err := b.db.ClearDuplicateFlag(ctx, args.Amount, strings.TrimSpace(args.Person), groupJID)
+				if err != nil {
+					return "", fmt.Errorf("не удалось снять пометку дубля: %w", err)
+				}
+				if !found {
+					return fmt.Sprintf("Чека на %.0f ₽, помеченного дублем, не нашёл — возможно, он уже засчитан.", args.Amount), nil
+				}
+				return fmt.Sprintf("Снял пометку дубля: %s, %.0f ₽ от %s — теперь чек учитывается в сборе.",
+					name, args.Amount, txDate.Format("02.01.2006 15:04")), nil
 			}
 
 			var fromPtr, toPtr *time.Time
@@ -1662,8 +1734,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 		fmt.Printf("Чек (сообщение %d): похоже на повтор чека от %s на %.0f ₽ (первый раз был %s) — не учитываю в сумме\n",
 			rawID, canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"))
 		b.sendText(chat, fmt.Sprintf(
-			"⚠️ Похоже, этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.",
-			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04")))
+			"⚠️ Похоже, этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора. "+
+				"Если это ошибка — напиши мне «это не дубль, засчитай чек %s на %.0f», и я его учту.",
+			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), canonical, rd.Amount))
 	}
 }
 
@@ -1707,12 +1780,53 @@ func (b *Bot) sendMonthlyReport(ctx context.Context, chat types.JID) {
 }
 
 func (b *Bot) sendText(chat types.JID, text string) {
-	_, err := b.client.SendMessage(context.Background(), chat, &waProto.Message{
+	resp, err := b.client.SendMessage(context.Background(), chat, &waProto.Message{
 		Conversation: proto.String(text),
 	})
 	if err != nil {
 		fmt.Println("Ошибка отправки сообщения:", err)
+		return
 	}
+	b.rememberSent(chat, resp.ID)
+}
+
+// rememberSent запоминает ID отправленного ботом сообщения (до 20 последних
+// на чат), чтобы по просьбе владельца бот мог их отозвать.
+func (b *Bot) rememberSent(chat types.JID, id string) {
+	if id == "" {
+		return
+	}
+	key := chat.String()
+	b.sentMu.Lock()
+	b.sentMsgs[key] = append(b.sentMsgs[key], id)
+	if len(b.sentMsgs[key]) > 20 {
+		b.sentMsgs[key] = b.sentMsgs[key][len(b.sentMsgs[key])-20:]
+	}
+	b.sentMu.Unlock()
+}
+
+// deleteOwnMessages отзывает ("удаляет у всех") последние n сообщений бота
+// в чате. Возвращает, сколько удалил.
+func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) int {
+	key := chat.String()
+	b.sentMu.Lock()
+	ids := b.sentMsgs[key]
+	if n > len(ids) {
+		n = len(ids)
+	}
+	toDelete := append([]string(nil), ids[len(ids)-n:]...)
+	b.sentMsgs[key] = ids[:len(ids)-n]
+	b.sentMu.Unlock()
+
+	deleted := 0
+	for i := len(toDelete) - 1; i >= 0; i-- {
+		if _, err := b.client.SendMessage(ctx, chat, b.client.BuildRevoke(chat, types.EmptyJID, toDelete[i])); err != nil {
+			fmt.Println("Ошибка удаления своего сообщения:", err)
+			continue
+		}
+		deleted++
+	}
+	return deleted
 }
 
 func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) {

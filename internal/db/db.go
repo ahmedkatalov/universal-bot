@@ -236,22 +236,25 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 const DuplicateWindow = 5 * time.Minute
 
 // FindDuplicateReceipt проверяет, не встречался ли уже такой же чек.
-// Сначала — по точному совпадению номера документа/кода авторизации
-// (это ID самой банковской операции, самый надёжный признак). Если их нет
-// или совпадения не нашлось — по получателю, сумме и времени операции
-// в пределах DuplicateWindow. Возвращает true и время найденного оригинала.
+//
+// Если у чека есть надёжный ID операции (номер документа или код авторизации),
+// дубль определяется ТОЛЬКО по точному совпадению этого ID. Нечёткое сравнение
+// по сумме+времени в этом случае НЕ применяется: у банковских чеков номер
+// документа уникален для каждой операции, поэтому разные переводы с разными
+// номерами — это разные операции, даже если сумма и время близки. Так мы не
+// ругаемся "дубль" на два реально разных платежа одному человеку.
+// Нечёткое сравнение (сумма + получатель + время в пределах DuplicateWindow)
+// используется только для чеков БЕЗ номера документа и кода авторизации.
+//
+// Оригиналом считается только ЖИВАЯ запись: не помеченная сама дублем, не
+// исключённая вручную и не из удалённого в WhatsApp сообщения — иначе чек,
+// уже убранный из учёта, продолжал бы блокировать повторную отправку.
 //
 // groupJID ограничивает проверку одной группой: рабочий процесс владельца —
 // работники кидают чеки в одну группу, оттуда их пересылают в другую, и это
-// НЕ дубль. Дубль — только повтор того же чека в той же группе. Пустой
-// groupJID означает поиск по всем группам (используется для информационной
-// проверки чеков, присланных в личку).
+// НЕ дубль. Пустой groupJID = поиск по всем группам (для информационной
+// проверки чеков из лички).
 func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
-	// Оригиналом для проверки считается только ЖИВАЯ запись: не помеченная
-	// сама дублем, не исключённая вручную и не из удалённого в WhatsApp
-	// сообщения. Иначе чек, который уже убрали из учёта (удалили сообщение
-	// или исключили через ассистента), продолжал бы блокировать повторную
-	// отправку как "дубль".
 	if docNumber != "" || authCode != "" {
 		var existing time.Time
 		err := d.pool.QueryRow(ctx, `
@@ -268,11 +271,13 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 		if err == nil {
 			return true, existing, nil
 		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			return false, time.Time{}, err
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, time.Time{}, nil // есть надёжный ID, совпадения нет -> это другая операция
 		}
+		return false, time.Time{}, err
 	}
 
+	// Ни номера документа, ни кода авторизации — полагаемся на эвристику.
 	var existing time.Time
 	err := d.pool.QueryRow(ctx, `
 		SELECT br.tx_date FROM bank_receipts br
@@ -287,6 +292,8 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 		  AND br.is_duplicate = false
 		  AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(br.doc_number, '') = ''
+		  AND COALESCE(br.auth_code, '') = ''
 		ORDER BY br.tx_date
 		LIMIT 1
 	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID).Scan(&existing)
@@ -420,6 +427,33 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 		out = append(out, op)
 	}
 	return out, rows.Err()
+}
+
+// ClearDuplicateFlag снимает пометку "дубль" с последнего чека, помеченного
+// дублем, подходящего по сумме (и, если заданы, по имени/группе) — когда
+// владелец говорит "это не дубль, засчитай". Возвращает данные снятого чека.
+func (d *DB) ClearDuplicateFlag(ctx context.Context, amount float64, person, groupJID string) (found bool, name string, txDate time.Time, err error) {
+	err = d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET is_duplicate = false, ignored = false
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			LEFT JOIN contacts c ON c.id = br.contact_id
+			WHERE br.is_duplicate = true
+			  AND br.amount = $1
+			  AND ($2 = '' OR COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $2 || '%')
+			  AND ($3 = '' OR br.group_jid = $3)
+			ORDER BY br.tx_date DESC
+			LIMIT 1
+		)
+		RETURNING COALESCE((SELECT canonical_name FROM contacts WHERE id = bank_receipts.contact_id), recipient_raw, ''), tx_date
+	`, amount, person, groupJID).Scan(&name, &txDate)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, "", time.Time{}, nil
+	}
+	if err != nil {
+		return false, "", time.Time{}, err
+	}
+	return true, name, txDate, nil
 }
 
 // SetOperationIgnored включает/выключает ручное исключение операции из учёта.
