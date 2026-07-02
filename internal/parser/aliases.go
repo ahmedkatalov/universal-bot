@@ -1,6 +1,9 @@
 package parser
 
-import "strings"
+import (
+	"sort"
+	"strings"
+)
 
 // AliasMap сопоставляет вариант написания имени с каноничным именем в базе.
 // Заполняется из таблицы contacts.aliases при старте бота (см. internal/db).
@@ -76,6 +79,21 @@ func (am *AliasMap) ResolveName(rawName string) (string, bool) {
 		return found, true
 	}
 	return strings.TrimSpace(rawName), false
+}
+
+// Canonicals возвращает отсортированный список всех каноничных имён —
+// используется, например, чтобы подсказать ИИ-доразбору известных людей.
+func (am *AliasMap) Canonicals() []string {
+	seen := map[string]bool{}
+	var out []string
+	for _, canonical := range am.toCanonical {
+		if !seen[canonical] {
+			seen[canonical] = true
+			out = append(out, canonical)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func normalize(s string) string {

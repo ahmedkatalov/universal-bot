@@ -159,12 +159,13 @@ func (b *Bot) handleEvent(evt interface{}) {
 	ctx := context.Background()
 
 	if !msg.Info.IsGroup {
-		// Личный чат с номером бота — если настроен Claude, отвечаем как
-		// персональный ассистент; иначе просто игнорируем.
+		// Личный чат с номером бота — если настроен ассистент, отвечаем.
+		// В отдельной горутине: ответ ИИ может занимать десятки секунд,
+		// и он не должен блокировать разбор сообщений из групп.
 		fmt.Printf("Личное сообщение от %s (chat=%s, fromMe=%v): %q\n",
 			msg.Info.Sender, msg.Info.Chat, msg.Info.IsFromMe, extractText(msg.Message))
 		if b.assistant != nil {
-			b.handlePrivateMessage(ctx, msg)
+			go b.handlePrivateMessage(ctx, msg)
 		} else {
 			fmt.Println("Ассистент не настроен (нет OPENROUTER_API_KEY) — сообщение проигнорировано")
 		}
@@ -274,7 +275,12 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 
 	if len(result.Unparsed) > 0 {
 		fmt.Printf("Не распознано (сообщение %d): %v\n", rawID, result.Unparsed)
-		// При желании можно отправлять эти строки владельцу в личку для ручной проверки.
+		// Строки с цифрами (возможные платежи в незнакомом формате) отдаём
+		// на доразбор ИИ — в фоне, чтобы не тормозить остальные сообщения.
+		if b.assistant != nil && containsDigit(result.Unparsed) {
+			unparsed := append([]string(nil), result.Unparsed...)
+			go b.aiRescueUnparsed(context.Background(), senderName, unparsed, rawID, msg.Info.Timestamp)
+		}
 	}
 
 	_ = b.db.MarkMessageParsed(ctx, rawID)
@@ -443,8 +449,15 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		summaryText = sb.String()
 	}
 
-	return "Ты — личный ассистент владельца WhatsApp-бота учёта финансов. Бот ведёт единый учёт " +
-		"по всем WhatsApp-группам, в которых состоит его номер. Отвечай кратко и по делу, на русском языке.\n\n" +
+	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. " +
+		"Общайся свободно и по-человечески на любые темы: можешь поболтать, ответить на общие вопросы, " +
+		"помочь советом, пошутить — ты не ограничен только финансами. Отвечай на русском, живо и без канцелярита, " +
+		"но без лишней воды.\n\n" +
+		"При этом ты «мозг» этого бота и знаешь, как он устроен: бот собирает платежи из рабочих WhatsApp-групп " +
+		"(суммы из текстовых сообщений и банковские чеки с фото через OCR), ведёт единый учёт по всем группам, " +
+		"замечает дубли чеков и умеет строить отчёты. Если владелец спрашивает, как что-то работает, почему чек " +
+		"не распознался или что-то посчиталось не так — объясняй и подсказывай, как поправить (например, добавить " +
+		"алиас имени или переслать чек в рабочую группу).\n\n" +
 		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
 		"Сводка по сбору средств за текущий месяц (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
 		summaryText +
@@ -573,6 +586,42 @@ func (b *Bot) saveMediaFile(waMessageID string, data []byte) string {
 // запасной вариант, если на самом чеке не удалось распознать дату/время операции.
 func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string, rawID int, receivedAt time.Time) {
 	rd := parser.ParseReceipt(text)
+
+	// Обычный парсер не справился (нестандартная вёрстка чека, кривой OCR) —
+	// пробуем доразобрать через ИИ, дополняя только недостающие поля.
+	if (rd.Amount == 0 || rd.Recipient == "") && b.assistant != nil {
+		if rec, ok := b.aiRescueReceipt(ctx, text); ok {
+			if rd.Bank == "" {
+				rd.Bank = rec.Bank
+			}
+			if rd.Recipient == "" {
+				rd.Recipient = strings.TrimSpace(rec.Recipient)
+			}
+			if rd.Sender == "" {
+				rd.Sender = strings.TrimSpace(rec.Sender)
+			}
+			if rd.Amount == 0 {
+				rd.Amount = rec.Amount
+			}
+			if rd.DocNumber == "" {
+				rd.DocNumber = rec.DocNumber
+			}
+			if rd.AuthCode == "" {
+				rd.AuthCode = rec.AuthCode
+			}
+			if rd.Status == "" {
+				rd.Status = rec.Status
+			}
+			if !rd.HasTxTime {
+				if t, ok := parseAIDatetime(rec.Datetime); ok {
+					rd.TxTime = t
+					rd.HasTxTime = true
+				}
+			}
+			fmt.Printf("Чек (сообщение %d): обычный парсер не справился, ИИ дораспознал (получатель %q, сумма %.0f ₽)\n",
+				rawID, rd.Recipient, rd.Amount)
+		}
+	}
 
 	txDate := receivedAt
 	if rd.HasTxTime {

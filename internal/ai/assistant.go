@@ -167,6 +167,20 @@ func (a *Assistant) Reply(ctx context.Context, systemPrompt string, tools []Tool
 	return "", fmt.Errorf("openrouter: превышен лимит вызовов инструментов")
 }
 
+// Complete — одиночный запрос без инструментов и истории: системный промпт
+// плюс один пользовательский текст -> текст ответа. Используется внутренними
+// модулями бота (доразбор нераспознанных сообщений и чеков), а не для диалога.
+func (a *Assistant) Complete(ctx context.Context, systemPrompt, userText string) (string, error) {
+	msg, _, err := a.chat(ctx, []chatMessage{
+		{Role: "system", Content: systemPrompt},
+		{Role: "user", Content: userText},
+	}, nil)
+	if err != nil {
+		return "", err
+	}
+	return msg.Content, nil
+}
+
 func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {
 	payload, err := json.Marshal(chatRequest{
 		Model:     a.model,
