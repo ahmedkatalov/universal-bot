@@ -79,6 +79,106 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 	return pdf.OutputFileAndClose(outPath)
 }
 
+// Section — один блок произвольного PDF-отчёта: заголовок, колонки и строки.
+// Используется для отчётов, которые бот собирает по запросу ("кто сколько
+// чеков скинул", "сделай отчёт с такими-то данными").
+type Section struct {
+	Title   string     // заголовок блока (необязательно)
+	Columns []string   // названия колонок
+	Rows    [][]string // строки; длина каждой = len(Columns)
+	// TotalLabel/TotalRow — необязательная итоговая строка. Если TotalRow
+	// задан, рисуется выделенная строка итога (длина = len(Columns)).
+	TotalRow []string
+}
+
+// GenerateCustom строит PDF из произвольных секций-таблиц. Первая колонка
+// выравнивается влево, остальные вправо (обычно там числа). Ширины колонок
+// распределяются автоматически по ширине страницы.
+func GenerateCustom(title, subtitle string, sections []Section, fontDir, outPath string) error {
+	pdf := gofpdf.New("P", "mm", "A4", fontDir)
+	pdf.AddUTF8Font("DejaVu", "", "DejaVuSans.ttf")
+	pdf.AddUTF8Font("DejaVu", "B", "DejaVuSans-Bold.ttf")
+	pdf.AddPage()
+
+	pdf.SetFont("DejaVu", "B", 18)
+	pdf.CellFormat(0, 12, title, "", 1, "L", false, 0, "")
+
+	if subtitle != "" {
+		pdf.SetFont("DejaVu", "", 10)
+		pdf.SetTextColor(120, 120, 120)
+		pdf.CellFormat(0, 6, subtitle, "", 1, "L", false, 0, "")
+		pdf.SetTextColor(0, 0, 0)
+	}
+	pdf.Ln(4)
+
+	for i, sec := range sections {
+		if len(sec.Columns) == 0 {
+			continue
+		}
+		if sec.Title != "" {
+			pdf.SetFont("DejaVu", "B", 13)
+			pdf.SetTextColor(26, 60, 110)
+			pdf.CellFormat(0, 8, fmt.Sprintf("%d. %s", i+1, sec.Title), "", 1, "L", false, 0, "")
+			pdf.SetTextColor(0, 0, 0)
+			pdf.Ln(2)
+		}
+
+		widths := columnWidths(len(sec.Columns))
+		drawTableHeader(pdf, sec.Columns, widths)
+		fill := false
+		for _, row := range sec.Rows {
+			drawRow(pdf, padRow(row, len(sec.Columns)), widths, fill)
+			fill = !fill
+		}
+		if len(sec.TotalRow) > 0 {
+			drawTotalRowCells(pdf, padRow(sec.TotalRow, len(sec.Columns)), widths)
+		}
+		pdf.Ln(8)
+	}
+
+	return pdf.OutputFileAndClose(outPath)
+}
+
+// columnWidths распределяет 170 мм (ширина A4 за вычетом полей) по колонкам:
+// первая (обычно имя/описание) шире, остальные равны между собой.
+func columnWidths(n int) []float64 {
+	const total = 170.0
+	if n <= 1 {
+		return []float64{total}
+	}
+	first := total * 0.45
+	rest := (total - first) / float64(n-1)
+	widths := make([]float64, n)
+	widths[0] = first
+	for i := 1; i < n; i++ {
+		widths[i] = rest
+	}
+	return widths
+}
+
+func padRow(row []string, n int) []string {
+	if len(row) >= n {
+		return row[:n]
+	}
+	out := make([]string, n)
+	copy(out, row)
+	return out
+}
+
+// drawTotalRowCells рисует выделенную итоговую строку из готовых ячеек.
+func drawTotalRowCells(pdf *gofpdf.Fpdf, values []string, widths []float64) {
+	pdf.SetFont("DejaVu", "B", 10)
+	pdf.SetFillColor(255, 243, 205)
+	for i, v := range values {
+		align := "L"
+		if i > 0 {
+			align = "R"
+		}
+		pdf.CellFormat(widths[i], 8, v, "1", 0, align, true, 0, "")
+	}
+	pdf.Ln(-1)
+}
+
 func drawTableHeader(pdf *gofpdf.Fpdf, headers []string, widths []float64) {
 	pdf.SetFont("DejaVu", "B", 10)
 	pdf.SetFillColor(26, 60, 110)

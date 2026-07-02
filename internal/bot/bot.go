@@ -429,7 +429,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.savePendingTool(chat), b.correctionTool(""), b.personTool()}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.savePendingTool(chat), b.correctionTool(""), b.personTool(), b.customPDFTool(chat)}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -509,7 +509,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты,
 	// статистика по отправителям и корректировки (по умолчанию — в этой группе).
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.correctionTool(chat.String()), b.personTool()}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.correctionTool(chat.String()), b.personTool(), b.customPDFTool(chat)}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
 	if err != nil {
@@ -835,7 +835,13 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"'тот чек на 5000 был по ошибке, не считай', 'убери платёж Миланы на 3000', 'верни тот чек'. " +
 		"Если инструмент вернул несколько кандидатов — покажи их и уточни, какую операцию имели в виду.\n" +
 		"5. person_report — вся статистика по одному человеку: сколько чеков на его имя и платежей, суммы, " +
-		"первая/последняя операции. Вызывай при 'сколько чеков у Ахмеда', 'что там по Милане'. Период необязателен.\n\n" +
+		"первая/последняя операции. Вызывай при 'сколько чеков у Ахмеда', 'что там по Милане'. Период необязателен.\n" +
+		"6. make_custom_pdf — произвольный PDF-документ по описанию пользователя ('сделай чек/отчёт с такими данными', " +
+		"'оформи это в пдф'). Ты задаёшь заголовок, колонки и строки. Данные бери из результатов других инструментов " +
+		"или из того, что пользователь явно назвал — НЕ выдумывай цифры. Если для отчёта нужны данные — сначала " +
+		"вызови нужный инструмент (senders_report/person_report/send_finance_report), потом оформи в make_custom_pdf. " +
+		"Учти: senders_report и send_finance_report сами умеют присылать PDF (format=\"pdf\") — для стандартных " +
+		"отчётов проще использовать их, а make_custom_pdf нужен для нестандартной таблицы, которую попросил владелец.\n\n" +
 		"Также знай: если сообщение с платежом/чеком УДАЛИЛИ в WhatsApp, бот автоматически убирает его из учёта " +
 		"и пишет об этом в чат — отчёты всегда отражают актуальное состояние.\n\n" +
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
@@ -903,13 +909,14 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 
 // sendersTool — статистика "кто сколько чеков прислал": для групп, где
 // работники кидают чеки (их сбор считается по отправленным чекам).
-func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
+func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 	return ai.Tool{
 		Name: "senders_report",
 		Description: "Показывает, кто сколько чеков отправил и на какую сумму за период — по отправителям " +
 			"сообщений с чеками. Используй, когда спрашивают 'какой сотрудник сколько чеков скинул', " +
 			"'сколько чеков и какой сбор сделал Расул', 'проверь по группе сб оплата клиентов кто сколько отправил' " +
-			"и т.п. Если у отправителя не сохранено имя в WhatsApp, он будет показан по номеру телефона.",
+			"и т.п. Если у отправителя не сохранено имя в WhatsApp, он будет показан по номеру телефона. " +
+			"Может вернуть результат текстом или прислать PDF-документ (format=\"pdf\", если просят файл/пдф/документ).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -929,6 +936,11 @@ func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
 					"type":        "string",
 					"description": "Имя или номер телефона конкретного человека, если спрашивают про одного (например 'расул' или '7937...'). Пусто — по всем отправителям.",
 				},
+				"format": map[string]any{
+					"type":        "string",
+					"enum":        []string{"pdf", "text"},
+					"description": "\"pdf\" — прислать документ; \"text\" (по умолчанию) — вернуть цифры текстом",
+				},
 			},
 			"required": []string{"from_date", "to_date"},
 		},
@@ -938,6 +950,7 @@ func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
 				ToDate   string `json:"to_date"`
 				Group    string `json:"group"`
 				Sender   string `json:"sender"`
+				Format   string `json:"format"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
@@ -967,10 +980,42 @@ func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
 			if len(stats) == 0 {
 				return fmt.Sprintf("За период %s (%s) чеков не найдено.", periodLabel, groupLabel), nil
 			}
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "Чеки по отправителям за %s (%s):\n", periodLabel, groupLabel)
+
 			var totalCount int
 			var totalSum float64
+			for _, s := range stats {
+				totalCount += s.Count
+				totalSum += s.Total
+			}
+
+			if args.Format == "pdf" {
+				rows := make([][]string, 0, len(stats))
+				for _, s := range stats {
+					label := s.Name
+					if label == "" {
+						label = "+" + s.Phone
+					} else if s.Phone != "" {
+						label += " (+" + s.Phone + ")"
+					}
+					rows = append(rows, []string{label, fmt.Sprintf("%d", s.Count), formatRub(s.Total)})
+				}
+				section := report.Section{
+					Title:    "Чеки по отправителям",
+					Columns:  []string{"Отправитель", "Кол-во чеков", "Сумма, ₽"},
+					Rows:     rows,
+					TotalRow: []string{"ИТОГО", fmt.Sprintf("%d", totalCount), formatRub(totalSum)},
+				}
+				outPath := fmt.Sprintf("%s/senders_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
+				subtitle := "Период: " + periodLabel + " | " + groupLabel
+				if err := report.GenerateCustom("Отчёт: кто сколько чеков скинул", subtitle, []report.Section{section}, b.fontDir, outPath); err != nil {
+					return "", fmt.Errorf("ошибка генерации PDF: %w", err)
+				}
+				b.sendDocument(chat, outPath, "Чеки_по_отправителям_"+from.Format("2006-01-02")+".pdf")
+				return fmt.Sprintf("PDF с разбивкой по отправителям за %s (%s) отправлен: %d чек(ов) на %.0f ₽.", periodLabel, groupLabel, totalCount, totalSum), nil
+			}
+
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Чеки по отправителям за %s (%s):\n", periodLabel, groupLabel)
 			for _, s := range stats {
 				label := s.Name
 				if label == "" {
@@ -979,13 +1024,134 @@ func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
 					label += " (+" + s.Phone + ")"
 				}
 				fmt.Fprintf(&sb, "- %s: %d чек(ов), %.0f ₽\n", label, s.Count, s.Total)
-				totalCount += s.Count
-				totalSum += s.Total
 			}
 			fmt.Fprintf(&sb, "Итого: %d чек(ов) на %.0f ₽", totalCount, totalSum)
 			return sb.String(), nil
 		},
 	}
+}
+
+// customPDFTool — произвольный PDF по запросу владельца: он описывает, какие
+// колонки и строки нужны, а бот рисует таблицу и присылает документ.
+// Данные бот НЕ придумывает — модель заполняет их из результатов других
+// инструментов или из того, что явно продиктовал владелец.
+func (b *Bot) customPDFTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "make_custom_pdf",
+		Description: "Создаёт и присылает произвольный PDF-документ с таблицей(ами) по описанию пользователя. " +
+			"Используй, когда просят 'сделай чек/отчёт/документ с такими данными', 'оформи в пдф вот это', " +
+			"или когда нужно красиво оформить результат другого инструмента в файл. " +
+			"ВАЖНО: бери данные только из результатов инструментов или из того, что пользователь явно назвал — " +
+			"НЕ выдумывай цифры. Первая колонка выравнивается влево, остальные вправо (для чисел).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"title": map[string]any{
+					"type":        "string",
+					"description": "Заголовок документа",
+				},
+				"subtitle": map[string]any{
+					"type":        "string",
+					"description": "Подзаголовок: период, группа, автор и т.п. (необязательно)",
+				},
+				"sections": map[string]any{
+					"type":        "array",
+					"description": "Один или несколько блоков-таблиц",
+					"items": map[string]any{
+						"type": "object",
+						"properties": map[string]any{
+							"title":   map[string]any{"type": "string", "description": "Заголовок блока (необязательно)"},
+							"columns": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Названия колонок"},
+							"rows": map[string]any{
+								"type":        "array",
+								"description": "Строки таблицы; каждая — массив ячеек по числу колонок",
+								"items":       map[string]any{"type": "array", "items": map[string]any{"type": "string"}},
+							},
+							"total_row": map[string]any{
+								"type":        "array",
+								"items":       map[string]any{"type": "string"},
+								"description": "Необязательная итоговая строка (по числу колонок)",
+							},
+						},
+						"required": []string{"columns", "rows"},
+					},
+				},
+			},
+			"required": []string{"title", "sections"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Title    string `json:"title"`
+				Subtitle string `json:"subtitle"`
+				Sections []struct {
+					Title    string     `json:"title"`
+					Columns  []string   `json:"columns"`
+					Rows     [][]string `json:"rows"`
+					TotalRow []string   `json:"total_row"`
+				} `json:"sections"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			if strings.TrimSpace(args.Title) == "" || len(args.Sections) == 0 {
+				return "", fmt.Errorf("нужен заголовок и хотя бы одна таблица")
+			}
+			sections := make([]report.Section, 0, len(args.Sections))
+			for _, s := range args.Sections {
+				if len(s.Columns) == 0 {
+					continue
+				}
+				sections = append(sections, report.Section{
+					Title:    s.Title,
+					Columns:  s.Columns,
+					Rows:     s.Rows,
+					TotalRow: s.TotalRow,
+				})
+			}
+			if len(sections) == 0 {
+				return "", fmt.Errorf("не задано ни одной таблицы с колонками")
+			}
+			outPath := fmt.Sprintf("%s/custom_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
+			if err := report.GenerateCustom(args.Title, args.Subtitle, sections, b.fontDir, outPath); err != nil {
+				return "", fmt.Errorf("ошибка генерации PDF: %w", err)
+			}
+			b.sendDocument(chat, outPath, sanitizeFileName(args.Title)+".pdf")
+			return "Готовый PDF «" + args.Title + "» отправлен в чат.", nil
+		},
+	}
+}
+
+// formatRub форматирует сумму с разбивкой по разрядам для PDF-таблиц.
+func formatRub(v float64) string {
+	s := fmt.Sprintf("%.0f", v)
+	var out []byte
+	for i, c := range []byte(s) {
+		if i > 0 && (len(s)-i)%3 == 0 {
+			out = append(out, ' ')
+		}
+		out = append(out, c)
+	}
+	return string(out)
+}
+
+// sanitizeFileName делает из заголовка безопасное имя файла.
+func sanitizeFileName(s string) string {
+	s = strings.TrimSpace(s)
+	repl := func(r rune) rune {
+		switch r {
+		case '/', '\\', ':', '*', '?', '"', '<', '>', '|', '\n', '\t':
+			return '_'
+		}
+		return r
+	}
+	s = strings.Map(repl, s)
+	if len([]rune(s)) > 60 {
+		s = string([]rune(s)[:60])
+	}
+	if s == "" {
+		s = "Отчёт"
+	}
+	return s
 }
 
 // personTool — сводка по конкретному человеку: сколько чеков на его имя
