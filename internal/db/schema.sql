@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     media_path    TEXT,               -- путь к сохранённому фото чека, если есть
     received_at   TIMESTAMPTZ NOT NULL,
     parsed        BOOLEAN NOT NULL DEFAULT false,
+    deleted       BOOLEAN NOT NULL DEFAULT false, -- сообщение удалили в WhatsApp; его платежи/чеки не считаются
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -38,6 +39,7 @@ CREATE TABLE IF NOT EXISTS transactions (
     card_to         TEXT,              -- "втб", "карта (банк не указан)", "наличные"
     raw_message_id  INT REFERENCES raw_messages(id),
     tx_date         DATE NOT NULL,     -- дата операции (из сообщения или дата получения)
+    ignored         BOOLEAN NOT NULL DEFAULT false, -- ручное исключение из учёта через ассистента
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
@@ -70,6 +72,7 @@ CREATE TABLE IF NOT EXISTS bank_receipts (
     -- здесь заполняется только при дозагрузке через личку, если владелец
     -- указал, от кого эти чеки (например, "это чеки Расула").
     submitted_by    TEXT,
+    ignored         BOOLEAN NOT NULL DEFAULT false, -- ручное исключение из учёта через ассистента
     -- Дата И ВРЕМЯ операции (не время получения сообщения в WhatsApp) —
     -- берётся с самого чека, когда OCR смог его распознать; иначе время
     -- получения сообщения используется как приближение. Точное время нужно

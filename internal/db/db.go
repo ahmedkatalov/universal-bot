@@ -78,6 +78,19 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание индекса group_jid: %w", err)
 	}
 
+	// Поддержка удалённых сообщений и ручных корректировок: платёж/чек из
+	// удалённого в WhatsApp сообщения исключается из отчётов; ignored —
+	// ручное исключение через ассистента ("не считай тот чек на 5000").
+	if _, err := pool.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки deleted: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.ignored: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки bank_receipts.ignored: %w", err)
+	}
+
 	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
 	// чек, легально пересланный из группы СБ в основную, помечался дублем.
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
@@ -314,6 +327,103 @@ func (d *DB) AssignReceiptContact(ctx context.Context, receiptID, contactID int)
 	return err
 }
 
+// MarkMessageDeleted помечает сообщение WhatsApp удалённым (пользователь
+// удалил его в чате) и возвращает, сколько платежей и чеков было к нему
+// привязано — они автоматически выпадают из всех отчётов.
+func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCount, receiptCount int, err error) {
+	var rawID int
+	err = d.pool.QueryRow(ctx, `
+		UPDATE raw_messages SET deleted = true WHERE wa_message_id = $1 RETURNING id
+	`, waMessageID).Scan(&rawID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, nil // сообщение не было у нас в базе (например, болтовня)
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE raw_message_id = $1 AND ignored = false`, rawID).Scan(&txCount); err != nil {
+		return 0, 0, err
+	}
+	if err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM bank_receipts WHERE raw_message_id = $1 AND ignored = false AND is_duplicate = false`, rawID).Scan(&receiptCount); err != nil {
+		return 0, 0, err
+	}
+	return txCount, receiptCount, nil
+}
+
+// OperationRef — ссылка на операцию (текстовый платёж или чек) для ручных
+// корректировок через ассистента.
+type OperationRef struct {
+	Kind    string // "transaction" | "receipt"
+	ID      int
+	Name    string
+	Amount  float64
+	TxDate  time.Time
+	Ignored bool
+}
+
+// FindOperations ищет операции по сумме с необязательными уточнениями:
+// имя человека (подстрока), диапазон дат, группа. Возвращает до 10 последних —
+// используется ассистентом, чтобы найти операцию, которую владелец просит
+// исключить из учёта или вернуть обратно.
+func (d *DB) FindOperations(ctx context.Context, amount float64, person string, from, to *time.Time, groupJID string) ([]OperationRef, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT * FROM (
+			SELECT 'transaction' AS kind, t.id, COALESCE(c.canonical_name, t.raw_name) AS name,
+			       t.amount::float8 AS amount, t.tx_date::timestamptz AS tx_date,
+			       COALESCE(rm.wa_group_jid, '') AS group_jid, t.ignored
+			FROM transactions t
+			LEFT JOIN contacts c ON c.id = t.contact_id
+			LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+			WHERE t.amount = $1 AND COALESCE(rm.deleted, false) = false
+
+			UNION ALL
+
+			SELECT 'receipt', br.id, COALESCE(c.canonical_name, br.recipient_raw, ''),
+			       br.amount::float8, br.tx_date, COALESCE(br.group_jid, ''), br.ignored
+			FROM bank_receipts br
+			LEFT JOIN contacts c ON c.id = br.contact_id
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE br.amount = $1 AND br.is_duplicate = false AND COALESCE(rm.deleted, false) = false
+		) ops
+		WHERE ($2 = '' OR ops.name ILIKE '%' || $2 || '%')
+		  AND ($3::timestamptz IS NULL OR ops.tx_date >= $3)
+		  AND ($4::timestamptz IS NULL OR ops.tx_date < $4)
+		  AND ($5 = '' OR ops.group_jid = $5)
+		ORDER BY ops.tx_date DESC
+		LIMIT 10
+	`, amount, person, from, to, groupJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []OperationRef
+	for rows.Next() {
+		var op OperationRef
+		var groupJID string
+		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &groupJID, &op.Ignored); err != nil {
+			return nil, err
+		}
+		out = append(out, op)
+	}
+	return out, rows.Err()
+}
+
+// SetOperationIgnored включает/выключает ручное исключение операции из учёта.
+func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignored bool) error {
+	table := ""
+	switch kind {
+	case "transaction":
+		table = "transactions"
+	case "receipt":
+		table = "bank_receipts"
+	default:
+		return fmt.Errorf("неизвестный тип операции %q", kind)
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE `+table+` SET ignored = $2 WHERE id = $1`, id, ignored)
+	return err
+}
+
 // ---- Сводки ----
 
 // ContactSummary — агрегированная сумма по одному контакту за период.
@@ -342,6 +452,8 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID 
 		JOIN contacts c ON c.id = t.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		  AND t.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
 		  AND ($3 = '' OR rm.wa_group_jid = $3))
 
 		UNION ALL
@@ -350,9 +462,12 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID 
 			c.canonical_name, COALESCE(br.bank, 'банк не указан'), br.amount
 		FROM bank_receipts br
 		JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
 		  AND br.needs_review = false
 		  AND br.is_duplicate = false
+		  AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
 		  AND br.contact_id IS NOT NULL
 		  AND ($3 = '' OR br.group_jid = $3)
 		ORDER BY COALESCE(NULLIF(br.doc_number, ''), br.contact_id::text || '|' || br.amount::text || '|' || br.tx_date::text))
@@ -419,6 +534,8 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, send
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE br.tx_date >= $1 AND br.tx_date < $2
 			  AND br.is_duplicate = false
+			  AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
 			  AND br.amount > 0
 			  AND ($3 = '' OR br.group_jid = $3)
 		) s

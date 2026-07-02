@@ -190,6 +190,24 @@ func (b *Bot) handleEvent(evt interface{}) {
 	}
 	ctx := context.Background()
 
+	// Пользователь удалил сообщение ("Удалить у всех") — если к нему были
+	// привязаны платежи/чеки, они выпадают из учёта, а бот подтверждает
+	// это в чате, чтобы было видно, что отчёт обновился.
+	if prot := msg.Message.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_REVOKE {
+		revokedID := prot.GetKey().GetID()
+		txN, rcN, err := b.db.MarkMessageDeleted(ctx, revokedID)
+		if err != nil {
+			fmt.Println("Ошибка обработки удалённого сообщения:", err)
+			return
+		}
+		if txN+rcN > 0 {
+			fmt.Printf("Сообщение %s удалено — из учёта убрано платежей: %d, чеков: %d\n", revokedID, txN, rcN)
+			b.sendText(msg.Info.Chat, fmt.Sprintf(
+				"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
+		}
+		return
+	}
+
 	if !msg.Info.IsGroup {
 		// Личный чат с номером бота — если настроен ассистент, отвечаем.
 		// В отдельной горутине: ответ ИИ может занимать десятки секунд,
@@ -321,7 +339,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// на доразбор ИИ — в фоне, чтобы не тормозить остальные сообщения.
 		if b.assistant != nil && containsDigit(result.Unparsed) {
 			unparsed := append([]string(nil), result.Unparsed...)
-			go b.aiRescueUnparsed(context.Background(), senderName, unparsed, rawID, msg.Info.Timestamp)
+			go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, unparsed, rawID, msg.Info.Timestamp)
 		}
 	}
 
@@ -376,7 +394,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.savePendingTool(chat)}
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.savePendingTool(chat), b.correctionTool("")}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -454,9 +472,9 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	}
 	userText := senderName + ": " + query
 
-	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты
-	// и статистика по отправителям.
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx)}
+	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты,
+	// статистика по отправителям и корректировки (по умолчанию — в этой группе).
+	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx), b.correctionTool(chat.String())}
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
 	if err != nil {
@@ -755,7 +773,12 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"владелец присылает пропущенные чеки сюда в личку и просит их запомнить, указывая группу. Каждое фото чека " +
 		"уже распознано и ждёт; вызывай инструмент ТОЛЬКО после явной просьбы сохранить/запомнить/учесть, " +
 		"с названием группы (переспроси, если владелец её не назвал). Дата операции берётся с самого чека " +
-		"(включая год), так что чеки лягут на свои реальные даты. Дубли пропускаются автоматически.\n\n" +
+		"(включая год), так что чеки лягут на свои реальные даты. Дубли пропускаются автоматически.\n" +
+		"4. correct_operation — исключить ошибочную операцию из учёта или вернуть обратно. Вызывай, когда говорят " +
+		"'тот чек на 5000 был по ошибке, не считай', 'убери платёж Миланы на 3000', 'верни тот чек'. " +
+		"Если инструмент вернул несколько кандидатов — покажи их и уточни, какую операцию имели в виду.\n\n" +
+		"Также знай: если сообщение с платежом/чеком УДАЛИЛИ в WhatsApp, бот автоматически убирает его из учёта " +
+		"и пишет об этом в чат — отчёты всегда отражают актуальное состояние.\n\n" +
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
 		"расскажи, что на чеке (от кого, сумма, дата операции, учтён ли уже). В учёт чек попадает только " +
 		"через save_pending_receipts по явной просьбе, либо когда его присылают в рабочую группу."
@@ -902,6 +925,124 @@ func (b *Bot) sendersTool(ctx context.Context) ai.Tool {
 			}
 			fmt.Fprintf(&sb, "Итого: %d чек(ов) на %.0f ₽", totalCount, totalSum)
 			return sb.String(), nil
+		},
+	}
+}
+
+// correctionTool — ручные корректировки учёта: "тот чек на 5000 был по ошибке,
+// не считай его" / "верни обратно платёж на 3000". Ищет операцию по сумме
+// с уточнениями и помечает её исключённой (или снимает пометку).
+// defaultGroupJID — группа по умолчанию для поиска (в группе — она сама,
+// в личке — пусто, т.е. все группы).
+func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
+	return ai.Tool{
+		Name: "correct_operation",
+		Description: "Исключает операцию (платёж или чек) из учёта или возвращает её обратно. " +
+			"Вызывай, когда пользователь говорит, что запись ошибочная/не должна считаться " +
+			"('тот чек на 5000 скинули по ошибке, убери его', 'не считай платёж Миланы на 3000') " +
+			"или просит вернуть ранее исключённую ('верни тот чек на 5000'). " +
+			"Если под описание подходит несколько операций, инструмент вернёт список — уточни у пользователя " +
+			"дату или имя и вызови снова с уточнением.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"action": map[string]any{
+					"type":        "string",
+					"enum":        []string{"exclude", "restore"},
+					"description": "exclude — исключить из учёта; restore — вернуть обратно",
+				},
+				"amount": map[string]any{
+					"type":        "number",
+					"description": "Сумма операции в рублях (точная)",
+				},
+				"person": map[string]any{
+					"type":        "string",
+					"description": "Имя человека, если известно (для уточнения поиска)",
+				},
+				"date": map[string]any{
+					"type":        "string",
+					"description": "Дата операции YYYY-MM-DD, если известна (для уточнения поиска)",
+				},
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы, если пользователь её указал",
+				},
+			},
+			"required": []string{"action", "amount"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Action string  `json:"action"`
+				Amount float64 `json:"amount"`
+				Person string  `json:"person"`
+				Date   string  `json:"date"`
+				Group  string  `json:"group"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			if args.Amount <= 0 {
+				return "", fmt.Errorf("нужна точная сумма операции")
+			}
+
+			groupJID := defaultGroupJID
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID = jid.String()
+			}
+
+			var fromPtr, toPtr *time.Time
+			if strings.TrimSpace(args.Date) != "" {
+				day, err := time.ParseInLocation("2006-01-02", args.Date, time.Local)
+				if err != nil {
+					return "", fmt.Errorf("неверная дата %q, нужен формат YYYY-MM-DD", args.Date)
+				}
+				next := day.AddDate(0, 0, 1)
+				fromPtr, toPtr = &day, &next
+			}
+
+			ops, err := b.db.FindOperations(ctx, args.Amount, strings.TrimSpace(args.Person), fromPtr, toPtr, groupJID)
+			if err != nil {
+				return "", fmt.Errorf("ошибка поиска операции: %w", err)
+			}
+
+			// Для exclude интересны ещё не исключённые, для restore — исключённые.
+			wantIgnored := args.Action == "restore"
+			var candidates []db.OperationRef
+			for _, op := range ops {
+				if op.Ignored == wantIgnored {
+					candidates = append(candidates, op)
+				}
+			}
+
+			switch len(candidates) {
+			case 0:
+				if args.Action == "restore" {
+					return fmt.Sprintf("Исключённых операций на %.0f ₽ не нашёл.", args.Amount), nil
+				}
+				return fmt.Sprintf("Операций на %.0f ₽ в учёте не нашёл — возможно, она уже исключена или сумма другая.", args.Amount), nil
+			case 1:
+				op := candidates[0]
+				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, args.Action == "exclude"); err != nil {
+					return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+				}
+				verb := "исключена из учёта"
+				if args.Action == "restore" {
+					verb = "возвращена в учёт"
+				}
+				return fmt.Sprintf("Операция %s: %s, %.0f ₽ от %s. Отчёты уже учитывают это изменение.",
+					verb, op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04")), nil
+			default:
+				var sb strings.Builder
+				sb.WriteString("Нашёл несколько подходящих операций, уточни дату или имя:\n")
+				for _, op := range candidates {
+					fmt.Fprintf(&sb, "- %s, %.0f ₽, %s\n", op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04"))
+				}
+				return sb.String(), nil
+			}
 		},
 	}
 }

@@ -12,6 +12,8 @@ import (
 	"time"
 	"unicode"
 
+	"go.mau.fi/whatsmeow/types"
+
 	"whatsapp-bot/internal/db"
 )
 
@@ -29,16 +31,20 @@ func containsDigit(lines []string) bool {
 }
 
 // extractJSONBlock вырезает JSON из ответа модели — модели любят оборачивать
-// его в ```json ... ``` или добавлять пояснения до/после.
+// его в ```json ... ``` или добавлять пояснения до/после. Берём ту скобку
+// (массив или объект), которая встречается раньше: объект может содержать
+// массивы внутри и наоборот.
 func extractJSONBlock(s string) string {
-	if start := strings.Index(s, "["); start >= 0 {
-		if end := strings.LastIndex(s, "]"); end > start {
-			return s[start : end+1]
+	iArr := strings.Index(s, "[")
+	iObj := strings.Index(s, "{")
+	if iObj >= 0 && (iArr < 0 || iObj < iArr) {
+		if end := strings.LastIndex(s, "}"); end > iObj {
+			return s[iObj : end+1]
 		}
 	}
-	if start := strings.Index(s, "{"); start >= 0 {
-		if end := strings.LastIndex(s, "}"); end > start {
-			return s[start : end+1]
+	if iArr >= 0 {
+		if end := strings.LastIndex(s, "]"); end > iArr {
+			return s[iArr : end+1]
 		}
 	}
 	return ""
@@ -53,16 +59,27 @@ type aiPayment struct {
 
 // aiRescueUnparsed отдаёт нераспознанные строки группового сообщения модели
 // и сохраняет платежи, которые она смогла извлечь. Вызывается в фоне, чтобы
-// не тормозить обработку остальных сообщений.
-func (b *Bot) aiRescueUnparsed(ctx context.Context, senderName string, lines []string, rawID int, txDate time.Time) {
+// не тормозить обработку остальных сообщений. Модель отличает реальные
+// операции от обсуждения денег; если сомневается — бот задаёт уточняющий
+// вопрос прямо в группе, а не записывает наугад.
+func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time) {
 	system := "Ты — модуль разбора платежей в WhatsApp-боте учёта финансов. " +
 		"Тебе дают строки из сообщения рабочей группы, которые не смог разобрать обычный парсер. " +
-		"Известные люди: " + strings.Join(b.aliases.Canonicals(), ", ") + ".\n" +
-		"Верни СТРОГО JSON-массив объектов вида " +
-		`[{"name":"Имя","amount":12345,"note":"аванс|премия|долг|","card":"втб|сбер|наличные|"}]` + ". " +
-		"Включай ТОЛЬКО реальные платежи (кто-то сдал/перевёл/принёс деньги). Сумма — числом в рублях. " +
-		"name — имя из списка известных, если уверенно совпадает; иначе как написано в сообщении. " +
-		"Если платежей в строках нет (болтовня, время встречи, номер телефона и т.п.) — верни []."
+		"Известные люди: " + strings.Join(b.aliases.Canonicals(), ", ") + ".\n\n" +
+		"Верни СТРОГО один JSON-объект вида " +
+		`{"payments":[{"name":"Имя","amount":12345,"note":"аванс|премия|долг|","card":"втб|сбер|наличные|"}],"clarify":""}` + ".\n\n" +
+		"В payments включай ТОЛЬКО РЕАЛЬНО СОВЕРШЁННЫЕ операции — деньги фактически сдали/перевели/принесли: " +
+		"«Ахмед скинул 5000», «пришло 25 тыщ от Миланы», «оплатил 10000 за аренду». " +
+		"НЕ включай обсуждения, планы, вопросы и пересказы: «сказал взять 5000», «может нужно 10000», " +
+		"«я ему говорил про 7к», «сколько будет 5000?», «надо собрать лям» — это НЕ операции, верни для них пустой payments. " +
+		"Понимай сленг и разговорные суммы: 5к = 5000, 25 тыщ = 25000, лям = 1000000, полтора ляма = 1500000, " +
+		"«косарь» = 1000. Сумма — числом в рублях. " +
+		"name — имя из списка известных, если уверенно совпадает; иначе как написано в сообщении.\n\n" +
+		"clarify — уточняющий вопрос ОДНОЙ короткой фразой, ТОЛЬКО если строка похожа на реальную операцию, " +
+		"но непонятно ключевое (был ли платёж на самом деле, чьи это деньги, какая сумма). " +
+		"ВАЖНО: строка либо в payments, либо в clarify — никогда одновременно. Если непонятно, от кого деньги, " +
+		"НЕ записывай их на отправителя сообщения — задай clarify и оставь payments пустым. " +
+		"Для болтовни и явных обсуждений clarify оставь пустым — не переспрашивай по пустякам."
 
 	user := "Отправитель сообщения: " + senderName + "\nСтроки:\n" + strings.Join(lines, "\n")
 
@@ -75,10 +92,18 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, senderName string, lines []s
 	if block == "" {
 		return
 	}
-	var payments []aiPayment
-	if err := json.Unmarshal([]byte(block), &payments); err != nil {
+	var parsed struct {
+		Payments []aiPayment `json:"payments"`
+		Clarify  string      `json:"clarify"`
+	}
+	if err := json.Unmarshal([]byte(block), &parsed); err != nil {
 		fmt.Printf("ИИ-доразбор: не удалось разобрать JSON (%v): %s\n", err, block)
 		return
+	}
+	payments := parsed.Payments
+
+	if q := strings.TrimSpace(parsed.Clarify); q != "" {
+		b.sendText(chat, "❓ "+q)
 	}
 
 	saved := 0
