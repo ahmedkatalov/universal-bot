@@ -22,8 +22,9 @@ const (
 	defaultModel   = "~anthropic/claude-sonnet-latest" // алиас OpenRouter на последнюю версию Sonnet
 
 	// maxToolIterations — предохранитель от зацикливания, если модель
-	// почему-то продолжает звать инструменты бесконечно.
-	maxToolIterations = 5
+	// почему-то продолжает звать инструменты бесконечно. 8 хватает на
+	// цепочку вида "пересчитай -> собери отчёт -> оформи в PDF".
+	maxToolIterations = 8
 )
 
 // Turn — одна реплика в истории личного диалога.
@@ -186,7 +187,7 @@ func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []to
 		Model:     a.model,
 		Messages:  messages,
 		Tools:     tools,
-		MaxTokens: 1024,
+		MaxTokens: 2048,
 	})
 	if err != nil {
 		return chatMessage{}, "", err

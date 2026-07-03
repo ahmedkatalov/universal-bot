@@ -297,13 +297,36 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		mediaExt   string
 	)
 
-	// Чеки приходят и фотографиями, и PDF-документами (Сбер/ВТБ/РСХБ шлют
-	// PDF) — оба типа скачиваем и распознаём в текст.
+	// Чеки приходят фотографиями, PDF-документами (Сбер/ВТБ/РСХБ шлют PDF)
+	// и фото, отправленными "как файл" (без сжатия) — все типы скачиваем
+	// и распознаём в текст.
 	imgMsg := msg.Message.GetImageMessage()
 	docMsg := msg.Message.GetDocumentMessage()
 	isPDF := docMsg != nil && isPDFDocument(docMsg.GetMimetype(), docMsg.GetFileName())
+	isImgDoc := docMsg != nil && !isPDF && strings.HasPrefix(strings.ToLower(docMsg.GetMimetype()), "image/")
 
 	switch {
+	case isImgDoc:
+		hasMedia = true
+		mediaExt = ".jpg"
+		imgBytes, err := b.client.Download(ctx, docMsg)
+		if err != nil {
+			fmt.Println("Ошибка скачивания фото-файла:", err)
+			text = caption
+		} else {
+			mediaBytes = imgBytes
+			mediaPath = b.saveMediaFile(msg.Info.ID, imgBytes, mediaExt)
+			ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
+			if err != nil {
+				fmt.Println("Ошибка OCR фото-файла:", err)
+				text = caption
+			} else {
+				text = ocrText
+				if caption != "" {
+					text = caption + "\n" + ocrText
+				}
+			}
+		}
 	case imgMsg != nil:
 		hasMedia = true
 		mediaExt = ".jpg"
@@ -445,8 +468,9 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	imgMsg := msg.Message.GetImageMessage()
 	docMsg := msg.Message.GetDocumentMessage()
 	isPDF := docMsg != nil && isPDFDocument(docMsg.GetMimetype(), docMsg.GetFileName())
+	isImgDoc := docMsg != nil && !isPDF && strings.HasPrefix(strings.ToLower(docMsg.GetMimetype()), "image/")
 
-	if text == "" && imgMsg == nil && !isPDF {
+	if text == "" && imgMsg == nil && !isPDF && !isImgDoc {
 		fmt.Println("Личное сообщение без текста и вложений (стикер/реакция?) — пропускаю")
 		return
 	}
@@ -463,20 +487,28 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	// группы), но запоминаем как "ожидающий" чек: если владелец скажет
 	// "запомни их для группы такой-то", ассистент сохранит их инструментом
 	// save_pending_receipts.
-	if imgMsg != nil || isPDF {
+	if imgMsg != nil || isPDF || isImgDoc {
 		var (
 			mediaBytes []byte
 			mediaText  string
 			mediaExt   string
 			err        error
 		)
-		if imgMsg != nil {
+		switch {
+		case imgMsg != nil:
 			mediaExt = ".jpg"
 			mediaBytes, err = b.client.Download(ctx, imgMsg)
 			if err == nil {
 				mediaText, err = b.ocr.ExtractText(ctx, mediaBytes)
 			}
-		} else {
+		case isImgDoc:
+			// Фото, отправленное "как файл" (без сжатия).
+			mediaExt = ".jpg"
+			mediaBytes, err = b.client.Download(ctx, docMsg)
+			if err == nil {
+				mediaText, err = b.ocr.ExtractText(ctx, mediaBytes)
+			}
+		default:
 			mediaExt = ".pdf"
 			mediaBytes, err = b.client.Download(ctx, docMsg)
 			if err == nil {
@@ -604,6 +636,10 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.customPDFTool(chat),
 		b.deleteMessagesTool(chat),
 		b.forwardingTool(),
+		b.unclearTool(),
+		b.sendUnclearFileTool(chat),
+		b.fixReceiptTool(),
+		b.recountTool(),
 	}
 	if !inGroup {
 		tools = append(tools, b.savePendingTool(chat))
@@ -1064,7 +1100,25 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"8. manage_receipt_forwarding — автоматическая пересылка чеков между чатами. 'Давай все чеки из группы " +
 		"оплата клиентов скидывай в оплата клнт' -> action=set; 'пересылай чеки из лички в ...' -> from='личка'; " +
 		"'хватит пересылать' -> action=stop. Пересланные чеки сразу записываются в учёт целевой группы. " +
-		"Сейчас активные правила пересылки: " + forwardingList + ".\n\n" +
+		"Сейчас активные правила пересылки: " + forwardingList + ".\n" +
+		"9. list_unclear_receipts — список чеков/фото, которые бот не смог уверенно разобрать. " +
+		"'Какие чеки ты не понял?', 'что не распозналось?'.\n" +
+		"10. send_unclear_file — прислать файл непонятого чека в чат ('скинь мне тот чек, который не понял'), " +
+		"чтобы владелец сам посмотрел и продиктовал данные.\n" +
+		"11. fix_receipt — записать данные чека со слов владельца ('на том чеке Милана, 25000, 2 июля'). " +
+		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
+		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
+		"повторное сопоставление имён и доразбор нераспознанных сообщений. После него данные во всех отчётах свежие.\n\n" +
+		"Принципы работы:\n" +
+		"- Подстраивайся под живые ситуации: владелец может дать команду в любой формулировке — пойми смысл " +
+		"и выбери подходящий инструмент или их цепочку (например 'пересчитай и скинь итог' = recount_everything, " +
+		"затем send_finance_report). Не проси переформулировать, если смысл ясен.\n" +
+		"- Отвечай как толковый живой помощник: конкретные цифры и факты из инструментов, без канцелярита и воды. " +
+		"Если данных нет — так и скажи, не выдумывай.\n" +
+		"- Если просьба неоднозначна и от толкования зависит результат (какая группа, какой период, какой из " +
+		"нескольких чеков) — задай ОДИН короткий уточняющий вопрос, а не гадай.\n" +
+		"- Помни контекст диалога: если владелец говорит 'да', 'этот', 'запомни их' — это про то, что обсуждали " +
+		"в предыдущих репликах.\n\n" +
 		"Также знай: если сообщение с платежом/чеком УДАЛИЛИ в WhatsApp, бот автоматически убирает его из учёта " +
 		"и пишет об этом в чат — отчёты всегда отражают актуальное состояние.\n\n" +
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +

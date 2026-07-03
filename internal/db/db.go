@@ -518,6 +518,166 @@ func (d *DB) ListForwardRules(ctx context.Context) ([]ForwardRule, error) {
 	return out, rows.Err()
 }
 
+// UnclearItem — "непонятый" элемент: чек, который не удалось уверенно
+// разобрать (needs_review), либо фото/файл, из которого вообще не вышло
+// извлечь операцию. Kind: "receipt" (строка bank_receipts) или "message"
+// (сырое медиа-сообщение без единой распознанной операции).
+type UnclearItem struct {
+	Kind         string
+	ID           int // id чека (receipt) или id raw-сообщения (message)
+	GroupJID     string
+	RecipientRaw string
+	Amount       float64
+	TxDate       time.Time
+	MediaPath    string
+	SenderName   string
+}
+
+// UnclearItems возвращает непонятые чеки и медиа-сообщения (свежие первыми).
+// groupJID — необязательный фильтр по группе.
+func (d *DB) UnclearItems(ctx context.Context, groupJID string, limit int) ([]UnclearItem, error) {
+	rows, err := d.pool.Query(ctx, `
+		(SELECT 'receipt', br.id, COALESCE(br.group_jid, ''), COALESCE(br.recipient_raw, ''),
+		        COALESCE(br.amount, 0)::float8, br.tx_date, COALESCE(rm.media_path, ''),
+		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '')
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.needs_review = true AND br.ignored = false AND br.is_duplicate = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND ($1 = '' OR br.group_jid = $1))
+
+		UNION ALL
+
+		(SELECT 'message', rm.id, rm.wa_group_jid, '', 0, rm.received_at, COALESCE(rm.media_path, ''),
+		        COALESCE(NULLIF(rm.sender_name, ''), split_part(rm.sender_jid, '@', 1))
+		FROM raw_messages rm
+		WHERE rm.has_media = true AND rm.deleted = false
+		  AND rm.media_path IS NOT NULL AND rm.media_path <> ''
+		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
+		  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id)
+		  AND ($1 = '' OR rm.wa_group_jid = $1))
+
+		ORDER BY 6 DESC
+		LIMIT $2
+	`, groupJID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []UnclearItem
+	for rows.Next() {
+		var it UnclearItem
+		if err := rows.Scan(&it.Kind, &it.ID, &it.GroupJID, &it.RecipientRaw, &it.Amount, &it.TxDate, &it.MediaPath, &it.SenderName); err != nil {
+			return nil, err
+		}
+		out = append(out, it)
+	}
+	return out, rows.Err()
+}
+
+// UnclearMediaPath возвращает путь к сохранённому файлу непонятого элемента.
+func (d *DB) UnclearMediaPath(ctx context.Context, kind string, id int) (string, error) {
+	var path *string
+	var err error
+	switch kind {
+	case "receipt":
+		err = d.pool.QueryRow(ctx, `
+			SELECT rm.media_path FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE br.id = $1
+		`, id).Scan(&path)
+	case "message":
+		err = d.pool.QueryRow(ctx, `SELECT media_path FROM raw_messages WHERE id = $1`, id).Scan(&path)
+	default:
+		return "", fmt.Errorf("неизвестный тип элемента %q", kind)
+	}
+	if err != nil {
+		return "", err
+	}
+	if path == nil || *path == "" {
+		return "", fmt.Errorf("файл для этой записи не сохранён")
+	}
+	return *path, nil
+}
+
+// FixReceipt применяет данные, продиктованные владельцем, к непонятому чеку:
+// для kind="receipt" обновляет существующую запись, для kind="message"
+// создаёт запись чека поверх сырого медиа-сообщения. Нулевые/пустые значения
+// не трогают существующие поля.
+func (d *DB) FixReceipt(ctx context.Context, kind string, id int, contactID *int, recipientName string, amount float64, txDate *time.Time) error {
+	switch kind {
+	case "receipt":
+		_, err := d.pool.Exec(ctx, `
+			UPDATE bank_receipts SET
+				contact_id    = COALESCE($2, contact_id),
+				recipient_raw = COALESCE(NULLIF($3, ''), recipient_raw),
+				amount        = CASE WHEN $4 > 0 THEN $4 ELSE amount END,
+				tx_date       = COALESCE($5, tx_date),
+				needs_review  = false
+			WHERE id = $1
+		`, id, contactID, recipientName, amount, txDate)
+		return err
+	case "message":
+		var groupJID string
+		var receivedAt time.Time
+		if err := d.pool.QueryRow(ctx, `SELECT wa_group_jid, received_at FROM raw_messages WHERE id = $1`, id).Scan(&groupJID, &receivedAt); err != nil {
+			return fmt.Errorf("сообщение %d не найдено: %w", id, err)
+		}
+		when := receivedAt
+		if txDate != nil {
+			when = *txDate
+		}
+		_, err := d.pool.Exec(ctx, `
+			INSERT INTO bank_receipts (raw_message_id, recipient_raw, contact_id, amount, needs_review, group_jid, tx_date)
+			VALUES ($1, NULLIF($2, ''), $3, $4, false, $5, $6)
+		`, id, recipientName, contactID, amount, groupJID, when)
+		if err != nil {
+			return err
+		}
+		_, err = d.pool.Exec(ctx, `UPDATE raw_messages SET parsed = true WHERE id = $1`, id)
+		return err
+	default:
+		return fmt.Errorf("неизвестный тип элемента %q", kind)
+	}
+}
+
+// UnparsedTextMessages возвращает текстовые сообщения из групп, которые так и
+// не дали ни одной операции — кандидаты на повторный разбор ("пересчитай").
+type UnparsedMessage struct {
+	ID         int
+	GroupJID   string
+	SenderName string
+	Body       string
+	ReceivedAt time.Time
+}
+
+func (d *DB) UnparsedTextMessages(ctx context.Context, limit int) ([]UnparsedMessage, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT rm.id, rm.wa_group_jid, COALESCE(rm.sender_name, ''), COALESCE(rm.body, ''), rm.received_at
+		FROM raw_messages rm
+		WHERE rm.parsed = false AND rm.has_media = false AND rm.deleted = false
+		  AND COALESCE(rm.body, '') <> ''
+		  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id)
+		ORDER BY rm.received_at DESC
+		LIMIT $1
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []UnparsedMessage
+	for rows.Next() {
+		var m UnparsedMessage
+		if err := rows.Scan(&m.ID, &m.GroupJID, &m.SenderName, &m.Body, &m.ReceivedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // ListContacts возвращает все каноничные имена из учёта — ассистент подмешивает
 // их в промпт, чтобы исправлять опечатки в запросах ("ахмет каталов" -> "Ахмед").
 func (d *DB) ListContacts(ctx context.Context) ([]string, error) {
