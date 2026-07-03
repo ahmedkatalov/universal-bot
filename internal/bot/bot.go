@@ -412,6 +412,14 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	if text == "" {
+		// OCR не дал текста вообще. Последний шанс — Claude смотрит на само
+		// изображение: handleBankReceipt с пустым текстом сразу уйдёт в
+		// вижн-фолбэк. В фоне, т.к. вижн-запрос занимает секунды.
+		if mediaBytes != nil && b.assistant != nil {
+			mb, me, chatJID, ts := mediaBytes, mediaExt, msg.Info.Chat, msg.Info.Timestamp
+			go b.handleBankReceipt(context.Background(), chatJID, "", rawID, ts, mb, me)
+			return
+		}
 		fmt.Printf("Фото без распознанного текста (сообщение %d), нужна ручная проверка: %s\n", rawID, mediaPath)
 		return
 	}
@@ -419,7 +427,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Если фото похоже на скриншот банковского перевода — разбираем отдельным
 	// парсером с полями (Получатель/Сколько/Статус), а не обычным построчным.
 	if hasMedia && parser.LooksLikeBankReceipt(text) {
-		b.handleBankReceipt(ctx, msg.Info.Chat, text, rawID, msg.Info.Timestamp)
+		b.handleBankReceipt(ctx, msg.Info.Chat, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt)
 		return
 	}
 
@@ -851,30 +859,16 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 
 	rd := parser.ParseReceipt(ocrText)
 
-	// Парсер не справился — пробуем доразобрать через ИИ (как в группах).
+	// Парсер не справился — пробуем доразобрать через ИИ по тексту,
+	// а если и это не помогло — Claude смотрит на само изображение.
 	if rd.Amount == 0 || rd.Recipient == "" {
 		if rec, ok := b.aiRescueReceipt(ctx, ocrText); ok {
-			if rd.Recipient == "" {
-				rd.Recipient = strings.TrimSpace(rec.Recipient)
-			}
-			if rd.Sender == "" {
-				rd.Sender = strings.TrimSpace(rec.Sender)
-			}
-			if rd.Amount == 0 {
-				rd.Amount = rec.Amount
-			}
-			if rd.Bank == "" {
-				rd.Bank = rec.Bank
-			}
-			if rd.DocNumber == "" {
-				rd.DocNumber = rec.DocNumber
-			}
-			if !rd.HasTxTime {
-				if t, ok := parseAIDatetime(rec.Datetime); ok {
-					rd.TxTime = t
-					rd.HasTxTime = true
-				}
-			}
+			mergeAIReceipt(&rd, rec)
+		}
+	}
+	if rd.Amount == 0 || rd.Recipient == "" {
+		if rec, ok := b.aiVisionReceipt(ctx, mediaBytes, ext); ok {
+			mergeAIReceipt(&rd, rec)
 		}
 	}
 
@@ -2041,7 +2035,7 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 				fmt.Println("Ошибка сохранения пересланного чека:", err)
 				continue
 			}
-			b.handleBankReceipt(ctx, targetJID, text, rawID, ts)
+			b.handleBankReceipt(ctx, targetJID, text, rawID, ts, media, ext)
 		}
 	}
 }
@@ -2052,42 +2046,26 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 // имя) — помечает needs_review = true, чтобы владелец мог проверить вручную.
 // receivedAt — время получения сообщения в WhatsApp, используется как
 // запасной вариант, если на самом чеке не удалось распознать дату/время операции.
-func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string, rawID int, receivedAt time.Time) {
+// media/mediaExt — исходный файл чека (может быть nil): если и парсер, и
+// текстовый ИИ-доразбор не справились, Claude смотрит на изображение чека
+// напрямую (последний рубеж распознавания).
+func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt string) {
 	rd := parser.ParseReceipt(text)
 
 	// Обычный парсер не справился (нестандартная вёрстка чека, кривой OCR) —
-	// пробуем доразобрать через ИИ, дополняя только недостающие поля.
-	if (rd.Amount == 0 || rd.Recipient == "") && b.assistant != nil {
+	// пробуем доразобрать через ИИ по тексту, дополняя недостающие поля.
+	if (rd.Amount == 0 || rd.Recipient == "") && b.assistant != nil && strings.TrimSpace(text) != "" {
 		if rec, ok := b.aiRescueReceipt(ctx, text); ok {
-			if rd.Bank == "" {
-				rd.Bank = rec.Bank
-			}
-			if rd.Recipient == "" {
-				rd.Recipient = strings.TrimSpace(rec.Recipient)
-			}
-			if rd.Sender == "" {
-				rd.Sender = strings.TrimSpace(rec.Sender)
-			}
-			if rd.Amount == 0 {
-				rd.Amount = rec.Amount
-			}
-			if rd.DocNumber == "" {
-				rd.DocNumber = rec.DocNumber
-			}
-			if rd.AuthCode == "" {
-				rd.AuthCode = rec.AuthCode
-			}
-			if rd.Status == "" {
-				rd.Status = rec.Status
-			}
-			if !rd.HasTxTime {
-				if t, ok := parseAIDatetime(rec.Datetime); ok {
-					rd.TxTime = t
-					rd.HasTxTime = true
-				}
-			}
-			fmt.Printf("Чек (сообщение %d): обычный парсер не справился, ИИ дораспознал (получатель %q, сумма %.0f ₽)\n",
+			mergeAIReceipt(&rd, rec)
+			fmt.Printf("Чек (сообщение %d): обычный парсер не справился, ИИ дораспознал по тексту (получатель %q, сумма %.0f ₽)\n",
 				rawID, rd.Recipient, rd.Amount)
+		}
+	}
+
+	// Всё ещё нет ключевых полей — показываем Claude само изображение.
+	if (rd.Amount == 0 || rd.Recipient == "") && media != nil {
+		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
+			mergeAIReceipt(&rd, rec)
 		}
 	}
 

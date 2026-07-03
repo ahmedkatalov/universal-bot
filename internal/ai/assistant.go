@@ -9,6 +9,7 @@ package ai
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -180,6 +181,79 @@ func (a *Assistant) Complete(ctx context.Context, systemPrompt, userText string)
 		return "", err
 	}
 	return msg.Content, nil
+}
+
+// Мультимодальный запрос: контент пользователя — массив блоков (текст + картинка).
+type visionContentPart struct {
+	Type     string        `json:"type"`
+	Text     string        `json:"text,omitempty"`
+	ImageURL *visionImgURL `json:"image_url,omitempty"`
+}
+
+type visionImgURL struct {
+	URL string `json:"url"`
+}
+
+type visionMessage struct {
+	Role    string `json:"role"`
+	Content any    `json:"content"` // string для system, []visionContentPart для user
+}
+
+type visionRequest struct {
+	Model     string          `json:"model"`
+	Messages  []visionMessage `json:"messages"`
+	MaxTokens int             `json:"max_tokens,omitempty"`
+}
+
+// CompleteWithImage — одиночный запрос с картинкой: модель СМОТРИТ на
+// изображение (фото чека) и отвечает по нему. mimeType — "image/jpeg"
+// или "image/png".
+func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userText string, image []byte, mimeType string) (string, error) {
+	payload, err := json.Marshal(visionRequest{
+		Model: a.model,
+		Messages: []visionMessage{
+			{Role: "system", Content: systemPrompt},
+			{Role: "user", Content: []visionContentPart{
+				{Type: "text", Text: userText},
+				{Type: "image_url", ImageURL: &visionImgURL{
+					URL: "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(image),
+				}},
+			}},
+		},
+		MaxTokens: 1024,
+	})
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+a.apiKey)
+
+	resp, err := a.http.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("openrouter: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("openrouter: чтение ответа: %w", err)
+	}
+	var parsed chatResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", fmt.Errorf("openrouter: не удалось разобрать ответ (%d): %s", resp.StatusCode, string(body))
+	}
+	if parsed.Error != nil {
+		return "", fmt.Errorf("openrouter: %s", parsed.Error.Message)
+	}
+	if resp.StatusCode != http.StatusOK || len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
+	}
+	return parsed.Choices[0].Message.Content, nil
 }
 
 func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {

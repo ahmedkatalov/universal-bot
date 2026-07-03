@@ -15,6 +15,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"whatsapp-bot/internal/db"
+	"whatsapp-bot/internal/parser"
 )
 
 // containsDigit — быстрый фильтр: строки без цифр (шутки, болтовня в группе)
@@ -179,6 +180,88 @@ func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, b
 		return aiReceipt{}, false // модель тоже ничего не нашла
 	}
 	return rec, true
+}
+
+// aiVisionReceipt показывает файл чека (фото или PDF) модели "глазами" —
+// последний рубеж распознавания, когда OCR выдал кашу или вообще ничего.
+// Claude читает чек прямо с изображения: банк, получатель, сумма, дата.
+func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (aiReceipt, bool) {
+	if b.assistant == nil || len(media) == 0 {
+		return aiReceipt{}, false
+	}
+
+	img := media
+	mime := "image/jpeg"
+	if ext == ".pdf" {
+		rendered, err := renderPDFFirstPage(ctx, media)
+		if err != nil {
+			fmt.Println("Вижн-разбор: не удалось отрендерить PDF:", err)
+			return aiReceipt{}, false
+		}
+		img, mime = rendered, "image/png"
+	} else if len(img) >= 8 && string(img[:4]) == "\x89PNG" {
+		mime = "image/png"
+	}
+
+	system := "Ты — модуль разбора банковских чеков. Тебе показывают ИЗОБРАЖЕНИЕ чека/скриншота банковского перевода. " +
+		"Внимательно прочитай его и верни СТРОГО один JSON-объект вида " +
+		`{"bank":"","recipient":"","sender":"","amount":0,"doc_number":"","auth_code":"","status":"","datetime":""}` + ". " +
+		"recipient — ФИО получателя перевода (кому пришли деньги), sender — ФИО отправителя. " +
+		"amount — сумма перевода числом в рублях (без комиссии). " +
+		"datetime — дата и время операции с чека в формате YYYY-MM-DD HH:MM:SS (или YYYY-MM-DD HH:MM). " +
+		"Неизвестные поля оставь пустыми (amount — 0). Не выдумывай данные, которых нет на изображении. " +
+		"Если это вообще не банковский чек — верни все поля пустыми."
+
+	out, err := b.assistant.CompleteWithImage(ctx, system, "Прочитай этот чек и верни JSON.", img, mime)
+	if err != nil {
+		fmt.Println("Вижн-разбор чека не удался:", err)
+		return aiReceipt{}, false
+	}
+	block := extractJSONBlock(out)
+	if block == "" {
+		return aiReceipt{}, false
+	}
+	var rec aiReceipt
+	if err := json.Unmarshal([]byte(block), &rec); err != nil {
+		fmt.Printf("Вижн-разбор: не удалось разобрать JSON (%v): %s\n", err, block)
+		return aiReceipt{}, false
+	}
+	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" {
+		return aiReceipt{}, false
+	}
+	fmt.Printf("Вижн-разбор: Claude прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
+	return rec, true
+}
+
+// mergeAIReceipt дополняет ReceiptData недостающими полями из ответа ИИ.
+func mergeAIReceipt(rd *parser.ReceiptData, rec aiReceipt) {
+	if rd.Bank == "" {
+		rd.Bank = rec.Bank
+	}
+	if rd.Recipient == "" {
+		rd.Recipient = strings.TrimSpace(rec.Recipient)
+	}
+	if rd.Sender == "" {
+		rd.Sender = strings.TrimSpace(rec.Sender)
+	}
+	if rd.Amount == 0 {
+		rd.Amount = rec.Amount
+	}
+	if rd.DocNumber == "" {
+		rd.DocNumber = rec.DocNumber
+	}
+	if rd.AuthCode == "" {
+		rd.AuthCode = rec.AuthCode
+	}
+	if rd.Status == "" {
+		rd.Status = rec.Status
+	}
+	if !rd.HasTxTime {
+		if t, ok := parseAIDatetime(rec.Datetime); ok {
+			rd.TxTime = t
+			rd.HasTxTime = true
+		}
+	}
 }
 
 // parseAIDatetime разбирает дату/время из ответа модели.
