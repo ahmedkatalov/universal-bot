@@ -10,6 +10,7 @@ import (
 
 	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/bot"
+	"whatsapp-bot/internal/cmf"
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/ocr"
 	"whatsapp-bot/internal/parser"
@@ -135,7 +136,16 @@ func main() {
 		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
 	}
 
-	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, ownerNumbers, reportAdmins, botName, fontDir, reportDir)
+	// Интеграция с программой рассрочек (cmf): сверка чеков с внесёнными
+	// платежами. Выключена, если CMF_API_URL/CMF_EMAIL/CMF_PASSWORD не заданы.
+	cmfClient := cmf.NewFromEnv()
+	if cmfClient != nil {
+		log.Println("Сверка с программой рассрочек (cmf) включена")
+	} else {
+		log.Println("CMF_API_URL/CMF_EMAIL/CMF_PASSWORD не заданы — сверка с программой выключена")
+	}
+
+	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, cmfClient, groupJIDs, ownerNumbers, reportAdmins, botName, fontDir, reportDir)
 	if err != nil {
 		log.Fatalf("не удалось создать бота: %v", err)
 	}

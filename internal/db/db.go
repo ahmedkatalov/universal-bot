@@ -105,6 +105,41 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание таблицы forward_rules: %w", err)
 	}
 
+	// Сверка чеков с программой рассрочек (cmf): каждый чек из группы
+	// становится "наблюдением" — бот следит, внесли ли платёж в программу,
+	// и напоминает о забытых. bot_settings — простые настройки (например,
+	// к какой точке относить чеки, не найденные в программе).
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS cmf_watch (
+			id             SERIAL PRIMARY KEY,
+			raw_message_id INT REFERENCES raw_messages(id),
+			group_jid      TEXT NOT NULL,
+			sender_jid     TEXT,
+			client_text    TEXT,          -- имя плательщика из подписи к чеку
+			client_id      TEXT,          -- id клиента в cmf, когда сопоставлен
+			client_name    TEXT,          -- полное имя клиента из cmf
+			candidates     TEXT,          -- JSON кандидатов при неоднозначности
+			amount         NUMERIC(12,2) NOT NULL,
+			tx_date        TIMESTAMPTZ NOT NULL,
+			status         TEXT NOT NULL DEFAULT 'noname',
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+			checked_at     TIMESTAMPTZ
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы cmf_watch: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_status ON cmf_watch(status)`); err != nil {
+		return fmt.Errorf("индекс cmf_watch: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS bot_settings (
+			key   TEXT PRIMARY KEY,
+			value TEXT NOT NULL
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы bot_settings: %w", err)
+	}
+
 	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
 	// чек, легально пересланный из группы СБ в основную, помечался дублем.
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
@@ -676,6 +711,146 @@ func (d *DB) UnparsedTextMessages(ctx context.Context, limit int) ([]UnparsedMes
 		out = append(out, m)
 	}
 	return out, rows.Err()
+}
+
+// ---- Настройки бота ----
+
+// SettingGet возвращает значение настройки или "" если её нет.
+func (d *DB) SettingGet(ctx context.Context, key string) (string, error) {
+	var v string
+	err := d.pool.QueryRow(ctx, `SELECT value FROM bot_settings WHERE key = $1`, key).Scan(&v)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return v, err
+}
+
+// SettingSet сохраняет настройку.
+func (d *DB) SettingSet(ctx context.Context, key, value string) error {
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO bot_settings (key, value) VALUES ($1, $2)
+		ON CONFLICT (key) DO UPDATE SET value = $2
+	`, key, value)
+	return err
+}
+
+// ---- Сверка чеков с программой рассрочек (cmf) ----
+
+// CmfWatch — наблюдение за чеком: внесли ли платёж в программу.
+// Статусы: noname (нет имени плательщика), watch (клиент найден, ждём платёж
+// в программе), ambiguous (несколько кандидатов, ждём уточнения), unmatched
+// (клиент не найден в программе), found (платёж внесён), reminded (напомнили,
+// платёж так и не внесён), dismissed (закрыто вручную).
+type CmfWatch struct {
+	ID         int
+	GroupJID   string
+	SenderJID  string
+	ClientText string
+	ClientID   string
+	ClientName string
+	Candidates string
+	Amount     float64
+	TxDate     time.Time
+	Status     string
+	CreatedAt  time.Time
+}
+
+// InsertCmfWatch создаёт наблюдение, возвращает id.
+func (d *DB) InsertCmfWatch(ctx context.Context, rawMessageID int, groupJID, senderJID, clientText string, amount float64, txDate time.Time, status string) (int, error) {
+	var id int
+	err := d.pool.QueryRow(ctx, `
+		INSERT INTO cmf_watch (raw_message_id, group_jid, sender_jid, client_text, amount, tx_date, status)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7)
+		RETURNING id
+	`, rawMessageID, groupJID, senderJID, clientText, amount, txDate, status).Scan(&id)
+	return id, err
+}
+
+// UpdateCmfWatch обновляет поля наблюдения (пустые значения не трогают).
+func (d *DB) UpdateCmfWatch(ctx context.Context, id int, clientText, clientID, clientName, candidates, status string) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE cmf_watch SET
+			client_text = COALESCE(NULLIF($2, ''), client_text),
+			client_id   = COALESCE(NULLIF($3, ''), client_id),
+			client_name = COALESCE(NULLIF($4, ''), client_name),
+			candidates  = COALESCE(NULLIF($5, ''), candidates),
+			status      = COALESCE(NULLIF($6, ''), status),
+			checked_at  = now()
+		WHERE id = $1
+	`, id, clientText, clientID, clientName, candidates, status)
+	return err
+}
+
+// ListCmfWatches возвращает наблюдения в указанных статусах (свежие первыми).
+func (d *DB) ListCmfWatches(ctx context.Context, statuses []string, limit int) ([]CmfWatch, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, group_jid, COALESCE(sender_jid,''), COALESCE(client_text,''), COALESCE(client_id,''),
+		       COALESCE(client_name,''), COALESCE(candidates,''), amount::float8, tx_date, status, created_at
+		FROM cmf_watch
+		WHERE status = ANY($1)
+		ORDER BY created_at DESC
+		LIMIT $2
+	`, statuses, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CmfWatch
+	for rows.Next() {
+		var w CmfWatch
+		if err := rows.Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.ClientID, &w.ClientName,
+			&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// DueCmfWatches — наблюдения со статусом watch, созданные раньше cutoff:
+// пора проверить, внесён ли платёж в программу.
+func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]CmfWatch, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, group_jid, COALESCE(sender_jid,''), COALESCE(client_text,''), COALESCE(client_id,''),
+		       COALESCE(client_name,''), COALESCE(candidates,''), amount::float8, tx_date, status, created_at
+		FROM cmf_watch
+		WHERE status = 'watch' AND created_at < $1
+		ORDER BY created_at
+		LIMIT $2
+	`, cutoff, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CmfWatch
+	for rows.Next() {
+		var w CmfWatch
+		if err := rows.Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.ClientID, &w.ClientName,
+			&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// LatestNonameWatch — последнее наблюдение без имени от этого отправителя в
+// этой группе (для привязки имени, присланного отдельным сообщением).
+func (d *DB) LatestNonameWatch(ctx context.Context, groupJID, senderJID string, since time.Time) (int, bool, error) {
+	var id int
+	err := d.pool.QueryRow(ctx, `
+		SELECT id FROM cmf_watch
+		WHERE group_jid = $1 AND sender_jid = $2 AND status = 'noname' AND created_at > $3
+		ORDER BY created_at DESC
+		LIMIT 1
+	`, groupJID, senderJID, since).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
 }
 
 // ListContacts возвращает все каноничные имена из учёта — ассистент подмешивает

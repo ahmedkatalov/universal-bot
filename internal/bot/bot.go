@@ -30,6 +30,7 @@ import (
 	"google.golang.org/protobuf/proto"
 
 	"whatsapp-bot/internal/ai"
+	"whatsapp-bot/internal/cmf"
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/ocr"
 	"whatsapp-bot/internal/parser"
@@ -47,6 +48,7 @@ type Bot struct {
 	aliases       *parser.AliasMap
 	ocr           ocr.Extractor
 	assistant     *ai.Assistant
+	cmf           *cmf.Client        // nil => сверка с программой рассрочек выключена
 	allowedGroups map[types.JID]bool // пусто/nil => разрешены все группы, в которых состоит номер
 	ownerNumbers  map[string]bool    // пусто/nil => ассистент в личке отвечает всем; иначе только этим номерам
 	reportAdmins  map[string]bool    // номера, которым доступны отчёты/суммы; остальным — вежливый отказ
@@ -92,7 +94,7 @@ type pendingReceipt struct {
 // пустой список = отвечаем всем. reportAdmins — номера, которым доступна
 // отчётность (суммы, сборы, отчёты); остальным по этим вопросам — вежливый
 // отказ, но обычное общение и поиск конкретного чека доступны.
-func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, ownerNumbers, reportAdmins []string, botName, fontDir, reportDir string) (*Bot, error) {
+func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, cmfClient *cmf.Client, groupJIDs []string, ownerNumbers, reportAdmins []string, botName, fontDir, reportDir string) (*Bot, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -147,6 +149,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		aliases:       aliases,
 		ocr:           ocrClient,
 		assistant:     assistant,
+		cmf:           cmfClient,
 		allowedGroups: allowedGroups,
 		ownerNumbers:  owners,
 		reportAdmins:  admins,
@@ -159,6 +162,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	}
 
 	client.AddEventHandler(b.handleEvent)
+	go b.cmfWatcherLoop() // сверка чеков с программой рассрочек (no-op, если cmf == nil)
 	return b, nil
 }
 
@@ -427,8 +431,18 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Если фото похоже на скриншот банковского перевода — разбираем отдельным
 	// парсером с полями (Получатель/Сколько/Статус), а не обычным построчным.
 	if hasMedia && parser.LooksLikeBankReceipt(text) {
+		// Сверка с программой рассрочек: заводим наблюдение — внесут ли этот
+		// платёж в программу (имя клиента берём из подписи к чеку).
+		go b.cmfCapture(context.Background(), msg.Info.Chat, msg.Info.Sender.String(), caption, text, rawID, msg.Info.Timestamp)
 		b.handleBankReceipt(ctx, msg.Info.Chat, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt)
 		return
+	}
+
+	// Короткое текстовое сообщение сразу после чека без подписи — это, скорее
+	// всего, имя плательщика ("Саралиева Милана"): привязываем к наблюдению
+	// сверки с программой. Обычный разбор всё равно продолжается.
+	if b.cmfAttachName(ctx, msg.Info.Chat, msg.Info.Sender.String(), text) {
+		fmt.Printf("cmf: имя %q привязано к последнему чеку без имени\n", text)
 	}
 
 	result := parser.ParseMessage(text)
@@ -648,6 +662,9 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.sendUnclearFileTool(chat),
 		b.fixReceiptTool(),
 		b.recountTool(),
+	}
+	if b.cmf != nil {
+		tools = append(tools, b.cmfStatusTool(), b.cmfResolveTool(), b.cmfBranchTool())
 	}
 	if !inGroup {
 		tools = append(tools, b.savePendingTool(chat))
@@ -1103,6 +1120,12 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
 		"повторное сопоставление имён и доразбор нераспознанных сообщений. После него данные во всех отчётах свежие.\n\n" +
+		"Сверка с программой рассрочек (если настроена): каждый чек из группы бот сверяет с программой — " +
+		"внесли ли платёж клиенту. Имя клиента берётся из подписи к чеку или отдельного сообщения; " +
+		"при нескольких похожих клиентах бот сам спрашивает в группе, чей чек. Инструменты: " +
+		"cmf_status (что не внесено/ждёт), cmf_resolve (указать, чей чек — используй, когда владелец отвечает " +
+		"на вопрос о принадлежности чека), cmf_set_unmatched_branch ('запомни: чеки которых нет в программе — " +
+		"главная точка'). Если платёж не внесли за сутки, бот сам напоминает в группе.\n\n" +
 		"Принципы работы:\n" +
 		"- Подстраивайся под живые ситуации: владелец может дать команду в любой формулировке — пойми смысл " +
 		"и выбери подходящий инструмент или их цепочку (например 'пересчитай и скинь итог' = recount_everything, " +
