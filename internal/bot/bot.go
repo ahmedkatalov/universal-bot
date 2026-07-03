@@ -49,6 +49,7 @@ type Bot struct {
 	assistant     *ai.Assistant
 	allowedGroups map[types.JID]bool // пусто/nil => разрешены все группы, в которых состоит номер
 	ownerNumbers  map[string]bool    // пусто/nil => ассистент в личке отвечает всем; иначе только этим номерам
+	reportAdmins  map[string]bool    // номера, которым доступны отчёты/суммы; остальным — вежливый отказ
 	botName       string             // обращение в группах: "Джарвис скинь отчет"
 	fontDir       string
 	reportDir     string
@@ -88,8 +89,10 @@ type pendingReceipt struct {
 // которые нужно учитывать; пустой список означает "все группы, в которых
 // состоит номер бота". botName — имя, по которому к боту обращаются в группах.
 // ownerNumbers — номера (только цифры), которым разрешена личка с ассистентом;
-// пустой список = отвечаем всем.
-func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, ownerNumbers []string, botName, fontDir, reportDir string) (*Bot, error) {
+// пустой список = отвечаем всем. reportAdmins — номера, которым доступна
+// отчётность (суммы, сборы, отчёты); остальным по этим вопросам — вежливый
+// отказ, но обычное общение и поиск конкретного чека доступны.
+func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *parser.AliasMap, ocrClient ocr.Extractor, assistant *ai.Assistant, groupJIDs []string, ownerNumbers, reportAdmins []string, botName, fontDir, reportDir string) (*Bot, error) {
 	dbLog := waLog.Stdout("Database", "INFO", true)
 	container, err := sqlstore.New(ctx, "sqlite3", "file:"+sessionDBPath+"?_foreign_keys=on", dbLog)
 	if err != nil {
@@ -130,8 +133,12 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	if len(ownerNumbers) > 0 {
 		owners = make(map[string]bool, len(ownerNumbers))
 		for _, n := range ownerNumbers {
-			owners[strings.TrimLeft(strings.TrimSpace(n), "+")] = true
+			owners[normalizePhone(n)] = true
 		}
+	}
+	admins := make(map[string]bool, len(reportAdmins))
+	for _, n := range reportAdmins {
+		admins[normalizePhone(n)] = true
 	}
 
 	b := &Bot{
@@ -142,6 +149,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		assistant:     assistant,
 		allowedGroups: allowedGroups,
 		ownerNumbers:  owners,
+		reportAdmins:  admins,
 		botName:       botName,
 		fontDir:       fontDir,
 		reportDir:     reportDir,
@@ -217,6 +225,13 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// Собственные сообщения бота (в т.ч. пересланные им чеки) не обрабатываем —
 	// они записываются в учёт напрямую при пересылке; иначе возможны петли.
 	if msg.Info.IsFromMe {
+		return
+	}
+
+	// Статусы (сторис) и каналы — не чаты. Чужие статусы приходят как
+	// сообщения из status@broadcast; если на них "ответить", ответ
+	// ПУБЛИКУЕТСЯ КАК СТАТУС БОТА — поэтому игнорируем их полностью.
+	if msg.Info.Chat.Server == types.BroadcastServer || msg.Info.Chat.Server == types.NewsletterServer {
 		return
 	}
 
@@ -518,8 +533,9 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	history := append([]ai.Turn(nil), b.history[sender]...)
 	b.historyMu.Unlock()
 
-	system := b.buildAssistantSystemPrompt(ctx)
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.savePendingTool(chat), b.correctionTool(""), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat), b.forwardingTool()}
+	isAdmin := b.isReportAdmin(msg.Info)
+	system := b.buildAssistantSystemPromptFor(ctx, isAdmin)
+	tools := b.assistantTools(ctx, chat, isAdmin, false)
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
@@ -542,6 +558,57 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 	fmt.Println("Ответ ассистента:", reply)
 	b.sendText(chat, reply)
+}
+
+// normalizePhone приводит номер к формату WhatsApp: без плюса и пробелов,
+// российский "8XXXXXXXXXX" превращается в "7XXXXXXXXXX".
+func normalizePhone(n string) string {
+	n = strings.TrimPrefix(strings.TrimSpace(n), "+")
+	n = strings.ReplaceAll(n, " ", "")
+	n = strings.ReplaceAll(n, "-", "")
+	if len(n) == 11 && strings.HasPrefix(n, "8") {
+		n = "7" + n[1:]
+	}
+	return n
+}
+
+// isReportAdmin проверяет, входит ли отправитель в список тех, кому доступна
+// отчётность. Сверяем и основной JID, и альтернативный (WhatsApp может
+// подставлять скрытый LID вместо номера телефона).
+func (b *Bot) isReportAdmin(info types.MessageInfo) bool {
+	if len(b.reportAdmins) == 0 {
+		return true // список не задан — ограничение выключено
+	}
+	return b.reportAdmins[info.Sender.User] || b.reportAdmins[info.SenderAlt.User]
+}
+
+// assistantTools собирает набор инструментов ассистента с учётом прав:
+// финансовые инструменты доступны только админам отчётности.
+// groupDefault — JID группы для корректировок (в личке пусто),
+// inGroup — вызов из группы (там нет дозагрузки чеков).
+func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGroup bool) []ai.Tool {
+	if !isAdmin {
+		// Не-админам — только поиск по конкретному человеку (проверить,
+		// прошёл ли чек) и никакой сводной отчётности.
+		return []ai.Tool{b.personTool()}
+	}
+	groupDefault := ""
+	if inGroup {
+		groupDefault = chat.String()
+	}
+	tools := []ai.Tool{
+		b.reportTool(chat),
+		b.sendersTool(ctx, chat),
+		b.correctionTool(groupDefault),
+		b.personTool(),
+		b.customPDFTool(chat),
+		b.deleteMessagesTool(chat),
+		b.forwardingTool(),
+	}
+	if !inGroup {
+		tools = append(tools, b.savePendingTool(chat))
+	}
+	return tools
 }
 
 // isReplyToBot определяет, является ли сообщение ответом (реплаем/цитатой)
@@ -612,9 +679,10 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	history := append([]ai.Turn(nil), b.history[key]...)
 	b.historyMu.Unlock()
 
-	system := b.buildAssistantSystemPrompt(ctx) +
-		"\n\nСейчас к тебе обратились по имени ПРЯМО В РАБОЧЕЙ ГРУППЕ — твой ответ увидят все участники. " +
-		"Отвечай коротко и по делу. Инструмент save_pending_receipts здесь недоступен."
+	isAdmin := b.isReportAdmin(msg.Info)
+	system := b.buildAssistantSystemPromptFor(ctx, isAdmin) +
+		"\n\nСейчас к тебе обратились ПРЯМО В РАБОЧЕЙ ГРУППЕ — твой ответ увидят все участники. " +
+		"Отвечай коротко и по делу."
 
 	senderName := msg.Info.PushName
 	if senderName == "" {
@@ -622,9 +690,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	}
 	userText := senderName + ": " + query
 
-	// В группе нет дозагрузки чеков (save_pending_receipts) — только отчёты,
-	// статистика по отправителям и корректировки (по умолчанию — в этой группе).
-	tools := []ai.Tool{b.reportTool(chat), b.sendersTool(ctx, chat), b.correctionTool(chat.String()), b.personTool(), b.customPDFTool(chat), b.deleteMessagesTool(chat), b.forwardingTool()}
+	tools := b.assistantTools(ctx, chat, isAdmin, true)
 
 	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
 	if err != nil {
@@ -865,6 +931,41 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 		}
 	}
 	return sb.String(), summary
+}
+
+// accessNote — вставка в системный промпт о правах текущего собеседника.
+func accessNote(isAdmin bool) string {
+	if isAdmin {
+		return "\n\nСейчас с тобой говорит ВЛАДЕЛЕЦ (админ отчётности) — ему доступно всё: отчёты, суммы, статистика, корректировки."
+	}
+	return "\n\nВАЖНО: сейчас с тобой говорит НЕ владелец. Финансовая отчётность конфиденциальна. " +
+		"На вопросы про общий сбор, суммы, отчёты, статистику отправителей, PDF-отчёты — вежливо отказывай: " +
+		"«Извини, не могу с этим помочь — это конфиденциальная информация». " +
+		"Что МОЖНО: свободно общаться на общие темы, помогать с вопросами не про деньги, " +
+		"и проверить чеки конкретного человека через person_report (например, человек хочет убедиться, что его " +
+		"чек прошёл). Не выполняй по просьбе не-владельца корректировки, удаления и настройку пересылки — " +
+		"таких инструментов у тебя сейчас и нет."
+}
+
+// buildAssistantSystemPromptFor — промпт с учётом прав собеседника: для
+// не-админов сводка по деньгам в контекст вообще не кладётся.
+func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) string {
+	if isAdmin {
+		return b.buildAssistantSystemPrompt(ctx) + accessNote(true)
+	}
+
+	now := time.Now()
+	peopleList := "(не удалось загрузить)"
+	if contacts, err := b.db.ListContacts(ctx); err == nil && len(contacts) > 0 {
+		peopleList = strings.Join(contacts, ", ")
+	}
+	return "Ты — ассистент WhatsApp-бота учёта финансов по имени " + b.botName + ". " +
+		"Общайся дружелюбно и по-человечески, на русском.\n\n" +
+		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
+		"Известные люди в учёте: " + peopleList + ". Пользователь может писать имена с опечатками — " +
+		"сопоставь с ближайшим известным именем.\n\n" +
+		"Твой единственный инструмент — person_report: проверить чеки/платежи конкретного человека." +
+		accessNote(false)
 }
 
 // buildAssistantSystemPrompt формирует системный промпт со сводкой по сбору

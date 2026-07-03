@@ -26,3 +26,17 @@ func TestStripBotName(t *testing.T) {
 		}
 	}
 }
+
+func TestNormalizePhone(t *testing.T) {
+	cases := map[string]string{
+		"89287836800":      "79287836800", // российская 8 -> 7 (формат WhatsApp)
+		"89899171578":      "79899171578",
+		"+7 928 783-68-00": "79287836800",
+		"79287836800":      "79287836800", // уже нормализован
+	}
+	for in, want := range cases {
+		if got := normalizePhone(in); got != want {
+			t.Errorf("normalizePhone(%q) = %q, ожидали %q", in, got, want)
+		}
+	}
+}

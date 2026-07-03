@@ -61,6 +61,10 @@ func main() {
 	// (79370000000,79280000000): только они могут писать боту в личку
 	// (ассистент, дозагрузка чеков). Пусто — личка открыта всем.
 	ownerNumbers := parseGroupJIDs(os.Getenv("OWNER_NUMBERS"))
+	// REPORT_ADMINS — кому доступна отчётность (суммы, сборы, отчёты,
+	// корректировки). Остальным бот вежливо отказывает по этим вопросам,
+	// но общается и ищет конкретные чеки. Пусто — доступно всем.
+	reportAdmins := parseGroupJIDs(envOr("REPORT_ADMINS", "89287836800,89899171578"))
 	sessionPath := envOr("SESSION_DB_PATH", "./data/session.db")
 	fontDir := envOr("FONT_DIR", "./assets/fonts")
 	reportDir := envOr("REPORT_DIR", "./data/reports")
@@ -131,7 +135,7 @@ func main() {
 		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
 	}
 
-	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, ownerNumbers, botName, fontDir, reportDir)
+	b, err := bot.New(ctx, sessionPath, database, aliasMap, ocrClient, assistant, groupJIDs, ownerNumbers, reportAdmins, botName, fontDir, reportDir)
 	if err != nil {
 		log.Fatalf("не удалось создать бота: %v", err)
 	}

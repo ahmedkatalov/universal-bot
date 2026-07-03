@@ -40,6 +40,9 @@ services:
       # Кто может писать боту в личку (ассистент, дозагрузка чеков) — номера
       # через запятую без плюса: "79370000000,79280000000". Пусто = все.
       OWNER_NUMBERS: ${OWNER_NUMBERS:-}
+      # Кому доступна отчётность (сборы, суммы, отчёты, корректировки).
+      # Остальным бот вежливо отказывает, но общается и ищет конкретные чеки.
+      REPORT_ADMINS: ${REPORT_ADMINS:-89287836800,89899171578}
       OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
