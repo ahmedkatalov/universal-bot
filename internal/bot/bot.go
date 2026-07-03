@@ -346,12 +346,16 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		go b.applyForwardRules(context.Background(), msg.Info.Chat.String(), senderName, msg.Info.ID, mediaBytes, mediaExt, text, msg.Info.Timestamp)
 	}
 
-	// Обращение к боту по имени ("Джарвис скинь отчет") — отвечаем ассистентом
-	// прямо в группе, в учёт такое сообщение не идёт. В фоне, чтобы не
-	// блокировать разбор остальных сообщений.
+	// Обращение к боту по имени ("Джарвис скинь отчет") или ответом (реплаем)
+	// на его сообщение — отвечаем ассистентом прямо в группе, в учёт такое
+	// сообщение не идёт. В фоне, чтобы не блокировать разбор остальных.
 	if !hasMedia && b.assistant != nil {
 		if query, ok := b.stripBotName(text); ok {
 			go b.handleGroupAssistant(context.Background(), msg, query)
+			return
+		}
+		if b.isReplyToBot(msg) {
+			go b.handleGroupAssistant(context.Background(), msg, text)
 			return
 		}
 	}
@@ -538,6 +542,31 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 	fmt.Println("Ответ ассистента:", reply)
 	b.sendText(chat, reply)
+}
+
+// isReplyToBot определяет, является ли сообщение ответом (реплаем/цитатой)
+// на сообщение самого бота — такой ответ считается обращением к боту,
+// имя писать не обязательно.
+func (b *Bot) isReplyToBot(msg *events.Message) bool {
+	ext := msg.Message.GetExtendedTextMessage()
+	if ext == nil {
+		return false
+	}
+	ci := ext.GetContextInfo()
+	if ci == nil || ci.GetParticipant() == "" {
+		return false
+	}
+	quoted, err := types.ParseJID(ci.GetParticipant())
+	if err != nil {
+		return false
+	}
+	if own := b.client.Store.ID; own != nil && quoted.User == own.User {
+		return true
+	}
+	if lid := b.client.Store.LID; !lid.IsEmpty() && quoted.User == lid.User {
+		return true
+	}
+	return false
 }
 
 // stripBotName проверяет, начинается ли сообщение с имени бота
@@ -1981,8 +2010,8 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 			rawID, canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"))
 		b.sendText(chat, fmt.Sprintf(
 			"⚠️ Похоже, этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора. "+
-				"Если это ошибка — напиши мне «это не дубль, засчитай чек %s на %.0f», и я его учту.",
-			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), canonical, rd.Amount))
+				"Если это ошибка — ответь на это сообщение или напиши «%s, это не дубль, засчитай чек %s на %.0f», и я его учту.",
+			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), b.botName, canonical, rd.Amount))
 	}
 }
 
