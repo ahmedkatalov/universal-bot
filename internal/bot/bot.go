@@ -428,9 +428,13 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 
-	// Если фото похоже на скриншот банковского перевода — разбираем отдельным
-	// парсером с полями (Получатель/Сколько/Статус), а не обычным построчным.
-	if hasMedia && parser.LooksLikeBankReceipt(text) {
+	// Любое медиа (фото/PDF/фото-как-файл) в рабочей группе трактуем как чек
+	// и отдаём в каскад разбора: парсер полей -> ИИ по тексту -> Claude
+	// смотрит на само изображение. Раньше сюда попадали только те, где OCR
+	// выдал знакомые слова ("получатель", "сумма перевода"); если Tesseract
+	// на кириллице выдавал кашу, чёткий чек проваливался в разбор текста и
+	// терялся. Теперь распознаётся даже при плохом OCR — за счёт вижна.
+	if hasMedia {
 		// Сверка с программой рассрочек: заводим наблюдение — внесут ли этот
 		// платёж в программу (имя клиента берём из подписи к чеку).
 		go b.cmfCapture(context.Background(), msg.Info.Chat, msg.Info.Sender.String(), caption, text, rawID, msg.Info.Timestamp)
@@ -2098,6 +2102,14 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 	}
 
 	if rd.Amount == 0 || rd.Recipient == "" {
+		// Ни парсер, ни ИИ по тексту, ни вижн ничего не вытащили. Если это
+		// не выглядело чеком вообще (случайная картинка без денежных полей и
+		// без частичных данных) — не засоряем "непонятые", просто выходим.
+		looksReceipt := parser.LooksLikeBankReceipt(text) || rd.Amount > 0 || rd.Recipient != "" || rd.DocNumber != ""
+		if !looksReceipt {
+			fmt.Printf("Медиа (сообщение %d) не распознано как чек — пропускаю (вероятно, не чек)\n", rawID)
+			return
+		}
 		fmt.Printf("Чек (сообщение %d): не удалось распознать сумму/получателя, нужна ручная проверка\n", rawID)
 		_ = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 			RawMessageID: rawID,

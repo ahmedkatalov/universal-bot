@@ -44,40 +44,100 @@ func NewFromEnv() *Client {
 	}
 }
 
+// loginResponse покрывает оба режима ответа /login: сразу токен, либо
+// mode=select_profile со списком профилей (если у аккаунта их несколько).
+type loginResponse struct {
+	Token       string `json:"token"`
+	AccessToken string `json:"access_token"`
+	Mode        string `json:"mode"`
+	User        struct {
+		ID string `json:"id"`
+	} `json:"user"`
+	Profiles []struct {
+		ID        string `json:"id"`
+		UserID    string `json:"user_id"`
+		IsPrimary bool   `json:"is_primary"`
+	} `json:"profiles"`
+}
+
 func (c *Client) login(ctx context.Context) error {
-	payload, _ := json.Marshal(map[string]string{"email": c.email, "password": c.password})
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/auth/login", bytes.NewReader(payload))
+	body, err := c.postJSON(ctx, "/api/auth/login", map[string]string{
+		"email":    c.email,
+		"password": c.password,
+	})
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return fmt.Errorf("cmf login: %w", err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("cmf login вернул %d: %s", resp.StatusCode, truncate(string(body), 200))
-	}
-	var parsed struct {
-		Token       string `json:"token"`
-		AccessToken string `json:"access_token"`
-	}
+
+	var parsed loginResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		return fmt.Errorf("cmf login: не удалось разобрать ответ: %w", err)
 	}
-	token := parsed.Token
-	if token == "" {
-		token = parsed.AccessToken
+
+	token := firstNonEmpty(parsed.Token, parsed.AccessToken)
+
+	// Аккаунт с несколькими профилями: выбираем основной (или первый) и
+	// дозапрашиваем токен через /select-profile — коду бота не нужен код
+	// с почты, обычного логина email+пароль достаточно.
+	if token == "" && parsed.Mode == "select_profile" && len(parsed.Profiles) > 0 {
+		chosen := parsed.Profiles[0]
+		for _, p := range parsed.Profiles {
+			if p.IsPrimary {
+				chosen = p
+				break
+			}
+		}
+		userID := firstNonEmpty(chosen.UserID, parsed.User.ID)
+		selBody, err := c.postJSON(ctx, "/api/auth/select-profile", map[string]string{
+			"user_id":    userID,
+			"profile_id": chosen.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("cmf select-profile: %w", err)
+		}
+		var sel loginResponse
+		if err := json.Unmarshal(selBody, &sel); err != nil {
+			return fmt.Errorf("cmf select-profile: не удалось разобрать ответ: %w", err)
+		}
+		token = firstNonEmpty(sel.Token, sel.AccessToken)
 	}
+
 	if token == "" {
-		return fmt.Errorf("cmf login: в ответе нет токена (у бота должен быть аккаунт с одним профилем): %s", truncate(string(body), 200))
+		return fmt.Errorf("cmf login: в ответе нет токена: %s", truncate(string(body), 200))
 	}
 	c.tokenMu.Lock()
 	c.token = token
 	c.tokenMu.Unlock()
 	return nil
+}
+
+// postJSON отправляет POST с JSON-телом и возвращает тело ответа (200 OK).
+func (c *Client) postJSON(ctx context.Context, path string, payload any) ([]byte, error) {
+	data, _ := json.Marshal(payload)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cmf %s: %w", path, err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cmf %s вернул %d: %s", path, resp.StatusCode, truncate(string(body), 200))
+	}
+	return body, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
 }
 
 // get выполняет GET с токеном, при 401 перелогинивается и повторяет один раз.
