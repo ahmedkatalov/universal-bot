@@ -141,7 +141,9 @@ func firstNonEmpty(vals ...string) string {
 }
 
 // get выполняет GET с токеном, при 401 перелогинивается и повторяет один раз.
-func (c *Client) get(ctx context.Context, path string, query url.Values) ([]byte, error) {
+// branchID (если не пустой) уходит в заголовок X-Branch-ID — его требуют
+// роуты с RequireBranch (например, /contract-payments).
+func (c *Client) get(ctx context.Context, path string, query url.Values, branchID string) ([]byte, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		c.tokenMu.Lock()
 		token := c.token
@@ -164,6 +166,9 @@ func (c *Client) get(ctx context.Context, path string, query url.Values) ([]byte
 			return nil, err
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
+		if branchID != "" {
+			req.Header.Set("X-Branch-ID", branchID)
+		}
 
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -218,7 +223,7 @@ func (c *Client) LookupClients(ctx context.Context, fullName string) ([]ClientIn
 	q := url.Values{}
 	q.Set("full_name", fullName)
 	q.Set("limit", "10")
-	body, err := c.get(ctx, "/api/clients/lookup", q)
+	body, err := c.get(ctx, "/api/clients/lookup", q, "")
 	if err != nil {
 		return nil, err
 	}
@@ -240,7 +245,7 @@ type ContractRef struct {
 
 // ClientContracts возвращает договоры клиента.
 func (c *Client) ClientContracts(ctx context.Context, clientID string) ([]ContractRef, error) {
-	body, err := c.get(ctx, "/api/contracts/client/"+url.PathEscape(clientID)+"/contracts-summary", nil)
+	body, err := c.get(ctx, "/api/contracts/client/"+url.PathEscape(clientID)+"/contracts-summary", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -260,14 +265,15 @@ type Payment struct {
 	PaidAt time.Time `json:"paid_at"`
 }
 
-// ContractPayments возвращает платежи договора за период.
-func (c *Client) ContractPayments(ctx context.Context, contractID string, from, to time.Time) ([]Payment, error) {
+// ContractPayments возвращает платежи договора за период. branchID уходит
+// в X-Branch-ID (роут /contract-payments требует его).
+func (c *Client) ContractPayments(ctx context.Context, contractID, branchID string, from, to time.Time) ([]Payment, error) {
 	q := url.Values{}
 	q.Set("contract_id", contractID)
 	q.Set("date_from", from.Format("2006-01-02"))
 	q.Set("date_to", to.Format("2006-01-02"))
 	q.Set("limit", "200")
-	body, err := c.get(ctx, "/api/contract-payments/", q)
+	body, err := c.get(ctx, "/api/contract-payments/", q, branchID)
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +300,7 @@ func (c *Client) HasPaymentAround(ctx context.Context, clientID string, amount f
 	wantRub := int64(amount + 0.5)
 	wantKop := int64(amount*100 + 0.5)
 	for _, contract := range contracts {
-		payments, err := c.ContractPayments(ctx, contract.ID, from, to)
+		payments, err := c.ContractPayments(ctx, contract.ID, contract.BranchID, from, to)
 		if err != nil {
 			return false, err
 		}
