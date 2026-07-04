@@ -713,6 +713,47 @@ func (d *DB) UnparsedTextMessages(ctx context.Context, limit int) ([]UnparsedMes
 	return out, rows.Err()
 }
 
+// LedgerReceipt — распознанный чек из учёта для живой сверки с программой.
+type LedgerReceipt struct {
+	ID       int
+	Name     string // каноничное имя получателя (или recipient_raw)
+	Amount   float64
+	TxDate   time.Time
+	GroupJID string
+}
+
+// ReceiptsForPeriod возвращает распознанные банковские чеки за период
+// [from, to) — не дубли, не исключённые, из неудалённых сообщений,
+// с суммой и получателем. groupJID — необязательный фильтр по группе.
+func (d *DB) ReceiptsForPeriod(ctx context.Context, from, to time.Time, groupJID string) ([]LedgerReceipt, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.id, COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date, COALESCE(br.group_jid,'')
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.tx_date >= $1 AND br.tx_date < $2
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		  AND COALESCE(c.canonical_name, br.recipient_raw, '') <> ''
+		  AND ($3 = '' OR br.group_jid = $3)
+		ORDER BY br.tx_date DESC
+	`, from, to, groupJID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LedgerReceipt
+	for rows.Next() {
+		var r LedgerReceipt
+		if err := rows.Scan(&r.ID, &r.Name, &r.Amount, &r.TxDate, &r.GroupJID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ---- Настройки бота ----
 
 // SettingGet возвращает значение настройки или "" если её нет.

@@ -238,50 +238,246 @@ func (b *Bot) cmfExtractClientName(ctx context.Context, caption string) string {
 
 // ---- Инструменты ассистента ----
 
-// cmfStatusTool — состояние сверки с программой.
+// cmfStatusTool — ЖИВАЯ сверка распознанных чеков из учёта с программой:
+// какие внесены, какие нет, по каким клиент не найден. Работает по всему
+// учёту (в т.ч. по чекам, сохранённым через "запомни"), а не по отдельной
+// таблице наблюдений — поэтому реально отвечает "какие чеки не внесены".
 func (b *Bot) cmfStatusTool() ai.Tool {
 	return ai.Tool{
-		Name: "cmf_status",
-		Description: "Показывает состояние сверки чеков с программой рассрочек: какие чеки ждут внесения, " +
-			"какие не внесены (напомнено), по каким непонятно, чей клиент. Вызывай при вопросах " +
-			"'какие чеки не внесены в программу', 'что по сверке с программой', 'какие чеки без клиента'.",
-		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}},
+		Name: "cmf_check_receipts",
+		Description: "Живая сверка чеков с программой рассрочек: берёт распознанные чеки из учёта за период " +
+			"(по умолчанию сегодня) и проверяет по каждому, внесён ли платёж в программу. Показывает: внесённые, " +
+			"НЕ внесённые (их надо добавить), и чеки, клиента которых нет в программе. Вызывай ВСЕГДА при вопросах " +
+			"'какие чеки не внесены', 'какие сегодняшние чеки добавлены', 'чеки каких клиентов внесены', " +
+			"'проверь сверку'. Не отвечай про сверку по памяти — всегда вызывай этот инструмент.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from_date": map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD (пусто = сегодня)"},
+				"to_date":   map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD (пусто = сегодня)"},
+				"group":     map[string]any{"type": "string", "description": "Название группы (пусто = все)"},
+			},
+			"required": []string{},
+		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
-			ws, err := b.db.ListCmfWatches(ctx, []string{"watch", "reminded", "ambiguous", "unmatched", "noname"}, 30)
+			var args struct {
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Group    string `json:"group"`
+			}
+			_ = json.Unmarshal(input, &args)
+			now := time.Now()
+			from := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+			to := from.AddDate(0, 0, 1)
+			if args.FromDate != "" {
+				if t, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local); err == nil {
+					from = t
+				}
+			}
+			if args.ToDate != "" {
+				if t, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local); err == nil {
+					to = t.AddDate(0, 0, 1)
+				}
+			}
+			groupJID := ""
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID = jid.String()
+			}
+			return b.cmfReconcile(ctx, from, to, groupJID)
+		},
+	}
+}
+
+// cmfReconcile — живая сверка чеков учёта за период с программой.
+func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID string) (string, error) {
+	receipts, err := b.db.ReceiptsForPeriod(ctx, from, to, groupJID)
+	if err != nil {
+		return "", err
+	}
+	periodLabel := from.Format("02.01.2006")
+	if to.AddDate(0, 0, -1).Format("2006-01-02") != from.Format("2006-01-02") {
+		periodLabel += " — " + to.AddDate(0, 0, -1).Format("02.01.2006")
+	}
+	if len(receipts) == 0 {
+		return "За " + periodLabel + " распознанных чеков в учёте нет.", nil
+	}
+
+	var added, missing, noClient []string
+	for _, r := range receipts {
+		clients, err := b.cmfLookupWithTypos(ctx, r.Name)
+		if err != nil {
+			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка поиска в программе)", r.Name, r.Amount))
+			continue
+		}
+		switch len(clients) {
+		case 0:
+			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (клиента нет в программе)", r.Name, r.Amount))
+		case 1:
+			found, err := b.cmf.HasPaymentAround(ctx, clients[0].ID, r.Amount, r.TxDate, 5)
+			if err != nil {
+				noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка проверки платежа)", clients[0].FullName, r.Amount))
+				continue
+			}
+			line := fmt.Sprintf("%s — %.0f ₽ (чек от %s)", clients[0].FullName, r.Amount, r.TxDate.Format("02.01"))
+			if found {
+				added = append(added, line)
+			} else {
+				missing = append(missing, line)
+			}
+		default:
+			var names []string
+			for _, c := range clients {
+				names = append(names, c.FullName)
+			}
+			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (несколько клиентов: %s)", r.Name, r.Amount, strings.Join(names, ", ")))
+		}
+	}
+
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "Сверка с программой за %s (чеков: %d):\n\n", periodLabel, len(receipts))
+	if len(missing) > 0 {
+		fmt.Fprintf(&sb, "❌ НЕ внесены в программу (%d):\n- %s\n\n", len(missing), strings.Join(missing, "\n- "))
+	}
+	if len(noClient) > 0 {
+		fmt.Fprintf(&sb, "⚠️ Требуют внимания (%d):\n- %s\n\n", len(noClient), strings.Join(noClient, "\n- "))
+	}
+	if len(added) > 0 {
+		fmt.Fprintf(&sb, "✅ Уже внесены (%d):\n- %s\n", len(added), strings.Join(added, "\n- "))
+	}
+	if len(missing) == 0 && len(noClient) == 0 {
+		sb.WriteString("Все чеки внесены в программу ✅")
+	}
+	return sb.String(), nil
+}
+
+// cmfLookupWithTypos ищет клиента с допуском на опечатки (полная строка,
+// затем по отдельным словам имени).
+func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) ([]cmf.ClientInfo, error) {
+	clients, err := b.cmf.LookupClients(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	if len(clients) > 0 {
+		return clients, nil
+	}
+	seen := map[string]cmf.ClientInfo{}
+	for _, word := range strings.Fields(name) {
+		if len([]rune(word)) < 3 {
+			continue
+		}
+		if found, err := b.cmf.LookupClients(ctx, word); err == nil {
+			for _, c := range found {
+				seen[c.ID] = c
+			}
+		}
+	}
+	var out []cmf.ClientInfo
+	for _, c := range seen {
+		out = append(out, c)
+	}
+	return out, nil
+}
+
+// cmfAddPaymentTool — внести платёж по чеку в программу рассрочек.
+func (b *Bot) cmfAddPaymentTool() ai.Tool {
+	return ai.Tool{
+		Name: "cmf_add_payment",
+		Description: "Вносит платёж клиента в программу рассрочек (записывает оплату по договору). Вызывай, когда " +
+			"владелец просит внести/добавить платёж в программу: 'внеси чек Миланы на 25000 в программу', " +
+			"'добавь платёж Ахмеда Каталова 14000'. Находит клиента и его договор; если договоров несколько — " +
+			"вернёт список, тогда переспроси, по какому вносить (укажи contract_id). ЭТО ЗАПИСЬ В ПРОГРАММУ — " +
+			"вызывай только по явной просьбе внести, не по своей инициативе.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"client_name": map[string]any{"type": "string", "description": "Имя клиента в программе"},
+				"amount":      map[string]any{"type": "number", "description": "Сумма платежа в рублях"},
+				"date":        map[string]any{"type": "string", "description": "Дата платежа YYYY-MM-DD (пусто = сегодня)"},
+				"contract_id": map[string]any{"type": "string", "description": "ID договора, если у клиента их несколько (из предыдущего ответа инструмента)"},
+			},
+			"required": []string{"client_name", "amount"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				ClientName string  `json:"client_name"`
+				Amount     float64 `json:"amount"`
+				Date       string  `json:"date"`
+				ContractID string  `json:"contract_id"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", err
+			}
+			if b.cmf == nil {
+				return "", fmt.Errorf("интеграция с программой не настроена")
+			}
+			if args.Amount <= 0 {
+				return "", fmt.Errorf("нужна сумма платежа")
+			}
+			paidAt := time.Now()
+			if args.Date != "" {
+				if t, err := time.ParseInLocation("2006-01-02", args.Date, time.Local); err == nil {
+					paidAt = t
+				}
+			}
+
+			// Определяем клиента и договор.
+			var branchID, contractID string
+			if strings.TrimSpace(args.ContractID) != "" {
+				contractID = strings.TrimSpace(args.ContractID)
+				// branch неизвестен по id — найдём среди договоров клиента ниже
+			}
+			clients, err := b.cmfLookupWithTypos(ctx, strings.TrimSpace(args.ClientName))
 			if err != nil {
 				return "", err
 			}
-			if len(ws) == 0 {
-				return "Все чеки сверены с программой — открытых вопросов нет.", nil
+			if len(clients) == 0 {
+				return fmt.Sprintf("Клиента %q в программе не нашла.", args.ClientName), nil
 			}
-			branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch)
-			var sb strings.Builder
-			for _, w := range ws {
-				label := w.ClientName
-				if label == "" {
-					label = w.ClientText
+			if len(clients) > 1 && contractID == "" {
+				var names []string
+				for _, c := range clients {
+					names = append(names, c.FullName)
 				}
-				if label == "" {
-					label = "(имя не указано)"
-				}
-				switch w.Status {
-				case "watch":
-					fmt.Fprintf(&sb, "- [#%d] ждём внесения: %s, %.0f ₽, чек от %s\n", w.ID, label, w.Amount, w.TxDate.Format("02.01"))
-				case "reminded":
-					fmt.Fprintf(&sb, "- [#%d] НЕ ВНЕСЁН (напомнено): %s, %.0f ₽, чек от %s\n", w.ID, label, w.Amount, w.TxDate.Format("02.01"))
-				case "ambiguous":
-					fmt.Fprintf(&sb, "- [#%d] неоднозначно, кандидаты: %s, %.0f ₽ — нужен ответ, чей чек\n", w.ID, w.Candidates, w.Amount)
-				case "unmatched":
-					extra := ""
-					if branch != "" {
-						extra = " (точка: " + branch + ")"
+				return "Под это имя подходит несколько клиентов: " + strings.Join(names, "; ") + ". Уточни полное имя.", nil
+			}
+			contracts, err := b.cmf.ClientContracts(ctx, clients[0].ID)
+			if err != nil {
+				return "", err
+			}
+			if len(contracts) == 0 {
+				return fmt.Sprintf("У клиента %s нет договоров в программе.", clients[0].FullName), nil
+			}
+			var chosen *cmf.ContractRef
+			if contractID != "" {
+				for i := range contracts {
+					if contracts[i].ID == contractID {
+						chosen = &contracts[i]
+						break
 					}
-					fmt.Fprintf(&sb, "- [#%d] клиента нет в программе: %s, %.0f ₽%s\n", w.ID, label, w.Amount, extra)
-				case "noname":
-					fmt.Fprintf(&sb, "- [#%d] чек без имени плательщика, %.0f ₽ от %s\n", w.ID, w.Amount, w.TxDate.Format("02.01 15:04"))
 				}
+				if chosen == nil {
+					return "", fmt.Errorf("договор %s у клиента не найден", contractID)
+				}
+			} else if len(contracts) == 1 {
+				chosen = &contracts[0]
+			} else {
+				var lines []string
+				for _, c := range contracts {
+					lines = append(lines, fmt.Sprintf("договор №%d (%s, остаток %d ₽) — contract_id=%s", c.Number, c.ProductName, c.Remaining, c.ID))
+				}
+				return fmt.Sprintf("У клиента %s несколько договоров — уточни, по какому вносить:\n- %s", clients[0].FullName, strings.Join(lines, "\n- ")), nil
 			}
-			return sb.String(), nil
+			branchID = chosen.BranchID
+
+			if err := b.cmf.AddPayment(ctx, chosen.ID, branchID, int64(args.Amount+0.5), paidAt); err != nil {
+				return "", err
+			}
+			return fmt.Sprintf("✅ Внёс платёж в программу: %s, %.0f ₽, договор №%d, дата %s.",
+				clients[0].FullName, args.Amount, chosen.Number, paidAt.Format("02.01.2006")), nil
 		},
 	}
 }

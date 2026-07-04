@@ -237,10 +237,13 @@ func (c *Client) LookupClients(ctx context.Context, fullName string) ([]ClientIn
 	return out, nil
 }
 
-// ContractRef — договор клиента (id + точка).
+// ContractRef — договор клиента.
 type ContractRef struct {
-	ID       string `json:"id"`
-	BranchID string `json:"branch_id"`
+	ID          string `json:"id"`
+	BranchID    string `json:"branch_id"`
+	Number      int64  `json:"number"`
+	ProductName string `json:"product_name"`
+	Remaining   int64  `json:"remaining"`
 }
 
 // ClientContracts возвращает договоры клиента.
@@ -311,6 +314,57 @@ func (c *Client) HasPaymentAround(ctx context.Context, clientID string, amount f
 		}
 	}
 	return false, nil
+}
+
+// AddPayment вносит платёж по договору в программу (POST /contract-payments).
+// amountRub — сумма в рублях; paidAt — дата операции. branchID уходит в
+// X-Branch-ID. Возвращает ошибку, если программа отклонила запрос.
+func (c *Client) AddPayment(ctx context.Context, contractID, branchID string, amountRub int64, paidAt time.Time) error {
+	payload := map[string]any{
+		"contract_id": contractID,
+		"amount":      amountRub,
+		"paid_at":     paidAt.Format("2006-01-02"),
+		"type":        "regular",
+		"comment":     "Внесено ботом по чеку из WhatsApp",
+	}
+	data, _ := json.Marshal(payload)
+	for attempt := 0; attempt < 2; attempt++ {
+		c.tokenMu.Lock()
+		token := c.token
+		c.tokenMu.Unlock()
+		if token == "" {
+			if err := c.login(ctx); err != nil {
+				return err
+			}
+			continue
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/contract-payments/", bytes.NewReader(data))
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+token)
+		if branchID != "" {
+			req.Header.Set("X-Branch-ID", branchID)
+		}
+		resp, err := c.http.Do(req)
+		if err != nil {
+			return fmt.Errorf("cmf add payment: %w", err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusUnauthorized {
+			c.tokenMu.Lock()
+			c.token = ""
+			c.tokenMu.Unlock()
+			continue
+		}
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+			return fmt.Errorf("программа отклонила платёж (%d): %s", resp.StatusCode, truncate(string(body), 200))
+		}
+		return nil
+	}
+	return fmt.Errorf("cmf add payment: не удалось авторизоваться")
 }
 
 func truncate(s string, n int) string {
