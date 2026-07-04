@@ -15,10 +15,10 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/cmf"
-	"whatsapp-bot/internal/parser"
 )
 
 const settingUnmatchedBranch = "cmf_unmatched_branch"
@@ -34,74 +34,85 @@ func cmfRemindAfter() time.Duration {
 	return 24 * time.Hour
 }
 
-// cmfCapture заводит наблюдение за чеком из группы. caption — подпись к чеку
-// (там обычно пишут, чей это платёж: "с карты Пияна, Ахмед оплатил рассрочку").
-func (b *Bot) cmfCapture(ctx context.Context, chat types.JID, senderJID, caption, text string, rawID int, ts time.Time) {
-	if b.cmf == nil {
-		return
-	}
-	rd := parser.ParseReceipt(text)
-	if rd.Amount == 0 {
-		return // без суммы сверять нечего
-	}
-	txDate := ts
-	if rd.HasTxTime {
-		txDate = rd.TxTime
-	}
-
-	clientText := ""
-	if strings.TrimSpace(caption) != "" {
-		clientText = b.cmfExtractClientName(ctx, caption)
-	}
-
-	status := "noname"
-	if clientText != "" {
-		status = "lookup" // временный, сразу уточним ниже
-	}
-	watchID, err := b.db.InsertCmfWatch(ctx, rawID, chat.String(), senderJID, clientText, rd.Amount, txDate, status)
-	if err != nil {
-		fmt.Println("cmf: не удалось создать наблюдение:", err)
-		return
-	}
-	if clientText != "" {
-		b.cmfResolveWatch(ctx, watchID, chat, clientText, rd.Amount)
-	}
-}
-
-// cmfAttachName привязывает имя клиента, присланное отдельным сообщением
-// сразу после чека тем же отправителем ("Саралиева Милана").
-func (b *Bot) cmfAttachName(ctx context.Context, chat types.JID, senderJID, text string) bool {
-	if b.cmf == nil {
-		return false
-	}
+// looksLikeName проверяет, похожа ли строка на ФИО (короткая, без команд,
+// вопросов и лишних цифр). Возвращает очищенное имя (без суммы в хвосте).
+func looksLikeName(text string) (string, bool) {
 	name := strings.TrimSpace(text)
-	// Имя — короткая строка без команд и вопросов.
-	if name == "" || len([]rune(name)) > 60 || strings.ContainsAny(name, "?!/") {
-		return false
+	if name == "" || len([]rune(name)) > 60 || strings.ContainsAny(name, "?/\n") {
+		return "", false
 	}
-	words := strings.Fields(name)
-	if len(words) > 5 {
-		return false
-	}
-	watchID, ok, err := b.db.LatestNonameWatch(ctx, chat.String(), senderJID, time.Now().Add(-3*time.Minute))
-	if err != nil || !ok {
-		return false
-	}
-	// Убираем возможную сумму из хвоста ("Касумова марям 25.000").
 	var nameWords []string
-	for _, w := range words {
+	for _, w := range strings.Fields(name) {
+		// слова с цифрами (суммы "25.000", "20т") в имя не берём
 		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
 			continue
 		}
 		nameWords = append(nameWords, w)
 	}
-	if len(nameWords) == 0 {
+	if len(nameWords) == 0 || len(nameWords) > 5 {
+		return "", false
+	}
+	return strings.Join(nameWords, " "), true
+}
+
+// resolveReceiptPayer определяет ФИО клиента, написанное РЯДОМ с чеком:
+// подпись к фото, текст-ответ (свайп на чек) или отдельное имя, присланное
+// прямо перед чеком. Это и есть "чей чек" — важнее получателя на чеке.
+func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, caption string) string {
+	// 1. Подпись к чеку.
+	if strings.TrimSpace(caption) != "" {
+		if name := b.cmfExtractClientName(ctx, caption); name != "" {
+			return name
+		}
+	}
+	// 2. Чек — это ответ (свайп) на сообщение с именем.
+	if quoted := extractQuotedText(msg); strings.TrimSpace(quoted) != "" {
+		if name := b.cmfExtractClientName(ctx, quoted); name != "" {
+			return name
+		}
+	}
+	// 3. Имя, присланное прямо перед чеком тем же человеком.
+	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
+	b.pendingNameMu.Lock()
+	pn, ok := b.pendingNames[key]
+	if ok && time.Since(pn.at) < 4*time.Minute {
+		delete(b.pendingNames, key)
+		b.pendingNameMu.Unlock()
+		return pn.name
+	}
+	b.pendingNameMu.Unlock()
+	return ""
+}
+
+// rememberPendingName запоминает имя, присланное отдельным сообщением, —
+// вдруг следом придёт чек ("Ахмед Каталов" -> фото чека).
+func (b *Bot) rememberPendingName(msg *events.Message, text string) {
+	name, ok := looksLikeName(text)
+	if !ok {
+		return
+	}
+	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
+	b.pendingNameMu.Lock()
+	b.pendingNames[key] = pendingName{name: name, at: time.Now()}
+	b.pendingNameMu.Unlock()
+}
+
+// attachNameToReceipt привязывает ФИО, присланное ПОСЛЕ чека: либо ответом
+// (свайп) на конкретный чек, либо отдельным сообщением сразу за чеком.
+func (b *Bot) attachNameToReceipt(ctx context.Context, msg *events.Message, text string) bool {
+	if b.cmf == nil {
 		return false
 	}
-	name = strings.Join(nameWords, " ")
-
+	name, ok := looksLikeName(text)
+	if !ok {
+		return false
+	}
+	chat := msg.Info.Chat
+	watchID, wok, err := b.db.LatestNonameWatch(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-4*time.Minute))
+	if err != nil || !wok {
+		return false
+	}
 	if err := b.db.UpdateCmfWatch(ctx, watchID, name, "", "", "", "lookup"); err != nil {
-		fmt.Println("cmf: не удалось привязать имя:", err)
 		return false
 	}
 	var amount float64
@@ -114,6 +125,53 @@ func (b *Bot) cmfAttachName(ctx context.Context, chat types.JID, senderJID, text
 	}
 	go b.cmfResolveWatch(context.Background(), watchID, chat, name, amount)
 	return true
+}
+
+// cmfWatchReceipt заводит наблюдение сверки за уже разобранным чеком (с учётом
+// вижна) и сразу пытается сопоставить клиента. clientText — ФИО, написанное
+// рядом с чеком; если пусто, берётся получатель с чека.
+func (b *Bot) cmfWatchReceipt(ctx context.Context, chat types.JID, senderJID, clientText string, amount float64, txDate time.Time, rawID int) {
+	if b.cmf == nil || amount == 0 {
+		return
+	}
+	status := "noname"
+	if clientText != "" {
+		status = "lookup"
+	}
+	watchID, err := b.db.InsertCmfWatch(ctx, rawID, chat.String(), senderJID, clientText, amount, txDate, status)
+	if err != nil {
+		fmt.Println("cmf: не удалось создать наблюдение:", err)
+		return
+	}
+	if clientText != "" {
+		b.cmfResolveWatch(ctx, watchID, chat, clientText, amount)
+	}
+}
+
+// extractQuotedText возвращает текст сообщения, на которое ответили (свайп).
+func extractQuotedText(msg *events.Message) string {
+	ext := msg.Message.GetExtendedTextMessage()
+	if ext == nil {
+		return ""
+	}
+	ci := ext.GetContextInfo()
+	if ci == nil {
+		return ""
+	}
+	q := ci.GetQuotedMessage()
+	if q == nil {
+		return ""
+	}
+	if c := q.GetConversation(); c != "" {
+		return c
+	}
+	if e := q.GetExtendedTextMessage(); e != nil {
+		return e.GetText()
+	}
+	if img := q.GetImageMessage(); img != nil {
+		return img.GetCaption()
+	}
+	return ""
 }
 
 // cmfResolveWatch ищет клиента в программе по имени (ILIKE-подстрока; для

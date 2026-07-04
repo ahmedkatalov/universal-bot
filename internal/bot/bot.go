@@ -75,6 +75,17 @@ type Bot struct {
 	// чтобы по просьбе "удали своё сообщение" бот мог их отозвать.
 	sentMu   sync.Mutex
 	sentMsgs map[string][]string // chat JID -> последние отправленные IDs
+
+	// Недавние "имена без чека": ФИО клиента, написанное ПЕРЕД чеком
+	// ("Ахмед Каталов", а следом фото/PDF чека). Ключ groupJID|senderJID.
+	pendingNameMu sync.Mutex
+	pendingNames  map[string]pendingName
+}
+
+// pendingName — ФИО, написанное отправителем, пока без чека.
+type pendingName struct {
+	name string
+	at   time.Time
 }
 
 // pendingReceipt — распознанный чек из лички, ожидающий команды "запомнить".
@@ -159,6 +170,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		history:       make(map[string][]ai.Turn),
 		pending:       make(map[string][]pendingReceipt),
 		sentMsgs:      make(map[string][]string),
+		pendingNames:  make(map[string]pendingName),
 	}
 
 	client.AddEventHandler(b.handleEvent)
@@ -421,7 +433,9 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// вижн-фолбэк. В фоне, т.к. вижн-запрос занимает секунды.
 		if mediaBytes != nil && b.assistant != nil {
 			mb, me, chatJID, ts := mediaBytes, mediaExt, msg.Info.Chat, msg.Info.Timestamp
-			go b.handleBankReceipt(context.Background(), chatJID, "", rawID, ts, mb, me)
+			sender := msg.Info.Sender.String()
+			payer := b.resolveReceiptPayer(ctx, msg, caption)
+			go b.handleBankReceipt(context.Background(), chatJID, sender, "", rawID, ts, mb, me, payer)
 			return
 		}
 		fmt.Printf("Фото без распознанного текста (сообщение %d), нужна ручная проверка: %s\n", rawID, mediaPath)
@@ -435,19 +449,23 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// на кириллице выдавал кашу, чёткий чек проваливался в разбор текста и
 	// терялся. Теперь распознаётся даже при плохом OCR — за счёт вижна.
 	if hasMedia {
-		// Сверка с программой рассрочек: заводим наблюдение — внесут ли этот
-		// платёж в программу (имя клиента берём из подписи к чеку).
-		go b.cmfCapture(context.Background(), msg.Info.Chat, msg.Info.Sender.String(), caption, text, rawID, msg.Info.Timestamp)
-		b.handleBankReceipt(ctx, msg.Info.Chat, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt)
+		// Чей это чек — берём из ФИО, которое написали РЯДОМ с чеком:
+		// подпись к фото, текст ответом (свайп) или отдельное сообщение
+		// с именем прямо перед чеком. Это важнее, чем получатель на самом
+		// чеке (там может быть владелец карты, а не клиент).
+		payer := b.resolveReceiptPayer(ctx, msg, caption)
+		b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer)
 		return
 	}
 
-	// Короткое текстовое сообщение сразу после чека без подписи — это, скорее
-	// всего, имя плательщика ("Саралиева Милана"): привязываем к наблюдению
-	// сверки с программой. Обычный разбор всё равно продолжается.
-	if b.cmfAttachName(ctx, msg.Info.Chat, msg.Info.Sender.String(), text) {
-		fmt.Printf("cmf: имя %q привязано к последнему чеку без имени\n", text)
+	// Короткое текстовое сообщение сразу после чека без имени — это, скорее
+	// всего, ФИО плательщика ("Саралиева Милана"): привязываем к последнему
+	// чеку (или к чеку, на который это ответ). Обычный разбор продолжается.
+	if b.attachNameToReceipt(ctx, msg, text) {
+		fmt.Printf("cmf: имя %q привязано к чеку\n", text)
 	}
+	// Запоминаем как возможное имя ПЕРЕД будущим чеком.
+	b.rememberPendingName(msg, text)
 
 	result := parser.ParseMessage(text)
 	for _, tr := range result.Transactions {
@@ -1089,7 +1107,9 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"1. send_finance_report — отчёт по сбору за период (текстом или PDF). Вызывай при вопросах про суммы " +
 		"за даты/период или просьбах прислать отчёт. Переводи относительные даты и названия месяцев в YYYY-MM-DD " +
 		"от сегодняшней даты. format=\"pdf\" если просят файл/документ/пдф, иначе \"text\". " +
-		"Если названа конкретная группа — передай её название в group.\n" +
+		"Если названа конкретная группа — передай её название в group. В ОТВЕТЕ всегда явно пиши, за какой период " +
+		"и по какой группе цифры (или 'по всем группам'), чтобы не было путаницы. Если из вопроса неясно — по одной " +
+		"группе или по всем — уточни ОДНОЙ фразой перед отчётом.\n" +
 		"2. senders_report — кто сколько чеков отправил и на какую сумму (сбор по сотрудникам). Вызывай при " +
 		"вопросах вроде 'какой сотрудник сколько чеков скинул в группе сб оплата клиентов', 'сколько чеков сделал " +
 		"Расул за июль'. Можно фильтровать по группе и по человеку (имя или номер телефона).\n" +
@@ -2073,7 +2093,7 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 				fmt.Println("Ошибка сохранения пересланного чека:", err)
 				continue
 			}
-			b.handleBankReceipt(ctx, targetJID, text, rawID, ts, media, ext)
+			b.handleBankReceipt(ctx, targetJID, "", text, rawID, ts, media, ext, "")
 		}
 	}
 }
@@ -2087,7 +2107,10 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 // media/mediaExt — исходный файл чека (может быть nil): если и парсер, и
 // текстовый ИИ-доразбор не справились, Claude смотрит на изображение чека
 // напрямую (последний рубеж распознавания).
-func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt string) {
+// senderJID — кто прислал чек (для сверки с программой). payerOverride —
+// ФИО клиента, написанное рядом с чеком; если задано, платёж относится
+// именно к нему (а не к получателю на чеке — там часто владелец карты).
+func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt, payerOverride string) {
 	rd := parser.ParseReceipt(text)
 
 	// Обычный парсер не справился (нестандартная вёрстка чека, кривой OCR) —
@@ -2105,6 +2128,16 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
 			mergeAIReceipt(&rd, rec)
 		}
+	}
+
+	// ФИО, написанное рядом с чеком, важнее получателя на чеке — платёж
+	// относим к клиенту, которого назвал владелец. Получателя с чека
+	// сохраняем в SenderRaw для истории (если он там ещё не занят).
+	if payerOverride != "" {
+		if rd.Sender == "" && rd.Recipient != "" {
+			rd.Sender = rd.Recipient
+		}
+		rd.Recipient = payerOverride
 	}
 
 	txDate := receivedAt
@@ -2191,6 +2224,17 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, text string
 			"⚠️ Похоже, этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора. "+
 				"Если это ошибка — ответь на это сообщение или напиши «%s, это не дубль, засчитай чек %s на %.0f», и я его учту.",
 			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), b.botName, canonical, rd.Amount))
+	}
+
+	// Сверка с программой рассрочек: заводим наблюдение за этим чеком (с уже
+	// разобранной суммой/датой, включая вижн). Клиент — ФИО рядом с чеком,
+	// иначе получатель. Дубли не сверяем повторно.
+	if b.cmf != nil && !isDuplicate {
+		clientText := payerOverride
+		if clientText == "" {
+			clientText = rd.Recipient
+		}
+		go b.cmfWatchReceipt(context.Background(), chat, senderJID, clientText, rd.Amount, txDate, rawID)
 	}
 }
 

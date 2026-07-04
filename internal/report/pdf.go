@@ -5,6 +5,7 @@ package report
 import (
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/jung-kurt/gofpdf"
 	"whatsapp-bot/internal/db"
@@ -19,14 +20,7 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 	pdf.AddUTF8Font("DejaVu", "B", "DejaVuSans-Bold.ttf")
 	pdf.AddPage()
 
-	pdf.SetFont("DejaVu", "B", 18)
-	pdf.CellFormat(0, 12, "Отчёт по сбору средств", "", 1, "L", false, 0, "")
-
-	pdf.SetFont("DejaVu", "", 10)
-	pdf.SetTextColor(120, 120, 120)
-	pdf.CellFormat(0, 6, "Период: "+periodLabel, "", 1, "L", false, 0, "")
-	pdf.SetTextColor(0, 0, 0)
-	pdf.Ln(4)
+	drawHeaderBanner(pdf, "Финансовый отчёт", "Период: "+periodLabel)
 
 	// ===== Таблица по картам/наличным (сводная) =====
 	cardTotals := map[string]float64{}
@@ -100,16 +94,7 @@ func GenerateCustom(title, subtitle string, sections []Section, fontDir, outPath
 	pdf.AddUTF8Font("DejaVu", "B", "DejaVuSans-Bold.ttf")
 	pdf.AddPage()
 
-	pdf.SetFont("DejaVu", "B", 18)
-	pdf.CellFormat(0, 12, title, "", 1, "L", false, 0, "")
-
-	if subtitle != "" {
-		pdf.SetFont("DejaVu", "", 10)
-		pdf.SetTextColor(120, 120, 120)
-		pdf.CellFormat(0, 6, subtitle, "", 1, "L", false, 0, "")
-		pdf.SetTextColor(0, 0, 0)
-	}
-	pdf.Ln(4)
+	drawHeaderBanner(pdf, title, subtitle)
 
 	for i, sec := range sections {
 		if len(sec.Columns) == 0 {
@@ -137,6 +122,42 @@ func GenerateCustom(title, subtitle string, sections []Section, fontDir, outPath
 	}
 
 	return pdf.OutputFileAndClose(outPath)
+}
+
+// drawHeaderBanner рисует тёмную скруглённую шапку с заголовком и бейджем
+// "Сформировано: дата" справа — как в фирменном стиле финансового отчёта.
+func drawHeaderBanner(pdf *gofpdf.Fpdf, title, subtitle string) {
+	const (
+		x, y = 10.0, 10.0
+		w, h = 190.0, 34.0
+	)
+	// Тёмно-синяя плашка со скруглением.
+	pdf.SetFillColor(26, 43, 74)
+	pdf.RoundedRect(x, y, w, h, 6, "1234", "F")
+
+	// Бейдж "Сформировано" справа (более светлый синий).
+	badgeW := 62.0
+	pdf.SetFillColor(58, 84, 140)
+	pdf.RoundedRect(x+w-badgeW-6, y+6, badgeW, h-12, 5, "1234", "F")
+	pdf.SetFont("DejaVu", "", 9)
+	pdf.SetTextColor(220, 228, 245)
+	pdf.SetXY(x+w-badgeW-6, y+h/2-3)
+	pdf.CellFormat(badgeW, 6, "Сформировано: "+time.Now().Format("02.01.2006"), "", 0, "C", false, 0, "")
+
+	// Заголовок и подзаголовок.
+	pdf.SetTextColor(255, 255, 255)
+	pdf.SetFont("DejaVu", "B", 20)
+	pdf.SetXY(x+10, y+9)
+	pdf.CellFormat(w-badgeW-24, 10, title, "", 2, "L", false, 0, "")
+	if subtitle != "" {
+		pdf.SetFont("DejaVu", "", 10)
+		pdf.SetTextColor(190, 205, 230)
+		pdf.SetX(x + 10)
+		pdf.CellFormat(w-badgeW-24, 6, subtitle, "", 0, "L", false, 0, "")
+	}
+
+	pdf.SetTextColor(0, 0, 0)
+	pdf.SetY(y + h + 8)
 }
 
 // columnWidths распределяет 170 мм (ширина A4 за вычетом полей) по колонкам:
