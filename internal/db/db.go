@@ -85,6 +85,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS sender_bank TEXT",
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS sender_account TEXT",
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS card_owner TEXT",
+		// client_confirmed — клиент подтверждён (ФИО написали рядом или владелец
+		// ответил на вопрос). clarify_asked — бот уже спросил "чей чек".
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS client_confirmed BOOLEAN NOT NULL DEFAULT false",
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS clarify_asked BOOLEAN NOT NULL DEFAULT false",
 	} {
 		if _, err := pool.Exec(ctx, col); err != nil {
 			return fmt.Errorf("добавление колонки чека: %w", err)
@@ -277,26 +281,27 @@ func nullIfEmpty(s string) interface{} {
 // ---- Банковские чеки ----
 
 type BankReceiptInput struct {
-	RawMessageID   int
-	Bank           string
-	RecipientRaw   string // ФИО клиента (кому принадлежит чек — для атрибуции/поиска)
-	RecipientBank  string
-	RecipientPhone string
-	SenderRaw      string // ФИО отправителя (плательщик по чеку)
-	SenderBank     string
-	SenderAccount  string
-	CardOwner      string // получатель, напечатанный на чеке (владелец карты), если отличается от клиента
-	ContactID      *int   // nil, если получателя не удалось сопоставить с контактом
-	Amount         float64
-	Commission     float64
-	DocNumber      string
-	AuthCode       string
-	Status         string
-	NeedsReview    bool
-	IsDuplicate    bool
-	GroupJID       string    // группа, к которой относится чек (для дозагрузки из лички — целевая группа)
-	SubmittedBy    string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
-	TxDate         time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
+	RawMessageID    int
+	Bank            string
+	RecipientRaw    string // ФИО клиента (кому принадлежит чек — для атрибуции/поиска)
+	RecipientBank   string
+	RecipientPhone  string
+	SenderRaw       string // ФИО отправителя (плательщик по чеку)
+	SenderBank      string
+	SenderAccount   string
+	CardOwner       string // получатель, напечатанный на чеке (владелец карты), если отличается от клиента
+	ContactID       *int   // nil, если получателя не удалось сопоставить с контактом
+	Amount          float64
+	Commission      float64
+	DocNumber       string
+	AuthCode        string
+	Status          string
+	NeedsReview     bool
+	IsDuplicate     bool
+	ClientConfirmed bool      // клиент известен точно (ФИО написали рядом с чеком)
+	GroupJID        string    // группа, к которой относится чек (для дозагрузки из лички — целевая группа)
+	SubmittedBy     string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
+	TxDate          time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
@@ -304,13 +309,101 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 		INSERT INTO bank_receipts
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
 			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
-			 group_jid, submitted_by, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+			 client_confirmed, group_jid, submitted_by, tx_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
 		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
 		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
-		r.NeedsReview, r.IsDuplicate, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate)
+		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate)
 	return err
+}
+
+// ClarifyReceipt — чек, по которому бот не уверен, чей это клиент, и хочет
+// спросить в группе.
+type ClarifyReceipt struct {
+	ID          int
+	WaMessageID string
+	CardOwner   string
+	Amount      float64
+	TxDate      time.Time
+}
+
+// UnconfirmedReceipts возвращает чеки без подтверждённого клиента, по которым
+// бот ещё не спрашивал, старше olderThan, в группе. Если таких много (bulk-
+// импорт) — вызывающий код может не спрашивать. rawMessageID нужен, чтобы
+// потом привязать ответ к чеку по wa_message_id.
+func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]ClarifyReceipt, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(br.card_owner, br.recipient_raw, ''),
+		       br.amount::float8, br.tx_date
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND br.client_confirmed = false AND br.clarify_asked = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		  AND br.created_at < $2
+		ORDER BY br.created_at
+		LIMIT $3
+	`, groupJID, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ClarifyReceipt
+	for rows.Next() {
+		var c ClarifyReceipt
+		if err := rows.Scan(&c.ID, &c.WaMessageID, &c.CardOwner, &c.Amount, &c.TxDate); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CountUnconfirmed — сколько чеков без подтверждённого клиента в группе старше
+// olderThan (чтобы отличить "запуталась в паре" от массового импорта).
+func (d *DB) CountUnconfirmed(ctx context.Context, groupJID string, olderThan time.Time) (int, error) {
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND br.client_confirmed = false AND br.clarify_asked = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+		  AND br.created_at < $2
+	`, groupJID, olderThan).Scan(&n)
+	return n, err
+}
+
+// MarkReceiptAsked помечает, что бот уже спросил про этот чек.
+func (d *DB) MarkReceiptAsked(ctx context.Context, receiptID int) error {
+	_, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET clarify_asked = true WHERE id = $1`, receiptID)
+	return err
+}
+
+// ConfirmReceiptClientByMessage привязывает клиента к чеку (по id сообщения
+// чека) — когда владелец ответил на вопрос бота. Возвращает сумму.
+func (d *DB) ConfirmReceiptClientByMessage(ctx context.Context, waMessageID, name string, contactID *int) (bool, float64, error) {
+	var amount float64
+	err := d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false,
+			client_confirmed = true, clarify_asked = true
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
+		)
+		RETURNING amount::float8
+	`, waMessageID, name, contactID).Scan(&amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return true, amount, nil
 }
 
 // DuplicateWindow — окно вокруг времени операции, в котором совпадение
@@ -813,7 +906,7 @@ func (d *DB) HasRecentReceiptFrom(ctx context.Context, groupJID, senderJID strin
 // сообщением ПОСЛЕ чека. name/contactID — новый клиент. Возвращает сумму.
 func (d *DB) ReattributeLatestReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $4, contact_id = $5, needs_review = false
+		UPDATE bank_receipts SET recipient_raw = $4, contact_id = $5, needs_review = false, client_confirmed = true
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -839,7 +932,7 @@ func (d *DB) ReattributeLatestReceipt(ctx context.Context, groupJID, senderJID s
 // ответили (свайп), — по id сообщения WhatsApp.
 func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int) (found bool, amount float64, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false
+		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id

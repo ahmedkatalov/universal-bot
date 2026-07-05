@@ -80,6 +80,9 @@ type Bot struct {
 	// ("Ахмед Каталов", а следом фото/PDF чека). Ключ groupJID|senderJID.
 	pendingNameMu sync.Mutex
 	pendingNames  map[string]pendingName
+
+	// Проактивные вопросы "чей это чек" и привязка ответов к чекам.
+	clarify *clarifyState
 }
 
 // pendingName — ФИО, написанное отправителем, пока без чека.
@@ -171,10 +174,12 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		pending:       make(map[string][]pendingReceipt),
 		sentMsgs:      make(map[string][]string),
 		pendingNames:  make(map[string]pendingName),
+		clarify:       newClarifyState(),
 	}
 
 	client.AddEventHandler(b.handleEvent)
 	go b.cmfWatcherLoop() // сверка чеков с программой рассрочек (no-op, если cmf == nil)
+	go b.clarifyLoop()    // проактивные вопросы "чей это чек"
 	return b, nil
 }
 
@@ -455,6 +460,12 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// чеке (там может быть владелец карты, а не клиент).
 		payer := b.resolveReceiptPayer(ctx, msg, caption)
 		b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer)
+		return
+	}
+
+	// Ответ (свайп) на вопрос бота "чей это чек" — привязываем клиента к
+	// тому чеку и дальше не разбираем это сообщение.
+	if b.handleClarifyReply(ctx, msg, text) {
 		return
 	}
 
@@ -2226,25 +2237,26 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	}
 
 	err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
-		RawMessageID:   rawID,
-		Bank:           rd.Bank,
-		RecipientRaw:   rd.Recipient,
-		RecipientBank:  rd.RecipientBank,
-		RecipientPhone: rd.RecipientPhone,
-		SenderRaw:      rd.Sender,
-		SenderBank:     rd.SenderBank,
-		SenderAccount:  rd.SenderAccount,
-		CardOwner:      cardOwner,
-		ContactID:      contactIDPtr,
-		Amount:         rd.Amount,
-		Commission:     rd.Commission,
-		DocNumber:      rd.DocNumber,
-		AuthCode:       rd.AuthCode,
-		Status:         rd.Status,
-		NeedsReview:    needsReview,
-		IsDuplicate:    isDuplicate,
-		GroupJID:       chat.String(),
-		TxDate:         txDate,
+		RawMessageID:    rawID,
+		Bank:            rd.Bank,
+		RecipientRaw:    rd.Recipient,
+		RecipientBank:   rd.RecipientBank,
+		RecipientPhone:  rd.RecipientPhone,
+		SenderRaw:       rd.Sender,
+		SenderBank:      rd.SenderBank,
+		SenderAccount:   rd.SenderAccount,
+		CardOwner:       cardOwner,
+		ContactID:       contactIDPtr,
+		Amount:          rd.Amount,
+		Commission:      rd.Commission,
+		DocNumber:       rd.DocNumber,
+		AuthCode:        rd.AuthCode,
+		Status:          rd.Status,
+		NeedsReview:     needsReview,
+		IsDuplicate:     isDuplicate,
+		ClientConfirmed: payerOverride != "", // клиента назвал владелец — точно
+		GroupJID:        chat.String(),
+		TxDate:          txDate,
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)
