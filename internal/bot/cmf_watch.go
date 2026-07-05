@@ -34,11 +34,20 @@ func cmfRemindAfter() time.Duration {
 	return 24 * time.Hour
 }
 
-// looksLikeName проверяет, похожа ли строка на ФИО (короткая, без команд,
-// вопросов и лишних цифр). Возвращает очищенное имя (без суммы в хвосте).
+// nameStopwords — короткие реплики, которые НЕ являются именем клиента.
+var nameStopwords = map[string]bool{
+	"ок": true, "окей": true, "да": true, "нет": true, "спасибо": true, "спс": true,
+	"привет": true, "хорошо": true, "хор": true, "понял": true, "поняла": true,
+	"готово": true, "всё": true, "все": true, "ясно": true, "давай": true, "жду": true,
+	"плюс": true, "принял": true, "принято": true, "ладно": true, "ок.": true,
+}
+
+// looksLikeName проверяет, похожа ли строка на ФИО клиента. Требует 2+ слова
+// (реальные подписи к чекам — это ФИО: "цихаев саляхь", "Атабаев Турпал"),
+// без команд, вопросов, цифр и стоп-слов. Возвращает очищенное имя.
 func looksLikeName(text string) (string, bool) {
 	name := strings.TrimSpace(text)
-	if name == "" || len([]rune(name)) > 60 || strings.ContainsAny(name, "?/\n") {
+	if name == "" || len([]rune(name)) > 60 || strings.ContainsAny(name, "?/\n@") {
 		return "", false
 	}
 	var nameWords []string
@@ -47,9 +56,13 @@ func looksLikeName(text string) (string, bool) {
 		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
 			continue
 		}
+		if nameStopwords[strings.ToLower(w)] {
+			continue
+		}
 		nameWords = append(nameWords, w)
 	}
-	if len(nameWords) == 0 || len(nameWords) > 5 {
+	// Меньше 2 слов — это, скорее, реплика ("Ок"), а не ФИО клиента.
+	if len(nameWords) < 2 || len(nameWords) > 5 {
 		return "", false
 	}
 	return strings.Join(nameWords, " "), true
@@ -78,71 +91,79 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 			return name
 		}
 	}
-	// 3. Имя, присланное прямо перед чеком тем же человеком.
+	// 3. Имя из очереди (FIFO) — самое старое из написанных перед чеком.
 	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
 	b.pendingNameMu.Lock()
-	pn, ok := b.pendingNames[key]
-	if ok && time.Since(pn.at) < 4*time.Minute {
-		delete(b.pendingNames, key)
-		b.pendingNameMu.Unlock()
-		return pn.name
+	q := b.pendingNames[key]
+	// Отбрасываем протухшие (старше 6 минут) с головы очереди.
+	for len(q) > 0 && time.Since(q[0].at) > 6*time.Minute {
+		q = q[1:]
 	}
+	if len(q) > 0 {
+		name := q[0].name
+		b.pendingNames[key] = q[1:]
+		b.pendingNameMu.Unlock()
+		return name
+	}
+	b.pendingNames[key] = q
 	b.pendingNameMu.Unlock()
 	return ""
 }
 
-// rememberPendingName запоминает имя, присланное отдельным сообщением, —
-// вдруг следом придёт чек ("Ахмед Каталов" -> фото чека).
-func (b *Bot) rememberPendingName(msg *events.Message, text string) {
-	name, ok := looksLikeName(text)
-	if !ok {
-		return
-	}
+// enqueuePendingName кладёт имя в конец очереди (имя ПЕРЕД будущим чеком).
+func (b *Bot) enqueuePendingName(msg *events.Message, name string) {
 	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
 	b.pendingNameMu.Lock()
-	b.pendingNames[key] = pendingName{name: name, at: time.Now()}
+	q := b.pendingNames[key]
+	q = append(q, pendingName{name: name, at: time.Now()})
+	if len(q) > 20 {
+		q = q[len(q)-20:]
+	}
+	b.pendingNames[key] = q
 	b.pendingNameMu.Unlock()
 }
 
-// attachNameToReceipt привязывает ФИО, присланное ПОСЛЕ чека: либо ответом
-// (свайп) на конкретный чек, либо отдельным сообщением сразу за чеком.
-// ГЛАВНОЕ: переписывает клиента у чека В УЧЁТЕ (recipient_raw/contact),
-// чтобы поиск "найди чек Цихаева" находил по написанному ФИО, а не по
-// получателю на чеке. Работает независимо от сверки с программой.
-func (b *Bot) attachNameToReceipt(ctx context.Context, msg *events.Message, text string) bool {
+// handleNameMessage разбирает сообщение-имя (ФИО без чека) и по порядку
+// сообщений (FIFO) решает: это имя ПОСЛЕ чека (есть ждущий чек -> привязать)
+// или ПЕРЕД чеком (нет -> в очередь). Свайп на конкретный чек имеет приоритет.
+// Возвращает true, если сообщение — имя (обработано).
+func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string) bool {
 	name, ok := looksLikeName(text)
 	if !ok {
 		return false
 	}
 	chat := msg.Info.Chat
-
-	// Заводим контакт только если рядом реально есть чек (ответ на чек или
-	// свежий чек от этого отправителя) — иначе не засоряем список людей.
+	sender := msg.Info.Sender.String()
 	quotedID := extractQuotedStanzaID(msg)
-	hasRecent, _ := b.db.HasRecentReceiptFrom(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-6*time.Minute))
-	if quotedID == "" && !hasRecent {
-		return false
+	since := time.Now().Add(-6 * time.Minute)
+
+	// Есть ли ждущий чек (ответ на чек или неподтверждённый чек от отправителя)?
+	hasUnconfirmed, _ := b.db.HasUnconfirmedReceiptFrom(ctx, chat.String(), sender, since)
+	if quotedID == "" && !hasUnconfirmed {
+		// Чека рядом нет — значит имя написано ПЕРЕД будущим чеком.
+		b.enqueuePendingName(msg, name)
+		return true
 	}
 
-	// Сопоставляем ФИО с известным контактом (или создаём новый).
 	canonical, _ := b.aliases.ResolveName(name)
 	var contactIDPtr *int
 	if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 		contactIDPtr = &cid
 	}
 
-	// Если это ответ (свайп) на конкретный чек — переписываем именно его.
 	updated := false
 	if quotedID != "" {
 		if found, _, err := b.db.ReattributeReceiptByMessage(ctx, quotedID, canonical, contactIDPtr); err == nil && found {
 			updated = true
 		}
 	}
-	// Иначе — последний чек от этого отправителя в группе за последние минуты.
 	if !updated {
-		found, _, err := b.db.ReattributeLatestReceipt(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-6*time.Minute), canonical, contactIDPtr)
+		// Самый старый неподтверждённый чек от отправителя (FIFO по порядку чата).
+		found, _, err := b.db.ReattributeOldestUnconfirmedReceipt(ctx, chat.String(), sender, since, canonical, contactIDPtr)
 		if err != nil || !found {
-			return false
+			// Не нашли чек — на всякий случай запомним имя как ждущее.
+			b.enqueuePendingName(msg, name)
+			return true
 		}
 	}
 	fmt.Printf("Чек переатрибутирован на клиента %q (ФИО написали рядом с чеком)\n", canonical)

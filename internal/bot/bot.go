@@ -76,10 +76,11 @@ type Bot struct {
 	sentMu   sync.Mutex
 	sentMsgs map[string][]string // chat JID -> последние отправленные IDs
 
-	// Недавние "имена без чека": ФИО клиента, написанное ПЕРЕД чеком
-	// ("Ахмед Каталов", а следом фото/PDF чека). Ключ groupJID|senderJID.
+	// Очередь "имён без чека" (FIFO): ФИО клиентов, написанные ПЕРЕД чеками.
+	// Ключ groupJID|senderJID. Очередь нужна, когда имена и чеки идут пачками
+	// в любом чередовании — пары строятся по порядку сообщений.
 	pendingNameMu sync.Mutex
-	pendingNames  map[string]pendingName
+	pendingNames  map[string][]pendingName
 
 	// Проактивные вопросы "чей это чек" и привязка ответов к чекам.
 	clarify *clarifyState
@@ -173,7 +174,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		history:       make(map[string][]ai.Turn),
 		pending:       make(map[string][]pendingReceipt),
 		sentMsgs:      make(map[string][]string),
-		pendingNames:  make(map[string]pendingName),
+		pendingNames:  make(map[string][]pendingName),
 		clarify:       newClarifyState(),
 	}
 
@@ -469,14 +470,12 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 
-	// Короткое текстовое сообщение сразу после чека без имени — это, скорее
-	// всего, ФИО плательщика ("Саралиева Милана"): привязываем к последнему
-	// чеку (или к чеку, на который это ответ). Обычный разбор продолжается.
-	if b.attachNameToReceipt(ctx, msg, text) {
-		fmt.Printf("cmf: имя %q привязано к чеку\n", text)
+	// Сообщение-имя (ФИО без чека): по порядку сообщений привязываем к чеку
+	// (до или после), либо ставим в очередь для будущего чека. Если это имя —
+	// в учёт как платёж оно не идёт.
+	if b.handleNameMessage(ctx, msg, text) {
+		return
 	}
-	// Запоминаем как возможное имя ПЕРЕД будущим чеком.
-	b.rememberPendingName(msg, text)
 
 	result := parser.ParseMessage(text)
 	for _, tr := range result.Transactions {

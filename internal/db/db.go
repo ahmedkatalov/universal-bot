@@ -881,10 +881,10 @@ func (d *DB) ReceiptsForPeriod(ctx context.Context, from, to time.Time, groupJID
 	return out, rows.Err()
 }
 
-// HasRecentReceiptFrom — есть ли свежий чек от этого отправителя в группе
-// (или чек, на который он мог ответить). Дешёвая проверка перед тем, как
-// заводить контакт по написанному ФИО.
-func (d *DB) HasRecentReceiptFrom(ctx context.Context, groupJID, senderJID string, since time.Time) (bool, error) {
+// HasUnconfirmedReceiptFrom — есть ли свежий чек БЕЗ подтверждённого клиента
+// от этого отправителя, ждущий имени. Так отличаем "имя после чека" (есть
+// ждущий чек -> привязать) от "имя перед чеком" (нет -> запомнить в очередь).
+func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID string, since time.Time) (bool, error) {
 	var one int
 	err := d.pool.QueryRow(ctx, `
 		SELECT 1 FROM bank_receipts br
@@ -892,6 +892,7 @@ func (d *DB) HasRecentReceiptFrom(ctx context.Context, groupJID, senderJID strin
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 		  AND rm.sender_jid = $2
 		  AND br.created_at > $3
+		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
 		LIMIT 1
 	`, groupJID, senderJID, since).Scan(&one)
@@ -901,10 +902,9 @@ func (d *DB) HasRecentReceiptFrom(ctx context.Context, groupJID, senderJID strin
 	return err == nil, err
 }
 
-// ReattributeLatestReceipt переписывает получателя (клиента) у последнего
-// чека от этого отправителя в группе — когда ФИО написали отдельным
-// сообщением ПОСЛЕ чека. name/contactID — новый клиент. Возвращает сумму.
-func (d *DB) ReattributeLatestReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
+// ReattributeOldestUnconfirmedReceipt привязывает клиента к САМОМУ СТАРОМУ
+// неподтверждённому чеку от отправителя (FIFO — по порядку сообщений в чате).
+func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
 	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET recipient_raw = $4, contact_id = $5, needs_review = false, client_confirmed = true
 		WHERE id = (
@@ -913,8 +913,9 @@ func (d *DB) ReattributeLatestReceipt(ctx context.Context, groupJID, senderJID s
 			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 			  AND rm.sender_jid = $2
 			  AND br.created_at > $3
+			  AND br.client_confirmed = false
 			  AND br.is_duplicate = false AND br.ignored = false
-			ORDER BY br.created_at DESC
+			ORDER BY br.created_at ASC
 			LIMIT 1
 		)
 		RETURNING amount::float8
