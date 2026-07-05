@@ -1208,6 +1208,10 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
 		"повторное сопоставление имён и доразбор нераспознанных сообщений. После него данные во всех отчётах свежие.\n\n" +
+		"Действуй сам, цепочкой, не переспрашивая по мелочам. Пример: 'пересчитай эти чеки и скажи сбор за июнь' = " +
+		"recount_everything, затем send_finance_report за июнь. Сумма считается по ДАТЕ ОПЕРАЦИИ НА САМОМ ЧЕКЕ: " +
+		"чек с датой вне запрошенного месяца в сумму НЕ входит. Отчёт сам вернёт список таких исключённых чеков " +
+		"(блок '⚠️ НЕ посчитал в сумму...') — обязательно передай его владельцу, назвав, какие чеки и почему не вошли.\n\n" +
 		"Сверка с программой рассрочек (если настроена): бот сверяет чеки из групп с программой — внесли ли платёж " +
 		"клиенту. Инструменты:\n" +
 		"- cmf_check_receipts — ЖИВАЯ сверка: какие чеки внесены, какие НЕ внесены, по каким клиент не найден. " +
@@ -2081,8 +2085,21 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 	if err != nil {
 		return "", fmt.Errorf("ошибка при выборке данных: %w", err)
 	}
+	// Чеки, которые скинули недавно (за последние 12 часов), но по дате
+	// операции на самом чеке они ВНЕ запрошенного периода — их в сумму не
+	// берём, но явно отмечаем, чтобы владелец видел.
+	excludedNote := ""
+	if excluded, err := b.db.RecentReceiptsOutsidePeriod(ctx, from, to, time.Now().Add(-12*time.Hour), groupJIDs, 12); err == nil && len(excluded) > 0 {
+		var nb strings.Builder
+		fmt.Fprintf(&nb, "\n\n⚠️ НЕ посчитал в сумму (дата операции на чеке вне периода %s):\n", periodLabel)
+		for _, r := range excluded {
+			fmt.Fprintf(&nb, "- %s: %.0f ₽ — чек от %s\n", r.Name, r.Amount, r.TxDate.Format("02.01.2006"))
+		}
+		excludedNote = strings.TrimRight(nb.String(), "\n")
+	}
+
 	if len(summaries) == 0 {
-		return fmt.Sprintf("За период %s данных нет.", periodLabel), nil
+		return fmt.Sprintf("За период %s данных нет.%s", periodLabel, excludedNote), nil
 	}
 
 	if format == "pdf" {
@@ -2092,7 +2109,7 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 		}
 		fileName := "Отчёт_" + from.Format("2006-01-02") + "_" + toDay.Format("2006-01-02") + ".pdf"
 		b.sendDocument(chat, outPath, fileName)
-		return "PDF-отчёт за " + periodLabel + " отправлен в чат.", nil
+		return "PDF-отчёт за " + periodLabel + " отправлен в чат." + excludedNote, nil
 	}
 
 	var sb strings.Builder
@@ -2102,7 +2119,7 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 		total += s.Total
 	}
 	fmt.Fprintf(&sb, "Итого за %s: %.0f ₽", periodLabel, total)
-	return sb.String(), nil
+	return sb.String() + excludedNote, nil
 }
 
 // saveMediaFile сохраняет файл чека (фото или PDF) на диск для ручной

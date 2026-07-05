@@ -841,6 +841,41 @@ func (d *DB) UnparsedTextMessages(ctx context.Context, limit int) ([]UnparsedMes
 	return out, rows.Err()
 }
 
+// RecentReceiptsOutsidePeriod — чеки, ДОБАВЛЕННЫЕ недавно (created_at >=
+// createdAfter, т.е. "эти, которые только что скинули"), но с датой ОПЕРАЦИИ
+// вне запрошенного периода [from,to). Нужны, чтобы отчёт явно отметил, какие
+// чеки не вошли в сумму из-за даты на самом чеке.
+func (d *DB) RecentReceiptsOutsidePeriod(ctx context.Context, from, to, createdAfter time.Time, groupJIDs []string, limit int) ([]LedgerReceipt, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date, COALESCE(br.group_jid,'')
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.created_at >= $3
+		  AND (br.tx_date < $1 OR br.tx_date >= $2)
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		  AND COALESCE(c.canonical_name, br.recipient_raw, '') <> ''
+		  AND ($4::text[] IS NULL OR br.group_jid = ANY($4))
+		ORDER BY br.tx_date DESC
+		LIMIT $5
+	`, from, to, createdAfter, groupSliceArg(groupJIDs), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LedgerReceipt
+	for rows.Next() {
+		var r LedgerReceipt
+		if err := rows.Scan(&r.Name, &r.Amount, &r.TxDate, &r.GroupJID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // LedgerReceipt — распознанный чек из учёта для живой сверки с программой.
 type LedgerReceipt struct {
 	ID       int
