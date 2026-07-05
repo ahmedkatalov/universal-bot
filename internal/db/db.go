@@ -767,6 +767,52 @@ func (d *DB) ReceiptsForPeriod(ctx context.Context, from, to time.Time, groupJID
 	return out, rows.Err()
 }
 
+// ReceiptFile — сохранённый файл чека для отправки по запросу.
+type ReceiptFile struct {
+	Name      string
+	Amount    float64
+	TxDate    time.Time
+	MediaPath string
+}
+
+// ReceiptFilesForPerson находит сохранённые файлы чеков конкретного человека
+// (по подстроке имени получателя/контакта) за необязательный период —
+// чтобы бот мог "скинуть чек Миланы". Свежие первыми, до limit штук.
+func (d *DB) ReceiptFilesForPerson(ctx context.Context, personQuery string, from, to *time.Time, groupJID string, limit int) ([]ReceiptFile, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date, rm.media_path
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND rm.media_path IS NOT NULL AND rm.media_path <> ''
+		  AND COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $1 || '%'
+		  AND ($2::timestamptz IS NULL OR br.tx_date >= $2)
+		  AND ($3::timestamptz IS NULL OR br.tx_date < $3)
+		  AND ($4 = '' OR br.group_jid = $4)
+		ORDER BY br.tx_date DESC
+		LIMIT $5
+	`, personQuery, from, to, groupJID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReceiptFile
+	for rows.Next() {
+		var f ReceiptFile
+		var path *string
+		if err := rows.Scan(&f.Name, &f.Amount, &f.TxDate, &path); err != nil {
+			return nil, err
+		}
+		if path != nil {
+			f.MediaPath = *path
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
 // ---- Настройки бота ----
 
 // SettingGet возвращает значение настройки или "" если её нет.
@@ -1182,8 +1228,10 @@ type SenderStat struct {
 // groupJID — фильтр по группе (пусто = все), senderQuery — фильтр по человеку:
 // подстрока имени или номера телефона (пусто = все отправители).
 func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, senderQuery string) ([]SenderStat, error) {
-	// Имя ответственного ("забрал") берём в приоритете из памяти номеров
-	// (phone_owners по телефону отправителя), затем из submitted_by/pushname.
+	// "Сбор" по ответственному включает И чеки (bank_receipts), И наличку/
+	// текстовые платежи (transactions) — всё, что человек собрал. Имя берём
+	// в приоритете из памяти номеров (phone_owners по телефону отправителя),
+	// затем из submitted_by/pushname.
 	rows, err := d.pool.Query(ctx, `
 		SELECT s.sender_name, s.phone, COUNT(*), COALESCE(SUM(s.amount), 0)
 		FROM (
@@ -1200,6 +1248,21 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, send
 			  AND COALESCE(rm.deleted, false) = false
 			  AND br.amount > 0
 			  AND ($3 = '' OR br.group_jid = $3)
+
+			UNION ALL
+
+			SELECT
+				COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+				t.amount
+			FROM transactions t
+			JOIN raw_messages rm ON rm.id = t.raw_message_id
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+			WHERE t.tx_date >= $1 AND t.tx_date < $2
+			  AND t.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND t.amount > 0
+			  AND ($3 = '' OR rm.wa_group_jid = $3)
 		) s
 		WHERE ($4 = '' OR s.sender_name ILIKE '%' || $4 || '%' OR s.phone LIKE '%' || $4 || '%')
 		GROUP BY s.sender_name, s.phone

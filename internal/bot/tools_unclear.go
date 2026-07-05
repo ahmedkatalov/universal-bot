@@ -150,6 +150,90 @@ func (b *Bot) sendUnclearFileTool(chat types.JID) ai.Tool {
 	}
 }
 
+// sendClientReceiptTool — прислать сохранённый файл чека конкретного клиента
+// ("скинь чек Миланы", "покажи чеки Ахмеда за июнь").
+func (b *Bot) sendClientReceiptTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "send_client_receipt",
+		Description: "Присылает в этот чат сохранённый файл чека (фото или PDF) конкретного клиента/человека. " +
+			"Вызывай при 'скинь чек Миланы', 'покажи чек Ахмеда Каталова', 'пришли чеки за июнь по Расулу'. " +
+			"Имя обязательно; период и группа — по желанию. По умолчанию шлёт до 5 последних.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"person":    map[string]any{"type": "string", "description": "Имя клиента/человека"},
+				"from_date": map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD (необязательно)"},
+				"to_date":   map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD (необязательно)"},
+				"group":     map[string]any{"type": "string", "description": "Название группы (необязательно)"},
+				"limit":     map[string]any{"type": "integer", "description": "Сколько последних чеков прислать (по умолчанию 5)"},
+			},
+			"required": []string{"person"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Person   string `json:"person"`
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Group    string `json:"group"`
+				Limit    int    `json:"limit"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(args.Person) == "" {
+				return "", fmt.Errorf("нужно имя клиента")
+			}
+			if args.Limit <= 0 || args.Limit > 20 {
+				args.Limit = 5
+			}
+			var fromPtr, toPtr *time.Time
+			if args.FromDate != "" {
+				if t, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local); err == nil {
+					fromPtr = &t
+				}
+			}
+			if args.ToDate != "" {
+				if t, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local); err == nil {
+					next := t.AddDate(0, 0, 1)
+					toPtr = &next
+				}
+			}
+			groupJID := ""
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID = jid.String()
+			}
+			files, err := b.db.ReceiptFilesForPerson(ctx, strings.TrimSpace(args.Person), fromPtr, toPtr, groupJID, args.Limit)
+			if err != nil {
+				return "", err
+			}
+			if len(files) == 0 {
+				return fmt.Sprintf("Сохранённых файлов чеков по %q не нашла.", args.Person), nil
+			}
+			sent := 0
+			for _, f := range files {
+				data, err := os.ReadFile(f.MediaPath)
+				if err != nil {
+					continue
+				}
+				if strings.HasSuffix(strings.ToLower(f.MediaPath), ".pdf") {
+					b.sendDocumentBytes(chat, data, fmt.Sprintf("%s_%s.pdf", f.Name, f.TxDate.Format("2006-01-02")), "application/pdf")
+				} else {
+					b.sendImageBytes(chat, data)
+				}
+				sent++
+			}
+			if sent == 0 {
+				return "Файлы чеков нашлись в базе, но сами файлы на диске недоступны.", nil
+			}
+			return fmt.Sprintf("Отправил %d чек(ов) по %q.", sent, args.Person), nil
+		},
+	}
+}
+
 // fixReceiptTool — владелец продиктовал, что написано на чеке; записываем.
 func (b *Bot) fixReceiptTool() ai.Tool {
 	return ai.Tool{
