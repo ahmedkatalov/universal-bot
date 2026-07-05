@@ -140,6 +140,19 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание таблицы bot_settings: %w", err)
 	}
 
+	// Память номеров: телефон (кто прислал чек) -> имя ответственного,
+	// который "забрал" деньги. Редактируется владельцем через чат и
+	// переживает рестарты.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS phone_owners (
+			phone      TEXT PRIMARY KEY,
+			name       TEXT NOT NULL,
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы phone_owners: %w", err)
+	}
+
 	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
 	// чек, легально пересланный из группы СБ в основную, помечался дублем.
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
@@ -775,6 +788,96 @@ func (d *DB) SettingSet(ctx context.Context, key, value string) error {
 	return err
 }
 
+// ---- Память номеров (кто "забрал" деньги) ----
+
+// PhoneOwner — сопоставление телефона с ответственным.
+type PhoneOwner struct {
+	Phone string
+	Name  string
+}
+
+// SetPhoneOwner сохраняет/меняет владельца номера (навсегда).
+func (d *DB) SetPhoneOwner(ctx context.Context, phone, name string) error {
+	_, err := d.pool.Exec(ctx, `
+		INSERT INTO phone_owners (phone, name) VALUES ($1, $2)
+		ON CONFLICT (phone) DO UPDATE SET name = $2, updated_at = now()
+	`, phone, name)
+	return err
+}
+
+// RemovePhoneOwner убирает номер из памяти.
+func (d *DB) RemovePhoneOwner(ctx context.Context, phone string) (bool, error) {
+	tag, err := d.pool.Exec(ctx, `DELETE FROM phone_owners WHERE phone = $1`, phone)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// SetReceiptCollectorByMessage привязывает чек (по id сообщения WhatsApp)
+// к ответственному, который "забрал" деньги — заполняет submitted_by.
+// Возвращает данные чека для подтверждения.
+func (d *DB) SetReceiptCollectorByMessage(ctx context.Context, waMessageID, collector string) (found bool, amount float64, recipient string, err error) {
+	err = d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET submitted_by = $2
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE rm.wa_message_id = $1
+			ORDER BY br.id DESC LIMIT 1
+		)
+		RETURNING amount::float8, COALESCE(recipient_raw, '')
+	`, waMessageID, collector).Scan(&amount, &recipient)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, "", nil
+	}
+	if err != nil {
+		return false, 0, "", err
+	}
+	return true, amount, recipient, nil
+}
+
+// SetReceiptCollectorLatest привязывает к ответственному последний чек в группе
+// (по желанию — с конкретной суммой). Для команды "запиши этот чек на X",
+// сказанной сразу после отправки чека.
+func (d *DB) SetReceiptCollectorLatest(ctx context.Context, groupJID, collector string, amount float64) (found bool, gotAmount float64, recipient string, err error) {
+	err = d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET submitted_by = $2
+		WHERE id = (
+			SELECT id FROM bank_receipts
+			WHERE group_jid = $1 AND is_duplicate = false AND ignored = false
+			  AND ($3 <= 0 OR amount = $3)
+			ORDER BY created_at DESC LIMIT 1
+		)
+		RETURNING amount::float8, COALESCE(recipient_raw, '')
+	`, groupJID, collector, amount).Scan(&gotAmount, &recipient)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, "", nil
+	}
+	if err != nil {
+		return false, 0, "", err
+	}
+	return true, gotAmount, recipient, nil
+}
+
+// ListPhoneOwners возвращает всю память номеров.
+func (d *DB) ListPhoneOwners(ctx context.Context) ([]PhoneOwner, error) {
+	rows, err := d.pool.Query(ctx, `SELECT phone, name FROM phone_owners ORDER BY name, phone`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PhoneOwner
+	for rows.Next() {
+		var p PhoneOwner
+		if err := rows.Scan(&p.Phone, &p.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
 // ---- Сверка чеков с программой рассрочек (cmf) ----
 
 // CmfWatch — наблюдение за чеком: внесли ли платёж в программу.
@@ -1079,15 +1182,18 @@ type SenderStat struct {
 // groupJID — фильтр по группе (пусто = все), senderQuery — фильтр по человеку:
 // подстрока имени или номера телефона (пусто = все отправители).
 func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, senderQuery string) ([]SenderStat, error) {
+	// Имя ответственного ("забрал") берём в приоритете из памяти номеров
+	// (phone_owners по телефону отправителя), затем из submitted_by/pushname.
 	rows, err := d.pool.Query(ctx, `
 		SELECT s.sender_name, s.phone, COUNT(*), COALESCE(SUM(s.amount), 0)
 		FROM (
 			SELECT
-				COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+				COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
 				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
 				br.amount
 			FROM bank_receipts br
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 			WHERE br.tx_date >= $1 AND br.tx_date < $2
 			  AND br.is_duplicate = false
 			  AND br.ignored = false

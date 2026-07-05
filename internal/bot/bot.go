@@ -613,6 +613,10 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	system := b.buildAssistantSystemPromptFor(ctx, isAdmin)
 	tools := b.assistantTools(ctx, chat, isAdmin, false)
 
+	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
+	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
+	text += quotedSenderPhoneNote(msg)
+
 	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
 	if err != nil {
 		fmt.Println("Ошибка ответа Claude:", err)
@@ -684,6 +688,8 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.sendUnclearFileTool(chat),
 		b.fixReceiptTool(),
 		b.recountTool(),
+		b.phoneMemoryTool(chat),
+		b.assignReceiptTool(chat),
 	}
 	if b.cmf != nil {
 		tools = append(tools, b.cmfStatusTool(), b.cmfAddPaymentTool(), b.cmfResolveTool(), b.cmfBranchTool())
@@ -771,7 +777,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	if senderName == "" {
 		senderName = msg.Info.Sender.User
 	}
-	userText := senderName + ": " + query
+	userText := senderName + ": " + query + quotedSenderPhoneNote(msg)
 
 	tools := b.assistantTools(ctx, chat, isAdmin, true)
 
@@ -1154,8 +1160,18 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"Это запись в программу — только по явной просьбе. Если у клиента несколько договоров, инструмент вернёт " +
 		"список — переспроси, по какому вносить.\n" +
 		"- cmf_resolve — указать, чей чек, когда клиентов несколько похожих.\n" +
-		"- cmf_set_unmatched_branch — 'запомни: чеки которых нет в программе — главная точка'.\n" +
+		"- cmf_set_unmatched_branch — точка для чеков, клиента которых НЕТ в программе " +
+		"('запомни: чек клиента, которого нет в программе, относится к точке Нойбер'). Для клиентов, которые ЕСТЬ " +
+		"в программе, точка (филиал — Грозный/Главная и т.п.) берётся автоматически из их договора, задавать не нужно.\n" +
 		"Если платёж не внесли за сутки, бот сам напоминает в группе.\n\n" +
+		"Память номеров (кто 'забрал' деньги): у каждого чека есть отправитель (номер WhatsApp). Если номер " +
+		"привязан к человеку в памяти — этот человек считается ответственным, который забрал деньги, и так он " +
+		"показывается в отчёте по ответственным (senders_report). Инструмент phone_memory: 'открой память номеров' " +
+		"(list), 'запомни этот номер — Расул' / 'этот номер теперь Майр-Эли' (set, сохраняется навсегда), убрать " +
+		"(remove). Номер бери из слов владельца; если он написал 'этот номер' ответом (свайпом) на чек — в тексте " +
+		"будет [Контекст ответа: номер отправителя +...], используй его.\n" +
+		"assign_receipt_collector — привязать конкретный чек к тому, кто забрал деньги ('запиши этот чек на " +
+		"Майр-Эли'). Если это ответ на чек, в тексте будет [Контекст ответа: ... id сообщения ...] — передай id.\n\n" +
 		"Принципы работы:\n" +
 		"- Подстраивайся под живые ситуации: владелец может дать команду в любой формулировке — пойми смысл " +
 		"и выбери подходящий инструмент или их цепочку (например 'пересчитай и скинь итог' = recount_everything, " +
