@@ -79,7 +79,8 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			}
 			text := fmt.Sprintf("🤔 Чей это чек? Получатель на чеке: %s, сумма %.0f ₽, %s. "+
 				"Ответьте на это сообщение именем клиента (кому засчитать).", owner, it.Amount, it.TxDate.Format("02.01 15:04"))
-			botMsgID := b.sendTextReturnID(jid, text)
+			// Отправляем ЦИТАТОЙ на сам чек — чтобы в чате было видно, о каком.
+			botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
 			_ = b.db.MarkReceiptAsked(ctx, it.ID)
 			if botMsgID != "" && it.WaMessageID != "" {
 				b.clarify.mu.Lock()

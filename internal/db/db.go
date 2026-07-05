@@ -323,6 +323,7 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 type ClarifyReceipt struct {
 	ID          int
 	WaMessageID string
+	SenderJID   string
 	CardOwner   string
 	Amount      float64
 	TxDate      time.Time
@@ -334,8 +335,8 @@ type ClarifyReceipt struct {
 // потом привязать ответ к чеку по wa_message_id.
 func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]ClarifyReceipt, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(br.card_owner, br.recipient_raw, ''),
-		       br.amount::float8, br.tx_date
+		SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''),
+		       COALESCE(br.card_owner, br.recipient_raw, ''), br.amount::float8, br.tx_date
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
@@ -354,7 +355,7 @@ func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan
 	var out []ClarifyReceipt
 	for rows.Next() {
 		var c ClarifyReceipt
-		if err := rows.Scan(&c.ID, &c.WaMessageID, &c.CardOwner, &c.Amount, &c.TxDate); err != nil {
+		if err := rows.Scan(&c.ID, &c.WaMessageID, &c.SenderJID, &c.CardOwner, &c.Amount, &c.TxDate); err != nil {
 			return nil, err
 		}
 		out = append(out, c)
@@ -1384,7 +1385,17 @@ type ContactSummary struct {
 // в группу СБ, владельцы пересылают в основную) — при сводке по всем группам
 // такие копии схлопываются в одну операцию через DISTINCT ON по номеру
 // документа (а без него — по контакту+сумме+времени операции).
-func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID string) ([]ContactSummary, error) {
+// groupSliceArg превращает список групп в аргумент для SQL ANY($n::text[]):
+// nil/пусто -> nil (значит "все группы", условие пропускается).
+func groupSliceArg(groupJIDs []string) any {
+	if len(groupJIDs) == 0 {
+		return nil
+	}
+	return groupJIDs
+}
+
+// groupJIDs — необязательный список групп (nil/пусто = все группы).
+func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
 		FROM transactions t
@@ -1393,7 +1404,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID 
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
-		  AND ($3 = '' OR rm.wa_group_jid = $3))
+		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
 		UNION ALL
 
@@ -1408,9 +1419,9 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJID 
 		  AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
 		  AND br.contact_id IS NOT NULL
-		  AND ($3 = '' OR br.group_jid = $3)
+		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
 		ORDER BY COALESCE(NULLIF(br.doc_number, ''), br.contact_id::text || '|' || br.amount::text || '|' || br.tx_date::text))
-	`, from, to, groupJID)
+	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
 		return nil, err
 	}
@@ -1461,7 +1472,7 @@ type SenderStat struct {
 // кто сколько чеков прислал и на какую сумму. Дубли не считаются.
 // groupJID — фильтр по группе (пусто = все), senderQuery — фильтр по человеку:
 // подстрока имени или номера телефона (пусто = все отправители).
-func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, senderQuery string) ([]SenderStat, error) {
+func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []string, senderQuery string) ([]SenderStat, error) {
 	// "Сбор" по ответственному включает И чеки (bank_receipts), И наличку/
 	// текстовые платежи (transactions) — всё, что человек собрал. Имя берём
 	// в приоритете из памяти номеров (phone_owners по телефону отправителя),
@@ -1481,7 +1492,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, send
 			  AND br.ignored = false
 			  AND COALESCE(rm.deleted, false) = false
 			  AND br.amount > 0
-			  AND ($3 = '' OR br.group_jid = $3)
+			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
 
 			UNION ALL
 
@@ -1496,12 +1507,12 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJID, send
 			  AND t.ignored = false
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
-			  AND ($3 = '' OR rm.wa_group_jid = $3)
+			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
 		) s
 		WHERE ($4 = '' OR s.sender_name ILIKE '%' || $4 || '%' OR s.phone LIKE '%' || $4 || '%')
 		GROUP BY s.sender_name, s.phone
 		ORDER BY 4 DESC
-	`, from, to, groupJID, senderQuery)
+	`, from, to, groupSliceArg(groupJIDs), senderQuery)
 	if err != nil {
 		return nil, err
 	}
