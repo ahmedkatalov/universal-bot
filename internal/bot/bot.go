@@ -2179,6 +2179,17 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, waMsgID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt, payerOverride string) {
 	rd := parser.ParseReceipt(text)
 
+	// RECEIPT_VISION_FIRST=1 — читать чек-фото сразу глазами Claude (макс.
+	// точность на «неразборчивых» фото, дороже по токенам). Для PDF не нужно —
+	// там надёжный текстовый слой.
+	visionFirst := receiptVisionFirst() && media != nil && mediaExt != ".pdf" && b.assistant != nil
+	if visionFirst {
+		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
+			applyAIReceiptAuthoritative(&rd, rec)
+			fmt.Printf("Чек (сообщение %d): прочитан Claude с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
+		}
+	}
+
 	// Обычный парсер не справился (нестандартная вёрстка чека, кривой OCR) —
 	// пробуем доразобрать через ИИ по тексту, дополняя недостающие поля.
 	if (rd.Amount == 0 || rd.Recipient == "") && b.assistant != nil && strings.TrimSpace(text) != "" {
@@ -2189,8 +2200,11 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		}
 	}
 
-	// Всё ещё нет ключевых полей — показываем Claude само изображение.
-	if (rd.Amount == 0 || rd.Recipient == "") && media != nil {
+	// Слабый OCR: нет ключевых полей ИЛИ не прочитались ни номер документа,
+	// ни время операции (значит структура чека не распозналась) — показываем
+	// Claude само изображение. Пропускаем, если вижн уже отработал первым.
+	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
+	if !visionFirst && weakOCR && media != nil {
 		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
 			mergeAIReceipt(&rd, rec)
 		}

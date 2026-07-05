@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 	"unicode"
@@ -238,6 +239,57 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (ai
 	}
 	fmt.Printf("Вижн-разбор: Claude прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
 	return rec, true
+}
+
+// receiptVisionFirst — читать фото-чеки сразу через Claude (RECEIPT_VISION_FIRST).
+func receiptVisionFirst() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("RECEIPT_VISION_FIRST")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// applyAIReceiptAuthoritative заполняет ReceiptData из ответа ИИ КАК ОСНОВНОЙ
+// источник (перезаписывает поля) — когда чек прочитан вижном первым.
+func applyAIReceiptAuthoritative(rd *parser.ReceiptData, rec aiReceipt) {
+	if v := strings.TrimSpace(rec.Bank); v != "" {
+		rd.Bank = v
+	}
+	if v := strings.TrimSpace(rec.Recipient); v != "" {
+		rd.Recipient = v
+	}
+	if v := strings.TrimSpace(rec.RecipientBank); v != "" {
+		rd.RecipientBank = v
+	}
+	if v := strings.TrimSpace(rec.RecipientPhone); v != "" {
+		rd.RecipientPhone = v
+	}
+	if v := strings.TrimSpace(rec.Sender); v != "" {
+		rd.Sender = v
+	}
+	if v := strings.TrimSpace(rec.SenderBank); v != "" {
+		rd.SenderBank = v
+	}
+	if v := strings.TrimSpace(rec.SenderAccount); v != "" {
+		rd.SenderAccount = v
+	}
+	if rec.Amount > 0 {
+		rd.Amount = rec.Amount
+	}
+	if rec.Commission > 0 {
+		rd.Commission = rec.Commission
+	}
+	if v := strings.TrimSpace(rec.DocNumber); v != "" {
+		rd.DocNumber = v
+	}
+	if v := strings.TrimSpace(rec.AuthCode); v != "" {
+		rd.AuthCode = v
+	}
+	if v := strings.TrimSpace(rec.Status); v != "" {
+		rd.Status = v
+	}
+	if t, ok := parseAIDatetime(rec.Datetime); ok {
+		rd.TxTime = t
+		rd.HasTxTime = true
+	}
 }
 
 // mergeAIReceipt дополняет ReceiptData недостающими полями из ответа ИИ.
