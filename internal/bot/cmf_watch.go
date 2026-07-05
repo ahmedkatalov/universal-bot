@@ -64,10 +64,17 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 		if name := b.cmfExtractClientName(ctx, caption); name != "" {
 			return name
 		}
+		// ИИ не выделил, но подпись сама похожа на ФИО ("цихаев саляхь").
+		if name, ok := looksLikeName(caption); ok {
+			return name
+		}
 	}
 	// 2. Чек — это ответ (свайп) на сообщение с именем.
 	if quoted := extractQuotedText(msg); strings.TrimSpace(quoted) != "" {
 		if name := b.cmfExtractClientName(ctx, quoted); name != "" {
+			return name
+		}
+		if name, ok := looksLikeName(quoted); ok {
 			return name
 		}
 	}
@@ -99,32 +106,75 @@ func (b *Bot) rememberPendingName(msg *events.Message, text string) {
 
 // attachNameToReceipt привязывает ФИО, присланное ПОСЛЕ чека: либо ответом
 // (свайп) на конкретный чек, либо отдельным сообщением сразу за чеком.
+// ГЛАВНОЕ: переписывает клиента у чека В УЧЁТЕ (recipient_raw/contact),
+// чтобы поиск "найди чек Цихаева" находил по написанному ФИО, а не по
+// получателю на чеке. Работает независимо от сверки с программой.
 func (b *Bot) attachNameToReceipt(ctx context.Context, msg *events.Message, text string) bool {
-	if b.cmf == nil {
-		return false
-	}
 	name, ok := looksLikeName(text)
 	if !ok {
 		return false
 	}
 	chat := msg.Info.Chat
-	watchID, wok, err := b.db.LatestNonameWatch(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-4*time.Minute))
-	if err != nil || !wok {
+
+	// Заводим контакт только если рядом реально есть чек (ответ на чек или
+	// свежий чек от этого отправителя) — иначе не засоряем список людей.
+	quotedID := extractQuotedStanzaID(msg)
+	hasRecent, _ := b.db.HasRecentReceiptFrom(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-6*time.Minute))
+	if quotedID == "" && !hasRecent {
 		return false
 	}
-	if err := b.db.UpdateCmfWatch(ctx, watchID, name, "", "", "", "lookup"); err != nil {
-		return false
+
+	// Сопоставляем ФИО с известным контактом (или создаём новый).
+	canonical, _ := b.aliases.ResolveName(name)
+	var contactIDPtr *int
+	if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+		contactIDPtr = &cid
 	}
-	var amount float64
-	if ws, err := b.db.ListCmfWatches(ctx, []string{"lookup"}, 50); err == nil {
-		for _, w := range ws {
-			if w.ID == watchID {
-				amount = w.Amount
-			}
+
+	// Если это ответ (свайп) на конкретный чек — переписываем именно его.
+	updated := false
+	if quotedID != "" {
+		if found, _, err := b.db.ReattributeReceiptByMessage(ctx, quotedID, canonical, contactIDPtr); err == nil && found {
+			updated = true
 		}
 	}
-	go b.cmfResolveWatch(context.Background(), watchID, chat, name, amount)
+	// Иначе — последний чек от этого отправителя в группе за последние минуты.
+	if !updated {
+		found, _, err := b.db.ReattributeLatestReceipt(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-6*time.Minute), canonical, contactIDPtr)
+		if err != nil || !found {
+			return false
+		}
+	}
+	fmt.Printf("Чек переатрибутирован на клиента %q (ФИО написали рядом с чеком)\n", canonical)
+
+	// Дополнительно обновляем наблюдение сверки, если программа подключена.
+	if b.cmf != nil {
+		if watchID, wok, err := b.db.LatestNonameWatch(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-6*time.Minute)); err == nil && wok {
+			_ = b.db.UpdateCmfWatch(ctx, watchID, canonical, "", "", "", "lookup")
+			var amount float64
+			if ws, err := b.db.ListCmfWatches(ctx, []string{"lookup"}, 50); err == nil {
+				for _, w := range ws {
+					if w.ID == watchID {
+						amount = w.Amount
+					}
+				}
+			}
+			go b.cmfResolveWatch(context.Background(), watchID, chat, canonical, amount)
+		}
+	}
 	return true
+}
+
+// extractQuotedStanzaID возвращает id сообщения, на которое ответили (свайп).
+func extractQuotedStanzaID(msg *events.Message) string {
+	ext := msg.Message.GetExtendedTextMessage()
+	if ext == nil {
+		return ""
+	}
+	if ci := ext.GetContextInfo(); ci != nil {
+		return ci.GetStanzaID()
+	}
+	return ""
 }
 
 // cmfWatchReceipt заводит наблюдение сверки за уже разобранным чеком (с учётом

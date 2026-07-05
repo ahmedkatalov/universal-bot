@@ -767,6 +767,75 @@ func (d *DB) ReceiptsForPeriod(ctx context.Context, from, to time.Time, groupJID
 	return out, rows.Err()
 }
 
+// HasRecentReceiptFrom — есть ли свежий чек от этого отправителя в группе
+// (или чек, на который он мог ответить). Дешёвая проверка перед тем, как
+// заводить контакт по написанному ФИО.
+func (d *DB) HasRecentReceiptFrom(ctx context.Context, groupJID, senderJID string, since time.Time) (bool, error) {
+	var one int
+	err := d.pool.QueryRow(ctx, `
+		SELECT 1 FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.created_at > $3
+		  AND br.is_duplicate = false AND br.ignored = false
+		LIMIT 1
+	`, groupJID, senderJID, since).Scan(&one)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// ReattributeLatestReceipt переписывает получателя (клиента) у последнего
+// чека от этого отправителя в группе — когда ФИО написали отдельным
+// сообщением ПОСЛЕ чека. name/contactID — новый клиент. Возвращает сумму.
+func (d *DB) ReattributeLatestReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
+	err = d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET recipient_raw = $4, contact_id = $5, needs_review = false
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+			  AND rm.sender_jid = $2
+			  AND br.created_at > $3
+			  AND br.is_duplicate = false AND br.ignored = false
+			ORDER BY br.created_at DESC
+			LIMIT 1
+		)
+		RETURNING amount::float8
+	`, groupJID, senderJID, since, name, contactID).Scan(&amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return true, amount, nil
+}
+
+// ReattributeReceiptByMessage переписывает получателя у чека, на который
+// ответили (свайп), — по id сообщения WhatsApp.
+func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int) (found bool, amount float64, err error) {
+	err = d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false
+			ORDER BY br.id DESC LIMIT 1
+		)
+		RETURNING amount::float8
+	`, waMessageID, name, contactID).Scan(&amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return true, amount, nil
+}
+
 // ReceiptFile — сохранённый файл чека для отправки по запросу.
 type ReceiptFile struct {
 	Name      string

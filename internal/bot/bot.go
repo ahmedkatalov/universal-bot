@@ -2201,7 +2201,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// ResolveName умеет сопоставлять полные ФИО с чеков ("Милана Нажудовна К.")
 	// с короткими алиасами ("Милана") — по словам, а не только точным совпадением.
 	canonical, matched := b.aliases.ResolveName(rd.Recipient)
-	needsReview := !matched // не нашли уверенного совпадения — на ручную проверку
+	// Не нашли уверенного совпадения — на ручную проверку. Но если клиента
+	// назвал сам владелец (payerOverride), имени доверяем — проверка не нужна.
+	needsReview := !matched && payerOverride == ""
 
 	var contactIDPtr *int
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)
