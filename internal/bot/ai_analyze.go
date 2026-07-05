@@ -140,27 +140,39 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 }
 
 type aiReceipt struct {
-	Bank      string  `json:"bank"`
-	Recipient string  `json:"recipient"`
-	Sender    string  `json:"sender"`
-	Amount    float64 `json:"amount"`
-	DocNumber string  `json:"doc_number"`
-	AuthCode  string  `json:"auth_code"`
-	Status    string  `json:"status"`
-	Datetime  string  `json:"datetime"` // "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM" или ""
+	Bank           string  `json:"bank"`            // банк чека (сторона получателя)
+	Recipient      string  `json:"recipient"`       // ФИО получателя
+	RecipientBank  string  `json:"recipient_bank"`  // банк получателя, если указан отдельно
+	RecipientPhone string  `json:"recipient_phone"` // телефон получателя
+	Sender         string  `json:"sender"`          // ФИО отправителя (плательщик)
+	SenderBank     string  `json:"sender_bank"`     // банк отправителя
+	SenderAccount  string  `json:"sender_account"`  // счёт/карта отправителя
+	Amount         float64 `json:"amount"`
+	Commission     float64 `json:"commission"`
+	DocNumber      string  `json:"doc_number"`
+	AuthCode       string  `json:"auth_code"`
+	Status         string  `json:"status"`
+	Datetime       string  `json:"datetime"` // "YYYY-MM-DD HH:MM:SS", "YYYY-MM-DD HH:MM" или ""
 }
+
+// receiptSchemaJSON — форма JSON для ИИ-разбора чека (полный набор полей).
+const receiptSchemaJSON = `{"bank":"","recipient":"","recipient_bank":"","recipient_phone":"","sender":"","sender_bank":"","sender_account":"","amount":0,"commission":0,"doc_number":"","auth_code":"","status":"","datetime":""}`
+
+// receiptExtractRules — общие правила извлечения полей чека для ИИ.
+const receiptExtractRules = "recipient — ФИО получателя перевода (кому пришли деньги), sender — ФИО отправителя (кто платил). " +
+	"recipient_bank/sender_bank — банки сторон, если указаны (например 'Банк получателя: Альфа-Банк'). " +
+	"recipient_phone — телефон получателя, sender_account — счёт/карта отправителя (последние цифры). " +
+	"amount — сумма перевода числом в рублях (БЕЗ комиссии), commission — комиссия числом. " +
+	"datetime — дата и время операции с чека в формате YYYY-MM-DD HH:MM:SS (или YYYY-MM-DD HH:MM). " +
+	"doc_number — номер документа/операции, auth_code — код авторизации, status — статус ('Выполнено' и т.п.). " +
+	"Заполняй ВСЕ поля, которые есть на чеке; неизвестные оставь пустыми (числа — 0). Не выдумывай данные."
 
 // aiRescueReceipt отдаёт OCR-текст чека модели, когда обычный парсер не смог
 // вытащить сумму или получателя (нестандартная вёрстка, кривой OCR).
 func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, bool) {
 	system := "Ты — модуль разбора банковских чеков в WhatsApp-боте учёта финансов. " +
 		"Тебе дают текст, распознанный OCR со скриншота банковского перевода (текст может быть с ошибками распознавания). " +
-		"Верни СТРОГО один JSON-объект вида " +
-		`{"bank":"","recipient":"","sender":"","amount":0,"doc_number":"","auth_code":"","status":"","datetime":""}` + ". " +
-		"recipient — ФИО получателя перевода (кому пришли деньги), sender — ФИО отправителя. " +
-		"amount — сумма перевода числом в рублях (без комиссии). " +
-		"datetime — дата и время операции с чека в формате YYYY-MM-DD HH:MM:SS (или YYYY-MM-DD HH:MM, если секунд нет). " +
-		"Неизвестные поля оставь пустыми (amount — 0). Не выдумывай данные, которых нет в тексте."
+		"Верни СТРОГО один JSON-объект вида " + receiptSchemaJSON + ". " + receiptExtractRules
 
 	out, err := b.assistant.Complete(ctx, system, ocrText)
 	if err != nil {
@@ -204,13 +216,8 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (ai
 	}
 
 	system := "Ты — модуль разбора банковских чеков. Тебе показывают ИЗОБРАЖЕНИЕ чека/скриншота банковского перевода. " +
-		"Внимательно прочитай его и верни СТРОГО один JSON-объект вида " +
-		`{"bank":"","recipient":"","sender":"","amount":0,"doc_number":"","auth_code":"","status":"","datetime":""}` + ". " +
-		"recipient — ФИО получателя перевода (кому пришли деньги), sender — ФИО отправителя. " +
-		"amount — сумма перевода числом в рублях (без комиссии). " +
-		"datetime — дата и время операции с чека в формате YYYY-MM-DD HH:MM:SS (или YYYY-MM-DD HH:MM). " +
-		"Неизвестные поля оставь пустыми (amount — 0). Не выдумывай данные, которых нет на изображении. " +
-		"Если это вообще не банковский чек — верни все поля пустыми."
+		"Внимательно прочитай его и верни СТРОГО один JSON-объект вида " + receiptSchemaJSON + ". " + receiptExtractRules +
+		" Если это вообще не банковский чек — верни все поля пустыми."
 
 	out, err := b.assistant.CompleteWithImage(ctx, system, "Прочитай этот чек и верни JSON.", img, mime)
 	if err != nil {
@@ -244,8 +251,23 @@ func mergeAIReceipt(rd *parser.ReceiptData, rec aiReceipt) {
 	if rd.Sender == "" {
 		rd.Sender = strings.TrimSpace(rec.Sender)
 	}
+	if rd.RecipientBank == "" {
+		rd.RecipientBank = strings.TrimSpace(rec.RecipientBank)
+	}
+	if rd.RecipientPhone == "" {
+		rd.RecipientPhone = strings.TrimSpace(rec.RecipientPhone)
+	}
+	if rd.SenderBank == "" {
+		rd.SenderBank = strings.TrimSpace(rec.SenderBank)
+	}
+	if rd.SenderAccount == "" {
+		rd.SenderAccount = strings.TrimSpace(rec.SenderAccount)
+	}
 	if rd.Amount == 0 {
 		rd.Amount = rec.Amount
+	}
+	if rd.Commission == 0 {
+		rd.Commission = rec.Commission
 	}
 	if rd.DocNumber == "" {
 		rd.DocNumber = rec.DocNumber

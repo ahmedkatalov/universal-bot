@@ -234,6 +234,79 @@ func (b *Bot) sendClientReceiptTool(chat types.JID) ai.Tool {
 	}
 }
 
+// receiptDetailsTool — показать все распознанные данные чека(ов) клиента.
+func (b *Bot) receiptDetailsTool() ai.Tool {
+	return ai.Tool{
+		Name: "receipt_details",
+		Description: "Показывает ВСЕ распознанные данные чека(ов) конкретного клиента: клиент (кому принадлежит), " +
+			"получатель на чеке и его банк/телефон, отправитель и его банк/счёт, сумма, комиссия, дата/время, " +
+			"номер документа, код авторизации, статус. Вызывай при 'покажи все данные чека Цихаева', " +
+			"'что за чек у Миланы', 'детали последнего чека Ахмеда'.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"person": map[string]any{"type": "string", "description": "Имя клиента"},
+				"limit":  map[string]any{"type": "integer", "description": "Сколько последних чеков показать (по умолчанию 3)"},
+			},
+			"required": []string{"person"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Person string `json:"person"`
+				Limit  int    `json:"limit"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", err
+			}
+			if strings.TrimSpace(args.Person) == "" {
+				return "", fmt.Errorf("нужно имя клиента")
+			}
+			if args.Limit <= 0 || args.Limit > 10 {
+				args.Limit = 3
+			}
+			items, err := b.db.ReceiptDetailsForPerson(ctx, strings.TrimSpace(args.Person), args.Limit)
+			if err != nil {
+				return "", err
+			}
+			if len(items) == 0 {
+				return fmt.Sprintf("Чеков по %q не нашла.", args.Person), nil
+			}
+			var sb strings.Builder
+			for i, r := range items {
+				if i > 0 {
+					sb.WriteString("\n")
+				}
+				fmt.Fprintf(&sb, "Чек %d — клиент: %s\n", i+1, r.Client)
+				fmt.Fprintf(&sb, "  Сумма: %.0f ₽", r.Amount)
+				if r.Commission > 0 {
+					fmt.Fprintf(&sb, " (комиссия %.0f ₽)", r.Commission)
+				}
+				sb.WriteString("\n")
+				if !r.TxDate.IsZero() {
+					fmt.Fprintf(&sb, "  Дата операции: %s\n", r.TxDate.Format("02.01.2006 15:04:05"))
+				}
+				appendField(&sb, "  Получатель на чеке", r.CardOwner)
+				appendField(&sb, "  Банк получателя", r.RecipientBank)
+				appendField(&sb, "  Телефон получателя", r.RecipientPhone)
+				appendField(&sb, "  Отправитель", r.Sender)
+				appendField(&sb, "  Банк отправителя", r.SenderBank)
+				appendField(&sb, "  Счёт отправителя", r.SenderAccount)
+				appendField(&sb, "  Банк чека", r.Bank)
+				appendField(&sb, "  Номер документа", r.DocNumber)
+				appendField(&sb, "  Код авторизации", r.AuthCode)
+				appendField(&sb, "  Статус", r.Status)
+			}
+			return sb.String(), nil
+		},
+	}
+}
+
+func appendField(sb *strings.Builder, label, value string) {
+	if strings.TrimSpace(value) != "" {
+		fmt.Fprintf(sb, "%s: %s\n", label, value)
+	}
+}
+
 // fixReceiptTool — владелец продиктовал, что написано на чеке; записываем.
 func (b *Bot) fixReceiptTool() ai.Tool {
 	return ai.Tool{

@@ -54,8 +54,13 @@ CREATE TABLE IF NOT EXISTS bank_receipts (
     id              SERIAL PRIMARY KEY,
     raw_message_id  INT REFERENCES raw_messages(id),
     bank            TEXT,
-    recipient_raw   TEXT,           -- ФИО получателя (чья карта) как распознано OCR
-    sender_raw      TEXT,           -- ФИО отправителя (клиент, который платил)
+    recipient_raw   TEXT,           -- клиент, кому принадлежит чек (для атрибуции/поиска)
+    recipient_bank  TEXT,           -- банк получателя, если указан на чеке
+    recipient_phone TEXT,           -- телефон получателя
+    sender_raw      TEXT,           -- ФИО отправителя (плательщик по чеку)
+    sender_bank     TEXT,           -- банк отправителя
+    sender_account  TEXT,           -- счёт/карта отправителя
+    card_owner      TEXT,           -- получатель, напечатанный на чеке (владелец карты)
     contact_id      INT REFERENCES contacts(id), -- сопоставлено через alias, если получилось
     amount          NUMERIC(12,2),
     commission      NUMERIC(12,2),

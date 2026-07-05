@@ -687,6 +687,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.unclearTool(),
 		b.sendUnclearFileTool(chat),
 		b.sendClientReceiptTool(chat),
+		b.receiptDetailsTool(),
 		b.fixReceiptTool(),
 		b.recountTool(),
 		b.phoneMemoryTool(chat),
@@ -1156,6 +1157,8 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"чтобы владелец сам посмотрел и продиктовал данные.\n" +
 		"10b. send_client_receipt — прислать сохранённый файл чека КОНКРЕТНОГО клиента ('скинь чек Миланы', " +
 		"'покажи чеки Ахмеда за июнь'). Не путать с send_unclear_file (тот — только про непонятые).\n" +
+		"10c. receipt_details — показать ВСЕ данные чека клиента (получатель и его банк/телефон, отправитель и его " +
+		"банк/счёт, сумма, комиссия, дата, номер документа, код) — 'покажи все данные чека Цихаева'.\n" +
 		"11. fix_receipt — записать данные чека со слов владельца ('на том чеке Милана, 25000, 2 июля'). " +
 		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
@@ -2158,11 +2161,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 
 	// ФИО, написанное рядом с чеком, важнее получателя на чеке — платёж
 	// относим к клиенту, которого назвал владелец. Получателя с чека
-	// сохраняем в SenderRaw для истории (если он там ещё не занят).
+	// (владельца карты) сохраняем отдельно в cardOwner для истории.
+	cardOwner := ""
 	if payerOverride != "" {
-		if rd.Sender == "" && rd.Recipient != "" {
-			rd.Sender = rd.Recipient
-		}
+		cardOwner = rd.Recipient
 		rd.Recipient = payerOverride
 	}
 
@@ -2224,20 +2226,25 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	}
 
 	err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
-		RawMessageID: rawID,
-		Bank:         rd.Bank,
-		RecipientRaw: rd.Recipient,
-		SenderRaw:    rd.Sender,
-		ContactID:    contactIDPtr,
-		Amount:       rd.Amount,
-		Commission:   rd.Commission,
-		DocNumber:    rd.DocNumber,
-		AuthCode:     rd.AuthCode,
-		Status:       rd.Status,
-		NeedsReview:  needsReview,
-		IsDuplicate:  isDuplicate,
-		GroupJID:     chat.String(),
-		TxDate:       txDate,
+		RawMessageID:   rawID,
+		Bank:           rd.Bank,
+		RecipientRaw:   rd.Recipient,
+		RecipientBank:  rd.RecipientBank,
+		RecipientPhone: rd.RecipientPhone,
+		SenderRaw:      rd.Sender,
+		SenderBank:     rd.SenderBank,
+		SenderAccount:  rd.SenderAccount,
+		CardOwner:      cardOwner,
+		ContactID:      contactIDPtr,
+		Amount:         rd.Amount,
+		Commission:     rd.Commission,
+		DocNumber:      rd.DocNumber,
+		AuthCode:       rd.AuthCode,
+		Status:         rd.Status,
+		NeedsReview:    needsReview,
+		IsDuplicate:    isDuplicate,
+		GroupJID:       chat.String(),
+		TxDate:         txDate,
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)

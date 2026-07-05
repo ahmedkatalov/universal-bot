@@ -78,6 +78,19 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание индекса group_jid: %w", err)
 	}
 
+	// Полные данные чека: карта/банк/телефон сторон — для справки и показа.
+	for _, col := range []string{
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS recipient_bank TEXT",
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS recipient_phone TEXT",
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS sender_bank TEXT",
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS sender_account TEXT",
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS card_owner TEXT",
+	} {
+		if _, err := pool.Exec(ctx, col); err != nil {
+			return fmt.Errorf("добавление колонки чека: %w", err)
+		}
+	}
+
 	// Поддержка удалённых сообщений и ручных корректировок: платёж/чек из
 	// удалённого в WhatsApp сообщения исключается из отчётов; ignored —
 	// ручное исключение через ассистента ("не считай тот чек на 5000").
@@ -264,31 +277,39 @@ func nullIfEmpty(s string) interface{} {
 // ---- Банковские чеки ----
 
 type BankReceiptInput struct {
-	RawMessageID int
-	Bank         string
-	RecipientRaw string
-	SenderRaw    string
-	ContactID    *int // nil, если получателя не удалось сопоставить с контактом
-	Amount       float64
-	Commission   float64
-	DocNumber    string
-	AuthCode     string
-	Status       string
-	NeedsReview  bool
-	IsDuplicate  bool
-	GroupJID     string    // группа, к которой относится чек (для дозагрузки из лички — целевая группа)
-	SubmittedBy  string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
-	TxDate       time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
+	RawMessageID   int
+	Bank           string
+	RecipientRaw   string // ФИО клиента (кому принадлежит чек — для атрибуции/поиска)
+	RecipientBank  string
+	RecipientPhone string
+	SenderRaw      string // ФИО отправителя (плательщик по чеку)
+	SenderBank     string
+	SenderAccount  string
+	CardOwner      string // получатель, напечатанный на чеке (владелец карты), если отличается от клиента
+	ContactID      *int   // nil, если получателя не удалось сопоставить с контактом
+	Amount         float64
+	Commission     float64
+	DocNumber      string
+	AuthCode       string
+	Status         string
+	NeedsReview    bool
+	IsDuplicate    bool
+	GroupJID       string    // группа, к которой относится чек (для дозагрузки из лички — целевая группа)
+	SubmittedBy    string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
+	TxDate         time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO bank_receipts
-			(raw_message_id, bank, recipient_raw, sender_raw, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate, group_jid, submitted_by, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.SenderRaw), r.ContactID, r.Amount, r.Commission,
-		nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status), r.NeedsReview, r.IsDuplicate,
-		nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate)
+			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
+			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
+			 group_jid, submitted_by, tx_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
+		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
+		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
+		r.NeedsReview, r.IsDuplicate, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate)
 	return err
 }
 
@@ -834,6 +855,56 @@ func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name 
 		return false, 0, err
 	}
 	return true, amount, nil
+}
+
+// ReceiptDetail — полные данные чека для показа владельцу.
+type ReceiptDetail struct {
+	Client         string // клиент, кому принадлежит чек
+	CardOwner      string // получатель на чеке (владелец карты)
+	RecipientBank  string
+	RecipientPhone string
+	Sender         string
+	SenderBank     string
+	SenderAccount  string
+	Bank           string
+	Amount         float64
+	Commission     float64
+	DocNumber      string
+	AuthCode       string
+	Status         string
+	TxDate         time.Time
+}
+
+// ReceiptDetailsForPerson возвращает полные данные чеков клиента (по имени),
+// свежие первыми — для ответа "покажи все данные чека Цихаева".
+func (d *DB) ReceiptDetailsForPerson(ctx context.Context, personQuery string, limit int) ([]ReceiptDetail, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(c.canonical_name, br.recipient_raw, ''), COALESCE(br.card_owner, ''),
+		       COALESCE(br.recipient_bank, ''), COALESCE(br.recipient_phone, ''),
+		       COALESCE(br.sender_raw, ''), COALESCE(br.sender_bank, ''), COALESCE(br.sender_account, ''),
+		       COALESCE(br.bank, ''), br.amount::float8, COALESCE(br.commission, 0)::float8,
+		       COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''), COALESCE(br.status, ''), br.tx_date
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $1 || '%'
+		ORDER BY br.tx_date DESC
+		LIMIT $2
+	`, personQuery, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReceiptDetail
+	for rows.Next() {
+		var r ReceiptDetail
+		if err := rows.Scan(&r.Client, &r.CardOwner, &r.RecipientBank, &r.RecipientPhone, &r.Sender, &r.SenderBank,
+			&r.SenderAccount, &r.Bank, &r.Amount, &r.Commission, &r.DocNumber, &r.AuthCode, &r.Status, &r.TxDate); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
 }
 
 // ReceiptFile — сохранённый файл чека для отправки по запросу.
