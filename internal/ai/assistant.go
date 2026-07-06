@@ -73,9 +73,42 @@ func New(apiKey, model, baseURL string) *Assistant {
 
 type chatMessage struct {
 	Role       string     `json:"role"`
-	Content    string     `json:"content"`
+	Content    any        `json:"content"` // string или []contentBlock (для кэширования)
 	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
 	ToolCallID string     `json:"tool_call_id,omitempty"`
+}
+
+// contentBlock — блок контента; на статичный блок вешаем cache_control,
+// чтобы OpenRouter/Anthropic кэшировали большой неизменный промпт и брали
+// с него ~10% цены при повторных запросах (модель та же — «ум» не теряется).
+type contentBlock struct {
+	Type         string        `json:"type"`
+	Text         string        `json:"text"`
+	CacheControl *cacheControl `json:"cache_control,omitempty"`
+}
+
+type cacheControl struct {
+	Type string `json:"type"` // "ephemeral"
+}
+
+// contentString извлекает текст из поля content ответа (там всегда строка).
+func contentString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
+// systemWithCache формирует системное сообщение: большой статичный блок с
+// пометкой кэширования + небольшой динамический блок (дата, сводка) без неё.
+func systemWithCache(staticPart, dynamicPart string) chatMessage {
+	blocks := []contentBlock{
+		{Type: "text", Text: staticPart, CacheControl: &cacheControl{Type: "ephemeral"}},
+	}
+	if dynamicPart != "" {
+		blocks = append(blocks, contentBlock{Type: "text", Text: dynamicPart})
+	}
+	return chatMessage{Role: "system", Content: blocks}
 }
 
 type toolCall struct {
@@ -121,9 +154,9 @@ type chatResponse struct {
 // истории диалога и доступных инструментов. Если модель решает вызвать
 // инструмент, Reply выполняет его через tool.Handle и отдаёт результат
 // обратно модели, пока не получит финальный текстовый ответ.
-func (a *Assistant) Reply(ctx context.Context, systemPrompt string, tools []Tool, history []Turn, userText string) (string, error) {
+func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem string, tools []Tool, history []Turn, userText string) (string, error) {
 	messages := make([]chatMessage, 0, len(history)+2)
-	messages = append(messages, chatMessage{Role: "system", Content: systemPrompt})
+	messages = append(messages, systemWithCache(staticSystem, dynamicSystem))
 	for _, t := range history {
 		role := "assistant"
 		if t.FromUser {
@@ -153,7 +186,7 @@ func (a *Assistant) Reply(ctx context.Context, systemPrompt string, tools []Tool
 		messages = append(messages, respMsg)
 
 		if finishReason != "tool_calls" || len(respMsg.ToolCalls) == 0 {
-			return respMsg.Content, nil
+			return contentString(respMsg.Content), nil
 		}
 
 		for _, call := range respMsg.ToolCalls {
@@ -180,7 +213,7 @@ func (a *Assistant) Complete(ctx context.Context, systemPrompt, userText string)
 	if err != nil {
 		return "", err
 	}
-	return msg.Content, nil
+	return contentString(msg.Content), nil
 }
 
 // Мультимодальный запрос: контент пользователя — массив блоков (текст + картинка).
@@ -253,7 +286,7 @@ func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userTex
 	if resp.StatusCode != http.StatusOK || len(parsed.Choices) == 0 {
 		return "", fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
 	}
-	return parsed.Choices[0].Message.Content, nil
+	return contentString(parsed.Choices[0].Message.Content), nil
 }
 
 func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {

@@ -621,14 +621,14 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Unlock()
 
 	isAdmin := b.isReportAdmin(msg.Info)
-	system := b.buildAssistantSystemPromptFor(ctx, isAdmin)
+	staticSys, dynSys := b.buildAssistantSystemPromptFor(ctx, isAdmin)
 	tools := b.assistantTools(ctx, chat, isAdmin, false)
 
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
 	text += quotedSenderPhoneNote(msg)
 
-	reply, err := b.assistant.Reply(ctx, system, tools, history, text)
+	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
 	if err != nil {
 		fmt.Println("Ошибка ответа Claude:", err)
 		b.sendText(chat, "Не получилось ответить: "+err.Error())
@@ -786,8 +786,8 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	if groups := b.joinedGroups(ctx); groups[chat] != "" {
 		curGroupName = groups[chat]
 	}
-	system := b.buildAssistantSystemPromptFor(ctx, isAdmin) +
-		"\n\nСейчас к тебе обратились ПРЯМО В РАБОЧЕЙ ГРУППЕ «" + curGroupName + "» — твой ответ увидят все участники. " +
+	staticSys, dynSys := b.buildAssistantSystemPromptFor(ctx, isAdmin)
+	dynSys += "\n\nСейчас к тебе обратились ПРЯМО В РАБОЧЕЙ ГРУППЕ «" + curGroupName + "» — твой ответ увидят все участники. " +
 		"Отвечай коротко и по делу. Если владелец говорит 'здесь', 'в этой группе', 'в эту группу', 'вот тут' — " +
 		"это про ЭТУ группу («" + curGroupName + "»), сразу используй её как group в инструментах, НЕ переспрашивай."
 
@@ -799,7 +799,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	tools := b.assistantTools(ctx, chat, isAdmin, true)
 
-	reply, err := b.assistant.Reply(ctx, system, tools, history, userText)
+	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
 	if err != nil {
 		fmt.Println("Ошибка ответа ассистента в группе:", err)
 		b.sendText(chat, "Не получилось ответить: "+err.Error())
@@ -1075,9 +1075,13 @@ func accessNote(isAdmin bool) string {
 
 // buildAssistantSystemPromptFor — промпт с учётом прав собеседника: для
 // не-админов сводка по деньгам в контекст вообще не кладётся.
-func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) string {
+// buildAssistantSystemPromptFor возвращает СТАТИЧНУЮ часть промпта (большая,
+// неизменная — кэшируется) и ДИНАМИЧЕСКУЮ (дата, сводка, группы, люди —
+// маленькая, меняется). Так кэш срезает стоимость повторных запросов.
+func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) (staticPart, dynamicPart string) {
 	if isAdmin {
-		return b.buildAssistantSystemPrompt(ctx) + accessNote(true)
+		s, d := b.buildAssistantSystemPrompt(ctx)
+		return s + accessNote(true), d
 	}
 
 	now := time.Now()
@@ -1085,19 +1089,20 @@ func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) s
 	if contacts, err := b.db.ListContacts(ctx); err == nil && len(contacts) > 0 {
 		peopleList = strings.Join(contacts, ", ")
 	}
-	return "Ты — ассистент WhatsApp-бота учёта финансов по имени " + b.botName + ". " +
+	staticPart = "Ты — ассистент WhatsApp-бота учёта финансов по имени " + b.botName + ". " +
 		"Общайся дружелюбно и по-человечески, на русском.\n\n" +
-		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
-		"Известные люди в учёте: " + peopleList + ". Пользователь может писать имена с опечатками — " +
-		"сопоставь с ближайшим известным именем.\n\n" +
+		"Пользователь может писать имена с опечатками — сопоставь с ближайшим известным именем.\n" +
 		"Твой единственный инструмент — person_report: проверить чеки/платежи конкретного человека." +
 		accessNote(false)
+	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n" +
+		"Известные люди в учёте: " + peopleList + "."
+	return staticPart, dynamicPart
 }
 
 // buildAssistantSystemPrompt формирует системный промпт со сводкой по сбору
 // за текущий месяц (по всем группам сразу) и с сегодняшней датой, чтобы
 // ассистент правильно понимал относительные даты ("сегодня", "3 июля" и т.п.).
-func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
+func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynamicPart string) {
 	now := time.Now()
 	from := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, now.Location())
 
@@ -1143,7 +1148,15 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		forwardingList = strings.Join(parts, "; ")
 	}
 
-	return "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. Тебя зовут " + b.botName + " — " +
+	// Динамическая часть (маленькая, меняется) — НЕ кэшируется.
+	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n" +
+		"Группы, в которых состоит бот: " + groupsList + ".\n" +
+		"Известные люди в учёте: " + peopleList + ".\n" +
+		"Активные правила пересылки чеков: " + forwardingList + ".\n" +
+		"Сводка по сбору за текущий месяц (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" + summaryText
+
+	// Статичная часть (большая, неизменная) — кэшируется.
+	staticPart = "Ты — универсальный личный ассистент владельца WhatsApp-бота учёта финансов. Тебя зовут " + b.botName + " — " +
 		"в группах к тебе обращаются по этому имени. " +
 		"Общайся свободно и по-человечески на любые темы: можешь поболтать, ответить на общие вопросы, " +
 		"помочь советом, пошутить — ты не ограничен только финансами. Отвечай на русском, живо и без канцелярита, " +
@@ -1152,15 +1165,10 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"(суммы из текстовых сообщений и банковские чеки с фото через OCR), помнит, из какой группы и от кого " +
 		"пришёл каждый чек, замечает дубли и умеет строить отчёты. Если владелец спрашивает, как что-то работает, " +
 		"почему чек не распознался или что-то посчиталось не так — объясняй и подсказывай, как поправить.\n\n" +
-		"Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n\n" +
-		"Группы, в которых состоит бот: " + groupsList + ".\n\n" +
-		"Известные люди в учёте: " + peopleList + ". " +
-		"Пользователь может писать имена с опечатками или в другой форме ('ахмет каталов', 'миланка') — " +
-		"сам сопоставь с ближайшим известным именем и используй точное имя из списка при вызовах инструментов; " +
-		"если сомневаешься, к кому относится запрос, — переспроси.\n\n" +
-		"Сводка по сбору средств за текущий месяц по всем группам (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" +
-		summaryText +
-		"\n\nТвои инструменты:\n" +
+		"Актуальные данные (дата, список групп, известные люди, правила пересылки, сводка за месяц) даны " +
+		"в отдельном блоке контекста ниже — опирайся на них. Имена пользователь может писать с опечатками " +
+		"('ахмет каталов', 'миланка') — сам сопоставь с ближайшим известным и используй точное имя из списка.\n\n" +
+		"Твои инструменты:\n" +
 		"1. send_finance_report — отчёт по сбору за период (текстом или PDF). Вызывай при вопросах про суммы " +
 		"за даты/период или просьбах прислать отчёт. Переводи относительные даты и названия месяцев в YYYY-MM-DD " +
 		"от сегодняшней даты. format=\"pdf\" если просят файл/документ/пдф, иначе \"text\". " +
@@ -1195,7 +1203,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"8. manage_receipt_forwarding — автоматическая пересылка чеков между чатами. 'Давай все чеки из группы " +
 		"оплата клиентов скидывай в оплата клнт' -> action=set; 'пересылай чеки из лички в ...' -> from='личка'; " +
 		"'хватит пересылать' -> action=stop. Пересланные чеки сразу записываются в учёт целевой группы. " +
-		"Сейчас активные правила пересылки: " + forwardingList + ".\n" +
+		"Текущие активные правила пересылки смотри в блоке контекста.\n" +
 		"9. list_unclear_receipts — список чеков/фото, которые бот не смог уверенно разобрать. " +
 		"'Какие чеки ты не понял?', 'что не распозналось?'.\n" +
 		"10. send_unclear_file — прислать файл непонятого чека в чат ('скинь мне тот чек, который не понял'), " +
@@ -1258,6 +1266,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) string {
 		"Если пользователь присылает фото чека, ты получишь его распознанное содержимое в квадратных скобках — " +
 		"расскажи, что на чеке (от кого, сумма, дата операции, учтён ли уже). В учёт чек попадает только " +
 		"через save_pending_receipts по явной просьбе, либо когда его присылают в рабочую группу."
+	return staticPart, dynamicPart
 }
 
 // reportTool — инструмент Claude для отчёта за произвольный период. При
