@@ -1503,6 +1503,47 @@ type SenderStat struct {
 	Total float64
 }
 
+// CardTotal — сколько перевели на карту конкретного получателя.
+type CardTotal struct {
+	CardOwner string // чья карта получила деньги (ФИО получателя с чека)
+	Bank      string // банк получателя, если распознан
+	Count     int
+	Total     float64
+}
+
+// CardTotals — разбивка «на чьи карты сколько перевели» за период. Владелец
+// карты = получатель, напечатанный на чеке (card_owner, а если нет — recipient_raw).
+// Не путать с клиентом рассрочки: сюда идёт именно владелец карты-получателя.
+func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []string) ([]CardTotal, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), 'не распознано') AS card,
+		       COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), '') AS bank,
+		       COUNT(*), COALESCE(SUM(br.amount), 0)
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.tx_date >= $1 AND br.tx_date < $2
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+		GROUP BY card, bank
+		ORDER BY 4 DESC
+	`, from, to, groupSliceArg(groupJIDs))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CardTotal
+	for rows.Next() {
+		var c CardTotal
+		if err := rows.Scan(&c.CardOwner, &c.Bank, &c.Count, &c.Total); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // SenderStats возвращает статистику по отправителям чеков за период [from, to):
 // кто сколько чеков прислал и на какую сумму. Дубли не считаются.
 // groupJID — фильтр по группе (пусто = все), senderQuery — фильтр по человеку:

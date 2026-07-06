@@ -690,6 +690,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 	tools := []ai.Tool{
 		b.reportTool(chat),
 		b.sendersTool(ctx, chat),
+		b.cardsTool(chat),
 		b.correctionTool(groupDefault),
 		b.personTool(),
 		b.customPDFTool(chat),
@@ -1181,6 +1182,9 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"'какой сотрудник сколько собрал'. Фильтр по группе и по человеку (имя или номер). ВАЖНО: 'сбор X' — это " +
 		"обычно про того, кто СОБРАЛ (senders_report), а не про клиента; если из контекста ясно, что X — клиент " +
 		"(его платежи по рассрочке), тогда person_report.\n" +
+		"2b. cards_report — НА ЧЬИ КАРТЫ сколько перевели (по владельцам карт-получателей). Вызывай при " +
+		"'на чьи карты сколько перевели', 'разбивка по картам', 'сколько пришло на карту Нажуда'. " +
+		"Это про владельца КАРТЫ-получателя, не про клиента и не про того, кто собрал.\n" +
 		"3. save_pending_receipts — дозагрузка чеков в учёт. Когда бота не было в группе (добавили с опозданием), " +
 		"владелец присылает пропущенные чеки сюда в личку и просит их запомнить, указывая группу. Каждое фото чека " +
 		"уже распознано и ждёт; вызывай инструмент ТОЛЬКО после явной просьбы сохранить/запомнить/учесть, " +
@@ -1217,9 +1221,13 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
 		"повторное сопоставление имён и доразбор нераспознанных сообщений. После него данные во всех отчётах свежие.\n\n" +
 		"Ты — управляющий мозг этого бота: сам понимай задачу и доводи до конца, комбинируя инструменты в любую " +
-		"нужную цепочку, а не жди пошаговых указаний. ВАЖНО про точность: суммы, сборы, сверку, даты и отчёты НЕ " +
-		"считай в уме — всегда бери цифры из инструментов (они берут точные данные из базы); свои арифметические " +
-		"итоги не выдумывай. Так ты полностью ведёшь диалог и решения, а числа остаются достоверными.\n" +
+		"нужную цепочку, а не жди пошаговых указаний. У тебя ПОЛНАЯ свобода: владелец может попросить несколько " +
+		"вещей одной фразой ('посчитай сбор за июнь, и на чьи карты сколько перевели, и кто сколько собрал') — " +
+		"вызови ВСЕ нужные инструменты (send_finance_report + cards_report + senders_report) и собери результаты " +
+		"в один аккуратный ответ. Гибкие формулировки понимай по смыслу ('учти вот эти чеки за тот период', " +
+		"'скинь пдф по картам', 'а на карту Нажуда сколько') и сразу выполняй. ВАЖНО про точность: суммы, сборы, " +
+		"сверку, даты и отчёты НЕ считай в уме — всегда бери цифры из инструментов (они берут точные данные из " +
+		"базы); свои арифметические итоги не выдумывай. Так ты полностью ведёшь диалог и решения, а числа достоверны.\n" +
 		"Действуй сам, цепочкой, не переспрашивая по мелочам. Пример: 'пересчитай эти чеки и скажи сбор за июнь' = " +
 		"recount_everything, затем send_finance_report за июнь. Сумма считается по ДАТЕ ОПЕРАЦИИ НА САМОМ ЧЕКЕ: " +
 		"чек с датой вне запрошенного месяца в сумму НЕ входит. Отчёт сам вернёт список таких исключённых чеков " +
@@ -1319,6 +1327,117 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 				return "", err
 			}
 			return b.buildReportForAssistant(ctx, chat, args.FromDate, args.ToDate, args.Format, groupJIDs, groupLabel)
+		},
+	}
+}
+
+// cardsTool — разбивка "на чьи карты сколько перевели" за период.
+func (b *Bot) cardsTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "cards_report",
+		Description: "Показывает, НА ЧЬИ КАРТЫ и сколько перевели за период — разбивка по получателям чеков " +
+			"(владельцам карт). Вызывай при 'на чьи карты сколько перевели', 'разбивка по картам', " +
+			"'сколько пришло на карту Миланы/Нажуда'. Это про владельца КАРТЫ-получателя (не про клиента рассрочки). " +
+			"Можно текстом или PDF (format=\"pdf\"). Период, группа(ы) и конкретная карта — по желанию.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from_date": map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD"},
+				"to_date":   map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD"},
+				"group":     map[string]any{"type": "string", "description": "Группа(ы); несколько через запятую/'и'; пусто — все"},
+				"card":      map[string]any{"type": "string", "description": "Имя владельца карты, если нужен только он (пусто — все карты)"},
+				"format":    map[string]any{"type": "string", "enum": []string{"pdf", "text"}, "description": "pdf — прислать документ; text — цифры в ответ"},
+			},
+			"required": []string{"from_date", "to_date"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				FromDate, ToDate, Group, Card, Format string
+			}
+			raw := struct {
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Group    string `json:"group"`
+				Card     string `json:"card"`
+				Format   string `json:"format"`
+			}{}
+			if err := json.Unmarshal(input, &raw); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			args.FromDate, args.ToDate, args.Group, args.Card, args.Format = raw.FromDate, raw.ToDate, raw.Group, raw.Card, raw.Format
+
+			from, err := time.Parse("2006-01-02", args.FromDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
+			}
+			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
+			}
+			groupJIDs, groupLabel, err := b.resolveGroups(ctx, args.Group)
+			if err != nil {
+				return "", err
+			}
+			cards, err := b.db.CardTotals(ctx, from, toDay.AddDate(0, 0, 1), groupJIDs)
+			if err != nil {
+				return "", fmt.Errorf("ошибка выборки: %w", err)
+			}
+			// Фильтр по конкретной карте, если попросили.
+			if q := strings.ToLower(strings.TrimSpace(args.Card)); q != "" {
+				var f []db.CardTotal
+				for _, c := range cards {
+					if strings.Contains(strings.ToLower(c.CardOwner), q) {
+						f = append(f, c)
+					}
+				}
+				cards = f
+			}
+			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
+			if len(cards) == 0 {
+				return fmt.Sprintf("На карты за %s (%s) переводов не найдено.", periodLabel, groupLabel), nil
+			}
+
+			var total float64
+			var count int
+			for _, c := range cards {
+				total += c.Total
+				count += c.Count
+			}
+
+			if args.Format == "pdf" {
+				rows := make([][]string, 0, len(cards))
+				for _, c := range cards {
+					label := c.CardOwner
+					if c.Bank != "" {
+						label += " (" + c.Bank + ")"
+					}
+					rows = append(rows, []string{label, fmt.Sprintf("%d", c.Count), formatRub(c.Total)})
+				}
+				section := report.Section{
+					Title:    "Переводы по картам получателей",
+					Columns:  []string{"Карта (получатель)", "Кол-во", "Сумма, ₽"},
+					Rows:     rows,
+					TotalRow: []string{"ИТОГО", fmt.Sprintf("%d", count), formatRub(total)},
+				}
+				outPath := fmt.Sprintf("%s/cards_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
+				if err := report.GenerateCustom("Переводы по картам", "Период: "+periodLabel+" | "+groupLabel, []report.Section{section}, b.fontDir, outPath); err != nil {
+					return "", fmt.Errorf("ошибка генерации PDF: %w", err)
+				}
+				b.sendDocument(chat, outPath, "Карты_"+from.Format("2006-01-02")+".pdf")
+				return fmt.Sprintf("PDF по картам за %s (%s) отправлен: %d переводов на %.0f ₽.", periodLabel, groupLabel, count, total), nil
+			}
+
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "На чьи карты сколько перевели за %s (%s):\n", periodLabel, groupLabel)
+			for _, c := range cards {
+				bank := ""
+				if c.Bank != "" {
+					bank = " · " + c.Bank
+				}
+				fmt.Fprintf(&sb, "- %s%s: %.0f ₽ (%d переводов)\n", c.CardOwner, bank, c.Total, c.Count)
+			}
+			fmt.Fprintf(&sb, "Итого: %.0f ₽ (%d переводов)", total, count)
+			return sb.String(), nil
 		},
 	}
 }
