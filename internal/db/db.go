@@ -6,11 +6,19 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
+
+// nameKey нормализует имя для группировки в отчётах: регистр и лишние пробелы
+// не должны плодить дубли одного человека. Без этого «Хадаев Али» и «Хадаев
+// али» попадали в две строки отчёта, и суммы по человеку были неверные.
+func nameKey(s string) string {
+	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
 
 type DB struct {
 	pool *pgxpool.Pool
@@ -1491,11 +1499,14 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		if err := rows.Scan(&name, &card, &amount); err != nil {
 			return nil, err
 		}
-		cs, ok := byName[name]
+		// Группируем по нормализованному ключу, чтобы «Хадаев Али» и «Хадаев
+		// али» были одним человеком. Для показа берём первый вариант написания.
+		key := nameKey(name)
+		cs, ok := byName[key]
 		if !ok {
 			cs = &ContactSummary{CanonicalName: name, ByCard: map[string]float64{}}
-			byName[name] = cs
-			order = append(order, name)
+			byName[key] = cs
+			order = append(order, key)
 		}
 		cs.Total += amount
 		cs.Count++
@@ -1507,8 +1518,8 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 	}
 
 	result := make([]ContactSummary, 0, len(order))
-	for _, name := range order {
-		result = append(result, *byName[name])
+	for _, key := range order {
+		result = append(result, *byName[key])
 	}
 	return result, rows.Err()
 }
