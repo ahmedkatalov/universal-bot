@@ -129,8 +129,9 @@ func main() {
 	apiKey := envOr("OPENROUTER_API_KEY", os.Getenv("OPENAI_API_KEY"))
 	if apiKey != "" {
 		model := envOr("OPENROUTER_MODEL", os.Getenv("OPENAI_MODEL"))
+		visionModel := os.Getenv("OPENROUTER_VISION_MODEL") // пусто => тем же, что и мозг
 		baseURL := envOr("OPENROUTER_BASE_URL", "")
-		assistant = ai.New(apiKey, model, baseURL)
+		assistant = ai.New(apiKey, model, visionModel, baseURL)
 		log.Println("Личный ассистент (OpenRouter) включён — отвечаю на сообщения в личку номеру бота")
 	} else {
 		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")

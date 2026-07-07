@@ -26,6 +26,11 @@ const (
 	// почему-то продолжает звать инструменты бесконечно. Запас на длинные
 	// цепочки вида "пересчитай -> отчёт по группе -> сверка -> оформить в PDF".
 	maxToolIterations = 12
+
+	// maxHTTPAttempts — сколько раз повторяем запрос к OpenRouter при
+	// временных сбоях (обрыв сети, таймаут, 429/5xx). Без этого один сетевой
+	// «икание» рушил весь ответ бота; с ретраями — переживает.
+	maxHTTPAttempts = 3
 )
 
 // Turn — одна реплика в истории личного диалога.
@@ -45,10 +50,11 @@ type Tool struct {
 }
 
 type Assistant struct {
-	apiKey  string
-	model   string
-	baseURL string
-	http    *http.Client
+	apiKey      string
+	model       string // «мозг»: диалог, отчёты, сверка, вызовы инструментов
+	visionModel string // чтение чеков (зрение); по умолчанию совпадает с model
+	baseURL     string
+	http        *http.Client
 }
 
 // New создаёт клиента OpenRouter. apiKey — значение OPENROUTER_API_KEY.
@@ -56,18 +62,25 @@ type Assistant struct {
 // пусто -> берётся defaultModel. baseURL — обычно оставляют пустым
 // (используется https://openrouter.ai/api/v1), задаётся отдельно только
 // если стоит прокси/самостоятельный gateway с тем же протоколом.
-func New(apiKey, model, baseURL string) *Assistant {
+// visionModel пусто -> зрение идёт той же моделью, что и «мозг» (лучшее
+// распознавание). Можно задать отдельную дешёвую модель (напр. Haiku) через
+// OPENROUTER_VISION_MODEL, если распознавание чеков хочется удешевить.
+func New(apiKey, model, visionModel, baseURL string) *Assistant {
 	if model == "" {
 		model = defaultModel
+	}
+	if visionModel == "" {
+		visionModel = model
 	}
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
 	return &Assistant{
-		apiKey:  apiKey,
-		model:   model,
-		baseURL: strings.TrimRight(baseURL, "/"),
-		http:    &http.Client{Timeout: 60 * time.Second},
+		apiKey:      apiKey,
+		model:       model,
+		visionModel: visionModel,
+		baseURL:     strings.TrimRight(baseURL, "/"),
+		http:        &http.Client{Timeout: 90 * time.Second},
 	}
 }
 
@@ -243,7 +256,7 @@ type visionRequest struct {
 // или "image/png".
 func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userText string, image []byte, mimeType string) (string, error) {
 	payload, err := json.Marshal(visionRequest{
-		Model: a.model,
+		Model: a.visionModel,
 		Messages: []visionMessage{
 			{Role: "system", Content: systemPrompt},
 			{Role: "user", Content: []visionContentPart{
@@ -259,32 +272,15 @@ func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userTex
 		return "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
+	parsed, status, err := a.postCompletions(ctx, payload)
 	if err != nil {
 		return "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.apiKey)
-
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("openrouter: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return "", fmt.Errorf("openrouter: чтение ответа: %w", err)
-	}
-	var parsed chatResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", fmt.Errorf("openrouter: не удалось разобрать ответ (%d): %s", resp.StatusCode, string(body))
 	}
 	if parsed.Error != nil {
 		return "", fmt.Errorf("openrouter: %s", parsed.Error.Message)
 	}
-	if resp.StatusCode != http.StatusOK || len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
+	if status != http.StatusOK || len(parsed.Choices) == 0 {
+		return "", fmt.Errorf("openrouter вернул %d", status)
 	}
 	return contentString(parsed.Choices[0].Message.Content), nil
 }
@@ -300,33 +296,15 @@ func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []to
 		return chatMessage{}, "", err
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
+	parsed, status, err := a.postCompletions(ctx, payload)
 	if err != nil {
 		return chatMessage{}, "", err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+a.apiKey)
-
-	resp, err := a.http.Do(req)
-	if err != nil {
-		return chatMessage{}, "", fmt.Errorf("openrouter: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return chatMessage{}, "", fmt.Errorf("openrouter: чтение ответа: %w", err)
-	}
-
-	var parsed chatResponse
-	if err := json.Unmarshal(body, &parsed); err != nil {
-		return chatMessage{}, "", fmt.Errorf("openrouter: не удалось разобрать ответ (%d): %s", resp.StatusCode, string(body))
 	}
 	if parsed.Error != nil {
 		return chatMessage{}, "", fmt.Errorf("openrouter: %s", parsed.Error.Message)
 	}
-	if resp.StatusCode != http.StatusOK {
-		return chatMessage{}, "", fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
+	if status != http.StatusOK {
+		return chatMessage{}, "", fmt.Errorf("openrouter вернул %d", status)
 	}
 	if len(parsed.Choices) == 0 {
 		return chatMessage{}, "", fmt.Errorf("openrouter: пустой ответ")
@@ -334,6 +312,61 @@ func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []to
 
 	choice := parsed.Choices[0]
 	return choice.Message, choice.FinishReason, nil
+}
+
+// postCompletions отправляет уже сериализованный запрос на /chat/completions
+// и повторяет попытку при временных сбоях: обрыв сети, таймаут, ответы 429 и
+// 5xx. Возвращает разобранный ответ и HTTP-статус последней попытки. Ошибки
+// уровня приложения (200 с error в теле, 4xx кроме 429) не ретраятся — их
+// разбирают вызывающие. backoff растёт (≈0.6s, 1.2s), но упирается в ctx.
+func (a *Assistant) postCompletions(ctx context.Context, payload []byte) (chatResponse, int, error) {
+	var lastErr error
+	for attempt := 0; attempt < maxHTTPAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return chatResponse{}, 0, ctx.Err()
+			case <-time.After(time.Duration(attempt) * 600 * time.Millisecond):
+			}
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
+		if err != nil {
+			return chatResponse{}, 0, err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+a.apiKey)
+
+		resp, err := a.http.Do(req)
+		if err != nil {
+			// Сетевой сбой/таймаут — если контекст ещё жив, пробуем снова.
+			lastErr = fmt.Errorf("openrouter: %w", err)
+			if ctx.Err() != nil {
+				return chatResponse{}, 0, ctx.Err()
+			}
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("openrouter: чтение ответа: %w", err)
+			continue
+		}
+
+		// Временная перегрузка провайдера — стоит повторить.
+		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
+			lastErr = fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
+			continue
+		}
+
+		var parsed chatResponse
+		if err := json.Unmarshal(body, &parsed); err != nil {
+			return chatResponse{}, resp.StatusCode, fmt.Errorf("openrouter: не удалось разобрать ответ (%d): %s", resp.StatusCode, string(body))
+		}
+		return parsed, resp.StatusCode, nil
+	}
+	return chatResponse{}, 0, lastErr
 }
 
 func runTool(ctx context.Context, tools []Tool, call toolCall) string {

@@ -178,10 +178,43 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		clarify:       newClarifyState(),
 	}
 
+	b.loadHistory(ctx) // восстановить память диалогов ассистента после рестарта
+
 	client.AddEventHandler(b.handleEvent)
 	go b.cmfWatcherLoop() // сверка чеков с программой рассрочек (no-op, если cmf == nil)
 	go b.clarifyLoop()    // проактивные вопросы "чей это чек"
 	return b, nil
+}
+
+// loadHistory поднимает сохранённую в БД историю диалогов ассистента в память
+// при старте. Если БД недоступна или пуста — бот просто начинает с чистого
+// листа, это не критично.
+func (b *Bot) loadHistory(ctx context.Context) {
+	turns, err := b.db.AllChatHistory(ctx)
+	if err != nil {
+		fmt.Println("Не удалось загрузить историю диалогов ассистента:", err)
+		return
+	}
+	b.historyMu.Lock()
+	for _, t := range turns {
+		b.history[t.ChatKey] = append(b.history[t.ChatKey], ai.Turn{FromUser: t.FromUser, Text: t.Text})
+	}
+	b.historyMu.Unlock()
+	if len(turns) > 0 {
+		fmt.Printf("Память диалогов восстановлена: %d реплик\n", len(turns))
+	}
+}
+
+// persistTurns сохраняет пару реплик (вопрос + ответ) в БД, чтобы память
+// пережила рестарт. Ошибку только логируем — на ответ пользователю не влияет.
+func (b *Bot) persistTurns(ctx context.Context, key, userText, reply string) {
+	err := b.db.SaveChatTurns(ctx, key, []db.ChatTurn{
+		{ChatKey: key, FromUser: true, Text: userText},
+		{ChatKey: key, FromUser: false, Text: reply},
+	}, maxPrivateHistory)
+	if err != nil {
+		fmt.Println("Не удалось сохранить историю диалога:", err)
+	}
 }
 
 // Connect авторизуется. Если сохранённой сессии нет — печатает QR-код в консоль,
@@ -642,6 +675,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.historyMu.Lock()
 	b.history[sender] = updated
 	b.historyMu.Unlock()
+	b.persistTurns(ctx, sender, text, reply) // память переживёт рестарт
 
 	if reply == "" {
 		fmt.Println("Ассистент вернул пустой ответ — ничего не отправляю")
@@ -814,6 +848,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	b.historyMu.Lock()
 	b.history[key] = updated
 	b.historyMu.Unlock()
+	b.persistTurns(ctx, key, userText, reply) // память группового диалога переживёт рестарт
 
 	if reply != "" {
 		b.sendText(chat, reply)

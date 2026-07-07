@@ -170,6 +170,25 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание таблицы phone_owners: %w", err)
 	}
 
+	// История диалога ассистента: раньше жила только в памяти и стиралась при
+	// каждом рестарте контейнера — бот «забывал» разговор. Теперь пишем в БД,
+	// поэтому память переживает перезапуски. Ключ chat_key — JID отправителя
+	// (личка) или JID группы (обращение по имени в группе).
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS assistant_history (
+			id         BIGSERIAL PRIMARY KEY,
+			chat_key   TEXT NOT NULL,
+			from_user  BOOLEAN NOT NULL,
+			body       TEXT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы assistant_history: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_assistant_history_key ON assistant_history(chat_key, id)`); err != nil {
+		return fmt.Errorf("индекс assistant_history: %w", err)
+	}
+
 	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
 	// чек, легально пересланный из группы СБ в основную, помечался дублем.
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
@@ -1603,4 +1622,64 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// ChatTurn — одна реплика диалога ассистента, как она лежит в БД. Отдельный от
+// ai.Turn тип, чтобы пакет db не зависел от пакета ai (нет лишней связности).
+type ChatTurn struct {
+	ChatKey  string
+	FromUser bool
+	Text     string
+}
+
+// AllChatHistory возвращает всю сохранённую историю диалогов ассистента в
+// хронологическом порядке (по id). Бот группирует её по chat_key при старте,
+// чтобы восстановить память после рестарта.
+func (d *DB) AllChatHistory(ctx context.Context) ([]ChatTurn, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT chat_key, from_user, body FROM assistant_history ORDER BY id
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []ChatTurn
+	for rows.Next() {
+		var t ChatTurn
+		if err := rows.Scan(&t.ChatKey, &t.FromUser, &t.Text); err != nil {
+			return nil, err
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}
+
+// SaveChatTurns дописывает новые реплики диалога и подрезает историю ключа до
+// последних keep записей — чтобы таблица не росла бесконечно, а память
+// оставалась ограниченной тем же окном, что и в оперативке.
+func (d *DB) SaveChatTurns(ctx context.Context, key string, turns []ChatTurn, keep int) error {
+	if len(turns) == 0 {
+		return nil
+	}
+	batch := &pgx.Batch{}
+	for _, t := range turns {
+		batch.Queue(`INSERT INTO assistant_history (chat_key, from_user, body) VALUES ($1, $2, $3)`, key, t.FromUser, t.Text)
+	}
+	if keep > 0 {
+		batch.Queue(`
+			DELETE FROM assistant_history
+			WHERE chat_key = $1 AND id NOT IN (
+				SELECT id FROM assistant_history WHERE chat_key = $1 ORDER BY id DESC LIMIT $2
+			)
+		`, key, keep)
+	}
+	br := d.pool.SendBatch(ctx, batch)
+	defer br.Close()
+	for i := 0; i < batch.Len(); i++ {
+		if _, err := br.Exec(); err != nil {
+			return err
+		}
+	}
+	return nil
 }
