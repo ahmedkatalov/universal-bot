@@ -627,3 +627,40 @@ func TestParseTxTimeAbsentWhenNoDateOnReceipt(t *testing.T) {
 		t.Errorf("не ожидали найти время операции, получили %v", rd.TxTime)
 	}
 }
+
+// TestBankOrderMatchesMarkers защищает инвариант: каждый банк из bankOrder
+// есть в bankMarkers. Иначе detectBank обратится к nil-регекспу и упадёт в
+// проде на первом же чеке. Дешёвый предохранитель от опечатки в списке.
+func TestBankOrderMatchesMarkers(t *testing.T) {
+	for _, b := range bankOrder {
+		if bankMarkers[b] == nil {
+			t.Fatalf("банк %q есть в bankOrder, но нет в bankMarkers — detectBank упадёт", b)
+		}
+	}
+	if len(bankOrder) != len(bankMarkers) {
+		t.Fatalf("bankOrder(%d) и bankMarkers(%d) рассинхронизированы", len(bankOrder), len(bankMarkers))
+	}
+}
+
+// TestDetectRussianBanks проверяет распознавание расширенного списка банков —
+// в т.ч. новых (МКБ, ОТП, Точка, ЮMoney) и латинских написаний.
+func TestDetectRussianBanks(t *testing.T) {
+	cases := map[string]string{
+		"Перевод через Сбербанк":         "Сбербанк",
+		"SberBank Online":                "Сбербанк",
+		"Московский кредитный банк":      "МКБ",
+		"МКБ, перевод":                   "МКБ",
+		"ОТП Банк":                       "ОТП Банк",
+		"Банк Точка":                     "Точка",
+		"Перевод ЮMoney":                 "ЮMoney",
+		"Alfa-Bank transfer":            "Альфа-Банк",
+		"VTB":                            "ВТБ",
+		"Газпромбанк":                    "Газпромбанк",
+		"Райффайзен банк":                "Райффайзен",
+	}
+	for text, want := range cases {
+		if got := detectBank(text); got != want {
+			t.Errorf("detectBank(%q) = %q, ожидали %q", text, got, want)
+		}
+	}
+}

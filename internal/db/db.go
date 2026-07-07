@@ -1545,7 +1545,7 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 		  AND COALESCE(rm.deleted, false) = false
 		  AND br.amount > 0
 		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
-		GROUP BY card, bank
+		GROUP BY 1, 2
 		ORDER BY 4 DESC
 	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
