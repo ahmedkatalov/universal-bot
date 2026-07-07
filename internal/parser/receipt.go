@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // ReceiptData — то, что удалось извлечь со скриншота банковского перевода.
@@ -49,7 +50,7 @@ var bankMarkers = map[string]*regexp.Regexp{
 	"Газпромбанк":    regexp.MustCompile(`(?i)газпромбанк|(^|\W)гпб(\W|$)|gazprombank`),
 	"Альфа-Банк":     regexp.MustCompile(`(?i)альфа.?банк|alfa.?bank`),
 	"Россельхозбанк": regexp.MustCompile(`(?i)россельхоз|(^|\W)рсхб(\W|$)|(^|\W)rshb(\W|$)`),
-	"Т-Банк":         regexp.MustCompile(`(?i)тинькофф|т.?банк|тбанк|tinkoff|t.?bank`),
+	"Т-Банк":         regexp.MustCompile(`(?i)тинькофф|tinkoff|(^|[^\p{L}])т[-.\s]?банк|(^|[^\p{L}])t[-.\s]?bank`),
 	"Открытие":       regexp.MustCompile(`(?i)банк\s*открытие|открытие\s*банк`),
 	"Совкомбанк":     regexp.MustCompile(`(?i)совкомбанк|халва|sovcombank`),
 	"Райффайзен":     regexp.MustCompile(`(?i)райффайзен|raiffeisen`),
@@ -411,7 +412,35 @@ func detectBank(text string) string {
 			return bank
 		}
 	}
-	return ""
+	// Универсальный ловец: любой банк, которого нет в списке выше, но чьё
+	// название оформлено одним словом на "…банк" (Мособлбанк, Тимербанк и т.п.).
+	return genericBankName(text)
+}
+
+// reGenericBank ловит слово, оканчивающееся на "банк" (мин. 3 буквы до него),
+// ограниченное не-буквами. Так распознаётся ЛЮБОЙ банк с названием-одним-словом,
+// даже не перечисленный явно. \p{L} корректно работает с кириллицей в RE2.
+var reGenericBank = regexp.MustCompile(`(?i)(?:^|[^\p{L}])([\p{L}-]{3,}банк)(?:[^\p{L}]|$)`)
+
+// notBankWords — «…банк»-слова, которые банком НЕ являются (интернет-банк и т.п.).
+var notBankWords = map[string]bool{
+	"интернет-банк": true, "интернетбанк": true, "онлайн-банк": true, "онлайнбанк": true,
+	"мобильныйбанк": true, "мобильный-банк": true, "смс-банк": true, "банк-клиент": true,
+	"необанк": true, "мойбанк": true, "супербанк": true,
+}
+
+func genericBankName(text string) string {
+	m := reGenericBank.FindStringSubmatch(text)
+	if m == nil {
+		return ""
+	}
+	name := strings.ToLower(strings.TrimSpace(m[1]))
+	if notBankWords[name] {
+		return ""
+	}
+	r := []rune(name)
+	r[0] = unicode.ToUpper(r[0])
+	return string(r)
 }
 
 // headerLines возвращает первые n непустых строк одной строкой — "шапку" чека.
