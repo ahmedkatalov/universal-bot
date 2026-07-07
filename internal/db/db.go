@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -1457,6 +1458,13 @@ func groupSliceArg(groupJIDs []string) any {
 }
 
 // groupJIDs — необязательный список групп (nil/пусто = все группы).
+// cashTxCondition — SQL-условие «этот текстовый платёж — реальная наличка», а
+// не повторение чека. Наличкой считаем, если в тексте есть: наличка/нал/кэш,
+// «офис» (сдал в офис) или «у ‹имя›» (напр. «Ахмед 10000 у Дени» — нал на руках
+// у Дени). Порядок слов не важен. Чистое «ФИО + сумма» без пометки — это дубль
+// чека (работник переписал чек текстом) и в СБОР НЕ идёт: сам чек уже посчитан.
+const cashTxCondition = `COALESCE(rm.body, '') ~* '(налич|\yнал\y|кэш|\ycash\y|\yофис|\yу\s+\S)'`
+
 func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
@@ -1466,6 +1474,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
+		  AND `+cashTxCondition+`
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
 		UNION ALL
@@ -1545,10 +1554,13 @@ type CardTotal struct {
 // карты = получатель, напечатанный на чеке (card_owner, а если нет — recipient_raw).
 // Не путать с клиентом рассрочки: сюда идёт именно владелец карты-получателя.
 func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []string) ([]CardTotal, error) {
+	// Берём построчно и агрегируем в Go по нормализованному имени владельца
+	// карты — чтобы варианты написания одного человека («Танзила Рахмановна С»
+	// и «Танзила Рахмановна С.») не разбивались на две карты и не недосчитывали.
 	rows, err := d.pool.Query(ctx, `
 		SELECT COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), 'не распознано') AS card,
 		       COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), '') AS bank,
-		       COUNT(*), COALESCE(SUM(br.amount), 0)
+		       br.amount::float8
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
@@ -1556,22 +1568,43 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 		  AND COALESCE(rm.deleted, false) = false
 		  AND br.amount > 0
 		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
-		GROUP BY 1, 2
-		ORDER BY 4 DESC
 	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	var out []CardTotal
+
+	byCard := map[string]*CardTotal{}
+	var order []string
 	for rows.Next() {
-		var c CardTotal
-		if err := rows.Scan(&c.CardOwner, &c.Bank, &c.Count, &c.Total); err != nil {
+		var card, bank string
+		var amount float64
+		if err := rows.Scan(&card, &bank, &amount); err != nil {
 			return nil, err
 		}
-		out = append(out, c)
+		key := nameKey(card)
+		c, ok := byCard[key]
+		if !ok {
+			c = &CardTotal{CardOwner: card, Bank: bank}
+			byCard[key] = c
+			order = append(order, key)
+		}
+		if c.Bank == "" && bank != "" {
+			c.Bank = bank
+		}
+		c.Count++
+		c.Total += amount
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	out := make([]CardTotal, 0, len(order))
+	for _, key := range order {
+		out = append(out, *byCard[key])
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Total > out[j].Total })
+	return out, nil
 }
 
 // SenderStats возвращает статистику по отправителям чеков за период [from, to):
@@ -1613,6 +1646,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			  AND t.ignored = false
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
+			  AND `+cashTxCondition+`
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
 		) s
 		WHERE ($4 = '' OR s.sender_name ILIKE '%' || $4 || '%' OR s.phone LIKE '%' || $4 || '%')
