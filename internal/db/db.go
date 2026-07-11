@@ -491,14 +491,20 @@ func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan t
 	return n, err
 }
 
-// FillReceiptByMessage заполняет чек ответом владельца: ФИО клиента и — если
-// сумма не была прочитана (amount <= 0) — сумму из ответа. Не перезатирает
-// уже прочитанную сумму. Возвращает итоговую сумму чека.
+// FillReceiptByMessage применяет ответ владельца на вопрос про чек:
+//   - если задано имя ($2 != '') — ставит клиента (recipient + contact);
+//   - если задана сумма ($4 > 0) — ставит/ИСПРАВЛЯЕТ сумму (в т.ч. поверх
+//     ошибочно прочитанной — для правки подозрительных сумм);
+//   - пустой ответ (только «да/верно») просто снимает флаги (подтверждение).
+//
+// Возвращает итоговую сумму чека.
 func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (bool, float64, error) {
 	var got float64
 	err := d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3,
-			amount = CASE WHEN amount <= 0 AND $4 > 0 THEN $4 ELSE amount END,
+		UPDATE bank_receipts SET
+			recipient_raw = CASE WHEN $2 = '' THEN recipient_raw ELSE $2 END,
+			contact_id    = CASE WHEN $2 = '' THEN contact_id    ELSE $3 END,
+			amount        = CASE WHEN $4 > 0  THEN $4            ELSE amount END,
 			needs_review = false, client_confirmed = true, clarify_asked = true
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -529,6 +535,25 @@ func (d *DB) CountUnconfirmed(ctx context.Context, groupJID string, olderThan ti
 		  AND br.created_at < $2
 	`, groupJID, olderThan).Scan(&n)
 	return n, err
+}
+
+// GroupAmountMedian — медианная сумма чеков группы за период (since..) и число
+// чеков, на которых она посчитана. Нужна, чтобы ловить подозрительно большие
+// суммы (напр. OCR/зрение приписали лишний ноль): 130 000 -> 1 300 000.
+func (d *DB) GroupAmountMedian(ctx context.Context, groupJID string, since time.Time) (float64, int, error) {
+	var median float64
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(percentile_cont(0.5) WITHIN GROUP (ORDER BY br.amount), 0)::float8, COUNT(*)
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		  AND br.created_at >= $2
+	`, groupJID, since).Scan(&median, &n)
+	return median, n, err
 }
 
 // MarkReceiptAsked помечает, что бот уже спросил про этот чек.
