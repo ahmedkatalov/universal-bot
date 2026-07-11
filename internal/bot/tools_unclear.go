@@ -151,6 +151,96 @@ func (b *Bot) sendUnclearFileTool(chat types.JID) ai.Tool {
 	}
 }
 
+// sendUnclearFilesTool — прислать в этот чат (обычно личку владельца) СРАЗУ ВСЕ
+// файлы непонятых чеков из группы: «скинь нераспознанные чеки из этой группы».
+func (b *Bot) sendUnclearFilesTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "send_unclear_files",
+		Description: "Присылает в этот чат ВСЕ файлы (фото/PDF) непонятых чеков из группы — тех, что бот не смог " +
+			"разобрать. Вызывай при 'скинь нераспознанные чеки из группы X', 'покажи все непонятые чеки', " +
+			"'пришли мне чеки, которые не понял'. Каждый файл подписан кодом (receipt:12) и тем, что не так — " +
+			"потом эти данные можно продиктовать через fix_receipt. group — по какой группе (пусто — по всем).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"group": map[string]any{"type": "string", "description": "Название группы (пусто — по всем)"},
+				"limit": map[string]any{"type": "integer", "description": "Сколько файлов прислать (по умолчанию 10, максимум 30)"},
+			},
+			"required": []string{},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Group string `json:"group"`
+				Limit int    `json:"limit"`
+			}
+			_ = json.Unmarshal(input, &args)
+			if args.Limit <= 0 || args.Limit > 30 {
+				args.Limit = 10
+			}
+			groupJID := ""
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID = jid.String()
+			}
+			items, err := b.db.UnclearItems(ctx, groupJID, args.Limit)
+			if err != nil {
+				return "", fmt.Errorf("ошибка выборки: %w", err)
+			}
+			groups := b.joinedGroups(ctx)
+			sent, noFile := 0, 0
+			for _, it := range items {
+				if strings.TrimSpace(it.MediaPath) == "" {
+					continue // без файла (например, текстовое сообщение) — тут не шлём
+				}
+				data, err := os.ReadFile(it.MediaPath)
+				if err != nil {
+					noFile++
+					continue
+				}
+				code := fmt.Sprintf("%s:%d", it.Kind, it.ID)
+				caption := code + " — " + unclearReason(it)
+				if jid, err := types.ParseJID(it.GroupJID); err == nil {
+					if name, ok := groups[jid]; ok {
+						caption += " (группа " + name + ")"
+					}
+				}
+				if strings.HasSuffix(strings.ToLower(it.MediaPath), ".pdf") {
+					b.sendDocumentBytes(chat, data, code+".pdf", "application/pdf")
+					b.sendText(chat, caption)
+				} else {
+					b.sendImageWithCaption(chat, data, caption)
+				}
+				sent++
+			}
+			if sent == 0 {
+				if noFile > 0 {
+					return "Непонятые чеки есть, но их файлы на диске недоступны.", nil
+				}
+				return "Непонятых чеков с файлами не нашла — всё разобрано.", nil
+			}
+			return fmt.Sprintf("Отправил %d файл(ов) непонятых чеков. Под каждым — код (напр. receipt:12) и что не так. "+
+				"Скажи, что на нужном чеке (например 'на receipt:12 Ахмед Каталов 15000'), и я запишу через fix_receipt.", sent), nil
+		},
+	}
+}
+
+// unclearReason — короткое описание, что именно бот не разобрал.
+func unclearReason(it db.UnclearItem) string {
+	switch {
+	case it.Kind == "message":
+		return "фото/файл без распознанной операции"
+	case it.Amount == 0 && it.RecipientRaw == "":
+		return "не распознались ни сумма, ни получатель"
+	case it.Amount == 0:
+		return fmt.Sprintf("получатель %q, сумма не распозналась", it.RecipientRaw)
+	default:
+		return fmt.Sprintf("получатель %q — незнакомое имя, %.0f ₽", it.RecipientRaw, it.Amount)
+	}
+}
+
 // sendClientReceiptTool — прислать сохранённый файл чека конкретного клиента
 // ("скинь чек Миланы", "покажи чеки Ахмеда за июнь").
 func (b *Bot) sendClientReceiptTool(chat types.JID) ai.Tool {

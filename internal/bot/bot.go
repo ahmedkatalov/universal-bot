@@ -746,6 +746,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.forwardingTool(),
 		b.unclearTool(),
 		b.sendUnclearFileTool(chat),
+		b.sendUnclearFilesTool(chat),
 		b.sendClientReceiptTool(chat),
 		b.receiptDetailsTool(),
 		b.fixReceiptTool(),
@@ -1268,8 +1269,10 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"Текущие активные правила пересылки смотри в блоке контекста.\n" +
 		"9. list_unclear_receipts — список чеков/фото, которые бот не смог уверенно разобрать. " +
 		"'Какие чеки ты не понял?', 'что не распозналось?'.\n" +
-		"10. send_unclear_file — прислать файл непонятого чека в чат ('скинь мне тот чек, который не понял'), " +
-		"чтобы владелец сам посмотрел и продиктовал данные.\n" +
+		"10. send_unclear_file — прислать ОДИН файл непонятого чека по коду ('скинь тот чек receipt:12').\n" +
+		"10a. send_unclear_files — прислать в личку СРАЗУ ВСЕ файлы непонятых чеков из группы " +
+		"('скинь нераспознанные чеки из этой группы', 'пришли мне все непонятые чеки'). Под каждым — код и что не так; " +
+		"дальше владелец диктует, и ты пишешь через fix_receipt.\n" +
 		"10b. send_client_receipt — прислать сохранённый файл чека КОНКРЕТНОГО клиента ('скинь чек Миланы', " +
 		"'покажи чеки Ахмеда за июнь'). Не путать с send_unclear_file (тот — только про непонятые).\n" +
 		"10c. receipt_details — показать ВСЕ данные чека клиента (получатель и его банк/телефон, отправитель и его " +
@@ -2718,23 +2721,29 @@ func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) int 
 
 // sendImageBytes отправляет фото (например, пересланный чек) в чат.
 func (b *Bot) sendImageBytes(chat types.JID, data []byte) {
+	b.sendImageWithCaption(chat, data, "")
+}
+
+// sendImageWithCaption отправляет фото с подписью (пусто = без подписи).
+func (b *Bot) sendImageWithCaption(chat types.JID, data []byte, caption string) {
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaImage)
 	if err != nil {
 		fmt.Println("Ошибка загрузки фото в WhatsApp:", err)
 		return
 	}
-	msg := &waProto.Message{
-		ImageMessage: &waProto.ImageMessage{
-			URL:           proto.String(uploaded.URL),
-			Mimetype:      proto.String("image/jpeg"),
-			FileLength:    proto.Uint64(uploaded.FileLength),
-			FileSHA256:    uploaded.FileSHA256,
-			FileEncSHA256: uploaded.FileEncSHA256,
-			MediaKey:      uploaded.MediaKey,
-			DirectPath:    proto.String(uploaded.DirectPath),
-		},
+	img := &waProto.ImageMessage{
+		URL:           proto.String(uploaded.URL),
+		Mimetype:      proto.String("image/jpeg"),
+		FileLength:    proto.Uint64(uploaded.FileLength),
+		FileSHA256:    uploaded.FileSHA256,
+		FileEncSHA256: uploaded.FileEncSHA256,
+		MediaKey:      uploaded.MediaKey,
+		DirectPath:    proto.String(uploaded.DirectPath),
 	}
-	resp, err := b.client.SendMessage(context.Background(), chat, msg)
+	if caption != "" {
+		img.Caption = proto.String(caption)
+	}
+	resp, err := b.client.SendMessage(context.Background(), chat, &waProto.Message{ImageMessage: img})
 	if err != nil {
 		fmt.Println("Ошибка отправки фото:", err)
 		return
