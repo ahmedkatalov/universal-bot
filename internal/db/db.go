@@ -1510,6 +1510,24 @@ func groupSliceArg(groupJIDs []string) any {
 }
 
 // groupJIDs — необязательный список групп (nil/пусто = все группы).
+// countableTextCondition — какой ТЕКСТОВЫЙ платёж считать в сбор. Считаем, если
+// это наличка (is_cash) ИЛИ у него НЕТ парного распознанного чека (тот же
+// контакт + та же сумма + та же группа за период). То есть каждый платёж
+// считается ОДИН раз: если работник и чек прислал, и переписал текстом — берём
+// чек, а текст-дубль отбрасываем; но если чек не распознался, платёж не
+// теряется — учитывается текст. Это чинит и задвоение, и недосчёт.
+const countableTextCondition = `(
+		t.is_cash = true
+		OR NOT EXISTS (
+			SELECT 1 FROM bank_receipts brd
+			WHERE brd.contact_id = t.contact_id
+			  AND brd.amount = t.amount
+			  AND brd.is_duplicate = false AND brd.ignored = false
+			  AND brd.tx_date >= $1 AND brd.tx_date < $2
+			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+		)
+	)`
+
 func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
@@ -1518,7 +1536,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false
-		  AND t.is_cash = true
+		  AND `+countableTextCondition+`
 		  AND COALESCE(rm.deleted, false) = false
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
@@ -1689,7 +1707,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 			WHERE t.tx_date >= $1 AND t.tx_date < $2
 			  AND t.ignored = false
-			  AND t.is_cash = true
+			  AND `+countableTextCondition+`
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
