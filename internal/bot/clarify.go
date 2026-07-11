@@ -16,6 +16,9 @@ import (
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	"google.golang.org/protobuf/proto"
+
+	"whatsapp-bot/internal/db"
+	"whatsapp-bot/internal/parser"
 )
 
 const (
@@ -64,35 +67,52 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 		if !b.isAllowedGroup(jid) {
 			continue
 		}
-		// Массовый импорт (много чеков без имени) — не спрашиваем по каждому.
-		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); err != nil || n == 0 || n > clarifyMaxAsk {
-			continue
-		}
-		items, err := b.db.UnconfirmedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
-		if err != nil {
-			continue
-		}
-		for _, it := range items {
-			owner := it.CardOwner
-			if owner == "" {
-				owner = "не распознан"
-			}
-			text := fmt.Sprintf("🤔 Чей это чек? Получатель на чеке: %s, сумма %.0f ₽, %s. "+
-				"Ответьте на это сообщение именем клиента (кому засчитать).", owner, it.Amount, it.TxDate.Format("02.01 15:04"))
-			// Отправляем ЦИТАТОЙ на сам чек — чтобы в чате было видно, о каком.
-			botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
-			_ = b.db.MarkReceiptAsked(ctx, it.ID)
-			if botMsgID != "" && it.WaMessageID != "" {
-				b.clarify.mu.Lock()
-				b.clarify.askMap[botMsgID] = it.WaMessageID
-				// не даём карте расти бесконечно
-				if len(b.clarify.askMap) > 500 {
-					b.clarify.askMap = map[string]string{botMsgID: it.WaMessageID}
+		// 1. Чеки без имени клиента — «чей это чек?».
+		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+			items, err := b.db.UnconfirmedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
+			if err == nil {
+				for _, it := range items {
+					owner := it.CardOwner
+					if owner == "" {
+						owner = "не распознан"
+					}
+					text := fmt.Sprintf("🤔 Чей это чек? Получатель на чеке: %s, сумма %.0f ₽, %s. "+
+						"Ответьте на это сообщение именем клиента (кому засчитать).", owner, it.Amount, it.TxDate.Format("02.01 15:04"))
+					b.askClarify(ctx, jid, text, it)
+					asked++
 				}
-				b.clarify.mu.Unlock()
 			}
-			asked++
 		}
+		if asked >= clarifyPerCycle {
+			break
+		}
+		// 2. Чеки, у которых не прочиталась сумма — «не смог разобрать, что на чеке?».
+		if n, err := b.db.CountUnrecognized(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+			items, err := b.db.UnrecognizedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
+			if err == nil {
+				for _, it := range items {
+					text := "🤔 Не смог разобрать этот чек (не прочитал сумму). Ответьте на это сообщение " +
+						"суммой и ФИО клиента — например: «Ахмед Каталов 15000»."
+					b.askClarify(ctx, jid, text, it)
+					asked++
+				}
+			}
+		}
+	}
+}
+
+// askClarify отправляет вопрос цитатой на сам чек и запоминает связь
+// «id вопроса -> id сообщения чека», чтобы привязать ответ владельца.
+func (b *Bot) askClarify(ctx context.Context, jid types.JID, text string, it db.ClarifyReceipt) {
+	botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
+	_ = b.db.MarkReceiptAsked(ctx, it.ID)
+	if botMsgID != "" && it.WaMessageID != "" {
+		b.clarify.mu.Lock()
+		b.clarify.askMap[botMsgID] = it.WaMessageID
+		if len(b.clarify.askMap) > 500 {
+			b.clarify.askMap = map[string]string{botMsgID: it.WaMessageID}
+		}
+		b.clarify.mu.Unlock()
 	}
 }
 
@@ -113,6 +133,9 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		return false
 	}
 
+	// Ответ может содержать И сумму (для чеков с непрочитанной суммой),
+	// и ФИО: «Ахмед Каталов 15000». Имя — без цифр, сумма — отдельно.
+	replyAmount := parser.ExtractAmount(text)
 	name, ok := looksLikeName(text)
 	if !ok {
 		name = strings.TrimSpace(text) // владелец мог ответить свободно — берём как есть
@@ -125,7 +148,7 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 		contactIDPtr = &cid
 	}
-	found, amount, err := b.db.ConfirmReceiptClientByMessage(ctx, receiptWaID, canonical, contactIDPtr)
+	found, amount, err := b.db.FillReceiptByMessage(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
 	if err != nil || !found {
 		return false
 	}

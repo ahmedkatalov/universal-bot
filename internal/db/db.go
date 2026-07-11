@@ -443,6 +443,78 @@ func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan
 	return out, rows.Err()
 }
 
+// UnrecognizedReceipts — чеки, у которых бот НЕ смог прочитать сумму
+// (amount <= 0), по которым ещё не спрашивал. Это фото/PDF, где ни OCR, ни ИИ,
+// ни зрение не вытащили сумму — бот спросит в группе, что на чеке.
+func (d *DB) UnrecognizedReceipts(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]ClarifyReceipt, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''),
+		       COALESCE(br.card_owner, br.recipient_raw, ''), br.amount::float8, br.tx_date
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND br.clarify_asked = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount <= 0
+		  AND br.created_at < $2
+		ORDER BY br.created_at
+		LIMIT $3
+	`, groupJID, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ClarifyReceipt
+	for rows.Next() {
+		var c ClarifyReceipt
+		if err := rows.Scan(&c.ID, &c.WaMessageID, &c.SenderJID, &c.CardOwner, &c.Amount, &c.TxDate); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// CountUnrecognized — сколько чеков с непрочитанной суммой в группе старше olderThan.
+func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan time.Time) (int, error) {
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND br.clarify_asked = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND br.amount <= 0
+		  AND br.created_at < $2
+	`, groupJID, olderThan).Scan(&n)
+	return n, err
+}
+
+// FillReceiptByMessage заполняет чек ответом владельца: ФИО клиента и — если
+// сумма не была прочитана (amount <= 0) — сумму из ответа. Не перезатирает
+// уже прочитанную сумму. Возвращает итоговую сумму чека.
+func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (bool, float64, error) {
+	var got float64
+	err := d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3,
+			amount = CASE WHEN amount <= 0 AND $4 > 0 THEN $4 ELSE amount END,
+			needs_review = false, client_confirmed = true, clarify_asked = true
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
+		)
+		RETURNING amount::float8
+	`, waMessageID, name, contactID, amount).Scan(&got)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, nil
+	}
+	if err != nil {
+		return false, 0, err
+	}
+	return true, got, nil
+}
+
 // CountUnconfirmed — сколько чеков без подтверждённого клиента в группе старше
 // olderThan (чтобы отличить "запуталась в паре" от массового импорта).
 func (d *DB) CountUnconfirmed(ctx context.Context, groupJID string, olderThan time.Time) (int, error) {
@@ -465,27 +537,6 @@ func (d *DB) MarkReceiptAsked(ctx context.Context, receiptID int) error {
 	return err
 }
 
-// ConfirmReceiptClientByMessage привязывает клиента к чеку (по id сообщения
-// чека) — когда владелец ответил на вопрос бота. Возвращает сумму.
-func (d *DB) ConfirmReceiptClientByMessage(ctx context.Context, waMessageID, name string, contactID *int) (bool, float64, error) {
-	var amount float64
-	err := d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false,
-			client_confirmed = true, clarify_asked = true
-		WHERE id = (
-			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
-			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
-		)
-		RETURNING amount::float8
-	`, waMessageID, name, contactID).Scan(&amount)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, nil
-	}
-	if err != nil {
-		return false, 0, err
-	}
-	return true, amount, nil
-}
 
 // DuplicateWindow — окно вокруг времени операции, в котором совпадение
 // получателя и суммы считается вероятным повтором одного и того же чека
