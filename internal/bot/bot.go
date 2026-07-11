@@ -82,14 +82,23 @@ type Bot struct {
 	pendingNameMu sync.Mutex
 	pendingNames  map[string][]pendingName
 
+	// Фото пачки наличных денег = пометка "это наличка" для соседнего платежа
+	// «ФИО+сумма». Фото может прийти ДО или ПОСЛЕ текста, поэтому запоминаем
+	// недавнее фото-нала по отправителю (ключ groupJID|senderJID -> время).
+	pendingCashMu sync.Mutex
+	pendingCash   map[string]time.Time
+
 	// Проактивные вопросы "чей это чек" и привязка ответов к чекам.
 	clarify *clarifyState
 }
 
-// pendingName — ФИО, написанное отправителем, пока без чека.
+// pendingName — ФИО, написанное отправителем, пока без чека. amount — сумма,
+// если она была в том же сообщении («Шошуков Руслан 22т»): нужна, чтобы при
+// приходе фото наличных записать наличку на эту сумму.
 type pendingName struct {
-	name string
-	at   time.Time
+	name   string
+	amount float64
+	at     time.Time
 }
 
 // pendingReceipt — распознанный чек из лички, ожидающий команды "запомнить".
@@ -175,6 +184,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		pending:       make(map[string][]pendingReceipt),
 		sentMsgs:      make(map[string][]string),
 		pendingNames:  make(map[string][]pendingName),
+		pendingCash:   make(map[string]time.Time),
 		clarify:       newClarifyState(),
 	}
 
@@ -474,8 +484,8 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			mb, me, chatJID, ts := mediaBytes, mediaExt, msg.Info.Chat, msg.Info.Timestamp
 			sender := msg.Info.Sender.String()
 			waMsgID := msg.Info.ID
-			payer := b.resolveReceiptPayer(ctx, msg, caption)
-			go b.handleBankReceipt(context.Background(), chatJID, sender, waMsgID, "", rawID, ts, mb, me, payer)
+			payer, payerAmount := b.resolveReceiptPayer(ctx, msg, caption)
+			go b.handleBankReceipt(context.Background(), chatJID, sender, waMsgID, "", rawID, ts, mb, me, payer, payerAmount)
 			return
 		}
 		fmt.Printf("Фото без распознанного текста (сообщение %d), нужна ручная проверка: %s\n", rawID, mediaPath)
@@ -493,8 +503,8 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// подпись к фото, текст ответом (свайп) или отдельное сообщение
 		// с именем прямо перед чеком. Это важнее, чем получатель на самом
 		// чеке (там может быть владелец карты, а не клиент).
-		payer := b.resolveReceiptPayer(ctx, msg, caption)
-		b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), msg.Info.ID, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer)
+		payer, payerAmount := b.resolveReceiptPayer(ctx, msg, caption)
+		b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), msg.Info.ID, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer, payerAmount)
 		return
 	}
 
@@ -507,11 +517,14 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Сообщение-имя (ФИО без чека): по порядку сообщений привязываем к чеку
 	// (до или после), либо ставим в очередь для будущего чека. Если это имя —
 	// в учёт как платёж оно не идёт.
-	if b.handleNameMessage(ctx, msg, text) {
+	if b.handleNameMessage(ctx, msg, text, rawID) {
 		return
 	}
 
 	result := parser.ParseMessage(text)
+	// Наличка: либо помечено словом в тексте, либо рядом пришло фото пачки
+	// денег от того же отправителя (пометка снимается один раз на сообщение).
+	isCashMsg := parser.IsCash(text) || (len(result.Transactions) > 0 && b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String()))
 	for _, tr := range result.Transactions {
 		canonical := b.aliases.Resolve(tr.RawName)
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
@@ -525,6 +538,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			Amount:       tr.Amount,
 			Note:         tr.Note,
 			CardTo:       tr.CardTo,
+			IsCash:       isCashMsg,
 			RawMessageID: rawID,
 			TxDate:       msg.Info.Timestamp,
 		})
@@ -1204,7 +1218,8 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"ВАЖНОЕ ПРАВИЛО СБОРА (наличка vs дубль чека). В сбор входят: (1) распознанные банковские чеки и " +
 		"(2) НАЛИЧКА. Наличка — это текстовая запись, где ЯВНО помечено, что деньги наличные: есть слово " +
 		"'наличка'/'нал'/'кэш', либо 'офис' (сдал в офис), либо 'у ‹имя›' (например 'Ахмед Каталов 10000 у Дени' — " +
-		"значит наличка на руках у Дени). Порядок слов не важен. А ЧИСТОЕ 'ФИО + сумма' БЕЗ таких пометок — это НЕ " +
+		"значит наличка на руках у Дени), либо рядом прислали ФОТО ПАЧКИ ДЕНЕГ (фото наличных = пометка 'это нал' для " +
+		"соседнего платежа ФИО+сумма). Порядок слов не важен. А ЧИСТОЕ 'ФИО + сумма' БЕЗ таких пометок — это НЕ " +
 		"отдельный платёж, а повторение чека: работник переписал текстом сумму с чека клиента. Поэтому такие записи " +
 		"в сбор НЕ идут (сам чек уже посчитан) — бот их намеренно не считает. Если владелец удивляется, что сумма " +
 		"стала меньше, чем раньше — объясни, что раньше эти текстовые дубли чеков ошибочно удваивали сумму, а теперь " +
@@ -2351,7 +2366,7 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 				fmt.Println("Ошибка сохранения пересланного чека:", err)
 				continue
 			}
-			b.handleBankReceipt(ctx, targetJID, "", "", text, rawID, ts, media, ext, "")
+			b.handleBankReceipt(ctx, targetJID, "", "", text, rawID, ts, media, ext, "", 0)
 		}
 	}
 }
@@ -2368,17 +2383,95 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 // senderJID — кто прислал чек (для сверки с программой). payerOverride —
 // ФИО клиента, написанное рядом с чеком; если задано, платёж относится
 // именно к нему (а не к получателю на чеке — там часто владелец карты).
-func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, waMsgID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt, payerOverride string) {
+
+const cashLinkWindow = 10 * time.Minute
+
+// markPendingCash запоминает, что отправитель только что прислал фото наличных —
+// чтобы пометить наличкой его следующий текстовый платёж (фото пришло раньше текста).
+func (b *Bot) markPendingCash(chat types.JID, senderJID string) {
+	key := chat.String() + "|" + senderJID
+	b.pendingCashMu.Lock()
+	b.pendingCash[key] = time.Now()
+	b.pendingCashMu.Unlock()
+}
+
+// consumePendingCash сообщает, есть ли свежая пометка фото-нала от отправителя,
+// и снимает её (используется при вставке текстового платежа).
+func (b *Bot) consumePendingCash(chat types.JID, senderJID string) bool {
+	key := chat.String() + "|" + senderJID
+	b.pendingCashMu.Lock()
+	defer b.pendingCashMu.Unlock()
+	at, ok := b.pendingCash[key]
+	if !ok {
+		return false
+	}
+	delete(b.pendingCash, key)
+	return time.Since(at) <= cashLinkWindow
+}
+
+// handleCashPhoto обрабатывает фото пачки наличных: это НАЛИЧКА. Помечаем
+// наличкой ближайший текстовый платёж этого отправителя; если платёж ещё не
+// пришёл — ставим пометку, чтобы засчитать его при поступлении. Если сумма видна
+// на фото и известно ФИО (подпись/очередь) — записываем наличку сразу.
+func (b *Bot) handleCashPhoto(ctx context.Context, chat types.JID, senderJID, payer string, amount float64, receivedAt time.Time, rawID int) {
+	since := receivedAt.Add(-cashLinkWindow)
+	// 1. Рядом уже есть распознанный текстовый платёж этого отправителя — помечаем его наличкой.
+	if marked, err := b.db.MarkLatestPaymentCash(ctx, chat.String(), senderJID, since); err != nil {
+		fmt.Println("Фото налички: не удалось пометить платёж наличкой:", err)
+	} else if marked > 0 {
+		fmt.Printf("Фото налички (сообщение %d): ближайший платёж на %.0f ₽ засчитан как наличка\n", rawID, marked)
+		return
+	}
+	// 2. Рядом было «ФИО+сумма», которое ушло в очередь имён (не как платёж) — запишем наличку по нему.
+	if name, amt, ok := b.consumePendingNameCash(chat, senderJID); ok {
+		b.recordCashPayment(ctx, chat, name, amt, rawID, receivedAt)
+		return
+	}
+	// 3. Сумма видна на самом фото и знаем ФИО (подпись/очередь) — пишем наличку.
+	if amount > 0 && payer != "" {
+		b.recordCashPayment(ctx, chat, payer, amount, rawID, receivedAt)
+		return
+	}
+	// 4. Платёж ещё не пришёл — запомним пометку, засчитаем при поступлении.
+	b.markPendingCash(chat, senderJID)
+	fmt.Printf("Фото налички (сообщение %d): жду соседний платёж, чтобы засчитать как наличку\n", rawID)
+}
+
+// recordCashPayment записывает наличный платёж (ФИО + сумма) в учёт.
+func (b *Bot) recordCashPayment(ctx context.Context, chat types.JID, payer string, amount float64, rawID int, txDate time.Time) {
+	canonical := b.aliases.Resolve(payer)
+	contactID, err := b.db.GetOrCreateContact(ctx, canonical)
+	if err != nil {
+		fmt.Println("Наличка: ошибка контакта:", err)
+		return
+	}
+	if err := b.db.InsertTransaction(ctx, db.TransactionInput{
+		ContactID: contactID, RawName: payer, Amount: amount,
+		CardTo: "наличные", IsCash: true, RawMessageID: rawID, TxDate: txDate,
+	}); err != nil {
+		fmt.Println("Наличка: ошибка сохранения:", err)
+		return
+	}
+	fmt.Printf("Наличка записана (сообщение %d): %s на %.0f ₽\n", rawID, canonical, amount)
+}
+
+func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, waMsgID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt, payerOverride string, payerAmount float64) {
 	rd := parser.ParseReceipt(text)
 
 	// RECEIPT_VISION_FIRST=1 — читать чек-фото сразу глазами Claude (макс.
 	// точность на «неразборчивых» фото, дороже по токенам). Для PDF не нужно —
 	// там надёжный текстовый слой.
+	cashPhoto := false
+	cashAmount := 0.0
 	visionFirst := receiptVisionFirst() && media != nil && mediaExt != ".pdf" && b.assistant != nil
 	if visionFirst {
 		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
-			applyAIReceiptAuthoritative(&rd, rec)
-			fmt.Printf("Чек (сообщение %d): прочитан Claude с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
+			if rec.Kind == "cash" {
+				cashPhoto, cashAmount = true, rec.Amount
+			} else {
+				applyAIReceiptAuthoritative(&rd, rec)
+				fmt.Printf("Чек (сообщение %d): прочитан Claude с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
+			}
 		}
 	}
 
@@ -2398,8 +2491,24 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
 	if !visionFirst && weakOCR && media != nil {
 		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
-			mergeAIReceipt(&rd, rec)
+			if rec.Kind == "cash" {
+				cashPhoto, cashAmount = true, rec.Amount
+			} else {
+				mergeAIReceipt(&rd, rec)
+			}
 		}
+	}
+
+	// Фото пачки наличных — это НАЛИЧКА, а не чек. Засчитываем как наличку
+	// (помечаем соседний текстовый платёж или пишем сразу) и выходим. Сумму
+	// берём с фото, если видна, иначе — из подписи/имени рядом (payerAmount).
+	if cashPhoto {
+		amt := cashAmount
+		if amt == 0 {
+			amt = payerAmount
+		}
+		b.handleCashPhoto(ctx, chat, senderJID, payerOverride, amt, receivedAt, rawID)
+		return
 	}
 
 	// ФИО, написанное рядом с чеком, важнее получателя на чеке — платёж

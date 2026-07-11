@@ -244,6 +244,36 @@ func extractNote(lower string) string {
 	return ""
 }
 
+// reCash — пометки, что платёж НАЛИЧНЫЙ: слова наличка/нал/кэш, «офис» (сдал в
+// офис) или «у ‹имя›» (нал на руках у кого-то). \p{L}-границы корректно
+// работают с кириллицей (в отличие от \b/\W в RE2). Используется, чтобы решить,
+// считать ли текстовый платёж в сбор (чистое «ФИО+сумма» без пометки — дубль чека).
+var reCash = regexp.MustCompile(`(?i)(налич|кэш|(^|[^\p{L}])нал([^\p{L}]|$)|(^|[^\p{L}])cash([^\p{L}]|$)|(^|[^\p{L}])офис|(^|[^\p{L}])у\s+\p{L})`)
+
+// IsCash сообщает, помечен ли текст как наличная оплата.
+func IsCash(text string) bool {
+	return reCash.MatchString(text)
+}
+
+// reShorthand — сокращённая сумма: «22т», «5к», «25 тыщ», «3 млн», «полляма».
+var reShorthand = regexp.MustCompile(`(?i)(\d[\d\s.,]*)\s*(кк|к|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:[^\p{L}]|$)`)
+
+// ExtractAmount вытаскивает денежную сумму из строки, понимая сокращения
+// («22т»=22000, «5к»=5000, «3 млн»=3000000). Если сокращения нет — обычный
+// разбор числа. 0, если суммы не нашлось.
+func ExtractAmount(text string) float64 {
+	if m := reShorthand.FindStringSubmatch(text); m != nil {
+		base := ParseMoneyValue(m[1])
+		switch mult := strings.ToLower(m[2]); {
+		case mult == "кк" || strings.HasPrefix(mult, "млн") || strings.HasPrefix(mult, "лям"):
+			return base * 1_000_000
+		default: // к, т, тыс, тыщ, косарь
+			return base * 1000
+		}
+	}
+	return ParseMoneyValue(text)
+}
+
 func extractCard(lower string) string {
 	if m := cardRe.FindString(lower); m != "" {
 		return strings.ToLower(m)

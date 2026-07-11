@@ -26,3 +26,26 @@ func TestLooksLikeName(t *testing.T) {
 		}
 	}
 }
+
+// TestLooksLikeNameCash — «ФИО + сумма + эмодзи + служебные слова» очищается
+// до чистого ФИО (важно для налички: «Шошуков Руслан 22т ✅ За 2 месяца»).
+func TestLooksLikeNameCash(t *testing.T) {
+	cases := map[string]string{
+		"Шошуков Руслан 22т ✅ За 2 месяца": "Шошуков Руслан",
+		"Магомедов Иса ✅":                  "Магомедов Иса", // эмодзи отброшена
+		"Иса ✅":                            "",              // одно имя-слово — не ФИО
+		"бакиев ахмед":                     "бакиев ахмед",
+	}
+	for in, want := range cases {
+		got, ok := looksLikeName(in)
+		if want == "" {
+			if ok {
+				t.Errorf("looksLikeName(%q) = (%q,true), ожидали false", in, got)
+			}
+			continue
+		}
+		if !ok || got != want {
+			t.Errorf("looksLikeName(%q) = (%q,%v), ожидали (%q,true)", in, got, ok, want)
+		}
+	}
+}

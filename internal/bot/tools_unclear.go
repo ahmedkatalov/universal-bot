@@ -28,6 +28,7 @@ func dbTransactionFromParsed(tr parser.Transaction, contactID, rawID int, ts tim
 		Amount:       tr.Amount,
 		Note:         tr.Note,
 		CardTo:       tr.CardTo,
+		IsCash:       parser.IsCash(tr.RawName + " " + tr.Note + " " + tr.CardTo),
 		RawMessageID: rawID,
 		TxDate:       ts,
 	}

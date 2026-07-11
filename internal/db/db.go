@@ -179,6 +179,26 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание таблицы phone_owners: %w", err)
 	}
 
+	// Наличные платежи: помечаем текстовые транзакции, которые реально наличка
+	// (а не переписанный текстом чек), чтобы отчёты считали их в сбор. Флаг
+	// проставляется при вставке; для уже накопленных данных — разовый backfill
+	// по тексту сообщения (наличка/нал/кэш/офис/«у ‹имя›») и по card_to.
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_cash BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.is_cash: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE transactions t SET is_cash = true
+		FROM raw_messages rm
+		WHERE rm.id = t.raw_message_id
+		  AND t.is_cash = false
+		  AND (
+		    COALESCE(rm.body, '') ~* '(налич|\yнал\y|кэш|\ycash\y|\yофис|\yу\s+\S)'
+		    OR COALESCE(t.card_to, '') ~* 'налич'
+		  )
+	`); err != nil {
+		return fmt.Errorf("backfill transactions.is_cash: %w", err)
+	}
+
 	// История диалога ассистента: раньше жила только в памяти и стиралась при
 	// каждом рестарте контейнера — бот «забывал» разговор. Теперь пишем в БД,
 	// поэтому память переживает перезапуски. Ключ chat_key — JID отправителя
@@ -287,16 +307,48 @@ type TransactionInput struct {
 	Amount       float64
 	Note         string
 	CardTo       string
+	IsCash       bool // платёж помечен как наличка (иначе — дубль чека, в сбор не идёт)
 	RawMessageID int
 	TxDate       time.Time
 }
 
 func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
 	_, err := d.pool.Exec(ctx, `
-		INSERT INTO transactions (contact_id, raw_name, amount, note, card_to, raw_message_id, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7)
-	`, tx.ContactID, tx.RawName, tx.Amount, nullIfEmpty(tx.Note), nullIfEmpty(tx.CardTo), tx.RawMessageID, tx.TxDate)
+		INSERT INTO transactions (contact_id, raw_name, amount, note, card_to, is_cash, raw_message_id, tx_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+	`, tx.ContactID, tx.RawName, tx.Amount, nullIfEmpty(tx.Note), nullIfEmpty(tx.CardTo), tx.IsCash, tx.RawMessageID, tx.TxDate)
 	return err
+}
+
+// MarkLatestPaymentCash помечает наличкой самый свежий текстовый платёж от
+// данного отправителя в данном чате (с момента since). Нужно, когда наличка
+// подтверждается ОТДЕЛЬНЫМ сообщением — фото пачки денег: «ФИО+сумма» пришло
+// текстом, а рядом сообщением-фоткой денег помечено, что это нал. Возвращает
+// сумму помеченного платежа (0, если подходящего платежа нет).
+func (d *DB) MarkLatestPaymentCash(ctx context.Context, groupJID, senderJID string, since time.Time) (float64, error) {
+	var amount float64
+	err := d.pool.QueryRow(ctx, `
+		UPDATE transactions t SET is_cash = true
+		FROM raw_messages rm
+		WHERE rm.id = t.raw_message_id
+		  AND rm.sender_jid = $1
+		  AND rm.wa_group_jid = $2
+		  AND t.is_cash = false
+		  AND t.ignored = false
+		  AND rm.received_at >= $3
+		  AND t.id = (
+			SELECT t2.id FROM transactions t2
+			JOIN raw_messages rm2 ON rm2.id = t2.raw_message_id
+			WHERE rm2.sender_jid = $1 AND rm2.wa_group_jid = $2
+			  AND t2.is_cash = false AND t2.ignored = false AND rm2.received_at >= $3
+			ORDER BY rm2.received_at DESC LIMIT 1
+		  )
+		RETURNING t.amount
+	`, senderJID, groupJID, since).Scan(&amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, nil
+	}
+	return amount, err
 }
 
 func nullIfEmpty(s string) interface{} {
@@ -1458,13 +1510,6 @@ func groupSliceArg(groupJIDs []string) any {
 }
 
 // groupJIDs — необязательный список групп (nil/пусто = все группы).
-// cashTxCondition — SQL-условие «этот текстовый платёж — реальная наличка», а
-// не повторение чека. Наличкой считаем, если в тексте есть: наличка/нал/кэш,
-// «офис» (сдал в офис) или «у ‹имя›» (напр. «Ахмед 10000 у Дени» — нал на руках
-// у Дени). Порядок слов не важен. Чистое «ФИО + сумма» без пометки — это дубль
-// чека (работник переписал чек текстом) и в СБОР НЕ идёт: сам чек уже посчитан.
-const cashTxCondition = `COALESCE(rm.body, '') ~* '(налич|\yнал\y|кэш|\ycash\y|\yофис|\yу\s+\S)'`
-
 func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
@@ -1473,8 +1518,8 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false
+		  AND t.is_cash = true
 		  AND COALESCE(rm.deleted, false) = false
-		  AND `+cashTxCondition+`
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
 		UNION ALL
@@ -1644,9 +1689,9 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 			WHERE t.tx_date >= $1 AND t.tx_date < $2
 			  AND t.ignored = false
+			  AND t.is_cash = true
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
-			  AND `+cashTxCondition+`
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
 		) s
 		WHERE ($4 = '' OR s.sender_name ILIKE '%' || $4 || '%' OR s.phone LIKE '%' || $4 || '%')

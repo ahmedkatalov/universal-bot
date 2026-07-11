@@ -126,6 +126,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			Amount:       p.Amount,
 			Note:         p.Note,
 			CardTo:       p.Card,
+			IsCash:       parser.IsCash(strings.Join(lines, " ") + " " + p.Note + " " + p.Card),
 			RawMessageID: rawID,
 			TxDate:       txDate,
 		})
@@ -141,11 +142,12 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 }
 
 type aiReceipt struct {
+	Kind           string  `json:"kind"`            // "receipt" (чек), "cash" (фото наличных), "other" (не чек)
 	Bank           string  `json:"bank"`            // банк чека (сторона получателя)
 	Recipient      string  `json:"recipient"`       // ФИО получателя
 	RecipientBank  string  `json:"recipient_bank"`  // банк получателя, если указан отдельно
 	RecipientPhone string  `json:"recipient_phone"` // телефон получателя
-	Sender         string  `json:"sender"`          // ФИО отправителя (плательщик)
+	Sender         string  `json:"sender"`          // ФИО отправителя (плательщик, напечатан на чеке)
 	SenderBank     string  `json:"sender_bank"`     // банк отправителя
 	SenderAccount  string  `json:"sender_account"`  // счёт/карта отправителя
 	Amount         float64 `json:"amount"`
@@ -157,11 +159,13 @@ type aiReceipt struct {
 }
 
 // receiptSchemaJSON — форма JSON для ИИ-разбора чека (полный набор полей).
-const receiptSchemaJSON = `{"bank":"","recipient":"","recipient_bank":"","recipient_phone":"","sender":"","sender_bank":"","sender_account":"","amount":0,"commission":0,"doc_number":"","auth_code":"","status":"","datetime":""}`
+const receiptSchemaJSON = `{"kind":"receipt","bank":"","recipient":"","recipient_bank":"","recipient_phone":"","sender":"","sender_bank":"","sender_account":"","amount":0,"commission":0,"doc_number":"","auth_code":"","status":"","datetime":""}`
 
 // receiptExtractRules — общие правила извлечения полей чека для ИИ.
-const receiptExtractRules = "recipient — ФИО получателя перевода (кому пришли деньги), sender — ФИО отправителя (кто платил). " +
-	"recipient_bank/sender_bank — банки сторон, если указаны (например 'Банк получателя: Альфа-Банк'). " +
+const receiptExtractRules = "kind — что на изображении: 'receipt' (банковский чек/квитанция перевода), 'cash' (ФОТО НАЛИЧНЫХ ДЕНЕГ — купюры в руке/на столе, а не чек), 'other' (что-то иное). " +
+	"recipient — ФИО ПОЛУЧАТЕЛЯ перевода (кому/на чью карту пришли деньги — владелец карты). " +
+	"sender — ФИО отправителя/плательщика, КАК НАПЕЧАТАНО НА ЧЕКЕ. ВАЖНО: напечатанный на чеке отправитель — это НЕ обязательно клиент рассрочки (часто платят с чужой карты). Клиента определяет бот по подписи рядом, а не ты — просто верни, что напечатано. " +
+	"recipient_bank/sender_bank — банки сторон, если указаны (например 'Банк получателя: Т-Банк'). " +
 	"recipient_phone — телефон получателя, sender_account — счёт/карта отправителя (последние цифры). " +
 	"amount — сумма перевода числом в рублях (БЕЗ комиссии), commission — комиссия числом. " +
 	"datetime — дата и время операции с чека в формате YYYY-MM-DD HH:MM:SS (или YYYY-MM-DD HH:MM). " +
@@ -216,11 +220,13 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (ai
 		mime = "image/png"
 	}
 
-	system := "Ты — модуль разбора банковских чеков. Тебе показывают ИЗОБРАЖЕНИЕ чека/скриншота банковского перевода. " +
-		"Внимательно прочитай его и верни СТРОГО один JSON-объект вида " + receiptSchemaJSON + ". " + receiptExtractRules +
-		" Если это вообще не банковский чек — верни все поля пустыми."
+	system := "Ты — модуль разбора изображений в боте учёта финансов. Тебе показывают ИЗОБРАЖЕНИЕ: обычно это чек/скриншот " +
+		"банковского перевода, но иногда — ФОТО НАЛИЧНЫХ ДЕНЕГ (пачка купюр в руке/на столе). " +
+		"Внимательно посмотри и верни СТРОГО один JSON-объект вида " + receiptSchemaJSON + ". " + receiptExtractRules +
+		" Если это фото наличных денег — kind='cash' (сумму заполни, только если она явно видна/подписана, иначе 0). " +
+		"Если это банковский чек — kind='receipt'. Если ни то ни другое — kind='other' и остальные поля пустыми."
 
-	out, err := b.assistant.CompleteWithImage(ctx, system, "Прочитай этот чек и верни JSON.", img, mime)
+	out, err := b.assistant.CompleteWithImage(ctx, system, "Что на изображении? Верни JSON.", img, mime)
 	if err != nil {
 		fmt.Println("Вижн-разбор чека не удался:", err)
 		return aiReceipt{}, false
@@ -233,6 +239,11 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (ai
 	if err := json.Unmarshal([]byte(block), &rec); err != nil {
 		fmt.Printf("Вижн-разбор: не удалось разобрать JSON (%v): %s\n", err, block)
 		return aiReceipt{}, false
+	}
+	// Фото наличных — это валидный результат (наличка), даже без суммы/получателя.
+	if rec.Kind == "cash" {
+		fmt.Printf("Вижн-разбор: на фото НАЛИЧНЫЕ деньги (сумма с фото: %.0f)\n", rec.Amount)
+		return rec, true
 	}
 	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" {
 		return aiReceipt{}, false

@@ -13,12 +13,14 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/cmf"
+	"whatsapp-bot/internal/parser"
 )
 
 const settingUnmatchedBranch = "cmf_unmatched_branch"
@@ -40,6 +42,10 @@ var nameStopwords = map[string]bool{
 	"привет": true, "хорошо": true, "хор": true, "понял": true, "поняла": true,
 	"готово": true, "всё": true, "все": true, "ясно": true, "давай": true, "жду": true,
 	"плюс": true, "принял": true, "принято": true, "ладно": true, "ок.": true,
+	// служебные слова, часто идущие рядом с оплатой («... за 2 месяца», «оплата»)
+	"за": true, "месяц": true, "месяца": true, "месяцев": true, "мес": true,
+	"оплата": true, "оплатил": true, "оплатила": true, "оплату": true, "нал": true,
+	"наличка": true, "наличкой": true, "наличными": true, "офис": true,
 }
 
 // looksLikeName проверяет, похожа ли строка на ФИО клиента. Требует 2+ слова
@@ -54,6 +60,10 @@ func looksLikeName(text string) (string, bool) {
 	for _, w := range strings.Fields(name) {
 		// слова с цифрами (суммы "25.000", "20т") в имя не берём
 		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+			continue
+		}
+		// эмодзи/символы без букв (✅, ✔, стрелки) — не часть имени
+		if strings.IndexFunc(w, unicode.IsLetter) < 0 {
 			continue
 		}
 		if nameStopwords[strings.ToLower(w)] {
@@ -71,24 +81,27 @@ func looksLikeName(text string) (string, bool) {
 // resolveReceiptPayer определяет ФИО клиента, написанное РЯДОМ с чеком:
 // подпись к фото, текст-ответ (свайп на чек) или отдельное имя, присланное
 // прямо перед чеком. Это и есть "чей чек" — важнее получателя на чеке.
-func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, caption string) string {
+// Возвращает ФИО клиента и сумму, если она была в подписи/имени рядом (нужна
+// для фото наличных: «ФИО+сумма» + фото денег = наличка на эту сумму). Для
+// обычного чека сумма берётся с самого чека, и это значение игнорируется.
+func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, caption string) (string, float64) {
 	// 1. Подпись к чеку.
 	if strings.TrimSpace(caption) != "" {
 		if name := b.cmfExtractClientName(ctx, caption); name != "" {
-			return name
+			return name, parser.ExtractAmount(caption)
 		}
 		// ИИ не выделил, но подпись сама похожа на ФИО ("цихаев саляхь").
 		if name, ok := looksLikeName(caption); ok {
-			return name
+			return name, parser.ExtractAmount(caption)
 		}
 	}
 	// 2. Чек — это ответ (свайп) на сообщение с именем.
 	if quoted := extractQuotedText(msg); strings.TrimSpace(quoted) != "" {
 		if name := b.cmfExtractClientName(ctx, quoted); name != "" {
-			return name
+			return name, parser.ExtractAmount(quoted)
 		}
 		if name, ok := looksLikeName(quoted); ok {
-			return name
+			return name, parser.ExtractAmount(quoted)
 		}
 	}
 	// 3. Имя из очереди (FIFO) — самое старое из написанных перед чеком.
@@ -100,22 +113,23 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 		q = q[1:]
 	}
 	if len(q) > 0 {
-		name := q[0].name
+		name, amount := q[0].name, q[0].amount
 		b.pendingNames[key] = q[1:]
 		b.pendingNameMu.Unlock()
-		return name
+		return name, amount
 	}
 	b.pendingNames[key] = q
 	b.pendingNameMu.Unlock()
-	return ""
+	return "", 0
 }
 
 // enqueuePendingName кладёт имя в конец очереди (имя ПЕРЕД будущим чеком).
-func (b *Bot) enqueuePendingName(msg *events.Message, name string) {
+// amount — сумма из того же сообщения (0, если её не было).
+func (b *Bot) enqueuePendingName(msg *events.Message, name string, amount float64) {
 	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
 	b.pendingNameMu.Lock()
 	q := b.pendingNames[key]
-	q = append(q, pendingName{name: name, at: time.Now()})
+	q = append(q, pendingName{name: name, amount: amount, at: time.Now()})
 	if len(q) > 20 {
 		q = q[len(q)-20:]
 	}
@@ -123,11 +137,29 @@ func (b *Bot) enqueuePendingName(msg *events.Message, name string) {
 	b.pendingNameMu.Unlock()
 }
 
+// consumePendingNameCash достаёт из очереди самое свежее ждущее имя С СУММОЙ от
+// данного отправителя (для случая «фото наличных пришло после ФИО+сумма»).
+func (b *Bot) consumePendingNameCash(chat types.JID, senderJID string) (string, float64, bool) {
+	key := chat.String() + "|" + senderJID
+	b.pendingNameMu.Lock()
+	defer b.pendingNameMu.Unlock()
+	q := b.pendingNames[key]
+	for i := len(q) - 1; i >= 0; i-- {
+		if q[i].amount > 0 && time.Since(q[i].at) <= cashLinkWindow {
+			name := q[i].name
+			amount := q[i].amount
+			b.pendingNames[key] = append(q[:i], q[i+1:]...)
+			return name, amount, true
+		}
+	}
+	return "", 0, false
+}
+
 // handleNameMessage разбирает сообщение-имя (ФИО без чека) и по порядку
 // сообщений (FIFO) решает: это имя ПОСЛЕ чека (есть ждущий чек -> привязать)
 // или ПЕРЕД чеком (нет -> в очередь). Свайп на конкретный чек имеет приоритет.
 // Возвращает true, если сообщение — имя (обработано).
-func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string) bool {
+func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string, rawID int) bool {
 	name, ok := looksLikeName(text)
 	if !ok {
 		return false
@@ -136,12 +168,20 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	sender := msg.Info.Sender.String()
 	quotedID := extractQuotedStanzaID(msg)
 	since := time.Now().Add(-6 * time.Minute)
+	amount := parser.ExtractAmount(text) // сумма из того же сообщения, если была
 
 	// Есть ли ждущий чек (ответ на чек или неподтверждённый чек от отправителя)?
 	hasUnconfirmed, _ := b.db.HasUnconfirmedReceiptFrom(ctx, chat.String(), sender, since)
 	if quotedID == "" && !hasUnconfirmed {
-		// Чека рядом нет — значит имя написано ПЕРЕД будущим чеком.
-		b.enqueuePendingName(msg, name)
+		// Чека рядом нет. Если это «ФИО+сумма» и рядом было фото пачки денег —
+		// это НАЛИЧКА, записываем сразу.
+		if amount > 0 && b.consumePendingCash(chat, sender) {
+			b.recordCashPayment(ctx, chat, name, amount, rawID, msg.Info.Timestamp)
+			return true
+		}
+		// Иначе имя (возможно с суммой) — в очередь: перед будущим чеком или
+		// фото наличных.
+		b.enqueuePendingName(msg, name, amount)
 		return true
 	}
 
@@ -162,7 +202,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 		found, _, err := b.db.ReattributeOldestUnconfirmedReceipt(ctx, chat.String(), sender, since, canonical, contactIDPtr)
 		if err != nil || !found {
 			// Не нашли чек — на всякий случай запомним имя как ждущее.
-			b.enqueuePendingName(msg, name)
+			b.enqueuePendingName(msg, name, amount)
 			return true
 		}
 	}

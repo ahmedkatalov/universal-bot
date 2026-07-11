@@ -170,3 +170,50 @@ func TestExpenseListFormat(t *testing.T) {
 		}
 	}
 }
+
+// TestIsCash — правило владельца: наличка помечается словом наличка/нал/кэш,
+// «офис» или «у ‹имя›»; чистое «ФИО+сумма» — это дубль чека, не наличка.
+func TestIsCash(t *testing.T) {
+	cash := []string{
+		"Шошуков Руслан 22т наличка",
+		"нал 15000",
+		"Ахмед Каталов 10000 у Дени",
+		"Иса 5000 офис",
+		"кэш 3000",
+		"передал 20000 наличными",
+	}
+	notCash := []string{
+		"Шошуков Руслан 22000",
+		"Милана 25000",
+		"оплата через интернет-банк 5000",
+		"Ахмед Каталов 10000",
+	}
+	for _, s := range cash {
+		if !IsCash(s) {
+			t.Errorf("IsCash(%q) = false, ожидали true (наличка)", s)
+		}
+	}
+	for _, s := range notCash {
+		if IsCash(s) {
+			t.Errorf("IsCash(%q) = true, ожидали false (не наличка)", s)
+		}
+	}
+}
+
+// TestExtractAmount — сокращённые суммы, как их пишут в группе.
+func TestExtractAmount(t *testing.T) {
+	cases := map[string]float64{
+		"Шошуков Руслан 22т":  22000,
+		"5к":                  5000,
+		"25 тыщ":              25000,
+		"3 млн":               3000000,
+		"Загалаев Адлан 130000": 130000,
+		"за 2 месяца":         2, // нет суффикса, маленькое число — как есть
+		"просто текст":        0,
+	}
+	for in, want := range cases {
+		if got := ExtractAmount(in); got != want {
+			t.Errorf("ExtractAmount(%q) = %.0f, ожидали %.0f", in, got, want)
+		}
+	}
+}
