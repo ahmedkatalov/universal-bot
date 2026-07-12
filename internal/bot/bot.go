@@ -2468,7 +2468,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	cashAmount := 0.0
 	visionFirst := receiptVisionFirst() && media != nil && mediaExt != ".pdf" && b.assistant != nil
 	if visionFirst {
-		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
+		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt); ok {
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
@@ -2493,7 +2493,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// Claude само изображение. Пропускаем, если вижн уже отработал первым.
 	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
 	if !visionFirst && weakOCR && media != nil {
-		if rec, ok := b.aiVisionReceipt(ctx, media, mediaExt); ok {
+		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt); ok {
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {

@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -254,6 +256,121 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (ai
 	}
 	fmt.Printf("Вижн-разбор: Claude прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
 	return rec, true
+}
+
+// receiptVisionReads — сколько независимых прочтений чека делать за один раз
+// (само-согласованность): по умолчанию 3. Из них берётся согласованная сумма —
+// это отсеивает разовые ошибки распознавания (напр. лишний ноль в одном чтении).
+// RECEIPT_VISION_READS=1 отключает (одно чтение).
+func receiptVisionReads() int {
+	if v := strings.TrimSpace(os.Getenv("RECEIPT_VISION_READS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 1 && n <= 5 {
+			return n
+		}
+	}
+	return 3
+}
+
+// aiVisionReceiptConsensus читает чек несколькими независимыми прогонами вижна
+// ПАРАЛЛЕЛЬНО (задержка ≈ одного запроса) и выбирает согласованный результат:
+// сумму, которая совпала в большинстве прочтений, а если все разные — медианную
+// (устойчивую к одному выбросу). Так разовая ошибка распознавания не проходит.
+func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext string) (aiReceipt, bool) {
+	n := receiptVisionReads()
+	if n <= 1 {
+		return b.aiVisionReceipt(ctx, media, ext)
+	}
+
+	type res struct {
+		rec aiReceipt
+		ok  bool
+	}
+	ch := make(chan res, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			rec, ok := b.aiVisionReceipt(ctx, media, ext)
+			ch <- res{rec, ok}
+		}()
+	}
+
+	var recs []aiReceipt
+	var cash *aiReceipt
+	cashVotes := 0
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if !r.ok {
+			continue
+		}
+		if r.rec.Kind == "cash" {
+			c := r.rec
+			cash = &c
+			cashVotes++
+			continue
+		}
+		recs = append(recs, r.rec)
+	}
+
+	// Фото наличных побеждает, если «наличкой» его назвало не меньше прочтений,
+	// чем «чеком» (в т.ч. когда чеков не вышло вовсе).
+	if cash != nil && cashVotes >= len(recs) {
+		return *cash, true
+	}
+	if len(recs) == 0 {
+		return aiReceipt{}, false
+	}
+
+	pick := pickConsensusReceipt(recs)
+	fmt.Printf("Вижн-консенсус (%d чтений): выбрана сумма %.0f ₽ (получатель %q)\n", n, pick.Amount, pick.Recipient)
+	return pick, true
+}
+
+// pickConsensusReceipt выбирает из нескольких прочтений одно: по согласованной
+// сумме (см. consensusAmount). Прочие поля берём из того прочтения, что дало
+// выбранную сумму. Прочтения без суммы — как запасной вариант.
+func pickConsensusReceipt(recs []aiReceipt) aiReceipt {
+	var amounts []float64
+	for _, r := range recs {
+		if r.Amount > 0 {
+			amounts = append(amounts, r.Amount)
+		}
+	}
+	if len(amounts) == 0 {
+		return recs[0] // суммы никто не прочитал — вернём первое (получатель и т.п.)
+	}
+	winner := consensusAmount(amounts)
+	for _, r := range recs {
+		if r.Amount == winner {
+			return r
+		}
+	}
+	return recs[0]
+}
+
+// consensusAmount возвращает согласованную сумму: если какая-то встречается 2+
+// раз — её (большинство); иначе медиану (средняя из отсортированных — отсекает
+// один резкий выброс вроде лишнего нуля).
+func consensusAmount(amounts []float64) float64 {
+	if len(amounts) == 0 {
+		return 0
+	}
+	counts := map[float64]int{}
+	for _, a := range amounts {
+		counts[a]++
+	}
+	var best float64
+	bestN := 0
+	for a, cnt := range counts {
+		if cnt > bestN || (cnt == bestN && a < best) {
+			best, bestN = a, cnt
+		}
+	}
+	if bestN >= 2 {
+		return best
+	}
+	sorted := append([]float64(nil), amounts...)
+	sort.Float64s(sorted)
+	// нижне-средний элемент: устойчив к завышающему выбросу (лишний ноль).
+	return sorted[(len(sorted)-1)/2]
 }
 
 // receiptVisionFirst — читать фото-чеки СРАЗУ глазами Claude, не полагаясь на
