@@ -49,3 +49,27 @@ func TestLooksLikeNameCash(t *testing.T) {
 		}
 	}
 }
+
+// TestFirstNameLine — ФИО извлекается из многострочного сообщения рядом с чеком
+// («Магамадов Алха\n22.000₽ ✅» -> «Магамадов Алха»).
+func TestFirstNameLine(t *testing.T) {
+	cases := map[string]string{
+		"Магамадов Алха\n22.000₽ ✅":     "Магамадов Алха",
+		"22000\nЦихаев Саляхь":           "Цихаев Саляхь",
+		"Его чек":                        "", // не ФИО (одно значимое слово)
+		"просто\nтекст без имени 5000":   "",
+		"Юсупов Умар":                    "Юсупов Умар", // однострочное тоже работает
+	}
+	for in, want := range cases {
+		got, ok := firstNameLine(in)
+		if want == "" {
+			if ok {
+				t.Errorf("firstNameLine(%q) = (%q,true), ожидали false", in, got)
+			}
+			continue
+		}
+		if !ok || got != want {
+			t.Errorf("firstNameLine(%q) = (%q,%v), ожидали (%q,true)", in, got, ok, want)
+		}
+	}
+}

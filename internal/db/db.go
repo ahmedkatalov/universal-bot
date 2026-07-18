@@ -443,6 +443,34 @@ func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan
 	return out, rows.Err()
 }
 
+// RecentSenderTexts возвращает тексты последних НЕ-медиа сообщений отправителя
+// в группе с момента since (свежие первыми). Нужны, чтобы перед вопросом «чей
+// это чек» проанализировать, не написали ли ФИО клиента рядом отдельным
+// сообщением («Магамадов Алха\n22.000₽»).
+func (d *DB) RecentSenderTexts(ctx context.Context, groupJID, senderJID string, since time.Time, limit int) ([]string, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT body FROM raw_messages
+		WHERE wa_group_jid = $1 AND sender_jid = $2
+		  AND received_at >= $3 AND COALESCE(deleted, false) = false
+		  AND COALESCE(body, '') <> ''
+		ORDER BY received_at DESC
+		LIMIT $4
+	`, groupJID, senderJID, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var body string
+		if err := rows.Scan(&body); err != nil {
+			return nil, err
+		}
+		out = append(out, body)
+	}
+	return out, rows.Err()
+}
+
 // UnrecognizedReceipts — чеки, у которых бот НЕ смог прочитать сумму
 // (amount <= 0), по которым ещё не спрашивал. Это фото/PDF, где ни OCR, ни ИИ,
 // ни зрение не вытащили сумму — бот спросит в группе, что на чеке.

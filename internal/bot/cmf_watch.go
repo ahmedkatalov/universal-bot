@@ -47,6 +47,16 @@ var nameStopwords = map[string]bool{
 	"за": true, "месяц": true, "месяца": true, "месяцев": true, "мес": true,
 	"оплата": true, "оплатил": true, "оплатила": true, "оплату": true, "нал": true,
 	"наличка": true, "наличкой": true, "наличными": true, "офис": true,
+	// местоимения и частые слова, из-за которых фразы типа «Его чек» ошибочно
+	// принимались за ФИО клиента
+	"его": true, "её": true, "ее": true, "их": true, "он": true, "она": true,
+	"оно": true, "они": true, "мы": true, "вы": true, "ты": true, "я": true,
+	"это": true, "этот": true, "эта": true, "эти": true, "тот": true, "та": true,
+	"те": true, "вот": true, "тут": true, "там": true, "здесь": true,
+	"чек": true, "чеки": true, "чека": true, "деньги": true, "сумма": true,
+	"перевод": true, "платёж": true, "платеж": true, "текст": true, "без": true,
+	"имени": true, "имя": true, "тебе": true, "мне": true, "ему": true, "ей": true,
+	"нам": true, "вам": true, "и": true, "в": true, "на": true, "от": true,
 }
 
 // looksLikeName проверяет, похожа ли строка на ФИО клиента. Требует 2+ слова
@@ -77,6 +87,19 @@ func looksLikeName(text string) (string, bool) {
 		return "", false
 	}
 	return strings.Join(nameWords, " "), true
+}
+
+// firstNameLine ищет ФИО клиента в МНОГОСТРОЧНОМ сообщении построчно
+// («Магамадов Алха\n22.000₽ ✅» -> «Магамадов Алха»). Нужна, когда рядом с чеком
+// пишут имя и сумму/галочку на разных строках, и looksLikeName по всему тексту
+// не срабатывает из-за переноса строки.
+func firstNameLine(text string) (string, bool) {
+	for _, line := range strings.Split(text, "\n") {
+		if name, ok := looksLikeName(line); ok {
+			return name, true
+		}
+	}
+	return "", false
 }
 
 // resolveReceiptPayer определяет ФИО клиента, написанное РЯДОМ с чеком:
@@ -161,10 +184,6 @@ func (b *Bot) consumePendingNameCash(chat types.JID, senderJID string) (string, 
 // или ПЕРЕД чеком (нет -> в очередь). Свайп на конкретный чек имеет приоритет.
 // Возвращает true, если сообщение — имя (обработано).
 func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string, rawID int) bool {
-	name, ok := looksLikeName(text)
-	if !ok {
-		return false
-	}
 	chat := msg.Info.Chat
 	sender := msg.Info.Sender.String()
 	quotedID := extractQuotedStanzaID(msg)
@@ -173,7 +192,25 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 
 	// Есть ли ждущий чек (ответ на чек или неподтверждённый чек от отправителя)?
 	hasUnconfirmed, _ := b.db.HasUnconfirmedReceiptFrom(ctx, chat.String(), sender, since)
-	if quotedID == "" && !hasUnconfirmed {
+	checkNearby := quotedID != "" || hasUnconfirmed
+
+	name, ok := looksLikeName(text)
+	if !ok {
+		// Рядом с чеком часто пишут ФИО и сумму НА РАЗНЫХ СТРОКАХ
+		// («Магамадов Алха\n22.000₽ ✅») — это подпись к чеку (кому засчитать),
+		// а не отдельный платёж. Берём ФИО из строки. Без чека рядом не трогаем —
+		// пусть парсер разберёт как обычный платёж.
+		if !checkNearby {
+			return false
+		}
+		if ln, found := firstNameLine(text); found {
+			name = ln
+		} else {
+			return false
+		}
+	}
+
+	if !checkNearby {
 		// Чека рядом нет. Если это «ФИО+сумма» и рядом было фото пачки денег —
 		// это НАЛИЧКА, записываем сразу.
 		if amount > 0 && b.consumePendingCash(chat, sender) {

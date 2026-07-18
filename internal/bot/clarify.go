@@ -72,6 +72,12 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			items, err := b.db.UnconfirmedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
 			if err == nil {
 				for _, it := range items {
+					// Прежде чем спрашивать — анализируем недавние сообщения этого
+					// же отправителя: вдруг ФИО клиента написали рядом с чеком
+					// (отдельной строкой/сообщением). Тогда привязываем молча.
+					if b.tryResolveClientFromContext(ctx, jid, it) {
+						continue
+					}
 					owner := it.CardOwner
 					if owner == "" {
 						owner = "не распознан"
@@ -99,6 +105,43 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// tryResolveClientFromContext — прежде чем спросить «чей чек», анализирует
+// недавние сообщения ТОГО ЖЕ отправителя: если рядом с чеком написали ФИО
+// клиента (в т.ч. отдельной строкой «Магамадов Алха\n22.000₽»), привязывает
+// чек к нему молча, без вопроса. Возвращает true, если удалось.
+func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it db.ClarifyReceipt) bool {
+	if it.WaMessageID == "" || it.SenderJID == "" {
+		return false
+	}
+	texts, err := b.db.RecentSenderTexts(ctx, jid.String(), it.SenderJID, time.Now().Add(-12*time.Minute), 15)
+	if err != nil {
+		return false
+	}
+	for _, t := range texts {
+		name, ok := looksLikeName(t)
+		if !ok {
+			name, ok = firstNameLine(t)
+		}
+		if !ok {
+			continue
+		}
+		canonical, _ := b.aliases.ResolveName(name)
+		// Владелец карты (получатель на чеке) — это НЕ клиент, его не берём.
+		if it.CardOwner != "" && strings.EqualFold(strings.TrimSpace(canonical), strings.TrimSpace(it.CardOwner)) {
+			continue
+		}
+		var contactIDPtr *int
+		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			contactIDPtr = &cid
+		}
+		if found, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
+			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
+			return true
+		}
+	}
+	return false
 }
 
 // askClarify отправляет вопрос цитатой на сам чек и запоминает связь
