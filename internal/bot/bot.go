@@ -818,6 +818,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.sendClientReceiptTool(chat),
 		b.receiptDetailsTool(),
 		b.receiptsLedgerTool(),
+		b.recordPaymentTool(),
 		b.fixReceiptTool(),
 		b.recountTool(),
 		b.phoneMemoryTool(chat),
@@ -1268,9 +1269,21 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		forwardingList = strings.Join(parts, "; ")
 	}
 
+	workingGroupNote := "рабочая группа не задана — при первой записи платежа спроси её ОДИН раз и запомни"
+	if wg, _ := b.db.SettingGet(ctx, settingWorkingGroup); wg != "" {
+		name := wg
+		if jid, err := types.ParseJID(wg); err == nil {
+			if gn, ok := b.joinedGroups(ctx)[jid]; ok {
+				name = gn
+			}
+		}
+		workingGroupNote = "«" + name + "» (используй её для record_payment по умолчанию, НЕ переспрашивай)"
+	}
+
 	// Динамическая часть (маленькая, меняется) — НЕ кэшируется.
 	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n" +
 		"Группы, в которых состоит бот: " + groupsList + ".\n" +
+		"Текущая рабочая группа для записи платежей: " + workingGroupNote + ".\n" +
 		"Известные люди в учёте: " + peopleList + ".\n" +
 		"Активные правила пересылки чеков: " + forwardingList + ".\n" +
 		"Сводка по сбору за текущий месяц (" + from.Format("02.01.2006") + " — " + now.Format("02.01.2006") + "):\n" + summaryText
@@ -1349,6 +1362,12 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"10d. receipts_ledger — ЖУРНАЛ чеков за период: по каждому чеку видно клиента, сумму, дату, КТО ПРИСЛАЛ его в " +
 		"WhatsApp и в КАКУЮ ГРУППУ. Вызывай при 'кто прислал этот чек', 'какие чеки от кого', 'кто в какую группу " +
 		"кидал', 'от кого чеки по клиенту X'. Так ты точно знаешь происхождение каждого чека (кто отправил, куда).\n" +
+		"10e. record_payment — ЗАПИСАТЬ платёж со слов владельца, когда он ДИКТУЕТ/пересылает платёж (а не бот сам поймал " +
+		"из группы). Если владелец пишет 'Джабраилов Мовсар оплатил наличными 22400', 'Асхабов Ибрагим наличка 35000 " +
+		"отдал Адаму', 'Умхадижиев Рахман 170т' — ты ДОЛЖЕН реально записать это через record_payment, а НЕ просто " +
+		"ответить 'записал' на словах. Прислали несколько платежей — вызови по КАЖДОМУ. Группу бери из 'рабочей группы' " +
+		"(см. динамический контекст); если она не задана — спроси ОДИН раз, дальше не переспрашивай. Наличными/нал = " +
+		"kind:'cash', иначе 'transfer'. 'отдал X'/'X взял' = collector. Не выдумывай запись — всегда через инструмент.\n" +
 		"11. fix_receipt — записать данные чека со слов владельца ('на том чеке Милана, 25000, 2 июля'). " +
 		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
