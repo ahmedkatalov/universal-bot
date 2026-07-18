@@ -88,6 +88,11 @@ type Bot struct {
 	pendingCashMu sync.Mutex
 	pendingCash   map[string]time.Time
 
+	// Кулдаун проактивных реплик в группах (ключ groupJID -> когда последний раз
+	// оценивали, стоит ли вставить реплику) — чтобы бот не флудил.
+	proactiveMu   sync.Mutex
+	lastProactive map[string]time.Time
+
 	// Проактивные вопросы "чей это чек" и привязка ответов к чекам.
 	clarify *clarifyState
 }
@@ -185,6 +190,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		sentMsgs:      make(map[string][]string),
 		pendingNames:  make(map[string][]pendingName),
 		pendingCash:   make(map[string]time.Time),
+		lastProactive: make(map[string]time.Time),
 		clarify:       newClarifyState(),
 	}
 
@@ -558,6 +564,67 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	_ = b.db.MarkMessageParsed(ctx, rawID)
+
+	// Проактивное участие в разговоре (по умолчанию ВЫКЛ, PROACTIVE_CHAT=1).
+	// Бот может по-человечески вставить полезную реплику — осторожно, с
+	// кулдауном и только когда реально есть что сказать. В фоне.
+	if !hasMedia && b.assistant != nil && proactiveChatEnabled() && worthChimingIn(text) {
+		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
+	}
+}
+
+func proactiveChatEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("PROACTIVE_CHAT")))
+	return v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+const proactiveCooldown = 5 * time.Minute
+
+// worthChimingIn — дешёвый фильтр: есть ли смысл вообще звать ИИ. Реагируем на
+// вопросы и содержательные реплики, но не на короткие «ок», числа и стикеры.
+func worthChimingIn(text string) bool {
+	t := strings.TrimSpace(text)
+	if len([]rune(t)) < 12 {
+		return false
+	}
+	if strings.Contains(t, "?") {
+		return true
+	}
+	return len([]rune(t)) >= 30 // длинная реплика/обсуждение
+}
+
+// maybeChimeIn решает через ИИ, стоит ли вставить реплику в групповой разговор,
+// и если да — пишет её. С кулдауном на группу, чтобы не флудить.
+func (b *Bot) maybeChimeIn(ctx context.Context, chat types.JID, senderName, text string) {
+	key := chat.String()
+	b.proactiveMu.Lock()
+	if last, ok := b.lastProactive[key]; ok && time.Since(last) < proactiveCooldown {
+		b.proactiveMu.Unlock()
+		return
+	}
+	b.lastProactive[key] = time.Now()
+	b.proactiveMu.Unlock()
+
+	system := "Ты — " + b.botName + ", ассистент в рабочей WhatsApp-группе по учёту рассрочек и платежей. " +
+		"Иногда, как полезный коллега, ты можешь сам вставить короткую реплику в разговор — ответить на вопрос, " +
+		"подсказать, поправить неточность по учёту/платежам. НО делай это РЕДКО и только по делу.\n\n" +
+		"Тебе показывают одно сообщение из группы. Реши: стоит ли тебе вмешаться?\n" +
+		"- Если можешь реально помочь (ответить на вопрос, дать полезный совет по учёту/платежам/клиентам) — " +
+		"напиши короткую реплику (1-2 предложения), по-человечески, без воды.\n" +
+		"- Если это личное, болтовня, не по твоей теме, или добавить нечего — верни РОВНО пустую строку. " +
+		"Лучше промолчать, чем влезть не по делу. Не здоровайся, не флуди, не повторяй сказанное."
+	user := senderName + ": " + text
+
+	reply, err := b.assistant.Complete(ctx, system, user)
+	if err != nil {
+		return
+	}
+	reply = strings.TrimSpace(reply)
+	// Модель могла вернуть пустую строку/кавычки/точку как «промолчать».
+	if len([]rune(reply)) < 3 || reply == "\"\"" || reply == "." {
+		return
+	}
+	b.sendText(chat, reply)
 }
 
 // handlePrivateMessage отвечает на сообщение, присланное прямо номеру бота
