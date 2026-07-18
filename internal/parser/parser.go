@@ -255,6 +255,32 @@ func IsCash(text string) bool {
 	return reCash.MatchString(text)
 }
 
+// reCollector — маркеры «кто забрал/собрал наличку».
+var reCollector = regexp.MustCompile(`(?i)(взял|забрал|отдал|собрал|принёс|принес)`)
+
+// LooksMessyPayment сообщает, что сообщение о платеже «грязного» формата, где
+// построчный детерминированный парсер ненадёжен (сумма и имя на разных строках,
+// наличка/ответственный отдельной строкой, «сумма без имени») — такое лучше
+// целиком отдать ИИ, чтобы он правильно связал ФИО, сумму, наличку и кто собрал.
+func LooksMessyPayment(text string, res ParseResult) bool {
+	// наличка, ответственный, или сокращённая сумма (170т, 5к) — детерминированный
+	// парсер такое путает (например «170т» читает как 170), отдаём ИИ.
+	if IsCash(text) || reCollector.MatchString(text) || reShorthand.MatchString(text) {
+		return true
+	}
+	for _, u := range res.Unparsed {
+		if strings.Contains(u, "сумма без имени") {
+			return true
+		}
+		for _, r := range u {
+			if r >= '0' && r <= '9' {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // reShorthand — сокращённая сумма: «22т», «5к», «25 тыщ», «3 млн», «полляма».
 var reShorthand = regexp.MustCompile(`(?i)(\d[\d\s.,]*)\s*(кк|к|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:[^\p{L}]|$)`)
 

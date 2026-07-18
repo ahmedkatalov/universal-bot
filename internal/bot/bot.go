@@ -528,38 +528,46 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	result := parser.ParseMessage(text)
-	// Наличка: либо помечено словом в тексте, либо рядом пришло фото пачки
-	// денег от того же отправителя (пометка снимается один раз на сообщение).
-	isCashMsg := parser.IsCash(text) || (len(result.Transactions) > 0 && b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String()))
-	for _, tr := range result.Transactions {
-		canonical := b.aliases.Resolve(tr.RawName)
-		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
-		if err != nil {
-			fmt.Println("Ошибка получения контакта:", err)
-			continue
-		}
-		err = b.db.InsertTransaction(ctx, db.TransactionInput{
-			ContactID:    contactID,
-			RawName:      tr.RawName,
-			Amount:       tr.Amount,
-			Note:         tr.Note,
-			CardTo:       tr.CardTo,
-			IsCash:       isCashMsg,
-			RawMessageID: rawID,
-			TxDate:       msg.Info.Timestamp,
-		})
-		if err != nil {
-			fmt.Println("Ошибка сохранения транзакции:", err)
-		}
-	}
 
-	if len(result.Unparsed) > 0 {
-		fmt.Printf("Не распознано (сообщение %d): %v\n", rawID, result.Unparsed)
-		// Строки с цифрами (возможные платежи в незнакомом формате) отдаём
-		// на доразбор ИИ — в фоне, чтобы не тормозить остальные сообщения.
-		if b.assistant != nil && containsDigit(result.Unparsed) {
-			unparsed := append([]string(nil), result.Unparsed...)
-			go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, unparsed, rawID, msg.Info.Timestamp)
+	// Грязный формат платежа (сумма и имя на разных строках, наличка/кто-собрал
+	// отдельной строкой, несколько платежей в одном сообщении) детерминированный
+	// парсер разбирает ненадёжно и теряет контекст. Такое отдаём ЦЕЛИКОМ ИИ —
+	// он правильно свяжет ФИО, сумму, наличку и ответственного. Детерминированный
+	// разбор для таких сообщений НЕ применяем (иначе задвоение/мусор).
+	routedToAI := b.assistant != nil && parser.LooksMessyPayment(text, result)
+	if routedToAI {
+		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp)
+	} else {
+		// Наличка: помечено словом в тексте, либо рядом пришло фото пачки денег.
+		isCashMsg := parser.IsCash(text) || (len(result.Transactions) > 0 && b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String()))
+		for _, tr := range result.Transactions {
+			canonical := b.aliases.Resolve(tr.RawName)
+			contactID, err := b.db.GetOrCreateContact(ctx, canonical)
+			if err != nil {
+				fmt.Println("Ошибка получения контакта:", err)
+				continue
+			}
+			err = b.db.InsertTransaction(ctx, db.TransactionInput{
+				ContactID:    contactID,
+				RawName:      tr.RawName,
+				Amount:       tr.Amount,
+				Note:         tr.Note,
+				CardTo:       tr.CardTo,
+				IsCash:       isCashMsg,
+				RawMessageID: rawID,
+				TxDate:       msg.Info.Timestamp,
+			})
+			if err != nil {
+				fmt.Println("Ошибка сохранения транзакции:", err)
+			}
+		}
+
+		if len(result.Unparsed) > 0 {
+			fmt.Printf("Не распознано (сообщение %d): %v\n", rawID, result.Unparsed)
+			if b.assistant != nil && containsDigit(result.Unparsed) {
+				unparsed := append([]string(nil), result.Unparsed...)
+				go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, unparsed, rawID, msg.Info.Timestamp)
+			}
 		}
 	}
 
@@ -568,7 +576,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Проактивное участие в разговоре: бот сам решает, когда вставить полезную
 	// реплику (в фоне). Пропускаем сообщения-платежи (это записи, не беседа) —
 	// по ним отвечать незачем.
-	if !hasMedia && b.assistant != nil && len(result.Transactions) == 0 &&
+	if !hasMedia && b.assistant != nil && !routedToAI && len(result.Transactions) == 0 &&
 		proactiveChatEnabled() && worthChimingIn(text) {
 		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
 	}

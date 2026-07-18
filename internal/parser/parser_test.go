@@ -217,3 +217,29 @@ func TestExtractAmount(t *testing.T) {
 		}
 	}
 }
+
+// TestLooksMessyPayment — грязные форматы (наличка/кто-собрал/сокращения/сумма
+// без имени) уходят в ИИ; чистый простой список — нет.
+func TestLooksMessyPayment(t *testing.T) {
+	messy := []string{
+		"Джабраилов сулеман\nналичка\n72.600р\nмансур взял",
+		"Оплата наличными:35.000₽\nАсхабов Ибрагим\nОтдал к Солтамурадову Адаму",
+		"У Усумова Рауфа забрал 31 т\nНаличка",
+		"Умхадижиев Рахман 170т",
+		"Манаев Шамиль 120т",
+	}
+	for _, s := range messy {
+		if !LooksMessyPayment(s, ParseMessage(s)) {
+			t.Errorf("LooksMessyPayment(%q) = false, ожидали true", s)
+		}
+	}
+	clean := []string{
+		"Ахмед 5000",
+		"Милана 25000\nРасул 30000",
+	}
+	for _, s := range clean {
+		if LooksMessyPayment(s, ParseMessage(s)) {
+			t.Errorf("LooksMessyPayment(%q) = true, ожидали false", s)
+		}
+	}
+}
