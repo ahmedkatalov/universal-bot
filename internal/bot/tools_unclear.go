@@ -325,6 +325,91 @@ func (b *Bot) sendClientReceiptTool(chat types.JID) ai.Tool {
 	}
 }
 
+// receiptsLedgerTool — журнал чеков: кто прислал какой чек и в какую группу.
+func (b *Bot) receiptsLedgerTool() ai.Tool {
+	return ai.Tool{
+		Name: "receipts_ledger",
+		Description: "Журнал чеков за период: по каждому чеку — клиент (кому засчитан), сумма, дата, КТО ПРИСЛАЛ его " +
+			"в WhatsApp и в КАКУЮ ГРУППУ. Вызывай при 'кто прислал этот чек', 'какие чеки от кого', 'кто в какую " +
+			"группу кидал', 'покажи чеки за период с отправителями', 'от кого чеки по клиенту X'. Фильтры: клиент " +
+			"(person) и группа(ы) — по желанию; несколько групп через запятую/'и'; пусто — по всем.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from_date": map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD"},
+				"to_date":   map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD"},
+				"person":    map[string]any{"type": "string", "description": "Фильтр по клиенту (пусто — все)"},
+				"group":     map[string]any{"type": "string", "description": "Группа(ы) (пусто — все)"},
+				"limit":     map[string]any{"type": "integer", "description": "Сколько чеков показать (по умолчанию 40, максимум 200)"},
+			},
+			"required": []string{"from_date", "to_date"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
+				Person   string `json:"person"`
+				Group    string `json:"group"`
+				Limit    int    `json:"limit"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			from, err := time.Parse("2006-01-02", args.FromDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
+			}
+			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
+			}
+			if args.Limit <= 0 || args.Limit > 200 {
+				args.Limit = 40
+			}
+			groupJIDs, groupLabel, err := b.resolveGroups(ctx, args.Group)
+			if err != nil {
+				return "", err
+			}
+			rows, err := b.db.ReceiptsLedger(ctx, from, toDay.AddDate(0, 0, 1), strings.TrimSpace(args.Person), groupJIDs, args.Limit)
+			if err != nil {
+				return "", fmt.Errorf("ошибка выборки: %w", err)
+			}
+			if len(rows) == 0 {
+				return fmt.Sprintf("Чеков за %s — %s (%s) не нашлось.", from.Format("02.01.2006"), toDay.Format("02.01.2006"), groupLabel), nil
+			}
+			groups := b.joinedGroups(ctx)
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Журнал чеков %s — %s (%s), всего %d:\n", from.Format("02.01"), toDay.Format("02.01"), groupLabel, len(rows))
+			var total float64
+			for _, r := range rows {
+				total += r.Amount
+				groupName := r.GroupJID
+				if jid, err := types.ParseJID(r.GroupJID); err == nil {
+					if name, ok := groups[jid]; ok {
+						groupName = name
+					}
+				}
+				client := r.Client
+				if client == "" {
+					client = "не распознан"
+				}
+				sender := r.SubmittedBy
+				if sender == "" {
+					sender = "?"
+				}
+				bank := ""
+				if r.Bank != "" {
+					bank = ", " + r.Bank
+				}
+				fmt.Fprintf(&sb, "• %s — %s — %.0f ₽%s — прислал: %s — группа: %s\n",
+					r.TxDate.Format("02.01 15:04"), client, r.Amount, bank, sender, groupName)
+			}
+			fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
+			return sb.String(), nil
+		},
+	}
+}
+
 // receiptDetailsTool — показать все распознанные данные чека(ов) клиента.
 func (b *Bot) receiptDetailsTool() ai.Tool {
 	return ai.Tool{

@@ -749,6 +749,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.sendUnclearFilesTool(chat),
 		b.sendClientReceiptTool(chat),
 		b.receiptDetailsTool(),
+		b.receiptsLedgerTool(),
 		b.fixReceiptTool(),
 		b.recountTool(),
 		b.phoneMemoryTool(chat),
@@ -1277,6 +1278,9 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"'покажи чеки Ахмеда за июнь'). Не путать с send_unclear_file (тот — только про непонятые).\n" +
 		"10c. receipt_details — показать ВСЕ данные чека клиента (получатель и его банк/телефон, отправитель и его " +
 		"банк/счёт, сумма, комиссия, дата, номер документа, код) — 'покажи все данные чека Цихаева'.\n" +
+		"10d. receipts_ledger — ЖУРНАЛ чеков за период: по каждому чеку видно клиента, сумму, дату, КТО ПРИСЛАЛ его в " +
+		"WhatsApp и в КАКУЮ ГРУППУ. Вызывай при 'кто прислал этот чек', 'какие чеки от кого', 'кто в какую группу " +
+		"кидал', 'от кого чеки по клиенту X'. Так ты точно знаешь происхождение каждого чека (кто отправил, куда).\n" +
 		"11. fix_receipt — записать данные чека со слов владельца ('на том чеке Милана, 25000, 2 июля'). " +
 		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +

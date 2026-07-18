@@ -1221,6 +1221,54 @@ func (d *DB) ReceiptDetailsForPerson(ctx context.Context, personQuery string, li
 	return out, rows.Err()
 }
 
+// LedgerRow — строка «журнала чеков»: кто прислал, кому засчитан, в какую группу.
+type LedgerRow struct {
+	Client      string    // клиент, кому засчитан чек
+	Amount      float64   // сумма
+	TxDate      time.Time // дата операции с чека
+	SubmittedBy string    // КТО прислал чек в WhatsApp (ответственный/отправитель)
+	GroupJID    string    // в какую группу прислали
+	Bank        string    // банк чека
+}
+
+// ReceiptsLedger — журнал чеков за период: по каждому чеку видно клиента, сумму,
+// дату, КТО прислал и в какую ГРУППУ. Фильтры: person (по клиенту), groupJIDs.
+func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person string, groupJIDs []string, limit int) ([]LedgerRow, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
+		       br.amount::float8,
+		       br.tx_date,
+		       COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
+		                split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		       COALESCE(br.group_jid, rm.wa_group_jid, ''),
+		       COALESCE(br.bank, '')
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.tx_date >= $1 AND br.tx_date < $2
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		  AND ($3 = '' OR COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $3 || '%')
+		  AND ($4::text[] IS NULL OR br.group_jid = ANY($4))
+		ORDER BY br.tx_date DESC
+		LIMIT $5
+	`, from, to, person, groupSliceArg(groupJIDs), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []LedgerRow
+	for rows.Next() {
+		var r LedgerRow
+		if err := rows.Scan(&r.Client, &r.Amount, &r.TxDate, &r.SubmittedBy, &r.GroupJID, &r.Bank); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // ReceiptFile — сохранённый файл чека для отправки по запросу.
 type ReceiptFile struct {
 	Name      string
