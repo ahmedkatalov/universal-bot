@@ -30,12 +30,13 @@ const (
 // clarifyMap хранит соответствие "id вопроса бота" -> "id сообщения чека",
 // чтобы ответ владельца на вопрос привязать к нужному чеку.
 type clarifyState struct {
-	mu     sync.Mutex
-	askMap map[string]string // botQuestionMsgID -> receiptWaMessageID
+	mu         sync.Mutex
+	askMap     map[string]string // botQuestionMsgID -> receiptWaMessageID (чей чек)
+	cashAskMap map[string]int    // botQuestionMsgID -> transactionID (у кого наличка)
 }
 
 func newClarifyState() *clarifyState {
-	return &clarifyState{askMap: make(map[string]string)}
+	return &clarifyState{askMap: make(map[string]string), cashAskMap: make(map[string]int)}
 }
 
 // clarifyLoop раз в 45 секунд проверяет группы на чеки без клиента и задаёт
@@ -85,6 +86,30 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 					text := fmt.Sprintf("🤔 Чей это чек? Получатель на чеке: %s, сумма %.0f ₽, %s. "+
 						"Ответьте на это сообщение именем клиента (кому засчитать).", owner, it.Amount, it.TxDate.Format("02.01 15:04"))
 					b.askClarify(ctx, jid, text, it)
+					asked++
+				}
+			}
+		}
+		if asked >= clarifyPerCycle {
+			break
+		}
+		// 3. Наличка без ответственного — «у кого наличка / кто забрал?».
+		if n, err := b.db.CountCashNeedingCollector(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+			items, err := b.db.CashNeedingCollector(ctx, jid.String(), before, clarifyPerCycle-asked)
+			if err == nil {
+				for _, it := range items {
+					text := fmt.Sprintf("🤔 Наличка: %s — %.0f ₽. У кого она, кто забрал деньги? "+
+						"Ответьте на это сообщение именем (например «у Дени» / «Мансур взял»).", it.Client, it.Amount)
+					botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
+					_ = b.db.MarkTxCollectorAsked(ctx, it.TxID)
+					if botMsgID != "" {
+						b.clarify.mu.Lock()
+						b.clarify.cashAskMap[botMsgID] = it.TxID
+						if len(b.clarify.cashAskMap) > 500 {
+							b.clarify.cashAskMap = map[string]int{botMsgID: it.TxID}
+						}
+						b.clarify.mu.Unlock()
+					}
 					asked++
 				}
 			}
@@ -142,6 +167,48 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		}
 	}
 	return false
+}
+
+// applyCashCollectorReply записывает ответственного (кто забрал наличку) из
+// ответа владельца на вопрос «у кого наличка?».
+func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID int, text string) bool {
+	collector := extractCollectorName(text)
+	if collector == "" {
+		return false
+	}
+	if canon, ok := b.aliases.ResolveName(collector); ok {
+		collector = canon
+	}
+	found, amount, client, err := b.db.SetTxCollector(ctx, txID, collector)
+	if err != nil || !found {
+		return false
+	}
+	b.sendText(chat, fmt.Sprintf("Записал: наличка %s %.0f ₽ — забрал %s.", client, amount, collector))
+	return true
+}
+
+// cashCollectorMarkers — слова-обёртки вокруг имени в ответе «у Дени», «Мансур взял».
+var cashCollectorMarkers = map[string]bool{
+	"у": true, "взял": true, "взяла": true, "забрал": true, "забрала": true,
+	"отдал": true, "отдала": true, "к": true, "собрал": true, "собрала": true,
+	"наличка": true, "нал": true, "наличными": true, "это": true, "руки": true, "руках": true,
+}
+
+// extractCollectorName вытаскивает имя ответственного из свободного ответа
+// («у Дени» -> «Дени», «Мансур взял» -> «Мансур», «отдал Адаму» -> «Адаму»).
+func extractCollectorName(text string) string {
+	var words []string
+	for _, w := range strings.Fields(text) {
+		lw := strings.ToLower(strings.Trim(w, ".,!?()«»\""))
+		if cashCollectorMarkers[lw] || lw == "" {
+			continue
+		}
+		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+			continue
+		}
+		words = append(words, w)
+	}
+	return strings.TrimSpace(strings.Join(words, " "))
 }
 
 // askClarify отправляет вопрос цитатой на сам чек и запоминает связь
@@ -202,6 +269,18 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	if quotedID == "" {
 		return false
 	}
+
+	// Ответ на вопрос «у кого наличка / кто забрал?» — записываем ответственного.
+	b.clarify.mu.Lock()
+	txID, isCashAsk := b.clarify.cashAskMap[quotedID]
+	if isCashAsk {
+		delete(b.clarify.cashAskMap, quotedID)
+	}
+	b.clarify.mu.Unlock()
+	if isCashAsk {
+		return b.applyCashCollectorReply(ctx, msg.Info.Chat, txID, text)
+	}
+
 	b.clarify.mu.Lock()
 	receiptWaID, ok := b.clarify.askMap[quotedID]
 	if ok {

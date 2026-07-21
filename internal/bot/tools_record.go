@@ -126,6 +126,7 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				Amount:       args.Amount,
 				CardTo:       cardTo,
 				IsCash:       isCash,
+				Collector:    collector,
 				RawMessageID: rawID,
 				TxDate:       txDate,
 			}); err != nil {

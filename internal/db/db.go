@@ -116,6 +116,14 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки bank_receipts.ignored: %w", err)
 	}
+	// Наличка: кто ФИЗИЧЕСКИ забрал деньги (ответственный). Если не указан —
+	// бот спрашивает «у кого наличка», collector_asked помечает, что уже спросил.
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.collector: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.collector_asked: %w", err)
+	}
 
 	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
 	if _, err := pool.Exec(ctx, `
@@ -307,17 +315,93 @@ type TransactionInput struct {
 	Amount       float64
 	Note         string
 	CardTo       string
-	IsCash       bool // платёж помечен как наличка (иначе — дубль чека, в сбор не идёт)
+	IsCash       bool   // платёж помечен как наличка (иначе — дубль чека, в сбор не идёт)
+	Collector    string // кто забрал наличку (ответственный), если известен
 	RawMessageID int
 	TxDate       time.Time
 }
 
 func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
 	_, err := d.pool.Exec(ctx, `
-		INSERT INTO transactions (contact_id, raw_name, amount, note, card_to, is_cash, raw_message_id, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-	`, tx.ContactID, tx.RawName, tx.Amount, nullIfEmpty(tx.Note), nullIfEmpty(tx.CardTo), tx.IsCash, tx.RawMessageID, tx.TxDate)
+		INSERT INTO transactions (contact_id, raw_name, amount, note, card_to, is_cash, collector, raw_message_id, tx_date)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+	`, tx.ContactID, tx.RawName, tx.Amount, nullIfEmpty(tx.Note), nullIfEmpty(tx.CardTo), tx.IsCash, nullIfEmpty(tx.Collector), tx.RawMessageID, tx.TxDate)
 	return err
+}
+
+// CashNeedingCollector — наличные платежи, у которых НЕ указан ответственный
+// (кто забрал) и бот ещё не спрашивал. Возвращает и id сообщения, чтобы задать
+// вопрос цитатой и привязать ответ.
+type CashCollectorAsk struct {
+	TxID        int
+	Client      string
+	Amount      float64
+	WaMessageID string
+	SenderJID   string
+	GroupJID    string
+}
+
+func (d *DB) CashNeedingCollector(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]CashCollectorAsk, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT t.id, COALESCE(c.canonical_name, t.raw_name, ''), t.amount::float8,
+		       COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''), COALESCE(rm.wa_group_jid, '')
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE rm.wa_group_jid = $1
+		  AND t.is_cash = true AND COALESCE(t.collector, '') = '' AND t.collector_asked = false
+		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false
+		  AND t.amount > 0 AND t.created_at < $2
+		ORDER BY t.created_at
+		LIMIT $3
+	`, groupJID, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CashCollectorAsk
+	for rows.Next() {
+		var a CashCollectorAsk
+		if err := rows.Scan(&a.TxID, &a.Client, &a.Amount, &a.WaMessageID, &a.SenderJID, &a.GroupJID); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// CountCashNeedingCollector — сколько наличных платежей ждут ответственного.
+func (d *DB) CountCashNeedingCollector(ctx context.Context, groupJID string, olderThan time.Time) (int, error) {
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE rm.wa_group_jid = $1
+		  AND t.is_cash = true AND COALESCE(t.collector, '') = '' AND t.collector_asked = false
+		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false
+		  AND t.amount > 0 AND t.created_at < $2
+	`, groupJID, olderThan).Scan(&n)
+	return n, err
+}
+
+// MarkTxCollectorAsked помечает, что про ответственного по этой наличке спросили.
+func (d *DB) MarkTxCollectorAsked(ctx context.Context, txID int) error {
+	_, err := d.pool.Exec(ctx, `UPDATE transactions SET collector_asked = true WHERE id = $1`, txID)
+	return err
+}
+
+// SetTxCollector записывает ответственного (кто забрал наличку) по id транзакции.
+func (d *DB) SetTxCollector(ctx context.Context, txID int, collector string) (bool, float64, string, error) {
+	var amount float64
+	var client string
+	err := d.pool.QueryRow(ctx, `
+		UPDATE transactions SET collector = $2, collector_asked = true WHERE id = $1
+		RETURNING amount::float8, COALESCE(raw_name, '')
+	`, txID, collector).Scan(&amount, &client)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, "", nil
+	}
+	return err == nil, amount, client, err
 }
 
 // MarkLatestPaymentCash помечает наличкой самый свежий текстовый платёж от
@@ -1851,7 +1935,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			UNION ALL
 
 			SELECT
-				COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+				COALESCE(NULLIF(t.collector, ''), NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
 				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
 				t.amount
 			FROM transactions t

@@ -73,3 +73,20 @@ func TestFirstNameLine(t *testing.T) {
 		}
 	}
 }
+
+// TestExtractCollectorName — из ответа «у кого наличка» вытаскивается имя.
+func TestExtractCollectorName(t *testing.T) {
+	cases := map[string]string{
+		"у Дени":       "Дени",
+		"Мансур взял":  "Мансур",
+		"отдал Адаму":  "Адаму",
+		"Дени":         "Дени",
+		"у Дени наличка": "Дени",
+		"взял":         "", // только маркер, имени нет
+	}
+	for in, want := range cases {
+		if got := extractCollectorName(in); got != want {
+			t.Errorf("extractCollectorName(%q) = %q, ожидали %q", in, got, want)
+		}
+	}
+}

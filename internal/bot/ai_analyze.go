@@ -137,18 +137,6 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			card = "наличные"
 		}
 
-		// Кто собрал наличку: если ИИ выделил ответственного, привязываем платёж
-		// к синтетическому сообщению «от него», чтобы «кто собрал» засчиталось
-		// именно ему; иначе — к исходному сообщению (сбор на отправителя).
-		txRawID := rawID
-		if collector := strings.TrimSpace(p.Collector); collector != "" {
-			waMsgID := fmt.Sprintf("collector-%d", time.Now().UnixNano())
-			if id, err := b.db.SaveRawMessage(ctx, waMsgID, chat.String(), "collector@c.us", collector,
-				collector+" собрал", false, "", txDate); err == nil {
-				txRawID = id
-			}
-		}
-
 		err = b.db.InsertTransaction(ctx, db.TransactionInput{
 			ContactID:    contactID,
 			RawName:      name,
@@ -156,7 +144,8 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			Note:         p.Note,
 			CardTo:       card,
 			IsCash:       isCash,
-			RawMessageID: txRawID,
+			Collector:    strings.TrimSpace(p.Collector),
+			RawMessageID: rawID,
 			TxDate:       txDate,
 		})
 		if err != nil {
