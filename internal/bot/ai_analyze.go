@@ -224,7 +224,7 @@ func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, b
 // aiVisionReceipt показывает файл чека (фото или PDF) модели "глазами" —
 // последний рубеж распознавания, когда OCR выдал кашу или вообще ничего.
 // Claude читает чек прямо с изображения: банк, получатель, сумма, дата.
-func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (aiReceipt, bool) {
+func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool) {
 	if b.assistant == nil || len(media) == 0 {
 		return aiReceipt{}, false
 	}
@@ -248,7 +248,16 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext string) (ai
 		" Если это фото наличных денег — kind='cash' (сумму заполни, только если она явно видна/подписана, иначе 0). " +
 		"Если это банковский чек — kind='receipt'. Если ни то ни другое — kind='other' и остальные поля пустыми."
 
-	out, err := b.assistant.CompleteWithImage(ctx, system, "Что на изображении? Верни JSON.", img, mime)
+	userText := "Что на изображении? Верни JSON."
+	if h := strings.TrimSpace(hint); h != "" {
+		// OCR-текст этого же чека как ПОДСКАЗКА (может быть с ошибками — верь
+		// картинке больше, но используй его, чтобы сверить цифры и ФИО).
+		if len([]rune(h)) > 1500 {
+			h = string([]rune(h)[:1500])
+		}
+		userText += "\n\nДля сверки — что распозналось OCR с этого чека (может быть с ошибками, доверяй изображению больше): " + h
+	}
+	out, err := b.assistant.CompleteWithImage(ctx, system, userText, img, mime)
 	if err != nil {
 		fmt.Println("Вижн-разбор чека не удался:", err)
 		return aiReceipt{}, false
@@ -291,10 +300,10 @@ func receiptVisionReads() int {
 // ПАРАЛЛЕЛЬНО (задержка ≈ одного запроса) и выбирает согласованный результат:
 // сумму, которая совпала в большинстве прочтений, а если все разные — медианную
 // (устойчивую к одному выбросу). Так разовая ошибка распознавания не проходит.
-func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext string) (aiReceipt, bool) {
+func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool) {
 	n := receiptVisionReads()
 	if n <= 1 {
-		return b.aiVisionReceipt(ctx, media, ext)
+		return b.aiVisionReceipt(ctx, media, ext, hint)
 	}
 
 	type res struct {
@@ -304,7 +313,7 @@ func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext st
 	ch := make(chan res, n)
 	for i := 0; i < n; i++ {
 		go func() {
-			rec, ok := b.aiVisionReceipt(ctx, media, ext)
+			rec, ok := b.aiVisionReceipt(ctx, media, ext, hint)
 			ch <- res{rec, ok}
 		}()
 	}

@@ -226,6 +226,24 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("индекс assistant_history: %w", err)
 	}
 
+	// Расходы: владелец пишет «сделал расход 5000 на бензин» — бот записывает
+	// сюда; по запросу «скинь мои расходы» строит PDF. Отдельно от сбора.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS expenses (
+			id         SERIAL PRIMARY KEY,
+			amount     NUMERIC NOT NULL,
+			note       TEXT,
+			created_by TEXT,
+			spent_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы expenses: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_expenses_spent_at ON expenses(spent_at)`); err != nil {
+		return fmt.Errorf("индекс expenses: %w", err)
+	}
+
 	// Починка ложных дублей: раньше дубль искался по ВСЕМ группам, из-за чего
 	// чек, легально пересланный из группы СБ в основную, помечался дублем.
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
@@ -2026,4 +2044,59 @@ func (d *DB) SaveChatTurns(ctx context.Context, key string, turns []ChatTurn, ke
 		}
 	}
 	return nil
+}
+
+// ---- Расходы ----
+
+// Expense — одна запись расхода.
+type Expense struct {
+	ID        int
+	Amount    float64
+	Note      string
+	CreatedBy string
+	SpentAt   time.Time
+}
+
+// InsertExpense записывает расход. Возвращает id.
+func (d *DB) InsertExpense(ctx context.Context, amount float64, note, createdBy string, spentAt time.Time) (int, error) {
+	var id int
+	err := d.pool.QueryRow(ctx, `
+		INSERT INTO expenses (amount, note, created_by, spent_at)
+		VALUES ($1, $2, $3, $4) RETURNING id
+	`, amount, nullIfEmpty(note), nullIfEmpty(createdBy), spentAt).Scan(&id)
+	return id, err
+}
+
+// ExpensesForPeriod возвращает расходы за период [from, to) и их сумму.
+func (d *DB) ExpensesForPeriod(ctx context.Context, from, to time.Time) ([]Expense, float64, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, amount::float8, COALESCE(note, ''), COALESCE(created_by, ''), spent_at
+		FROM expenses
+		WHERE spent_at >= $1 AND spent_at < $2
+		ORDER BY spent_at
+	`, from, to)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer rows.Close()
+	var out []Expense
+	var total float64
+	for rows.Next() {
+		var e Expense
+		if err := rows.Scan(&e.ID, &e.Amount, &e.Note, &e.CreatedBy, &e.SpentAt); err != nil {
+			return nil, 0, err
+		}
+		out = append(out, e)
+		total += e.Amount
+	}
+	return out, total, rows.Err()
+}
+
+// DeleteExpense удаляет расход по id (ручная отмена ошибочной записи).
+func (d *DB) DeleteExpense(ctx context.Context, id int) (bool, error) {
+	tag, err := d.pool.Exec(ctx, `DELETE FROM expenses WHERE id = $1`, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }

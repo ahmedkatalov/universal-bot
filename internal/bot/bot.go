@@ -827,6 +827,8 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.receiptDetailsTool(),
 		b.receiptsLedgerTool(),
 		b.recordPaymentTool(),
+		b.recordExpenseTool(),
+		b.expensesReportTool(chat),
 		b.fixReceiptTool(),
 		b.recountTool(),
 		b.phoneMemoryTool(chat),
@@ -1092,7 +1094,7 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 		}
 	}
 	if rd.Amount == 0 || rd.Recipient == "" {
-		if rec, ok := b.aiVisionReceipt(ctx, mediaBytes, ext); ok {
+		if rec, ok := b.aiVisionReceipt(ctx, mediaBytes, ext, ocrText); ok {
 			mergeAIReceipt(&rd, rec)
 		}
 	}
@@ -1376,6 +1378,9 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"ответить 'записал' на словах. Прислали несколько платежей — вызови по КАЖДОМУ. Группу бери из 'рабочей группы' " +
 		"(см. динамический контекст); если она не задана — спроси ОДИН раз, дальше не переспрашивай. Наличными/нал = " +
 		"kind:'cash', иначе 'transfer'. 'отдал X'/'X взял' = collector. Не выдумывай запись — всегда через инструмент.\n" +
+		"10f. record_expense / expenses_report — РАСХОДЫ (траты владельца, отдельно от сбора). 'сделал расход 5000 на " +
+		"бензин', 'потратил 12000' -> record_expense. 'скинь мои расходы', 'сколько потратил за июль' -> expenses_report " +
+		"(pdf или text). Расходы в сбор НЕ входят — это личные траты, считаются отдельно.\n" +
 		"11. fix_receipt — записать данные чека со слов владельца ('на том чеке Милана, 25000, 2 июля'). " +
 		"Обычный сценарий: list_unclear_receipts -> send_unclear_file -> владелец диктует -> fix_receipt.\n" +
 		"12. recount_everything — полный пересчёт учёта заново ('пересчитай', 'проанализируй всё заново'): " +
@@ -2567,7 +2572,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	cashAmount := 0.0
 	visionFirst := receiptVisionFirst() && media != nil && mediaExt != ".pdf" && b.assistant != nil
 	if visionFirst {
-		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt); ok {
+		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
@@ -2592,7 +2597,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// Claude само изображение. Пропускаем, если вижн уже отработал первым.
 	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
 	if !visionFirst && weakOCR && media != nil {
-		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt); ok {
+		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
