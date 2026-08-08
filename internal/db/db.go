@@ -632,6 +632,7 @@ func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string,
 	var got float64
 	err := d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
+			card_owner    = CASE WHEN $2 = '' THEN card_owner ELSE COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')) END,
 			recipient_raw = CASE WHEN $2 = '' THEN recipient_raw ELSE $2 END,
 			contact_id    = CASE WHEN $2 = '' THEN contact_id    ELSE $3 END,
 			amount        = CASE WHEN $4 > 0  THEN $4            ELSE amount END,
@@ -1228,7 +1229,9 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 // неподтверждённому чеку от отправителя (FIFO — по порядку сообщений в чате).
 func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $4, contact_id = $5, needs_review = false, client_confirmed = true
+		UPDATE bank_receipts SET
+			card_owner = COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')),
+			recipient_raw = $4, contact_id = $5, needs_review = false, client_confirmed = true
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -1255,7 +1258,9 @@ func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, 
 // ответили (свайп), — по id сообщения WhatsApp.
 func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int) (found bool, amount float64, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true
+		UPDATE bank_receipts SET
+			card_owner = COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')),
+			recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -1333,6 +1338,7 @@ type LedgerRow struct {
 	Collector   string    // кто ЗАБРАЛ наличку (если указан)
 	GroupJID    string    // в какую группу прислали
 	Bank        string    // банк чека / способ
+	CardOwner   string    // получатель на чеке (владелец карты) — для чеков
 }
 
 // ReceiptsLedger — ЕДИНЫЙ журнал ВСЕХ платежей за период: и чеки, и наличка/
@@ -1347,7 +1353,8 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
 		        '' AS collector,
 		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
-		        COALESCE(br.bank, '') AS bank
+		        COALESCE(br.bank, '') AS bank,
+		        COALESCE(br.card_owner, '') AS card_owner
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -1365,7 +1372,8 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
 		        COALESCE(t.collector, '') AS collector,
 		        COALESCE(rm.wa_group_jid, '') AS grp,
-		        COALESCE(t.card_to, '') AS bank
+		        COALESCE(t.card_to, '') AS bank,
+		        '' AS card_owner
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
@@ -1385,7 +1393,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 	var out []LedgerRow
 	for rows.Next() {
 		var r LedgerRow
-		if err := rows.Scan(&r.Kind, &r.Client, &r.Amount, &r.TxDate, &r.SubmittedBy, &r.Collector, &r.GroupJID, &r.Bank); err != nil {
+		if err := rows.Scan(&r.Kind, &r.Client, &r.Amount, &r.TxDate, &r.SubmittedBy, &r.Collector, &r.GroupJID, &r.Bank, &r.CardOwner); err != nil {
 			return nil, err
 		}
 		out = append(out, r)

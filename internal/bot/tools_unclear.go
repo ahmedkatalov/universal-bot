@@ -406,8 +406,12 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 				if r.Collector != "" {
 					collector = " — забрал: " + r.Collector
 				}
-				fmt.Fprintf(&sb, "• [%s] %s — %s — %.0f ₽%s — прислал: %s%s — группа: %s\n",
-					r.Kind, r.TxDate.Format("02.01 15:04"), client, r.Amount, bank, sender, collector, groupName)
+				card := ""
+				if r.CardOwner != "" {
+					card = " — карта: " + r.CardOwner
+				}
+				fmt.Fprintf(&sb, "• [%s] %s — клиент: %s — %.0f ₽%s%s — прислал: %s%s — группа: %s\n",
+					r.Kind, r.TxDate.Format("02.01 15:04"), client, r.Amount, card, bank, sender, collector, groupName)
 			}
 			fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
 			return sb.String(), nil
