@@ -51,12 +51,19 @@ func (b *Bot) clarifyLoop() {
 	}
 }
 
+// askReceiptsEnabled — включены ли уточняющие вопросы по чекам (чей чек, не
+// разобрал сумму, у кого наличка, неполный чек). По умолчанию ВКЛ; выключить
+// целиком: ASK_UNNAMED_RECEIPTS=0.
+func askReceiptsEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("ASK_UNNAMED_RECEIPTS")))
+	return !(v == "0" || v == "false" || v == "no")
+}
+
 func (b *Bot) clarifyTick(ctx context.Context) {
 	if b.assistant == nil {
 		return // без ИИ имена не разбираем — вопросы бессмысленны
 	}
-	// Можно выключить проактивные вопросы: ASK_UNNAMED_RECEIPTS=0.
-	if v := strings.ToLower(strings.TrimSpace(os.Getenv("ASK_UNNAMED_RECEIPTS"))); v == "0" || v == "false" || v == "no" {
+	if !askReceiptsEnabled() {
 		return
 	}
 	before := time.Now().Add(-clarifyGrace)

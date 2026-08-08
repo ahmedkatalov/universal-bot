@@ -2659,6 +2659,31 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		txDate = rd.TxTime
 	}
 
+	// Свёрнутый/неполный чек: сумма есть, но НЕ распозналась ни дата операции,
+	// ни номер документа/операции — это, как правило, свёрнутый экран банка
+	// («Перевод выполнен» без подробностей: нет даты, ФИО, номера операции).
+	// Такое нельзя учесть правильно (не та дата, непонятно кому) — просим
+	// прислать РАЗВЁРНУТЫЙ чек. В сумму пока не берём (needs_review).
+	if rd.Amount > 0 && !rd.HasTxTime && rd.DocNumber == "" && rd.AuthCode == "" && media != nil {
+		fmt.Printf("Чек (сообщение %d): неполный (нет даты и номера операции) — прошу развёрнутый\n", rawID)
+		_ = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
+			RawMessageID: rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
+			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
+			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate,
+		})
+		if askReceiptsEnabled() && waMsgID != "" {
+			miss := "даты операции"
+			if strings.TrimSpace(rd.Recipient) == "" {
+				miss = "даты операции и получателя"
+			}
+			b.sendReply(chat, fmt.Sprintf(
+				"🤔 Чек на %.0f ₽ пришёл НЕПОЛНЫМ — не видно %s (похоже на свёрнутый экран банка «Перевод выполнен»). "+
+					"Раскрой чек в приложении (нажми «Сохранить чек» / «Подробнее») и пришли ПОЛНЫЙ — тогда учту правильно, с датой.",
+				rd.Amount, miss), waMsgID, senderJID)
+		}
+		return
+	}
+
 	if rd.Amount == 0 || rd.Recipient == "" {
 		// Ни парсер, ни ИИ по тексту, ни вижн ничего не вытащили. Если это
 		// не выглядело чеком вообще (случайная картинка без денежных полей и
