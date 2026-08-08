@@ -329,10 +329,11 @@ func (b *Bot) sendClientReceiptTool(chat types.JID) ai.Tool {
 func (b *Bot) receiptsLedgerTool() ai.Tool {
 	return ai.Tool{
 		Name: "receipts_ledger",
-		Description: "Журнал чеков за период: по каждому чеку — клиент (кому засчитан), сумма, дата, КТО ПРИСЛАЛ его " +
-			"в WhatsApp и в КАКУЮ ГРУППУ. Вызывай при 'кто прислал этот чек', 'какие чеки от кого', 'кто в какую " +
-			"группу кидал', 'покажи чеки за период с отправителями', 'от кого чеки по клиенту X'. Фильтры: клиент " +
-			"(person) и группа(ы) — по желанию; несколько групп через запятую/'и'; пусто — по всем.",
+		Description: "ЕДИНЫЙ журнал ВСЕХ платежей за период (и чеки, и наличка/переводы): по каждому — ТИП " +
+			"(чек/наличка/перевод), клиент (кому засчитан), сумма, дата, КТО ПРИСЛАЛ в WhatsApp, в КАКУЮ ГРУППУ, а для " +
+			"налички — кто ЗАБРАЛ. Вызывай при 'кто прислал этот чек/платёж', 'наличка это или перевод', 'какого клиента " +
+			"чек', 'какие платежи от кого', 'кто в какую группу кидал', 'от кого платежи по клиенту X'. Фильтры: клиент " +
+			"(person) и группа(ы) — по желанию.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -379,7 +380,7 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 			}
 			groups := b.joinedGroups(ctx)
 			var sb strings.Builder
-			fmt.Fprintf(&sb, "Журнал чеков %s — %s (%s), всего %d:\n", from.Format("02.01"), toDay.Format("02.01"), groupLabel, len(rows))
+			fmt.Fprintf(&sb, "Журнал платежей %s — %s (%s), всего %d:\n", from.Format("02.01"), toDay.Format("02.01"), groupLabel, len(rows))
 			var total float64
 			for _, r := range rows {
 				total += r.Amount
@@ -398,11 +399,15 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 					sender = "?"
 				}
 				bank := ""
-				if r.Bank != "" {
+				if r.Bank != "" && r.Bank != "наличные" {
 					bank = ", " + r.Bank
 				}
-				fmt.Fprintf(&sb, "• %s — %s — %.0f ₽%s — прислал: %s — группа: %s\n",
-					r.TxDate.Format("02.01 15:04"), client, r.Amount, bank, sender, groupName)
+				collector := ""
+				if r.Collector != "" {
+					collector = " — забрал: " + r.Collector
+				}
+				fmt.Fprintf(&sb, "• [%s] %s — %s — %.0f ₽%s — прислал: %s%s — группа: %s\n",
+					r.Kind, r.TxDate.Format("02.01 15:04"), client, r.Amount, bank, sender, collector, groupName)
 			}
 			fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
 			return sb.String(), nil

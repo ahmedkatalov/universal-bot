@@ -1325,35 +1325,57 @@ func (d *DB) ReceiptDetailsForPerson(ctx context.Context, personQuery string, li
 
 // LedgerRow — строка «журнала чеков»: кто прислал, кому засчитан, в какую группу.
 type LedgerRow struct {
-	Client      string    // клиент, кому засчитан чек
+	Kind        string    // "чек", "наличка" или "перевод"
+	Client      string    // клиент, кому засчитан платёж
 	Amount      float64   // сумма
-	TxDate      time.Time // дата операции с чека
-	SubmittedBy string    // КТО прислал чек в WhatsApp (ответственный/отправитель)
+	TxDate      time.Time // дата операции
+	SubmittedBy string    // КТО прислал в WhatsApp
+	Collector   string    // кто ЗАБРАЛ наличку (если указан)
 	GroupJID    string    // в какую группу прислали
-	Bank        string    // банк чека
+	Bank        string    // банк чека / способ
 }
 
-// ReceiptsLedger — журнал чеков за период: по каждому чеку видно клиента, сумму,
-// дату, КТО прислал и в какую ГРУППУ. Фильтры: person (по клиенту), groupJIDs.
+// ReceiptsLedger — ЕДИНЫЙ журнал ВСЕХ платежей за период: и чеки, и наличка/
+// переводы. По каждому видно тип (чек/наличка/перевод), клиента, сумму, дату,
+// КТО прислал и в какую ГРУППУ, а для налички — кто забрал. Фильтры: person, groupJIDs.
 func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person string, groupJIDs []string, limit int) ([]LedgerRow, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
-		       br.amount::float8,
-		       br.tx_date,
-		       COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
-		                split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
-		       COALESCE(br.group_jid, rm.wa_group_jid, ''),
-		       COALESCE(br.bank, '')
+		(SELECT 'чек' AS kind,
+		        COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
+		        br.amount::float8 AS amount, br.tx_date,
+		        COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
+		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		        '' AS collector,
+		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
+		        COALESCE(br.bank, '') AS bank
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
 		  AND br.is_duplicate = false AND br.ignored = false
-		  AND COALESCE(rm.deleted, false) = false
-		  AND br.amount > 0
+		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
 		  AND ($3 = '' OR COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $3 || '%')
-		  AND ($4::text[] IS NULL OR br.group_jid = ANY($4))
-		ORDER BY br.tx_date DESC
+		  AND ($4::text[] IS NULL OR br.group_jid = ANY($4)))
+
+		UNION ALL
+
+		(SELECT CASE WHEN t.is_cash THEN 'наличка' ELSE 'перевод' END AS kind,
+		        COALESCE(c.canonical_name, t.raw_name, '') AS client,
+		        t.amount::float8 AS amount, t.tx_date,
+		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		        COALESCE(t.collector, '') AS collector,
+		        COALESCE(rm.wa_group_jid, '') AS grp,
+		        COALESCE(t.card_to, '') AS bank
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false AND t.amount > 0
+		  AND `+countableTextCondition+`
+		  AND ($3 = '' OR COALESCE(c.canonical_name, t.raw_name, '') ILIKE '%' || $3 || '%')
+		  AND ($4::text[] IS NULL OR rm.wa_group_jid = ANY($4)))
+
+		ORDER BY 4 DESC
 		LIMIT $5
 	`, from, to, person, groupSliceArg(groupJIDs), limit)
 	if err != nil {
@@ -1363,7 +1385,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 	var out []LedgerRow
 	for rows.Next() {
 		var r LedgerRow
-		if err := rows.Scan(&r.Client, &r.Amount, &r.TxDate, &r.SubmittedBy, &r.GroupJID, &r.Bank); err != nil {
+		if err := rows.Scan(&r.Kind, &r.Client, &r.Amount, &r.TxDate, &r.SubmittedBy, &r.Collector, &r.GroupJID, &r.Bank); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
