@@ -90,3 +90,27 @@ func TestExtractCollectorName(t *testing.T) {
 		}
 	}
 }
+
+// TestLooksLikeSilence — «отписки» модели (нечего добавить и т.п.) не постятся.
+func TestLooksLikeSilence(t *testing.T) {
+	silent := []string{
+		"Пустое сообщение без контекста — тут добавить нечего.",
+		"Тут мне нечего добавить",
+		"Промолчу",
+		"Не по теме, воздержусь",
+	}
+	for _, s := range silent {
+		if !looksLikeSilence(s) {
+			t.Errorf("looksLikeSilence(%q) = false, ожидали true", s)
+		}
+	}
+	useful := []string{
+		"Похоже, у Ахмеда за июль уже проходит 50000 — проверь, не дубль ли.",
+		"Этот чек лучше записать на Мусаева, а не на Нажуда.",
+	}
+	for _, s := range useful {
+		if looksLikeSilence(s) {
+			t.Errorf("looksLikeSilence(%q) = true, ожидали false", s)
+		}
+	}
+}
