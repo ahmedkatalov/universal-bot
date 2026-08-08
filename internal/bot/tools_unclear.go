@@ -419,6 +419,99 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 	}
 }
 
+// missingInGroupTool — какие чеки за период попали в ДРУГИЕ группы, но не в указанную.
+func (b *Bot) missingInGroupTool() ai.Tool {
+	return ai.Tool{
+		Name: "missing_in_group",
+		Description: "Показывает чеки, которые за период попали в ДРУГИЕ группы, но НЕ попали в указанную группу " +
+			"(например 'какие чеки не попали в Оплата КЛНТ, но есть в других группах', 'что не добавлено в Оплата КЛНТ'). " +
+			"'Тот же чек' определяется по номеру операции, а без него — по клиенту и сумме. По каждому видно клиента, " +
+			"сумму, дату, в какой группе чек есть и кто прислал. group — ЦЕЛЕВАЯ группа (обязательно). source_group — " +
+			"ограничить группами-источниками (пусто — все остальные).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"group":        map[string]any{"type": "string", "description": "ЦЕЛЕВАЯ группа — где проверяем, чего НЕ хватает (напр. «Оплата КЛНТ»)"},
+				"from_date":    map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD"},
+				"to_date":      map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD"},
+				"source_group": map[string]any{"type": "string", "description": "Ограничить источники группой(ами); пусто — все остальные"},
+				"limit":        map[string]any{"type": "integer", "description": "Сколько показать (по умолчанию 50, максимум 200)"},
+			},
+			"required": []string{"group", "from_date", "to_date"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Group       string `json:"group"`
+				FromDate    string `json:"from_date"`
+				ToDate      string `json:"to_date"`
+				SourceGroup string `json:"source_group"`
+				Limit       int    `json:"limit"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
+			}
+			if strings.TrimSpace(args.Group) == "" {
+				return "", fmt.Errorf("нужна целевая группа (где проверять, чего не хватает)")
+			}
+			targetJID, targetLabel, err := b.resolveGroup(ctx, args.Group)
+			if err != nil {
+				return "", err
+			}
+			from, err := time.Parse("2006-01-02", args.FromDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
+			}
+			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			if err != nil {
+				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
+			}
+			if args.Limit <= 0 || args.Limit > 200 {
+				args.Limit = 50
+			}
+			var sourceJIDs []string
+			if strings.TrimSpace(args.SourceGroup) != "" {
+				sourceJIDs, _, err = b.resolveGroups(ctx, args.SourceGroup)
+				if err != nil {
+					return "", err
+				}
+			}
+			rows, err := b.db.ChecksMissingFromGroup(ctx, targetJID.String(), from, toDay.AddDate(0, 0, 1), sourceJIDs, args.Limit)
+			if err != nil {
+				return "", fmt.Errorf("ошибка выборки: %w", err)
+			}
+			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
+			if len(rows) == 0 {
+				return fmt.Sprintf("За %s все чеки из других групп есть и в «%s» — не попавших нет.", periodLabel, targetLabel), nil
+			}
+			groups := b.joinedGroups(ctx)
+			var sb strings.Builder
+			var total float64
+			fmt.Fprintf(&sb, "Чеки за %s, которые есть в других группах, но НЕ попали в «%s» (%d):\n", periodLabel, targetLabel, len(rows))
+			for _, r := range rows {
+				total += r.Amount
+				groupName := r.GroupJID
+				if jid, err := types.ParseJID(r.GroupJID); err == nil {
+					if name, ok := groups[jid]; ok {
+						groupName = name
+					}
+				}
+				client := r.Client
+				if client == "" {
+					client = "не распознан"
+				}
+				sender := ""
+				if r.SubmittedBy != "" {
+					sender = " (прислал: " + r.SubmittedBy + ")"
+				}
+				fmt.Fprintf(&sb, "• %s — %s — %.0f ₽ — есть в «%s»%s\n",
+					r.TxDate.Format("02.01"), client, r.Amount, groupName, sender)
+			}
+			fmt.Fprintf(&sb, "Итого не попало в «%s»: %.0f ₽.", targetLabel, total)
+			return sb.String(), nil
+		},
+	}
+}
+
 // receiptDetailsTool — показать все распознанные данные чека(ов) клиента.
 func (b *Bot) receiptDetailsTool() ai.Tool {
 	return ai.Tool{

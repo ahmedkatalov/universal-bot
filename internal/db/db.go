@@ -1401,6 +1401,65 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 	return out, rows.Err()
 }
 
+// MissingCheck — чек, который есть в другой группе, но не попал в целевую.
+type MissingCheck struct {
+	Client      string
+	Amount      float64
+	TxDate      time.Time
+	GroupJID    string // в какой группе чек ЕСТЬ
+	SubmittedBy string // кто его туда прислал
+	DocNumber   string
+}
+
+// ChecksMissingFromGroup — чеки за период, которые попали в ДРУГИЕ группы, но
+// которых НЕТ в целевой группе targetJID. «Тот же чек» определяется по номеру
+// документа/операции, а без него — по клиенту и сумме. sourceJIDs ограничивает
+// список групп-источников (nil = все, кроме целевой).
+func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from, to time.Time, sourceJIDs []string, limit int) ([]MissingCheck, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
+		       br.amount::float8, br.tx_date,
+		       COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
+		       COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
+		                split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		       COALESCE(br.doc_number, '')
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.tx_date >= $1 AND br.tx_date < $2
+		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
+		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+		  AND COALESCE(br.group_jid, rm.wa_group_jid, '') <> $3
+		  AND ($4::text[] IS NULL OR COALESCE(br.group_jid, rm.wa_group_jid, '') = ANY($4))
+		  AND NOT EXISTS (
+			SELECT 1 FROM bank_receipts t
+			LEFT JOIN raw_messages trm ON trm.id = t.raw_message_id
+			WHERE COALESCE(t.group_jid, trm.wa_group_jid, '') = $3
+			  AND t.is_duplicate = false AND t.ignored = false
+			  AND COALESCE(trm.deleted, false) = false
+			  AND (
+				(NULLIF(br.doc_number, '') IS NOT NULL AND t.doc_number = br.doc_number)
+				OR (br.contact_id IS NOT NULL AND t.contact_id = br.contact_id AND t.amount = br.amount)
+			  )
+		  )
+		ORDER BY br.tx_date DESC
+		LIMIT $5
+	`, from, to, targetJID, groupSliceArg(sourceJIDs), limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []MissingCheck
+	for rows.Next() {
+		var m MissingCheck
+		if err := rows.Scan(&m.Client, &m.Amount, &m.TxDate, &m.GroupJID, &m.SubmittedBy, &m.DocNumber); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
 // ReceiptFile — сохранённый файл чека для отправки по запросу.
 type ReceiptFile struct {
 	Name      string
