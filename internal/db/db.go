@@ -1415,7 +1415,7 @@ type MissingCheck struct {
 // которых НЕТ в целевой группе targetJID. «Тот же чек» определяется по номеру
 // документа/операции, а без него — по клиенту и сумме. sourceJIDs ограничивает
 // список групп-источников (nil = все, кроме целевой).
-func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from, to time.Time, sourceJIDs []string, limit int) ([]MissingCheck, error) {
+func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from, to time.Time, sourceJIDs []string, person string, limit int) ([]MissingCheck, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
 		       br.amount::float8, br.tx_date,
@@ -1431,6 +1431,7 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
 		  AND COALESCE(br.group_jid, rm.wa_group_jid, '') <> $3
 		  AND ($4::text[] IS NULL OR COALESCE(br.group_jid, rm.wa_group_jid, '') = ANY($4))
+		  AND ($6 = '' OR COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $6 || '%')
 		  AND NOT EXISTS (
 			SELECT 1 FROM bank_receipts t
 			LEFT JOIN raw_messages trm ON trm.id = t.raw_message_id
@@ -1444,7 +1445,7 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		  )
 		ORDER BY br.tx_date DESC
 		LIMIT $5
-	`, from, to, targetJID, groupSliceArg(sourceJIDs), limit)
+	`, from, to, targetJID, groupSliceArg(sourceJIDs), limit, person)
 	if err != nil {
 		return nil, err
 	}

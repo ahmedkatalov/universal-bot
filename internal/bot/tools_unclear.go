@@ -423,18 +423,21 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 func (b *Bot) missingInGroupTool() ai.Tool {
 	return ai.Tool{
 		Name: "missing_in_group",
-		Description: "Показывает чеки, которые за период попали в ДРУГИЕ группы, но НЕ попали в указанную группу " +
-			"(например 'какие чеки не попали в Оплата КЛНТ, но есть в других группах', 'что не добавлено в Оплата КЛНТ'). " +
-			"'Тот же чек' определяется по номеру операции, а без него — по клиенту и сумме. По каждому видно клиента, " +
-			"сумму, дату, в какой группе чек есть и кто прислал. group — ЦЕЛЕВАЯ группа (обязательно). source_group — " +
-			"ограничить группами-источниками (пусто — все остальные).",
+		Description: "Сравнивает чеки между группами и показывает те, что есть в ГРУППЕ-ИСТОЧНИКЕ, но НЕ попали в " +
+			"ЦЕЛЕВУЮ группу. Направление: source_group → group (из источника в целевую). Работает для ЛЮБЫХ групп и в " +
+			"ОБЕ стороны — просто меняй местами source_group и group ('из А не попало в Б' vs 'из Б не попало в А'). " +
+			"group (целевая) обязательна; можно сказать «основная» — возьму запомненную основную группу. source_group — " +
+			"откуда сравнивать (пусто = все остальные группы). person — фильтр по клиенту ('только Ахмеда'). " +
+			"'Тот же чек' = по номеру операции, а без него по клиенту+сумме. Для разговорных уточнений ('а наоборот', " +
+			"'только за сегодня', 'только Ахмеда') вызывай снова, меняя нужный параметр, остальные оставляй как были.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"group":        map[string]any{"type": "string", "description": "ЦЕЛЕВАЯ группа — где проверяем, чего НЕ хватает (напр. «Оплата КЛНТ»)"},
+				"group":        map[string]any{"type": "string", "description": "ЦЕЛЕВАЯ группа — куда проверяем, дошло ли (или «основная»)"},
 				"from_date":    map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD"},
 				"to_date":      map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD"},
-				"source_group": map[string]any{"type": "string", "description": "Ограничить источники группой(ами); пусто — все остальные"},
+				"source_group": map[string]any{"type": "string", "description": "Группа-ИСТОЧНИК, откуда сравнивать; пусто — все остальные"},
+				"person":       map[string]any{"type": "string", "description": "Фильтр по клиенту (пусто — все)"},
 				"limit":        map[string]any{"type": "integer", "description": "Сколько показать (по умолчанию 50, максимум 200)"},
 			},
 			"required": []string{"group", "from_date", "to_date"},
@@ -445,15 +448,14 @@ func (b *Bot) missingInGroupTool() ai.Tool {
 				FromDate    string `json:"from_date"`
 				ToDate      string `json:"to_date"`
 				SourceGroup string `json:"source_group"`
+				Person      string `json:"person"`
 				Limit       int    `json:"limit"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
 			}
-			if strings.TrimSpace(args.Group) == "" {
-				return "", fmt.Errorf("нужна целевая группа (где проверять, чего не хватает)")
-			}
-			targetJID, targetLabel, err := b.resolveGroup(ctx, args.Group)
+			// resolveTargetGroup понимает и «основная» (роль), и обычное имя.
+			targetJID, targetLabel, err := b.resolveTargetGroup(ctx, args.Group)
 			if err != nil {
 				return "", err
 			}
@@ -475,7 +477,7 @@ func (b *Bot) missingInGroupTool() ai.Tool {
 					return "", err
 				}
 			}
-			rows, err := b.db.ChecksMissingFromGroup(ctx, targetJID.String(), from, toDay.AddDate(0, 0, 1), sourceJIDs, args.Limit)
+			rows, err := b.db.ChecksMissingFromGroup(ctx, targetJID.String(), from, toDay.AddDate(0, 0, 1), sourceJIDs, strings.TrimSpace(args.Person), args.Limit)
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}

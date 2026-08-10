@@ -19,6 +19,67 @@ import (
 )
 
 const settingWorkingGroup = "working_group"
+const settingMainGroup = "main_group"
+
+// mainGroupKeywords — как владелец называет основную группу (без имени).
+var mainGroupKeywords = map[string]bool{
+	"": true, "основная": true, "основную": true, "основной": true, "основная группа": true,
+	"главная": true, "главную": true, "главная группа": true, "основная группа учёта": true,
+	"группа оплаты": true, "основную группу": true, "главную группу": true,
+}
+
+// resolveTargetGroup понимает «основная группа» (роль) наравне с именем группы:
+// если владелец сказал «основная»/пусто — берём запомненную основную группу.
+func (b *Bot) resolveTargetGroup(ctx context.Context, name string) (types.JID, string, error) {
+	if mainGroupKeywords[strings.ToLower(strings.TrimSpace(name))] {
+		mg, _ := b.db.SettingGet(ctx, settingMainGroup)
+		if strings.TrimSpace(mg) == "" {
+			return types.JID{}, "", fmt.Errorf("основная группа не задана — скажи «основная группа это <название>», и я запомню")
+		}
+		jid, err := types.ParseJID(mg)
+		if err != nil {
+			return types.JID{}, "", fmt.Errorf("сохранённая основная группа неверна")
+		}
+		label := mg
+		if gn, ok := b.joinedGroups(ctx)[jid]; ok {
+			label = gn
+		}
+		return jid, label, nil
+	}
+	return b.resolveGroup(ctx, name)
+}
+
+// setMainGroupTool — запомнить, какая группа «основная» (куда должны попадать
+// все чеки). Дальше владелец может говорить просто «основная».
+func (b *Bot) setMainGroupTool() ai.Tool {
+	return ai.Tool{
+		Name: "set_main_group",
+		Description: "Запомнить ОСНОВНУЮ группу учёта (куда должны попадать все чеки/платежи). Вызывай, когда владелец " +
+			"говорит 'основная группа это Оплата КЛНТ', 'сделай Оплата КЛНТ основной', 'наша главная группа — X'. " +
+			"После этого он может говорить просто 'основная'/'главная', и ты будешь понимать эту группу.",
+		InputSchema: map[string]any{
+			"type":       "object",
+			"properties": map[string]any{"group": map[string]any{"type": "string", "description": "Название группы, которая станет основной"}},
+			"required":   []string{"group"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Group string `json:"group"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", err
+			}
+			jid, label, err := b.resolveGroup(ctx, args.Group)
+			if err != nil {
+				return "", err
+			}
+			if err := b.db.SettingSet(ctx, settingMainGroup, jid.String()); err != nil {
+				return "", fmt.Errorf("не удалось сохранить: %w", err)
+			}
+			return "Запомнил: основная группа — «" + label + "». Дальше можешь говорить просто «основная».", nil
+		},
+	}
+}
 
 // recordPaymentTool записывает наличный/безналичный платёж, продиктованный
 // владельцем, прямо в учёт (в рабочую группу).
