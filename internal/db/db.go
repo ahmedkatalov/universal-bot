@@ -2085,6 +2085,30 @@ const countableTextCondition = `(
 		)
 	)`
 
+// countableTextConditionByChat — тот же дедуп «текст vs чек», но для режима ПО
+// ДАТЕ ЧАТА: парный чек ищем по ЕГО дате присылки (brm.received_at в [$1,$2)),
+// а НЕ по дате операции. Иначе поздно присланный чек (дата операции в другом
+// дне/месяце) не находился бы, и его текст-дубль задваивал бы сумму. Так текст
+// отбрасывается, если рядом в тот же период прислали парный чек — считается один
+// раз (сам чек — в основной сумме, если его дата операции в месяце периода, или
+// отдельной «⚠️ старые чеки» секцией, если нет). $1/$2 в обоих чат-режимах = from/to.
+const countableTextConditionByChat = `(
+		t.dup_pending = false
+		AND (
+			t.is_cash = true
+			OR NOT EXISTS (
+				SELECT 1 FROM bank_receipts brd
+				LEFT JOIN raw_messages brm ON brm.id = brd.raw_message_id
+				WHERE brd.contact_id = t.contact_id
+				  AND brd.amount = t.amount
+				  AND brd.needs_review = false
+				  AND brd.is_duplicate = false AND brd.ignored = false
+				  AND brm.received_at >= $1 AND brm.received_at < $2
+				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+			)
+		)
+	)`
+
 func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
@@ -2169,7 +2193,7 @@ func (d *DB) SummaryForPeriodByChat(ctx context.Context, from, to, monthStart, m
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE rm.received_at >= $1 AND rm.received_at < $2
 		  AND t.ignored = false
-		  AND `+countableTextCondition+`
+		  AND `+countableTextConditionByChat+`
 		  AND COALESCE(rm.deleted, false) = false
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
@@ -2433,7 +2457,7 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 			WHERE rm.received_at >= $1 AND rm.received_at < $2
 			  AND t.ignored = false
-			  AND `+countableTextCondition+`
+			  AND `+countableTextConditionByChat+`
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))

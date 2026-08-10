@@ -1770,11 +1770,11 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 			}
 
 			to := toDay.AddDate(0, 0, 1)
+			monthStart := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, from.Location())
+			monthEnd := time.Date(toDay.Year(), toDay.Month(), 1, 0, 0, 0, 0, toDay.Location()).AddDate(0, 1, 0)
 			var stats []db.SenderStat
 			byChat := args.DateBasis == "chat"
 			if byChat {
-				monthStart := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, from.Location())
-				monthEnd := time.Date(toDay.Year(), toDay.Month(), 1, 0, 0, 0, 0, toDay.Location()).AddDate(0, 1, 0)
 				stats, err = b.db.SenderStatsByChat(ctx, from, to, monthStart, monthEnd, groupJIDs, strings.TrimSpace(args.Sender))
 			} else {
 				stats, err = b.db.SenderStats(ctx, from, to, groupJIDs, strings.TrimSpace(args.Sender))
@@ -1835,6 +1835,34 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				fmt.Fprintf(&sb, "- %s: %d чек(ов), %.0f ₽\n", label, s.Count, s.Total)
 			}
 			fmt.Fprintf(&sb, "Итого: %d чек(ов) на %.0f ₽", totalCount, totalSum)
+			// В режиме по дате чата чеки с датой операции из другого месяца в сбор
+			// не вошли — показываем их отдельно (как в send_finance_report), чтобы
+			// сбор не выглядел заниженным без объяснения.
+			if byChat {
+				if old, oerr := b.db.ChecksPostedOldOperation(ctx, from, to, monthStart, monthEnd, groupJIDs, 50); oerr == nil && len(old) > 0 {
+					senderQ := strings.ToLower(strings.TrimSpace(args.Sender))
+					var nb strings.Builder
+					var oldTotal float64
+					shown := 0
+					for _, r := range old {
+						if senderQ != "" && !strings.Contains(strings.ToLower(r.SubmittedBy), senderQ) {
+							continue // при фильтре по человеку — только его старые чеки
+						}
+						who := ""
+						if r.SubmittedBy != "" {
+							who = " (прислал: " + r.SubmittedBy + ")"
+						}
+						fmt.Fprintf(&nb, "- %s: %.0f ₽ — чек от %s%s\n", r.Name, r.Amount, r.TxDate.Format("02.01.2006"), who)
+						oldTotal += r.Amount
+						shown++
+					}
+					if shown > 0 {
+						sb.WriteString("\n\n⚠️ Старые чеки — присланы в период, но дата операции из другого месяца (НЕ в сборе выше):\n")
+						sb.WriteString(strings.TrimRight(nb.String(), "\n"))
+						fmt.Fprintf(&sb, "\nИтого старых чеков: %.0f ₽", oldTotal)
+					}
+				}
+			}
 			return sb.String(), nil
 		},
 	}
