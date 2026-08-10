@@ -1401,28 +1401,31 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 	return out, rows.Err()
 }
 
-// MissingCheck — чек, который есть в другой группе, но не попал в целевую.
+// MissingCheck — платёж (чек ИЛИ наличка), который есть в другой группе, но не
+// попал в целевую.
 type MissingCheck struct {
+	Kind        string // "чек" или "наличка"
 	Client      string
 	Amount      float64
 	TxDate      time.Time
-	GroupJID    string // в какой группе чек ЕСТЬ
-	SubmittedBy string // кто его туда прислал
+	GroupJID    string // в какой группе он ЕСТЬ
+	SubmittedBy string // кто его туда прислал / кто забрал (для налички)
 	DocNumber   string
 }
 
-// ChecksMissingFromGroup — чеки за период, которые попали в ДРУГИЕ группы, но
-// которых НЕТ в целевой группе targetJID. «Тот же чек» определяется по номеру
-// документа/операции, а без него — по клиенту и сумме. sourceJIDs ограничивает
-// список групп-источников (nil = все, кроме целевой).
+// ChecksMissingFromGroup — платежи за период (чеки И наличка), которые попали в
+// ДРУГИЕ группы, но которых НЕТ в целевой группе targetJID. «Тот же чек» — по
+// номеру операции, без него (и для налички) — по клиенту и сумме. sourceJIDs
+// ограничивает группы-источники (nil = все, кроме целевой). person — фильтр по клиенту.
 func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from, to time.Time, sourceJIDs []string, person string, limit int) ([]MissingCheck, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
-		       br.amount::float8, br.tx_date,
-		       COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
-		       COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
-		                split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
-		       COALESCE(br.doc_number, '')
+		(SELECT 'чек' AS kind,
+		        COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
+		        br.amount::float8 AS amount, br.tx_date,
+		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
+		        COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
+		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS who,
+		        COALESCE(br.doc_number, '') AS doc
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -1436,14 +1439,41 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 			SELECT 1 FROM bank_receipts t
 			LEFT JOIN raw_messages trm ON trm.id = t.raw_message_id
 			WHERE COALESCE(t.group_jid, trm.wa_group_jid, '') = $3
-			  AND t.is_duplicate = false AND t.ignored = false
-			  AND COALESCE(trm.deleted, false) = false
+			  AND t.is_duplicate = false AND t.ignored = false AND COALESCE(trm.deleted, false) = false
 			  AND (
 				(NULLIF(br.doc_number, '') IS NOT NULL AND t.doc_number = br.doc_number)
 				OR (br.contact_id IS NOT NULL AND t.contact_id = br.contact_id AND t.amount = br.amount)
 			  )
-		  )
-		ORDER BY br.tx_date DESC
+		  ))
+
+		UNION ALL
+
+		(SELECT 'наличка' AS kind,
+		        COALESCE(c.canonical_name, tx.raw_name, '') AS client,
+		        tx.amount::float8 AS amount, tx.tx_date,
+		        COALESCE(rm.wa_group_jid, '') AS grp,
+		        COALESCE(NULLIF(tx.collector, ''), NULLIF(rm.sender_name, ''),
+		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS who,
+		        '' AS doc
+		FROM transactions tx
+		JOIN raw_messages rm ON rm.id = tx.raw_message_id
+		LEFT JOIN contacts c ON c.id = tx.contact_id
+		WHERE tx.tx_date >= $1 AND tx.tx_date < $2
+		  AND tx.is_cash = true AND tx.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND tx.amount > 0
+		  AND COALESCE(rm.wa_group_jid, '') <> $3
+		  AND ($4::text[] IS NULL OR COALESCE(rm.wa_group_jid, '') = ANY($4))
+		  AND ($6 = '' OR COALESCE(c.canonical_name, tx.raw_name, '') ILIKE '%' || $6 || '%')
+		  AND tx.contact_id IS NOT NULL
+		  AND NOT EXISTS (
+			SELECT 1 FROM transactions t2
+			JOIN raw_messages rm2 ON rm2.id = t2.raw_message_id
+			WHERE COALESCE(rm2.wa_group_jid, '') = $3
+			  AND t2.is_cash = true AND t2.ignored = false AND COALESCE(rm2.deleted, false) = false
+			  AND t2.contact_id = tx.contact_id AND t2.amount = tx.amount
+		  ))
+
+		ORDER BY 4 DESC
 		LIMIT $5
 	`, from, to, targetJID, groupSliceArg(sourceJIDs), limit, person)
 	if err != nil {
@@ -1453,7 +1483,7 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 	var out []MissingCheck
 	for rows.Next() {
 		var m MissingCheck
-		if err := rows.Scan(&m.Client, &m.Amount, &m.TxDate, &m.GroupJID, &m.SubmittedBy, &m.DocNumber); err != nil {
+		if err := rows.Scan(&m.Kind, &m.Client, &m.Amount, &m.TxDate, &m.GroupJID, &m.SubmittedBy, &m.DocNumber); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

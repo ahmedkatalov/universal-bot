@@ -423,8 +423,8 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 func (b *Bot) missingInGroupTool() ai.Tool {
 	return ai.Tool{
 		Name: "missing_in_group",
-		Description: "Сравнивает чеки между группами и показывает те, что есть в ГРУППЕ-ИСТОЧНИКЕ, но НЕ попали в " +
-			"ЦЕЛЕВУЮ группу. Направление: source_group → group (из источника в целевую). Работает для ЛЮБЫХ групп и в " +
+		Description: "Сравнивает платежи (ЧЕКИ и НАЛИЧКУ) между группами и показывает те, что есть в ГРУППЕ-ИСТОЧНИКЕ, " +
+			"но НЕ попали в ЦЕЛЕВУЮ группу. Направление: source_group → group (из источника в целевую). Работает для ЛЮБЫХ групп и в " +
 			"ОБЕ стороны — просто меняй местами source_group и group ('из А не попало в Б' vs 'из Б не попало в А'). " +
 			"group (целевая) обязательна; можно сказать «основная» — возьму запомненную основную группу. source_group — " +
 			"откуда сравнивать (пусто = все остальные группы). person — фильтр по клиенту ('только Ахмеда'). " +
@@ -483,12 +483,12 @@ func (b *Bot) missingInGroupTool() ai.Tool {
 			}
 			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
 			if len(rows) == 0 {
-				return fmt.Sprintf("За %s все чеки из других групп есть и в «%s» — не попавших нет.", periodLabel, targetLabel), nil
+				return fmt.Sprintf("За %s все платежи (чеки и наличка) из других групп есть и в «%s» — не попавших нет.", periodLabel, targetLabel), nil
 			}
 			groups := b.joinedGroups(ctx)
 			var sb strings.Builder
 			var total float64
-			fmt.Fprintf(&sb, "Чеки за %s, которые есть в других группах, но НЕ попали в «%s» (%d):\n", periodLabel, targetLabel, len(rows))
+			fmt.Fprintf(&sb, "Платежи за %s, которые есть в других группах, но НЕ попали в «%s» (%d):\n", periodLabel, targetLabel, len(rows))
 			for _, r := range rows {
 				total += r.Amount
 				groupName := r.GroupJID
@@ -501,12 +501,12 @@ func (b *Bot) missingInGroupTool() ai.Tool {
 				if client == "" {
 					client = "не распознан"
 				}
-				sender := ""
+				who := ""
 				if r.SubmittedBy != "" {
-					sender = " (прислал: " + r.SubmittedBy + ")"
+					who = " (прислал: " + r.SubmittedBy + ")"
 				}
-				fmt.Fprintf(&sb, "• %s — %s — %.0f ₽ — есть в «%s»%s\n",
-					r.TxDate.Format("02.01"), client, r.Amount, groupName, sender)
+				fmt.Fprintf(&sb, "• [%s] %s — %s — %.0f ₽ — есть в «%s»%s\n",
+					r.Kind, r.TxDate.Format("02.01"), client, r.Amount, groupName, who)
 			}
 			fmt.Fprintf(&sb, "Итого не попало в «%s»: %.0f ₽.", targetLabel, total)
 			return sb.String(), nil
