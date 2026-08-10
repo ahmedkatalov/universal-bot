@@ -188,8 +188,12 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			break
 		}
 		// 4. Повтор налички — «У клиента уже была та же сумма, это новый платёж?».
+		// Без верхней границы n<=clarifyMaxAsk (как у других веток): придержанная
+		// наличка исключена из сбора, поэтому её ОБЯЗАТЕЛЬНО нужно спросить, иначе
+		// при накоплении >6 повторов ветка молча выключилась бы и деньги пропали
+		// из сбора навсегда. Спам ограничен общим лимитом clarifyPerCycle за цикл.
 		if b.cashDupCheckOn() {
-			if n, err := b.db.CountCashDupNeedingConfirm(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+			if n, err := b.db.CountCashDupNeedingConfirm(ctx, jid.String(), before); err == nil && n > 0 {
 				items, err := b.db.CashDupNeedingConfirm(ctx, jid.String(), before, clarifyPerCycle-asked)
 				if err == nil {
 					for _, it := range items {
@@ -202,7 +206,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 							it.Client, when, it.Amount)
 						botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
 						if botMsgID != "" {
-							_ = b.db.MarkCashDupAsked(ctx, it.TxID)
+							_ = b.db.MarkCashDupAsked(ctx, it.TxID, botMsgID)
 							b.registerDupAsk(botMsgID, it.TxID)
 							asked++
 						}
@@ -405,6 +409,13 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	b.clarify.mu.Lock()
 	dupTxID, isDupAsk := b.clarify.dupAskMap[quotedID]
 	b.clarify.mu.Unlock()
+	if !isDupAsk {
+		// Связь могла потеряться из памяти (рестарт бота) — ищем в БД по id
+		// сообщения-вопроса, чтобы поздний ответ всё равно сработал.
+		if id, ok, _ := b.db.DupTxByAskMsg(ctx, quotedID); ok {
+			dupTxID, isDupAsk = id, true
+		}
+	}
 	if isDupAsk {
 		resolved, isNew := parseCashDupAnswer(text)
 		if !resolved {

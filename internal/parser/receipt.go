@@ -492,12 +492,14 @@ func ParseMoneyValue(s string) float64 {
 		cleaned = strings.ReplaceAll(cleaned, ".", "")
 		cleaned = strings.ReplaceAll(cleaned, ",", ".")
 	} else {
-		// Единственный разделитель: если после него РОВНО 3 цифры и перед ним
-		// нет других разделителей — это разделитель тысяч ("35.000", "1,500").
-		// Если 1-2 цифры — десятичная часть ("844,03", "10000.00").
-		thousandsRe := regexp.MustCompile(`^(\d{1,3})[.,](\d{3})$`)
-		if tm := thousandsRe.FindStringSubmatch(cleaned); tm != nil {
-			cleaned = tm[1] + tm[2]
+		// Разделители тысяч: одна или несколько групп ровно по 3 цифры
+		// ("35.000", "1,500", "2.500.000", "1,234,567") — убираем их. Иначе
+		// единственный разделитель с 1-2 цифрами после — десятичная часть
+		// ("844,03", "10000.00").
+		thousandsRe := regexp.MustCompile(`^\d{1,3}([.,]\d{3})+$`)
+		if thousandsRe.MatchString(cleaned) {
+			cleaned = strings.ReplaceAll(cleaned, ".", "")
+			cleaned = strings.ReplaceAll(cleaned, ",", "")
 		} else {
 			cleaned = strings.ReplaceAll(cleaned, ",", ".")
 		}

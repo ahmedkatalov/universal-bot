@@ -795,11 +795,14 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 
-	updated := append(history, ai.Turn{FromUser: true, Text: text}, ai.Turn{FromUser: false, Text: reply})
+	// Дописываем пару к ТЕКУЩЕЙ истории под одним локом (а не к снимку history,
+	// снятому до многосекундного вызова ИИ) — иначе два быстрых сообщения от
+	// одного отправителя затирают ход друг друга.
+	b.historyMu.Lock()
+	updated := append(b.history[sender], ai.Turn{FromUser: true, Text: text}, ai.Turn{FromUser: false, Text: reply})
 	if len(updated) > maxPrivateHistory {
 		updated = updated[len(updated)-maxPrivateHistory:]
 	}
-	b.historyMu.Lock()
 	b.history[sender] = updated
 	b.historyMu.Unlock()
 	b.persistTurns(ctx, sender, text, reply) // память переживёт рестарт
@@ -975,11 +978,14 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 		return
 	}
 
-	updated := append(history, ai.Turn{FromUser: true, Text: userText}, ai.Turn{FromUser: false, Text: reply})
+	// Дописываем пару к ТЕКУЩЕЙ истории под одним локом (не к снимку, снятому до
+	// вызова ИИ) — иначе два одновременных обращения к боту в группе затирают
+	// ход друг друга.
+	b.historyMu.Lock()
+	updated := append(b.history[key], ai.Turn{FromUser: true, Text: userText}, ai.Turn{FromUser: false, Text: reply})
 	if len(updated) > maxPrivateHistory {
 		updated = updated[len(updated)-maxPrivateHistory:]
 	}
-	b.historyMu.Lock()
 	b.history[key] = updated
 	b.historyMu.Unlock()
 	b.persistTurns(ctx, key, userText, reply) // память группового диалога переживёт рестарт
@@ -1604,11 +1610,11 @@ func (b *Bot) cardsTool(chat types.JID) ai.Tool {
 			}
 			args.FromDate, args.ToDate, args.Group, args.Card, args.Format = raw.FromDate, raw.ToDate, raw.Group, raw.Card, raw.Format
 
-			from, err := time.Parse("2006-01-02", args.FromDate)
+			from, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
 			}
-			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			toDay, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
 			}
@@ -1728,11 +1734,11 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
 			}
-			from, err := time.Parse("2006-01-02", args.FromDate)
+			from, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", args.FromDate)
 			}
-			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			toDay, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата конца периода %q, нужен формат YYYY-MM-DD", args.ToDate)
 			}
@@ -2436,11 +2442,11 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 // достаёт сводку за период из БД и либо отправляет PDF, либо возвращает
 // текст для финального ответа модели.
 func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromStr, toStr, format string, groupJIDs []string, groupLabel string) (string, error) {
-	from, err := time.Parse("2006-01-02", fromStr)
+	from, err := time.ParseInLocation("2006-01-02", fromStr, time.Local)
 	if err != nil {
 		return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", fromStr)
 	}
-	toDay, err := time.Parse("2006-01-02", toStr)
+	toDay, err := time.ParseInLocation("2006-01-02", toStr, time.Local)
 	if err != nil {
 		return "", fmt.Errorf("неверная дата конца периода %q, нужен формат YYYY-MM-DD", toStr)
 	}

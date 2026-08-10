@@ -123,18 +123,24 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				return "", fmt.Errorf("нужны и клиент, и сумма (>0)")
 			}
 
-			// Группа: указана -> используем и ЗАПОМИНАЕМ как рабочую; иначе берём
-			// запомненную. Если нет ни там, ни там — просим назвать один раз.
+			// Группа: указана -> используем; ЗАПОМИНАЕМ как рабочую только при
+			// первой настройке (пока рабочей нет). Иначе разовая запись «в другую
+			// группу» молча сдвигала бы постоянную рабочую, и следующие платежи без
+			// группы летели бы не туда. Если группы нет ни там, ни там — просим
+			// назвать один раз.
 			groupJID := ""
+			existingWG, _ := b.db.SettingGet(ctx, settingWorkingGroup)
 			if strings.TrimSpace(args.Group) != "" {
 				jid, _, err := b.resolveGroup(ctx, args.Group)
 				if err != nil {
 					return "", err
 				}
 				groupJID = jid.String()
-				_ = b.db.SettingSet(ctx, settingWorkingGroup, groupJID)
+				if strings.TrimSpace(existingWG) == "" {
+					_ = b.db.SettingSet(ctx, settingWorkingGroup, groupJID)
+				}
 			} else {
-				groupJID, _ = b.db.SettingGet(ctx, settingWorkingGroup)
+				groupJID = existingWG
 				if groupJID == "" {
 					return "Не знаю, в какую группу записывать платежи. Назови рабочую группу один раз " +
 						"(например: «работаем с Оплата КЛНТ»), дальше буду использовать её автоматически.", nil
@@ -143,9 +149,11 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 
 			txDate := time.Now()
 			if s := strings.TrimSpace(args.Date); s != "" {
-				if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
-					txDate = t
+				t, err := time.ParseInLocation("2006-01-02", s, time.Local)
+				if err != nil {
+					return "", fmt.Errorf("не понял дату %q — нужен формат ГГГГ-ММ-ДД (например 2025-07-15)", s)
 				}
+				txDate = t
 			}
 
 			isCash := strings.EqualFold(args.Kind, "cash")
@@ -191,6 +199,7 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				Collector:    collector,
 				RawMessageID: rawID,
 				TxDate:       txDate,
+				DupCheck:     b.cashDupCheckOn(),
 			}); err != nil {
 				return "", fmt.Errorf("не удалось записать платёж: %w", err)
 			}
@@ -245,9 +254,11 @@ func (b *Bot) recordExpenseTool() ai.Tool {
 			}
 			spentAt := time.Now()
 			if s := strings.TrimSpace(args.Date); s != "" {
-				if t, err := time.ParseInLocation("2006-01-02", s, time.Local); err == nil {
-					spentAt = t
+				t, err := time.ParseInLocation("2006-01-02", s, time.Local)
+				if err != nil {
+					return "", fmt.Errorf("не понял дату %q — нужен формат ГГГГ-ММ-ДД (например 2025-07-15)", s)
 				}
+				spentAt = t
 			}
 			if _, err := b.db.InsertExpense(ctx, args.Amount, strings.TrimSpace(args.Note), "владелец", spentAt); err != nil {
 				return "", fmt.Errorf("не удалось записать расход: %w", err)

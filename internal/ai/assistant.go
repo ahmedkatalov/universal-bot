@@ -192,13 +192,17 @@ func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem strin
 	}
 
 	for i := 0; i < maxToolIterations; i++ {
-		respMsg, finishReason, err := a.chat(ctx, messages, toolDefs)
+		respMsg, _, err := a.chat(ctx, messages, toolDefs)
 		if err != nil {
 			return "", err
 		}
 		messages = append(messages, respMsg)
 
-		if finishReason != "tool_calls" || len(respMsg.ToolCalls) == 0 {
+		// Выполняем инструменты, если модель их вызвала, НЕЗАВИСИМО от
+		// finish_reason: часть моделей через OpenRouter возвращает tool_calls
+		// вместе с finish_reason "stop"/"length". Раньше такой ответ отбрасывался
+		// и текст «Записал платёж» уходил пользователю, а в БД ничего не писалось.
+		if len(respMsg.ToolCalls) == 0 {
 			return contentString(respMsg.Content), nil
 		}
 

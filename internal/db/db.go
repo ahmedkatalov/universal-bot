@@ -134,6 +134,12 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.dup_asked: %w", err)
 	}
+	// id сообщения-вопроса «новый или тот же?» — чтобы ответ владельца привязался
+	// к нужной транзакции ДАЖЕ после перезапуска бота (иначе связь жила только в
+	// памяти и придержанный платёж навсегда выпадал из сбора).
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_ask_msg_id TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.dup_ask_msg_id: %w", err)
+	}
 
 	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
 	if _, err := pool.Exec(ctx, `
@@ -354,17 +360,22 @@ func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
 	dupPending := false
 	if tx.IsCash && tx.DupCheck && tx.ContactID != 0 && tx.Amount > 0 {
 		// Есть ли уже засчитанная наличка тому же клиенту на ТУ ЖЕ сумму за
-		// последние 30 дней? Если да — это может быть случайный повтор (одну и ту
-		// же наличку скинули дважды). Придерживаем платёж (dup_pending) и просим
-		// владельца подтвердить «новый / тот же» — иначе задвоился бы сбор.
+		// последние 30 дней В ТОЙ ЖЕ ГРУППЕ? Если да — это может быть случайный
+		// повтор (одну и ту же наличку скинули дважды). Придерживаем платёж
+		// (dup_pending) и просим владельца подтвердить «новый / тот же». Группу
+		// учитываем обязательно: тот же клиент на ту же сумму в РАЗНЫХ группах —
+		// это разные платежи, придерживать нельзя (как и у чеков, см.
+		// FindDuplicateReceipt).
 		since := tx.TxDate.AddDate(0, 0, -30)
 		if err := d.pool.QueryRow(ctx, `
 			SELECT EXISTS (
-				SELECT 1 FROM transactions
-				WHERE contact_id = $1 AND amount = $2 AND is_cash = true
-				  AND ignored = false AND dup_pending = false
-				  AND tx_date >= $3 AND tx_date <= $4
-			)`, tx.ContactID, tx.Amount, since, tx.TxDate).Scan(&dupPending); err != nil {
+				SELECT 1 FROM transactions t
+				JOIN raw_messages rm ON rm.id = t.raw_message_id
+				WHERE t.contact_id = $1 AND t.amount = $2 AND t.is_cash = true
+				  AND t.ignored = false AND t.dup_pending = false
+				  AND t.tx_date >= $3 AND t.tx_date <= $4
+				  AND rm.wa_group_jid = (SELECT wa_group_jid FROM raw_messages WHERE id = $5)
+			)`, tx.ContactID, tx.Amount, since, tx.TxDate, tx.RawMessageID).Scan(&dupPending); err != nil {
 			dupPending = false // при ошибке не придерживаем — лучше засчитать, чем потерять
 		}
 	}
@@ -438,10 +449,30 @@ func (d *DB) CountCashDupNeedingConfirm(ctx context.Context, groupJID string, ol
 	return n, err
 }
 
-// MarkCashDupAsked помечает, что про повтор этой налички уже спросили.
-func (d *DB) MarkCashDupAsked(ctx context.Context, txID int) error {
-	_, err := d.pool.Exec(ctx, `UPDATE transactions SET dup_asked = true WHERE id = $1`, txID)
+// MarkCashDupAsked помечает, что про повтор этой налички уже спросили, и
+// сохраняет id сообщения-вопроса — чтобы ответ владельца привязался к платежу
+// даже после перезапуска бота (память dupAskMap теряется, БД — нет).
+func (d *DB) MarkCashDupAsked(ctx context.Context, txID int, askMsgID string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE transactions SET dup_asked = true, dup_ask_msg_id = $2 WHERE id = $1`, txID, nullIfEmpty(askMsgID))
 	return err
+}
+
+// DupTxByAskMsg находит придержанный платёж по id сообщения-вопроса «новый или
+// тот же?» — запасной путь, если связь потерялась из памяти (рестарт бота).
+func (d *DB) DupTxByAskMsg(ctx context.Context, askMsgID string) (int, bool, error) {
+	if askMsgID == "" {
+		return 0, false, nil
+	}
+	var txID int
+	err := d.pool.QueryRow(ctx, `
+		SELECT id FROM transactions
+		WHERE dup_ask_msg_id = $1 AND dup_pending = true AND ignored = false
+		ORDER BY id DESC LIMIT 1
+	`, askMsgID).Scan(&txID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return txID, err == nil, err
 }
 
 // ResolveCashDup применяет ответ владельца на вопрос про повтор налички:
@@ -488,7 +519,7 @@ func (d *DB) CashNeedingCollector(ctx context.Context, groupJID string, olderTha
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
 		WHERE rm.wa_group_jid = $1
-		  AND t.is_cash = true AND COALESCE(t.collector, '') = '' AND t.collector_asked = false
+		  AND t.is_cash = true AND t.dup_pending = false AND COALESCE(t.collector, '') = '' AND t.collector_asked = false
 		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false
 		  AND t.amount > 0 AND t.created_at < $2
 		ORDER BY t.created_at
@@ -516,7 +547,7 @@ func (d *DB) CountCashNeedingCollector(ctx context.Context, groupJID string, old
 		SELECT COUNT(*) FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE rm.wa_group_jid = $1
-		  AND t.is_cash = true AND COALESCE(t.collector, '') = '' AND t.collector_asked = false
+		  AND t.is_cash = true AND t.dup_pending = false AND COALESCE(t.collector, '') = '' AND t.collector_asked = false
 		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false
 		  AND t.amount > 0 AND t.created_at < $2
 	`, groupJID, olderThan).Scan(&n)
@@ -2069,7 +2100,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 
 		UNION ALL
 
-		(SELECT DISTINCT ON (COALESCE(NULLIF(br.doc_number, ''), br.contact_id::text || '|' || br.amount::text || '|' || br.tx_date::text))
+		(SELECT DISTINCT ON (COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 			c.canonical_name, COALESCE(br.bank, 'банк не указан'), br.amount
 		FROM bank_receipts br
 		JOIN contacts c ON c.id = br.contact_id
@@ -2081,7 +2112,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		  AND COALESCE(rm.deleted, false) = false
 		  AND br.contact_id IS NOT NULL
 		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
-		ORDER BY COALESCE(NULLIF(br.doc_number, ''), br.contact_id::text || '|' || br.amount::text || '|' || br.tx_date::text))
+		ORDER BY COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
 		return nil, err
@@ -2154,8 +2185,7 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 	// контакт/получатель + сумма + дата операции (как в SummaryForPeriod).
 	rows, err := d.pool.Query(ctx, `
 		SELECT card, bank, amount FROM (
-			SELECT DISTINCT ON (COALESCE(NULLIF(br.doc_number, ''),
-			                             COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || br.tx_date::text))
+			SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 				COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), 'не распознано') AS card,
 				COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), '') AS bank,
 				br.amount::float8 AS amount
@@ -2166,8 +2196,7 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 			  AND COALESCE(rm.deleted, false) = false
 			  AND br.amount > 0
 			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
-			ORDER BY COALESCE(NULLIF(br.doc_number, ''),
-			                  COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || br.tx_date::text)
+			ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text)
 		) dedup
 	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
@@ -2220,19 +2249,27 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 	rows, err := d.pool.Query(ctx, `
 		SELECT s.sender_name, s.phone, COUNT(*), COALESCE(SUM(s.amount), 0)
 		FROM (
-			SELECT
-				COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
-				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
-				br.amount
-			FROM bank_receipts br
-			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
-			WHERE br.tx_date >= $1 AND br.tx_date < $2
-			  AND br.is_duplicate = false
-			  AND br.ignored = false
-			  AND COALESCE(rm.deleted, false) = false
-			  AND br.amount > 0
-			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+			-- DISTINCT ON схлопывает один и тот же чек, разосланный в несколько
+			-- групп (как в SummaryForPeriod/CardTotals), чтобы сбор отправителя не
+			-- задваивался при подсчёте по всем группам. Из копий берём самую
+			-- раннюю (br.created_at) — обычно это тот, кто реально собрал и первым
+			-- запостил, а не тот, кто переслал.
+			SELECT sender_name, phone, amount FROM (
+				SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+					COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+					split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+					br.amount
+				FROM bank_receipts br
+				LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+				LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+				WHERE br.tx_date >= $1 AND br.tx_date < $2
+				  AND br.is_duplicate = false
+				  AND br.ignored = false
+				  AND COALESCE(rm.deleted, false) = false
+				  AND br.amount > 0
+				  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+				ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text), br.created_at
+			) bank_dedup
 
 			UNION ALL
 
