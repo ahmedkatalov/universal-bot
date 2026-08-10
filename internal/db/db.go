@@ -785,7 +785,7 @@ func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan t
 }
 
 // FillReceiptByMessage применяет ответ владельца на вопрос про чек:
-//   - если задано имя ($2 != '') — ставит клиента (recipient + contact);
+//   - если задано имя ($2 != ”) — ставит клиента (recipient + contact);
 //   - если задана сумма ($4 > 0) — ставит/ИСПРАВЛЯЕТ сумму (в т.ч. поверх
 //     ошибочно прочитанной — для правки подозрительных сумм);
 //   - пустой ответ (только «да/верно») просто снимает флаги (подтверждение).
@@ -861,7 +861,6 @@ func (d *DB) MarkReceiptAsked(ctx context.Context, receiptID int) error {
 	_, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET clarify_asked = true WHERE id = $1`, receiptID)
 	return err
 }
-
 
 // DuplicateWindow — окно вокруг времени операции, в котором совпадение
 // получателя и суммы считается вероятным повтором одного и того же чека
@@ -2118,10 +2117,14 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		return nil, err
 	}
 	defer rows.Close()
+	return scanContactSummaries(rows)
+}
 
+// scanContactSummaries сворачивает строки (имя, карта, сумма) в разбивку по
+// контактам с нормализацией имени. Общая для операционного и «чат»-режимов.
+func scanContactSummaries(rows pgx.Rows) ([]ContactSummary, error) {
 	byName := map[string]*ContactSummary{}
 	var order []string
-
 	for rows.Next() {
 		var name string
 		var card *string
@@ -2146,12 +2149,95 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		}
 		cs.ByCard[cardKey] += amount
 	}
-
 	result := make([]ContactSummary, 0, len(order))
 	for _, key := range order {
 		result = append(result, *byName[key])
 	}
 	return result, rows.Err()
+}
+
+// SummaryForPeriodByChat — сводка в режиме «по дате В ЧАТЕ» (когда прислали),
+// а не по дате операции на чеке. Фильтр по received_at сообщения. Чеки, у
+// которых дата операции ВНЕ месяца периода [monthStart, monthEnd), в основную
+// сумму НЕ берём — их отдельно показывает ChecksPostedOldOperation. Наличка и
+// текст датируются присылкой, поэтому попадают как обычно.
+func (d *DB) SummaryForPeriodByChat(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string) ([]ContactSummary, error) {
+	rows, err := d.pool.Query(ctx, `
+		(SELECT c.canonical_name, t.card_to, t.amount
+		FROM transactions t
+		JOIN contacts c ON c.id = t.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE rm.received_at >= $1 AND rm.received_at < $2
+		  AND t.ignored = false
+		  AND `+countableTextCondition+`
+		  AND COALESCE(rm.deleted, false) = false
+		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
+
+		UNION ALL
+
+		(SELECT DISTINCT ON (COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+			c.canonical_name, COALESCE(br.bank, 'банк не указан'), br.amount
+		FROM bank_receipts br
+		JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE rm.received_at >= $1 AND rm.received_at < $2
+		  AND br.tx_date >= $4 AND br.tx_date < $5
+		  AND br.needs_review = false
+		  AND br.is_duplicate = false
+		  AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.contact_id IS NOT NULL
+		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+		ORDER BY COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+	`, from, to, groupSliceArg(groupJIDs), monthStart, monthEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanContactSummaries(rows)
+}
+
+// OldCheck — чек, ПРИСЛАННЫЙ в период, но с датой операции из ДРУГОГО месяца
+// (в режиме «по дате чата» показывается отдельно, вне суммы дня).
+type OldCheck struct {
+	Name        string
+	Amount      float64
+	TxDate      time.Time
+	SubmittedBy string
+}
+
+// ChecksPostedOldOperation — чеки, присланные (received_at) в [from,to), у
+// которых дата операции вне месяца периода [monthStart, monthEnd). Для отдельной
+// «⚠️ старые чеки» секции в режиме по дате чата.
+func (d *DB) ChecksPostedOldOperation(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string, limit int) ([]OldCheck, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+			COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date,
+			COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '')
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE rm.received_at >= $1 AND rm.received_at < $2
+		  AND (br.tx_date < $4 OR br.tx_date >= $5)
+		  AND br.needs_review = false AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+		ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text), br.tx_date
+		LIMIT $6
+	`, from, to, groupSliceArg(groupJIDs), monthStart, monthEnd, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OldCheck
+	for rows.Next() {
+		var o OldCheck
+		if err := rows.Scan(&o.Name, &o.Amount, &o.TxDate, &o.SubmittedBy); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }
 
 // SenderStat — статистика по одному отправителю чеков: сколько чеков он
@@ -2295,7 +2381,10 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 		return nil, err
 	}
 	defer rows.Close()
+	return scanSenderStats(rows)
+}
 
+func scanSenderStats(rows pgx.Rows) ([]SenderStat, error) {
 	var out []SenderStat
 	for rows.Next() {
 		var s SenderStat
@@ -2305,6 +2394,59 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 		out = append(out, s)
 	}
 	return out, rows.Err()
+}
+
+// SenderStatsByChat — «сбор по отправителю» в режиме по дате В ЧАТЕ (received_at).
+// Чеки с датой операции вне месяца периода [monthStart, monthEnd) в сбор не
+// берём (их отдельно покажет ChecksPostedOldOperation). Наличка/текст —
+// по дате присылки.
+func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string, senderQuery string) ([]SenderStat, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT s.sender_name, s.phone, COUNT(*), COALESCE(SUM(s.amount), 0)
+		FROM (
+			SELECT sender_name, phone, amount FROM (
+				SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+					COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+					split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+					br.amount
+				FROM bank_receipts br
+				LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+				LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+				WHERE rm.received_at >= $1 AND rm.received_at < $2
+				  AND br.tx_date >= $5 AND br.tx_date < $6
+				  AND br.is_duplicate = false
+				  AND br.ignored = false
+				  AND COALESCE(rm.deleted, false) = false
+				  AND br.amount > 0
+				  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+				ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text), br.created_at
+			) bank_dedup
+
+			UNION ALL
+
+			SELECT
+				COALESCE(NULLIF(t.collector, ''), NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+				t.amount
+			FROM transactions t
+			JOIN raw_messages rm ON rm.id = t.raw_message_id
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+			WHERE rm.received_at >= $1 AND rm.received_at < $2
+			  AND t.ignored = false
+			  AND `+countableTextCondition+`
+			  AND COALESCE(rm.deleted, false) = false
+			  AND t.amount > 0
+			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
+		) s
+		WHERE ($4 = '' OR s.sender_name ILIKE '%' || $4 || '%' OR s.phone LIKE '%' || $4 || '%')
+		GROUP BY s.sender_name, s.phone
+		ORDER BY 4 DESC
+	`, from, to, groupSliceArg(groupJIDs), senderQuery, monthStart, monthEnd)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	return scanSenderStats(rows)
 }
 
 // ChatTurn — одна реплика диалога ассистента, как она лежит в БД. Отдельный от

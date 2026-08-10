@@ -1385,11 +1385,18 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"сразу), либо оставить пустым (по всем группам). В ОТВЕТЕ всегда явно пиши, за какой период и по какой " +
 		"группе/группам цифры. НЕ переспрашивай группу без нужды: если тебя вызвали В группе и не назвали другую — " +
 		"считай по ЭТОЙ группе; если пишут в личке без указания группы — считай по всем и так и напиши.\n" +
-		"2. senders_report — СБОР по ответственному (кто собрал/забрал деньги). Считает ВСЁ, что человек собрал: " +
-		"и чеки, и наличку/текстовые платежи. Вызывай при 'сбор Расула за июнь', 'сколько собрал Расул', " +
-		"'какой сотрудник сколько собрал'. Фильтр по группе и по человеку (имя или номер). ВАЖНО: 'сбор X' — это " +
-		"обычно про того, кто СОБРАЛ (senders_report), а не про клиента; если из контекста ясно, что X — клиент " +
-		"(его платежи по рассрочке), тогда person_report.\n" +
+		"   ДВЕ ДАТЫ У ПЛАТЕЖА (параметр date_basis): у чека есть дата ОПЕРАЦИИ (напечатана на чеке) и дата, когда " +
+		"его ПРИСЛАЛИ в чат. По умолчанию (date_basis=\"operation\") считаем по дате операции. Если владелец говорит " +
+		"«бери дату из чата», «считай по дате присылки», «когда скинули» — ставь date_basis=\"chat\": тогда сбор за " +
+		"день = всё, что прислали в этот день, а чеки с датой операции из ДРУГОГО месяца бот покажет ОТДЕЛЬНО (вне " +
+		"суммы дня) с пометкой. Наличка датируется присылкой в обоих режимах. Всегда пиши в ответе, по какой дате считал.\n" +
+		"2. senders_report — СБОР по ОТПРАВИТЕЛЮ (кто ПРИСЛАЛ чек в группу = кто собрал/забрал деньги). Считает ВСЁ, " +
+		"что человек собрал: и чеки (по тому, КТО ИХ ОТПРАВИЛ в WhatsApp), и наличку/текст (по ответственному). " +
+		"Вызывай при 'сбор Расула за июнь', 'сколько собрал/скинул Расул', 'какой сотрудник сколько собрал', " +
+		"'по группе СБ кто сколько отправил'. Фильтр по группе и по человеку (имя или номер). Тоже понимает " +
+		"date_basis (operation/chat), как send_finance_report. ВАЖНО: сбор считается по тому, КТО ОТПРАВИЛ чек — " +
+		"это ключевой смысл сбора СБ. 'сбор X' — обычно про того, кто СОБРАЛ (senders_report), а не про клиента; " +
+		"если из контекста ясно, что X — клиент (его платежи по рассрочке), тогда person_report.\n" +
 		"2b. cards_report — НА ЧЬИ КАРТЫ сколько перевели (по владельцам карт-получателей). Вызывай при " +
 		"'на чьи карты сколько перевели', 'разбивка по картам', 'сколько пришло на карту Нажуда'. " +
 		"Это про владельца КАРТЫ-получателя, не про клиента и не про того, кто собрал.\n" +
@@ -1553,15 +1560,23 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 					"type":        "string",
 					"description": "Название группы; можно указать ДВЕ и более через запятую или \"и\" (напр. \"Оплата КЛНТ и Отче\"). Пусто — по всем группам.",
 				},
+				"date_basis": map[string]any{
+					"type": "string",
+					"enum": []string{"operation", "chat"},
+					"description": "По какой дате считать. \"operation\" (по умолчанию) — по дате операции НА ЧЕКЕ. " +
+						"\"chat\" — по дате, когда чек ПРИСЛАЛИ в чат (бери, если просят «считай по дате чата»/«когда прислали»). " +
+						"В режиме chat чек с датой операции из другого месяца показывается отдельно, вне суммы дня.",
+				},
 			},
 			"required": []string{"from_date", "to_date", "format"},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
-				FromDate string `json:"from_date"`
-				ToDate   string `json:"to_date"`
-				Format   string `json:"format"`
-				Group    string `json:"group"`
+				FromDate  string `json:"from_date"`
+				ToDate    string `json:"to_date"`
+				Format    string `json:"format"`
+				Group     string `json:"group"`
+				DateBasis string `json:"date_basis"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
@@ -1570,7 +1585,7 @@ func (b *Bot) reportTool(chat types.JID) ai.Tool {
 			if err != nil {
 				return "", err
 			}
-			return b.buildReportForAssistant(ctx, chat, args.FromDate, args.ToDate, args.Format, groupJIDs, groupLabel)
+			return b.buildReportForAssistant(ctx, chat, args.FromDate, args.ToDate, args.Format, groupJIDs, groupLabel, args.DateBasis)
 		},
 	}
 }
@@ -1720,16 +1735,23 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 					"enum":        []string{"pdf", "text"},
 					"description": "\"pdf\" — прислать документ; \"text\" (по умолчанию) — вернуть цифры текстом",
 				},
+				"date_basis": map[string]any{
+					"type": "string",
+					"enum": []string{"operation", "chat"},
+					"description": "По какой дате считать чеки. \"operation\" (по умолчанию) — по дате операции на чеке. " +
+						"\"chat\" — по дате присылки в чат (бери, если просят «по дате чата»/«когда прислали»).",
+				},
 			},
 			"required": []string{"from_date", "to_date"},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
-				FromDate string `json:"from_date"`
-				ToDate   string `json:"to_date"`
-				Group    string `json:"group"`
-				Sender   string `json:"sender"`
-				Format   string `json:"format"`
+				FromDate  string `json:"from_date"`
+				ToDate    string `json:"to_date"`
+				Group     string `json:"group"`
+				Sender    string `json:"sender"`
+				Format    string `json:"format"`
+				DateBasis string `json:"date_basis"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
@@ -1747,11 +1769,23 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				return "", err
 			}
 
-			stats, err := b.db.SenderStats(ctx, from, toDay.AddDate(0, 0, 1), groupJIDs, strings.TrimSpace(args.Sender))
+			to := toDay.AddDate(0, 0, 1)
+			var stats []db.SenderStat
+			byChat := args.DateBasis == "chat"
+			if byChat {
+				monthStart := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, from.Location())
+				monthEnd := time.Date(toDay.Year(), toDay.Month(), 1, 0, 0, 0, 0, toDay.Location()).AddDate(0, 1, 0)
+				stats, err = b.db.SenderStatsByChat(ctx, from, to, monthStart, monthEnd, groupJIDs, strings.TrimSpace(args.Sender))
+			} else {
+				stats, err = b.db.SenderStats(ctx, from, to, groupJIDs, strings.TrimSpace(args.Sender))
+			}
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}
 			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
+			if byChat {
+				periodLabel += " · по дате в чате"
+			}
 			if len(stats) == 0 {
 				return fmt.Sprintf("За период %s (%s) чеков не найдено.", periodLabel, groupLabel), nil
 			}
@@ -2441,7 +2475,7 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 // buildReportForAssistant — общая логика инструмента send_finance_report:
 // достаёт сводку за период из БД и либо отправляет PDF, либо возвращает
 // текст для финального ответа модели.
-func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromStr, toStr, format string, groupJIDs []string, groupLabel string) (string, error) {
+func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromStr, toStr, format string, groupJIDs []string, groupLabel, dateBasis string) (string, error) {
 	from, err := time.ParseInLocation("2006-01-02", fromStr, time.Local)
 	if err != nil {
 		return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", fromStr)
@@ -2451,27 +2485,59 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 		return "", fmt.Errorf("неверная дата конца периода %q, нужен формат YYYY-MM-DD", toStr)
 	}
 	to := toDay.AddDate(0, 0, 1) // конец периода включительно -> верхняя граница исключительно
+	byChat := dateBasis == "chat"
 
 	periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
 	if groupLabel != "" {
 		periodLabel += " (" + groupLabel + ")"
 	}
 
-	summaries, err := b.db.SummaryForPeriod(ctx, from, to, groupJIDs)
-	if err != nil {
-		return "", fmt.Errorf("ошибка при выборке данных: %w", err)
-	}
-	// Чеки, которые скинули недавно (за последние 12 часов), но по дате
-	// операции на самом чеке они ВНЕ запрошенного периода — их в сумму не
-	// берём, но явно отмечаем, чтобы владелец видел.
+	var summaries []db.ContactSummary
 	excludedNote := ""
-	if excluded, err := b.db.RecentReceiptsOutsidePeriod(ctx, from, to, time.Now().Add(-12*time.Hour), groupJIDs, 12); err == nil && len(excluded) > 0 {
-		var nb strings.Builder
-		fmt.Fprintf(&nb, "\n\n⚠️ НЕ посчитал в сумму (дата операции на чеке вне периода %s):\n", periodLabel)
-		for _, r := range excluded {
-			fmt.Fprintf(&nb, "- %s: %.0f ₽ — чек от %s\n", r.Name, r.Amount, r.TxDate.Format("02.01.2006"))
+	if byChat {
+		// Режим по дате чата: считаем всё, что прислали в период. Чеки, у которых
+		// дата операции из ДРУГОГО месяца, в сумму дня не берём — показываем
+		// отдельной секцией с ⚠️.
+		monthStart := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, from.Location())
+		monthEnd := time.Date(toDay.Year(), toDay.Month(), 1, 0, 0, 0, 0, toDay.Location()).AddDate(0, 1, 0)
+		summaries, err = b.db.SummaryForPeriodByChat(ctx, from, to, monthStart, monthEnd, groupJIDs)
+		if err != nil {
+			return "", fmt.Errorf("ошибка при выборке данных: %w", err)
 		}
-		excludedNote = strings.TrimRight(nb.String(), "\n")
+		if old, err := b.db.ChecksPostedOldOperation(ctx, from, to, monthStart, monthEnd, groupJIDs, 50); err == nil && len(old) > 0 {
+			var nb strings.Builder
+			var oldTotal float64
+			fmt.Fprintf(&nb, "\n\n⚠️ Старые чеки — присланы в период, но дата операции из другого месяца (НЕ в сумме выше):\n")
+			for _, r := range old {
+				who := ""
+				if r.SubmittedBy != "" {
+					who = " (прислал: " + r.SubmittedBy + ")"
+				}
+				fmt.Fprintf(&nb, "- %s: %.0f ₽ — чек от %s%s\n", r.Name, r.Amount, r.TxDate.Format("02.01.2006"), who)
+				oldTotal += r.Amount
+			}
+			fmt.Fprintf(&nb, "Итого старых чеков: %.0f ₽", oldTotal)
+			excludedNote = "\n\n" + strings.TrimRight(nb.String(), "\n")
+		}
+	} else {
+		summaries, err = b.db.SummaryForPeriod(ctx, from, to, groupJIDs)
+		if err != nil {
+			return "", fmt.Errorf("ошибка при выборке данных: %w", err)
+		}
+		// Чеки, которые скинули недавно (за последние 12 часов), но по дате
+		// операции на самом чеке они ВНЕ запрошенного периода — их в сумму не
+		// берём, но явно отмечаем, чтобы владелец видел.
+		if excluded, err := b.db.RecentReceiptsOutsidePeriod(ctx, from, to, time.Now().Add(-12*time.Hour), groupJIDs, 12); err == nil && len(excluded) > 0 {
+			var nb strings.Builder
+			fmt.Fprintf(&nb, "\n\n⚠️ НЕ посчитал в сумму (дата операции на чеке вне периода %s):\n", periodLabel)
+			for _, r := range excluded {
+				fmt.Fprintf(&nb, "- %s: %.0f ₽ — чек от %s\n", r.Name, r.Amount, r.TxDate.Format("02.01.2006"))
+			}
+			excludedNote = strings.TrimRight(nb.String(), "\n")
+		}
+	}
+	if byChat {
+		periodLabel += " · по дате в чате (когда прислали)"
 	}
 
 	if len(summaries) == 0 {
