@@ -91,6 +91,38 @@ func TestExtractCollectorName(t *testing.T) {
 	}
 }
 
+// TestParseCashDupAnswer — ответ на вопрос «повтор налички: новый или тот же?».
+func TestParseCashDupAnswer(t *testing.T) {
+	type res struct {
+		resolved bool
+		isNew    bool
+	}
+	cases := map[string]res{
+		"новый":            {true, true},
+		"это новый платёж": {true, true},
+		"да, новый":        {true, true},
+		"отдельный":        {true, true},
+		"ещё один":         {true, true},
+		"да":               {true, true},
+		"тот же":           {true, false},
+		"это тот же самый": {true, false},
+		"тоже самое":       {true, false},
+		"повтор":           {true, false},
+		"дубль":            {true, false},
+		"не новый":         {true, false},
+		"нет":              {true, false},
+		"старый":           {true, false},
+		"хз":               {false, false}, // непонятно — переспросим
+		"":                 {false, false},
+	}
+	for in, want := range cases {
+		gotResolved, gotNew := parseCashDupAnswer(in)
+		if gotResolved != want.resolved || gotNew != want.isNew {
+			t.Errorf("parseCashDupAnswer(%q) = (%v, %v), ожидали (%v, %v)", in, gotResolved, gotNew, want.resolved, want.isNew)
+		}
+	}
+}
+
 // TestLooksLikeSilence — «отписки» модели (нечего добавить и т.п.) не постятся.
 func TestLooksLikeSilence(t *testing.T) {
 	silent := []string{

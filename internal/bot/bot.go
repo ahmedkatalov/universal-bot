@@ -565,6 +565,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 				IsCash:       isCashMsg,
 				RawMessageID: rawID,
 				TxDate:       msg.Info.Timestamp,
+				DupCheck:     b.cashDupCheckOn(),
 			})
 			if err != nil {
 				fmt.Println("Ошибка сохранения транзакции:", err)
@@ -2632,6 +2633,7 @@ func (b *Bot) recordCashPayment(ctx context.Context, chat types.JID, payer strin
 	if err := b.db.InsertTransaction(ctx, db.TransactionInput{
 		ContactID: contactID, RawName: payer, Amount: amount,
 		CardTo: "наличные", IsCash: true, RawMessageID: rawID, TxDate: txDate,
+		DupCheck: b.cashDupCheckOn(),
 	}); err != nil {
 		fmt.Println("Наличка: ошибка сохранения:", err)
 		return

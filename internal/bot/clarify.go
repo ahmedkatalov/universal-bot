@@ -33,12 +33,18 @@ type clarifyState struct {
 	mu           sync.Mutex
 	askMap       map[string]string // botQuestionMsgID -> receiptWaMessageID (чей чек)
 	cashAskMap   map[string]int    // botQuestionMsgID -> transactionID (у кого наличка)
+	dupAskMap    map[string]int    // botQuestionMsgID -> transactionID (повтор налички?)
 	askOrder     []string          // порядок вставки ключей askMap (для вытеснения старых)
 	cashAskOrder []string          // порядок вставки ключей cashAskMap
+	dupAskOrder  []string          // порядок вставки ключей dupAskMap
 }
 
 func newClarifyState() *clarifyState {
-	return &clarifyState{askMap: make(map[string]string), cashAskMap: make(map[string]int)}
+	return &clarifyState{
+		askMap:     make(map[string]string),
+		cashAskMap: make(map[string]int),
+		dupAskMap:  make(map[string]int),
+	}
 }
 
 // clarifyMapCap — максимум запоминаемых связей «вопрос бота -> чек/наличка».
@@ -62,6 +68,39 @@ func (b *Bot) registerCashAsk(botMsgID string, txID int) {
 		b.clarify.cashAskOrder = b.clarify.cashAskOrder[1:]
 		delete(b.clarify.cashAskMap, oldest)
 	}
+}
+
+// registerDupAsk запоминает связь «id вопроса про повтор налички -> id транзакции».
+func (b *Bot) registerDupAsk(botMsgID string, txID int) {
+	if botMsgID == "" {
+		return
+	}
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if _, exists := b.clarify.dupAskMap[botMsgID]; !exists {
+		b.clarify.dupAskOrder = append(b.clarify.dupAskOrder, botMsgID)
+	}
+	b.clarify.dupAskMap[botMsgID] = txID
+	for len(b.clarify.dupAskMap) > clarifyMapCap && len(b.clarify.dupAskOrder) > 0 {
+		oldest := b.clarify.dupAskOrder[0]
+		b.clarify.dupAskOrder = b.clarify.dupAskOrder[1:]
+		delete(b.clarify.dupAskMap, oldest)
+	}
+}
+
+// cashDupCheckEnabled — спрашивать ли про повторную наличку (та же сумма тому же
+// клиенту за 30 дней — возможно, случайный дубль). По умолчанию ВКЛ. Отключить
+// целиком: CASH_DUP_CHECK=0.
+func cashDupCheckEnabled() bool {
+	v := strings.ToLower(strings.TrimSpace(os.Getenv("CASH_DUP_CHECK")))
+	return v == "" || v == "1" || v == "true" || v == "yes" || v == "on"
+}
+
+// cashDupCheckOn — фактически включена ли проверка повторной налички. Требует и
+// общий выключатель уточнений (askReceiptsEnabled), и свой CASH_DUP_CHECK: иначе
+// придержанная наличка осталась бы без вопроса и навсегда вне сбора.
+func (b *Bot) cashDupCheckOn() bool {
+	return askReceiptsEnabled() && cashDupCheckEnabled()
 }
 
 // clarifyLoop раз в 45 секунд проверяет группы на чеки без клиента и задаёт
@@ -141,6 +180,32 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 						_ = b.db.MarkTxCollectorAsked(ctx, it.TxID)
 						b.registerCashAsk(botMsgID, it.TxID)
 						asked++
+					}
+				}
+			}
+		}
+		if asked >= clarifyPerCycle {
+			break
+		}
+		// 4. Повтор налички — «У клиента уже была та же сумма, это новый платёж?».
+		if b.cashDupCheckOn() {
+			if n, err := b.db.CountCashDupNeedingConfirm(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+				items, err := b.db.CashDupNeedingConfirm(ctx, jid.String(), before, clarifyPerCycle-asked)
+				if err == nil {
+					for _, it := range items {
+						when := "недавно"
+						if !it.PrevWhen.IsZero() {
+							when = "была " + it.PrevWhen.Format("02.01")
+						}
+						text := fmt.Sprintf("🤔 У клиента %s уже %s наличка на %.0f ₽. Это НОВЫЙ платёж или тот же самый (повтор)? "+
+							"Ответьте на это сообщение: «новый» — засчитаю отдельно, «тот же» — не считаю повтором.",
+							it.Client, when, it.Amount)
+						botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
+						if botMsgID != "" {
+							_ = b.db.MarkCashDupAsked(ctx, it.TxID)
+							b.registerDupAsk(botMsgID, it.TxID)
+							asked++
+						}
 					}
 				}
 			}
@@ -242,6 +307,33 @@ func extractCollectorName(text string) string {
 	return strings.TrimSpace(strings.Join(words, " "))
 }
 
+// parseCashDupAnswer разбирает ответ на вопрос про повтор налички.
+// Возвращает (resolved, isNew): resolved=false — ответ непонятен (переспросим).
+func parseCashDupAnswer(text string) (bool, bool) {
+	t := strings.ToLower(strings.TrimSpace(text))
+	// «тот же / повтор» проверяем первым: «не новый» содержит «нов».
+	sameMarkers := []string{"тот же", "та же", "то же", "тоже", "повтор", "дубл",
+		"один и тот", "не новый", "не считай", "старый", "ошиб"}
+	for _, m := range sameMarkers {
+		if strings.Contains(t, m) {
+			return true, false
+		}
+	}
+	if t == "нет" {
+		return true, false
+	}
+	newMarkers := []string{"нов", "отдельн", "друг", "ещё", "еще"}
+	for _, m := range newMarkers {
+		if strings.Contains(t, m) {
+			return true, true
+		}
+	}
+	if t == "да" {
+		return true, true // «да» на «это новый?» — новый
+	}
+	return false, false
+}
+
 // askClarify отправляет вопрос цитатой на сам чек и запоминает связь
 // «id вопроса -> id сообщения чека», чтобы привязать ответ владельца.
 func (b *Bot) askClarify(ctx context.Context, jid types.JID, text string, it db.ClarifyReceipt) {
@@ -307,6 +399,31 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	quotedID := extractQuotedStanzaID(msg)
 	if quotedID == "" {
 		return false
+	}
+
+	// Ответ на вопрос «наличка-повтор: новый или тот же?».
+	b.clarify.mu.Lock()
+	dupTxID, isDupAsk := b.clarify.dupAskMap[quotedID]
+	b.clarify.mu.Unlock()
+	if isDupAsk {
+		resolved, isNew := parseCashDupAnswer(text)
+		if !resolved {
+			b.sendText(msg.Info.Chat, "Ответьте, пожалуйста, «новый» (засчитать отдельно) или «тот же» (повтор, не считать).")
+			return true // оставляем связь — можно ответить ещё раз на тот же вопрос
+		}
+		b.clarify.mu.Lock()
+		delete(b.clarify.dupAskMap, quotedID)
+		b.clarify.mu.Unlock()
+		found, amount, client, err := b.db.ResolveCashDup(ctx, dupTxID, isNew)
+		if err != nil || !found {
+			return false
+		}
+		if isNew {
+			b.sendText(msg.Info.Chat, fmt.Sprintf("Засчитал как новый платёж: наличка %s %.0f ₽.", client, amount))
+		} else {
+			b.sendText(msg.Info.Chat, fmt.Sprintf("Понял, это повтор — не считаю: %s %.0f ₽.", client, amount))
+		}
+		return true
 	}
 
 	// Ответ на вопрос «у кого наличка / кто забрал?» — записываем ответственного.

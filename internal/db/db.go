@@ -124,6 +124,16 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.collector_asked: %w", err)
 	}
+	// Наличка-повтор: та же сумма тому же клиенту за 30 дней может быть случайным
+	// дублем (кто-то скинул одну и ту же наличку дважды). dup_pending — платёж
+	// придержан из сбора, пока владелец не подтвердит «новый»; dup_asked — уже
+	// спросили. У чеков от дублей защищает номер операции, у налички номера нет.
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_pending BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.dup_pending: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.dup_asked: %w", err)
+	}
 
 	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
 	if _, err := pool.Exec(ctx, `
@@ -337,14 +347,125 @@ type TransactionInput struct {
 	Collector    string // кто забрал наличку (ответственный), если известен
 	RawMessageID int
 	TxDate       time.Time
+	DupCheck     bool // проверять на повтор налички (та же сумма клиента за 30 дней)
 }
 
 func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
+	dupPending := false
+	if tx.IsCash && tx.DupCheck && tx.ContactID != 0 && tx.Amount > 0 {
+		// Есть ли уже засчитанная наличка тому же клиенту на ТУ ЖЕ сумму за
+		// последние 30 дней? Если да — это может быть случайный повтор (одну и ту
+		// же наличку скинули дважды). Придерживаем платёж (dup_pending) и просим
+		// владельца подтвердить «новый / тот же» — иначе задвоился бы сбор.
+		since := tx.TxDate.AddDate(0, 0, -30)
+		if err := d.pool.QueryRow(ctx, `
+			SELECT EXISTS (
+				SELECT 1 FROM transactions
+				WHERE contact_id = $1 AND amount = $2 AND is_cash = true
+				  AND ignored = false AND dup_pending = false
+				  AND tx_date >= $3 AND tx_date <= $4
+			)`, tx.ContactID, tx.Amount, since, tx.TxDate).Scan(&dupPending); err != nil {
+			dupPending = false // при ошибке не придерживаем — лучше засчитать, чем потерять
+		}
+	}
 	_, err := d.pool.Exec(ctx, `
-		INSERT INTO transactions (contact_id, raw_name, amount, note, card_to, is_cash, collector, raw_message_id, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-	`, tx.ContactID, tx.RawName, tx.Amount, nullIfEmpty(tx.Note), nullIfEmpty(tx.CardTo), tx.IsCash, nullIfEmpty(tx.Collector), tx.RawMessageID, tx.TxDate)
+		INSERT INTO transactions (contact_id, raw_name, amount, note, card_to, is_cash, collector, raw_message_id, tx_date, dup_pending)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+	`, tx.ContactID, tx.RawName, tx.Amount, nullIfEmpty(tx.Note), nullIfEmpty(tx.CardTo), tx.IsCash, nullIfEmpty(tx.Collector), tx.RawMessageID, tx.TxDate, dupPending)
 	return err
+}
+
+// CashDupAsk — наличка, похожая на повтор (та же сумма тому же клиенту за 30
+// дней): придержана из сбора, по ней ещё не спрашивали «новый или тот же».
+type CashDupAsk struct {
+	TxID        int
+	Client      string
+	Amount      float64
+	WaMessageID string
+	SenderJID   string
+	PrevWhen    time.Time // дата предыдущего такого платежа (для текста вопроса)
+}
+
+// CashDupNeedingConfirm — придержанные повторы налички, по которым пора спросить.
+func (d *DB) CashDupNeedingConfirm(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]CashDupAsk, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT t.id, COALESCE(c.canonical_name, t.raw_name, ''), t.amount::float8,
+		       COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''),
+		       (SELECT max(p.tx_date) FROM transactions p
+		         WHERE p.contact_id = t.contact_id AND p.amount = t.amount
+		           AND p.is_cash = true AND p.ignored = false AND p.dup_pending = false
+		           AND p.tx_date < t.tx_date)
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE rm.wa_group_jid = $1
+		  AND t.is_cash = true AND t.dup_pending = true AND t.dup_asked = false
+		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false
+		  AND t.amount > 0 AND t.created_at < $2
+		ORDER BY t.created_at
+		LIMIT $3
+	`, groupJID, olderThan, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CashDupAsk
+	for rows.Next() {
+		var a CashDupAsk
+		var prev *time.Time
+		if err := rows.Scan(&a.TxID, &a.Client, &a.Amount, &a.WaMessageID, &a.SenderJID, &prev); err != nil {
+			return nil, err
+		}
+		if prev != nil {
+			a.PrevWhen = *prev
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// CountCashDupNeedingConfirm — сколько придержанных повторов налички ждут ответа.
+func (d *DB) CountCashDupNeedingConfirm(ctx context.Context, groupJID string, olderThan time.Time) (int, error) {
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE rm.wa_group_jid = $1
+		  AND t.is_cash = true AND t.dup_pending = true AND t.dup_asked = false
+		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false
+		  AND t.amount > 0 AND t.created_at < $2
+	`, groupJID, olderThan).Scan(&n)
+	return n, err
+}
+
+// MarkCashDupAsked помечает, что про повтор этой налички уже спросили.
+func (d *DB) MarkCashDupAsked(ctx context.Context, txID int) error {
+	_, err := d.pool.Exec(ctx, `UPDATE transactions SET dup_asked = true WHERE id = $1`, txID)
+	return err
+}
+
+// ResolveCashDup применяет ответ владельца на вопрос про повтор налички:
+// isNew=true — новый платёж (снимаем придержку, идёт в сбор);
+// isNew=false — тот же (повтор): помечаем ignored, из сбора исключён.
+func (d *DB) ResolveCashDup(ctx context.Context, txID int, isNew bool) (bool, float64, string, error) {
+	var amount float64
+	var client string
+	var err error
+	if isNew {
+		err = d.pool.QueryRow(ctx, `
+			UPDATE transactions SET dup_pending = false, dup_asked = true
+			WHERE id = $1 RETURNING amount::float8, COALESCE(raw_name, '')
+		`, txID).Scan(&amount, &client)
+	} else {
+		err = d.pool.QueryRow(ctx, `
+			UPDATE transactions SET ignored = true, dup_pending = false, dup_asked = true
+			WHERE id = $1 RETURNING amount::float8, COALESCE(raw_name, '')
+		`, txID).Scan(&amount, &client)
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, 0, "", nil
+	}
+	return err == nil, amount, client, err
 }
 
 // CashNeedingCollector — наличные платежи, у которых НЕ указан ответственный
@@ -1484,7 +1605,7 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		JOIN raw_messages rm ON rm.id = tx.raw_message_id
 		LEFT JOIN contacts c ON c.id = tx.contact_id
 		WHERE tx.tx_date >= $1 AND tx.tx_date < $2
-		  AND tx.is_cash = true AND tx.ignored = false
+		  AND tx.is_cash = true AND tx.ignored = false AND tx.dup_pending = false
 		  AND COALESCE(rm.deleted, false) = false AND tx.amount > 0
 		  AND COALESCE(rm.wa_group_jid, '') <> $3
 		  AND ($4::text[] IS NULL OR COALESCE(rm.wa_group_jid, '') = ANY($4))
@@ -1919,15 +2040,18 @@ func groupSliceArg(groupJIDs []string) any {
 // чек, а текст-дубль отбрасываем; но если чек не распознался, платёж не
 // теряется — учитывается текст. Это чинит и задвоение, и недосчёт.
 const countableTextCondition = `(
-		t.is_cash = true
-		OR NOT EXISTS (
-			SELECT 1 FROM bank_receipts brd
-			WHERE brd.contact_id = t.contact_id
-			  AND brd.amount = t.amount
-			  AND brd.needs_review = false
-			  AND brd.is_duplicate = false AND brd.ignored = false
-			  AND brd.tx_date >= $1 AND brd.tx_date < $2
-			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+		t.dup_pending = false
+		AND (
+			t.is_cash = true
+			OR NOT EXISTS (
+				SELECT 1 FROM bank_receipts brd
+				WHERE brd.contact_id = t.contact_id
+				  AND brd.amount = t.amount
+				  AND brd.needs_review = false
+				  AND brd.is_duplicate = false AND brd.ignored = false
+				  AND brd.tx_date >= $1 AND brd.tx_date < $2
+				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+			)
 		)
 	)`
 

@@ -147,6 +147,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			Collector:    strings.TrimSpace(p.Collector),
 			RawMessageID: rawID,
 			TxDate:       txDate,
+			DupCheck:     b.cashDupCheckOn(),
 		})
 		if err != nil {
 			fmt.Println("ИИ-доразбор: ошибка сохранения транзакции:", err)
