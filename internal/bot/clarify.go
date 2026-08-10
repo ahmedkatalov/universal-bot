@@ -30,13 +30,38 @@ const (
 // clarifyMap хранит соответствие "id вопроса бота" -> "id сообщения чека",
 // чтобы ответ владельца на вопрос привязать к нужному чеку.
 type clarifyState struct {
-	mu         sync.Mutex
-	askMap     map[string]string // botQuestionMsgID -> receiptWaMessageID (чей чек)
-	cashAskMap map[string]int    // botQuestionMsgID -> transactionID (у кого наличка)
+	mu           sync.Mutex
+	askMap       map[string]string // botQuestionMsgID -> receiptWaMessageID (чей чек)
+	cashAskMap   map[string]int    // botQuestionMsgID -> transactionID (у кого наличка)
+	askOrder     []string          // порядок вставки ключей askMap (для вытеснения старых)
+	cashAskOrder []string          // порядок вставки ключей cashAskMap
 }
 
 func newClarifyState() *clarifyState {
 	return &clarifyState{askMap: make(map[string]string), cashAskMap: make(map[string]int)}
+}
+
+// clarifyMapCap — максимум запоминаемых связей «вопрос бота -> чек/наличка».
+const clarifyMapCap = 500
+
+// registerCashAsk запоминает связь «id вопроса про наличку -> id транзакции».
+// При переполнении удаляет САМЫЕ СТАРЫЕ ключи (по порядку вставки), а не весь
+// map целиком — иначе ответ на любой не-самый-новый вопрос теряет привязку.
+func (b *Bot) registerCashAsk(botMsgID string, txID int) {
+	if botMsgID == "" {
+		return
+	}
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if _, exists := b.clarify.cashAskMap[botMsgID]; !exists {
+		b.clarify.cashAskOrder = append(b.clarify.cashAskOrder, botMsgID)
+	}
+	b.clarify.cashAskMap[botMsgID] = txID
+	for len(b.clarify.cashAskMap) > clarifyMapCap && len(b.clarify.cashAskOrder) > 0 {
+		oldest := b.clarify.cashAskOrder[0]
+		b.clarify.cashAskOrder = b.clarify.cashAskOrder[1:]
+		delete(b.clarify.cashAskMap, oldest)
+	}
 }
 
 // clarifyLoop раз в 45 секунд проверяет группы на чеки без клиента и задаёт
@@ -108,16 +133,15 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 					text := fmt.Sprintf("🤔 Наличка: %s — %.0f ₽. У кого она, кто забрал деньги? "+
 						"Ответьте на это сообщение именем (например «у Дени» / «Мансур взял»).", it.Client, it.Amount)
 					botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
-					_ = b.db.MarkTxCollectorAsked(ctx, it.TxID)
 					if botMsgID != "" {
-						b.clarify.mu.Lock()
-						b.clarify.cashAskMap[botMsgID] = it.TxID
-						if len(b.clarify.cashAskMap) > 500 {
-							b.clarify.cashAskMap = map[string]int{botMsgID: it.TxID}
-						}
-						b.clarify.mu.Unlock()
+						// Помечаем «спросили» ТОЛЬКО если вопрос реально ушёл. При
+						// сбое отправки (botMsgID == "") оставляем платёж в очереди —
+						// следующий цикл переспросит, иначе наличка навсегда без
+						// ответственного.
+						_ = b.db.MarkTxCollectorAsked(ctx, it.TxID)
+						b.registerCashAsk(botMsgID, it.TxID)
+						asked++
 					}
-					asked++
 				}
 			}
 		}
@@ -233,9 +257,17 @@ func (b *Bot) registerClarifyAsk(botMsgID, receiptWaID string) {
 		return
 	}
 	b.clarify.mu.Lock()
+	if _, exists := b.clarify.askMap[botMsgID]; !exists {
+		b.clarify.askOrder = append(b.clarify.askOrder, botMsgID)
+	}
 	b.clarify.askMap[botMsgID] = receiptWaID
-	if len(b.clarify.askMap) > 500 {
-		b.clarify.askMap = map[string]string{botMsgID: receiptWaID}
+	// Вытесняем самые старые связи, а не весь map целиком — иначе ответ на любой
+	// не-самый-свежий вопрос «чей чек» теряет привязку и уходит в неверную
+	// FIFO-атрибуцию.
+	for len(b.clarify.askMap) > clarifyMapCap && len(b.clarify.askOrder) > 0 {
+		oldest := b.clarify.askOrder[0]
+		b.clarify.askOrder = b.clarify.askOrder[1:]
+		delete(b.clarify.askMap, oldest)
 	}
 	b.clarify.mu.Unlock()
 }

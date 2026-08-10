@@ -161,14 +161,16 @@ func (b *Bot) enqueuePendingName(msg *events.Message, name string, amount float6
 	b.pendingNameMu.Unlock()
 }
 
-// consumePendingNameCash достаёт из очереди самое свежее ждущее имя С СУММОЙ от
+// consumePendingNameCash достаёт из очереди самое РАННЕЕ ждущее имя С СУММОЙ от
 // данного отправителя (для случая «фото наличных пришло после ФИО+сумма»).
+// Порядок с головы совпадает с resolveReceiptPayer (FIFO) — чтобы фото денег и
+// приходящие следом чеки разбирали очередь в одном порядке, а не крест-накрест.
 func (b *Bot) consumePendingNameCash(chat types.JID, senderJID string) (string, float64, bool) {
 	key := chat.String() + "|" + senderJID
 	b.pendingNameMu.Lock()
 	defer b.pendingNameMu.Unlock()
 	q := b.pendingNames[key]
-	for i := len(q) - 1; i >= 0; i-- {
+	for i := 0; i < len(q); i++ {
 		if q[i].amount > 0 && time.Since(q[i].at) <= cashLinkWindow {
 			name := q[i].name
 			amount := q[i].amount
@@ -233,10 +235,17 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	if quotedID != "" {
 		if found, _, err := b.db.ReattributeReceiptByMessage(ctx, quotedID, canonical, contactIDPtr); err == nil && found {
 			updated = true
+		} else {
+			// Свайп пришёлся НЕ на чек (например, на вопрос бота, чья привязка уже
+			// вытеснена из askMap) — не привязываем вслепую к самому старому чеку
+			// (это дало бы неверную атрибуцию). Запоминаем имя как ждущее.
+			b.enqueuePendingName(msg, name, amount)
+			return true
 		}
 	}
 	if !updated {
-		// Самый старый неподтверждённый чек от отправителя (FIFO по порядку чата).
+		// Имя без свайпа: самый старый неподтверждённый чек от отправителя
+		// (FIFO по порядку чата).
 		found, _, err := b.db.ReattributeOldestUnconfirmedReceipt(ctx, chat.String(), sender, since, canonical, contactIDPtr)
 		if err != nil || !found {
 			// Не нашли чек — на всякий случай запомним имя как ждущее.
@@ -421,7 +430,11 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 // cmfExtractClientName вытаскивает имя плательщика из подписи к чеку через ИИ.
 func (b *Bot) cmfExtractClientName(ctx context.Context, caption string) string {
 	if b.assistant == nil {
-		return strings.TrimSpace(caption)
+		// Без ИИ не выделяем имя из подписи наугад: вернуть всю подпись
+		// («спасибо», «с карты Пияна перевёл») означало бы записать мусор в
+		// клиенты и затереть настоящего получателя. Пусть решает looksLikeName
+		// у вызывающего — он требует правдоподобное ФИО.
+		return ""
 	}
 	system := "Из подписи к банковскому чеку выдели имя КЛИЕНТА, который сделал платёж по своей рассрочке. " +
 		"Внимание: в подписи могут упоминаться посторонние имена (чья карта использовалась, кто переслал) — " +

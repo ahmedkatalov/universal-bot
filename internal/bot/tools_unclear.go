@@ -747,7 +747,7 @@ func (b *Bot) recountEverything(ctx context.Context) (string, error) {
 				aiCalls++
 				jid, err := types.ParseJID(m.GroupJID)
 				if err == nil {
-					b.aiRescueUnparsed(ctx, jid, m.SenderName, result.Unparsed, m.ID, m.ReceivedAt)
+					b.aiRescueUnparsed(ctx, jid, m.SenderName, result.Unparsed, m.ID, m.ReceivedAt, false)
 				}
 			}
 			if saved > 0 {

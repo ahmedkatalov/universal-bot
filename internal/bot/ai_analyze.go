@@ -67,7 +67,7 @@ type aiPayment struct {
 // не тормозить обработку остальных сообщений. Модель отличает реальные
 // операции от обсуждения денег; если сомневается — бот задаёт уточняющий
 // вопрос прямо в группе, а не записывает наугад.
-func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time) {
+func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint bool) {
 	system := "Ты — модуль разбора платежей в WhatsApp-боте учёта финансов. " +
 		"Тебе дают строки из сообщения рабочей группы, которые не смог разобрать обычный парсер. " +
 		"Известные люди: " + strings.Join(b.aliases.Canonicals(), ", ") + ".\n\n" +
@@ -131,7 +131,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			fmt.Println("ИИ-доразбор: ошибка контакта:", err)
 			continue
 		}
-		isCash := p.Cash || parser.IsCash(strings.Join(lines, " ")+" "+p.Note+" "+p.Card)
+		isCash := p.Cash || cashHint || parser.IsCash(strings.Join(lines, " ")+" "+p.Note+" "+p.Card)
 		card := p.Card
 		if isCash && card == "" {
 			card = "наличные"

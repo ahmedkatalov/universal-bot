@@ -536,10 +536,19 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// разбор для таких сообщений НЕ применяем (иначе задвоение/мусор).
 	routedToAI := b.assistant != nil && parser.LooksMessyPayment(text, result)
 	if routedToAI {
-		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp)
+		// Снимаем пометку «рядом было фото пачки денег» ЗДЕСЬ тоже — иначе она
+		// не гасится на этой ветке и позже ошибочно пометит наличкой чужой
+		// одиночный платёж. Если пометка свежая — эти платежи и есть наличка.
+		cashHint := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
+		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint)
 	} else {
 		// Наличка: помечено словом в тексте, либо рядом пришло фото пачки денег.
-		isCashMsg := parser.IsCash(text) || (len(result.Transactions) > 0 && b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String()))
+		// Пометку фото-нала снимаем только когда в сообщении есть что записать как
+		// платёж (разобранные транзакции или строки на ИИ-доразбор) — на чистой
+		// болтовне не трогаем, она ждёт настоящий платёж.
+		hasPayload := len(result.Transactions) > 0 || (b.assistant != nil && containsDigit(result.Unparsed))
+		cashPhotoNear := hasPayload && b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
+		isCashMsg := parser.IsCash(text) || cashPhotoNear
 		for _, tr := range result.Transactions {
 			canonical := b.aliases.Resolve(tr.RawName)
 			contactID, err := b.db.GetOrCreateContact(ctx, canonical)
@@ -566,7 +575,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			fmt.Printf("Не распознано (сообщение %d): %v\n", rawID, result.Unparsed)
 			if b.assistant != nil && containsDigit(result.Unparsed) {
 				unparsed := append([]string(nil), result.Unparsed...)
-				go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, unparsed, rawID, msg.Info.Timestamp)
+				go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, unparsed, rawID, msg.Info.Timestamp, isCashMsg)
 			}
 		}
 	}
@@ -2592,14 +2601,19 @@ func (b *Bot) handleCashPhoto(ctx context.Context, chat types.JID, senderJID, pa
 		fmt.Printf("Фото налички (сообщение %d): ближайший платёж на %.0f ₽ засчитан как наличка\n", rawID, marked)
 		return
 	}
-	// 2. Рядом было «ФИО+сумма», которое ушло в очередь имён (не как платёж) — запишем наличку по нему.
-	if name, amt, ok := b.consumePendingNameCash(chat, senderJID); ok {
-		b.recordCashPayment(ctx, chat, name, amt, rawID, receivedAt)
-		return
-	}
-	// 3. Сумма видна на самом фото и знаем ФИО (подпись/очередь) — пишем наличку.
+	// 2. ФИО клиента уже определено выше (resolveReceiptPayer — подпись/свайп/
+	// очередь) и передано сюда как payer. Если знаем и ФИО, и сумму — пишем
+	// наличку сразу. Это ВАЖНО делать раньше consumePendingNameCash: иначе одно
+	// фото денег «съест» два имени из очереди (одно — в resolveReceiptPayer,
+	// второе — здесь) и запишет фантомную наличку не тому клиенту.
 	if amount > 0 && payer != "" {
 		b.recordCashPayment(ctx, chat, payer, amount, rawID, receivedAt)
+		return
+	}
+	// 3. payer не определился (в подписи/очереди не было имени) — берём самое
+	// раннее ждущее «ФИО+сумма» из очереди.
+	if name, amt, ok := b.consumePendingNameCash(chat, senderJID); ok {
+		b.recordCashPayment(ctx, chat, name, amt, rawID, receivedAt)
 		return
 	}
 	// 4. Платёж ещё не пришёл — запомним пометку, засчитаем при поступлении.
@@ -2700,7 +2714,15 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// вместо чека. На нём не видно ни когда, ни на какую карту, ни чьё имя.
 	// Правильно учесть нельзя — просим прислать РАЗВЁРНУТЫЙ чек. В сумму не
 	// берём (needs_review), пока не пришлют полный.
-	if rd.Amount > 0 && !rd.HasTxTime && media != nil {
+	//
+	// Триггерим ТОЛЬКО когда чек действительно «пустой»: нет ни номера операции,
+	// ни получателя, и клиента не назвал владелец (payerOverride). Иначе полный
+	// чек, у которого лишь не распозналась дата (напр. формат даты с «T» или
+	// «дд.мм.гггг»), не должен выпадать из сбора — считаем его по времени
+	// сообщения. Примечание: при payerOverride!="" rd.Recipient уже заменён на
+	// клиента, поэтому проверка payerOverride=="" здесь корректна.
+	looksCollapsed := rd.DocNumber == "" && rd.Recipient == "" && payerOverride == ""
+	if rd.Amount > 0 && !rd.HasTxTime && media != nil && looksCollapsed {
 		fmt.Printf("Чек (сообщение %d): неполный (нет даты операции) — прошу развёрнутый\n", rawID)
 		_ = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 			RawMessageID: rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,

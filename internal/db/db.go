@@ -429,6 +429,9 @@ func (d *DB) SetTxCollector(ctx context.Context, txID int, collector string) (bo
 // сумму помеченного платежа (0, если подходящего платежа нет).
 func (d *DB) MarkLatestPaymentCash(ctx context.Context, groupJID, senderJID string, since time.Time) (float64, error) {
 	var amount float64
+	// Не помечаем наличкой текст, у которого есть парный распознанный чек в той
+	// же группе (это перевод/дубль чека, а не наличка) — иначе фото денег,
+	// присланное рядом, «воскресит» отброшенный дубль и задвоит сбор.
 	err := d.pool.QueryRow(ctx, `
 		UPDATE transactions t SET is_cash = true
 		FROM raw_messages rm
@@ -443,6 +446,14 @@ func (d *DB) MarkLatestPaymentCash(ctx context.Context, groupJID, senderJID stri
 			JOIN raw_messages rm2 ON rm2.id = t2.raw_message_id
 			WHERE rm2.sender_jid = $1 AND rm2.wa_group_jid = $2
 			  AND t2.is_cash = false AND t2.ignored = false AND rm2.received_at >= $3
+			  AND NOT EXISTS (
+				SELECT 1 FROM bank_receipts brd
+				WHERE brd.contact_id = t2.contact_id
+				  AND brd.amount = t2.amount
+				  AND brd.needs_review = false
+				  AND brd.is_duplicate = false AND brd.ignored = false
+				  AND COALESCE(brd.group_jid, '') = COALESCE(rm2.wa_group_jid, '')
+			  )
 			ORDER BY rm2.received_at DESC LIMIT 1
 		  )
 		RETURNING t.amount
@@ -636,7 +647,13 @@ func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string,
 			recipient_raw = CASE WHEN $2 = '' THEN recipient_raw ELSE $2 END,
 			contact_id    = CASE WHEN $2 = '' THEN contact_id    ELSE $3 END,
 			amount        = CASE WHEN $4 > 0  THEN $4            ELSE amount END,
-			needs_review = false, client_confirmed = true, clarify_asked = true
+			needs_review  = false,
+			-- Ответ ТОЛЬКО суммой (имя не назвали) НЕ подтверждает клиента: сумму
+			-- поправили, но кто клиент — всё ещё неизвестно, поэтому не гасим
+			-- флаги, чтобы бот мог спросить «чей это чек?». Имя в ответе или
+			-- простое «да/верно» — подтверждают.
+			client_confirmed = CASE WHEN $2 = '' AND $4 > 0 THEN client_confirmed ELSE true END,
+			clarify_asked    = CASE WHEN $2 = '' AND $4 > 0 THEN clarify_asked    ELSE true END
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
@@ -1439,10 +1456,18 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 			SELECT 1 FROM bank_receipts t
 			LEFT JOIN raw_messages trm ON trm.id = t.raw_message_id
 			WHERE COALESCE(t.group_jid, trm.wa_group_jid, '') = $3
-			  AND t.is_duplicate = false AND t.ignored = false AND COALESCE(trm.deleted, false) = false
+			  AND t.is_duplicate = false AND t.ignored = false AND t.needs_review = false
+			  AND COALESCE(trm.deleted, false) = false
 			  AND (
+				-- Есть номер операции — сверяем строго по нему (уникален).
 				(NULLIF(br.doc_number, '') IS NOT NULL AND t.doc_number = br.doc_number)
-				OR (br.contact_id IS NOT NULL AND t.contact_id = br.contact_id AND t.amount = br.amount)
+				-- Нет номера — запасной вариант по клиенту+сумме, но в пределах
+				-- ±3 дней, иначе ежемесячный платёж на ту же сумму «спрячет»
+				-- реально не дошедший.
+				OR (NULLIF(br.doc_number, '') IS NULL
+					AND br.contact_id IS NOT NULL
+					AND t.contact_id = br.contact_id AND t.amount = br.amount
+					AND t.tx_date BETWEEN br.tx_date - interval '3 days' AND br.tx_date + interval '3 days')
 			  )
 		  ))
 
@@ -1471,6 +1496,9 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 			WHERE COALESCE(rm2.wa_group_jid, '') = $3
 			  AND t2.is_cash = true AND t2.ignored = false AND COALESCE(rm2.deleted, false) = false
 			  AND t2.contact_id = tx.contact_id AND t2.amount = tx.amount
+			  -- ±3 дня: у налички нет номера операции, поэтому та же сумма тому же
+			  -- клиенту в другом периоде не должна маскировать не дошедшую.
+			  AND t2.tx_date BETWEEN tx.tx_date - interval '3 days' AND tx.tx_date + interval '3 days'
 		  ))
 
 		ORDER BY 4 DESC
@@ -1896,6 +1924,7 @@ const countableTextCondition = `(
 			SELECT 1 FROM bank_receipts brd
 			WHERE brd.contact_id = t.contact_id
 			  AND brd.amount = t.amount
+			  AND brd.needs_review = false
 			  AND brd.is_duplicate = false AND brd.ignored = false
 			  AND brd.tx_date >= $1 AND brd.tx_date < $2
 			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
@@ -1994,17 +2023,28 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 	// Берём построчно и агрегируем в Go по нормализованному имени владельца
 	// карты — чтобы варианты написания одного человека («Танзила Рахмановна С»
 	// и «Танзила Рахмановна С.») не разбивались на две карты и не недосчитывали.
+	// DISTINCT ON схлопывает один и тот же чек, разосланный в несколько групп
+	// (работник кинул в СБ-группу, оттуда переслали в основную — это НЕ дубль,
+	// см. FindDuplicateReceipt), чтобы карта получателя не задваивалась при
+	// подсчёте по всем группам. Ключ: номер документа, а без него —
+	// контакт/получатель + сумма + дата операции (как в SummaryForPeriod).
 	rows, err := d.pool.Query(ctx, `
-		SELECT COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), 'не распознано') AS card,
-		       COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), '') AS bank,
-		       br.amount::float8
-		FROM bank_receipts br
-		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-		WHERE br.tx_date >= $1 AND br.tx_date < $2
-		  AND br.is_duplicate = false AND br.ignored = false
-		  AND COALESCE(rm.deleted, false) = false
-		  AND br.amount > 0
-		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+		SELECT card, bank, amount FROM (
+			SELECT DISTINCT ON (COALESCE(NULLIF(br.doc_number, ''),
+			                             COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || br.tx_date::text))
+				COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), 'не распознано') AS card,
+				COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), '') AS bank,
+				br.amount::float8 AS amount
+			FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE br.tx_date >= $1 AND br.tx_date < $2
+			  AND br.is_duplicate = false AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND br.amount > 0
+			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+			ORDER BY COALESCE(NULLIF(br.doc_number, ''),
+			                  COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || br.tx_date::text)
+		) dedup
 	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
 		return nil, err
