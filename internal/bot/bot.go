@@ -1389,7 +1389,11 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 		"его ПРИСЛАЛИ в чат. По умолчанию (date_basis=\"operation\") считаем по дате операции. Если владелец говорит " +
 		"«бери дату из чата», «считай по дате присылки», «когда скинули» — ставь date_basis=\"chat\": тогда сбор за " +
 		"день = всё, что прислали в этот день, а чеки с датой операции из ДРУГОГО месяца бот покажет ОТДЕЛЬНО (вне " +
-		"суммы дня) с пометкой. Наличка датируется присылкой в обоих режимах. Всегда пиши в ответе, по какой дате считал.\n" +
+		"суммы дня) с пометкой. Наличка датируется присылкой в обоих режимах. Всегда пиши в ответе, по какой дате считал. " +
+		"СВЕРКА: отчёт сам добавляет раздел «ℹ️ НЕ вошло в сбор» (непроверенные чеки, придержанная наличка) с суммами — " +
+		"ОБЯЗАТЕЛЬНО передай его владельцу дословно. Если владелец говорит «сумма не сходится / ты ошибаешься в расчётах» — " +
+		"это почти всегда из-за этих исключений: покажи их и предложи разобрать (ответить на вопросы бота), тогда засчитается. " +
+		"Никогда не выдумывай сумму, чтобы «сошлось».\n" +
 		"2. senders_report — СБОР по ОТПРАВИТЕЛЮ (кто ПРИСЛАЛ чек в группу = кто собрал/забрал деньги). Считает ВСЁ, " +
 		"что человек собрал: и чеки (по тому, КТО ИХ ОТПРАВИЛ в WhatsApp), и наличку/текст (по ответственному). " +
 		"Вызывай при 'сбор Расула за июнь', 'сколько собрал/скинул Расул', 'какой сотрудник сколько собрал', " +
@@ -2568,8 +2572,31 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 		periodLabel += " · по дате в чате (когда прислали)"
 	}
 
+	var total float64
+	for _, s := range summaries {
+		total += s.Total
+	}
+
+	// Сверка: что НЕ вошло в сбор и почему. Именно эти «тихие» исключения дают
+	// расхождение с ручным подсчётом (обычно на десятки тысяч) — бот не считает
+	// то, в чём не уверен, пока владелец не разберётся. Показываем суммы явно.
+	reconNote := ""
+	if ex, err := b.db.ReportExclusions(ctx, from, to, groupJIDs); err == nil && (ex.NeedsReviewCount > 0 || ex.HeldCashCount > 0) {
+		var nb strings.Builder
+		nb.WriteString("\n\nℹ️ НЕ вошло в сбор (разберись — и засчитается):")
+		if ex.NeedsReviewCount > 0 {
+			fmt.Fprintf(&nb, "\n• Непроверенные чеки (не распознал клиента/сумму): %d шт на ~%.0f ₽ — ответь на вопросы бота «чей чек?» или суммой", ex.NeedsReviewCount, ex.NeedsReviewSum)
+		}
+		if ex.HeldCashCount > 0 {
+			fmt.Fprintf(&nb, "\n• Придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽ — ответь «новый» / «тот же»", ex.HeldCashCount, ex.HeldCashSum)
+		}
+		fmt.Fprintf(&nb, "\nЕсли всё это твоё — полный оборот за период: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
+		reconNote = nb.String()
+	}
+	notes := excludedNote + reconNote
+
 	if len(summaries) == 0 {
-		return fmt.Sprintf("За период %s данных нет.%s", periodLabel, excludedNote), nil
+		return fmt.Sprintf("За период %s данных нет.%s", periodLabel, notes), nil
 	}
 
 	if format == "pdf" {
@@ -2579,17 +2606,15 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 		}
 		fileName := "Отчёт_" + from.Format("2006-01-02") + "_" + toDay.Format("2006-01-02") + ".pdf"
 		b.sendDocument(chat, outPath, fileName)
-		return "PDF-отчёт за " + periodLabel + " отправлен в чат." + excludedNote, nil
+		return "PDF-отчёт за " + periodLabel + " отправлен в чат." + notes, nil
 	}
 
 	var sb strings.Builder
-	var total float64
 	for _, s := range summaries {
 		fmt.Fprintf(&sb, "%s: %.0f ₽ (%d платежей)\n", s.CanonicalName, s.Total, s.Count)
-		total += s.Total
 	}
 	fmt.Fprintf(&sb, "Итого за %s: %.0f ₽", periodLabel, total)
-	return sb.String() + excludedNote, nil
+	return sb.String() + notes, nil
 }
 
 // saveMediaFile сохраняет файл чека (фото или PDF) на диск для ручной

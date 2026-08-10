@@ -1331,6 +1331,47 @@ func (d *DB) RecentReceiptsOutsidePeriod(ctx context.Context, from, to, createdA
 	return out, rows.Err()
 }
 
+// ReportExclusions — суммы, которые НЕ вошли в сбор за период (и почему), чтобы
+// отчёт был сверяем до рубля. Именно эти «тихие» исключения дают расхождение с
+// ручным подсчётом: бот не считает то, в чём не уверен, пока владелец не
+// разберётся. Считаем по дате операции (tx_date) — как основной сбор.
+type ReportExclusions struct {
+	NeedsReviewCount int     // чеки, где бот не распознал клиента/сумму
+	NeedsReviewSum   float64 // их сумма (по распознанным суммам)
+	HeldCashCount    int     // придержанная наличка-повтор (ждём «новый/тот же?»)
+	HeldCashSum      float64
+}
+
+// ReportExclusions считает исключённые из сбора суммы за период [from, to).
+func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs []string) (ReportExclusions, error) {
+	var ex ReportExclusions
+	// Непроверенные чеки: needs_review (клиент/сумма не подтверждены), не дубль,
+	// не игнор, в периоде по дате операции. Сумма — по тем, где сумма распозналась.
+	err := d.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(br.amount), 0)::float8
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.tx_date >= $1 AND br.tx_date < $2
+		  AND br.needs_review = true AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.NeedsReviewCount, &ex.NeedsReviewSum)
+	if err != nil {
+		return ex, err
+	}
+	// Придержанная наличка-повтор: ждёт ответа «новый или тот же?».
+	err = d.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		  AND t.is_cash = true AND t.dup_pending = true AND t.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
+		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
+	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.HeldCashCount, &ex.HeldCashSum)
+	return ex, err
+}
+
 // LedgerReceipt — распознанный чек из учёта для живой сверки с программой.
 type LedgerReceipt struct {
 	ID       int
