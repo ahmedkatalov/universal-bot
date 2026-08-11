@@ -971,6 +971,30 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 	if err != nil {
 		return 0, 0, err
 	}
+	// Если удалили сообщение с ОРИГИНАЛОМ чека, а его копию бот пометил дублем в
+	// той же группе — повышаем ОДНУ живую копию до оригинала. Иначе платёж исчез
+	// бы совсем: оригинал удалён, копия скрыта как дубль. Ровно одну (свежую) на
+	// каждый удалённый оригинал — чтобы не задвоить, если копий несколько.
+	if _, e := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET is_duplicate = false
+		WHERE id IN (
+			SELECT DISTINCT ON (orig.id) dd.id
+			FROM bank_receipts orig
+			JOIN bank_receipts dd ON dd.id <> orig.id AND dd.is_duplicate = true AND dd.ignored = false
+				AND COALESCE(dd.group_jid, '') = COALESCE(orig.group_jid, '')
+				AND (
+					(NULLIF(orig.doc_number, '') IS NOT NULL AND dd.doc_number = orig.doc_number) OR
+					(NULLIF(orig.auth_code, '') IS NOT NULL AND dd.auth_code = orig.auth_code) OR
+					(dd.contact_id = orig.contact_id AND dd.amount = orig.amount
+					 AND abs(extract(epoch FROM dd.tx_date - orig.tx_date)) <= 300)
+				)
+			JOIN raw_messages drm ON drm.id = dd.raw_message_id AND COALESCE(drm.deleted, false) = false
+			WHERE orig.raw_message_id = $1 AND orig.is_duplicate = false AND orig.ignored = false
+			ORDER BY orig.id, dd.created_at DESC
+		)
+	`, rawID); e != nil {
+		fmt.Println("Промоут дубля после удаления оригинала не удался:", e)
+	}
 	if err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE raw_message_id = $1 AND ignored = false`, rawID).Scan(&txCount); err != nil {
 		return 0, 0, err
 	}
@@ -1375,6 +1399,19 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 				  AND t.tx_date >= $1 AND t.tx_date < $2
 				  AND COALESCE(trm.deleted, false) = false
 				  AND COALESCE(trm.wa_group_jid, '') = COALESCE(br.group_jid, '')
+			  )
+			  -- И не добавляем, если тот же платёж уже посчитан РАСПОЗНАННОЙ копией
+			  -- в другой группе (кросс-пост по номеру документа) — иначе «полный
+			  -- оборот» задвоил бы его.
+			  AND NOT EXISTS (
+				SELECT 1 FROM bank_receipts o
+				LEFT JOIN raw_messages orm ON orm.id = o.raw_message_id
+				WHERE o.id <> br.id
+				  AND o.needs_review = false AND o.is_duplicate = false AND o.ignored = false
+				  AND COALESCE(orm.deleted, false) = false
+				  AND o.tx_date >= $1 AND o.tx_date < $2
+				  AND ($3::text[] IS NULL OR o.group_jid = ANY($3))
+				  AND NULLIF(br.doc_number, '') IS NOT NULL AND o.doc_number = br.doc_number
 			  )
 			ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text)
 		) dedup

@@ -2594,7 +2594,7 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 				if ex.HeldCashCount > 0 {
 					fmt.Fprintf(&nb, "\n• Придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽ — ответь «новый» / «тот же»", ex.HeldCashCount, ex.HeldCashSum)
 				}
-				fmt.Fprintf(&nb, "\nЕсли всё это твоё — полный оборот за период: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
+				fmt.Fprintf(&nb, "\nМаксимум за период, если всё это твоё: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
 			}
 			if ex.TextDupCount > 0 {
 				fmt.Fprintf(&nb, "\n\nⓘ Текстовых платежей зачтено как дубль чека (уже в сумме, не дважды): %d шт на %.0f ₽. Если какой-то из них — ОТДЕЛЬНЫЙ платёж, скажи, зачту.", ex.TextDupCount, ex.TextDupSum)
