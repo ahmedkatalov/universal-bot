@@ -1336,30 +1336,53 @@ func (d *DB) RecentReceiptsOutsidePeriod(ctx context.Context, from, to, createdA
 // ручным подсчётом: бот не считает то, в чём не уверен, пока владелец не
 // разберётся. Считаем по дате операции (tx_date) — как основной сбор.
 type ReportExclusions struct {
-	NeedsReviewCount int     // чеки, где бот не распознал клиента/сумму
-	NeedsReviewSum   float64 // их сумма (по распознанным суммам)
+	NeedsReviewCount int     // чеки, где бот не распознал клиента/сумму (НЕ в сумме)
+	NeedsReviewSum   float64 // их сумма — станет деньгами после разбора
 	HeldCashCount    int     // придержанная наличка-повтор (ждём «новый/тот же?»)
 	HeldCashSum      float64
+	TextDupCount     int     // текстовые платежи, зачтённые как ДУБЛЬ чека (уже в сумме — как чек)
+	TextDupSum       float64 // информационно: НЕ прибавлять к обороту
 }
 
-// ReportExclusions считает исключённые из сбора суммы за период [from, to).
+// ReportExclusions считает исключённые из сбора суммы за период [from, to) по
+// дате операции (операционный режим). Три корзины, чтобы сбор был сверяем:
+//   - NeedsReview — деньги ВНЕ суммы (после разбора добавятся к обороту);
+//   - HeldCash    — придержанные повторы налички (тоже вне суммы);
+//   - TextDup     — тексты, зачтённые как дубль чека (уже в сумме — информационно,
+//     чтобы владелец мог заметить, если какой-то из них ОТДЕЛЬНЫЙ платёж).
 func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs []string) (ReportExclusions, error) {
 	var ex ReportExclusions
-	// Непроверенные чеки: needs_review (клиент/сумма не подтверждены), не дубль,
-	// не игнор, в периоде по дате операции. Сумма — по тем, где сумма распозналась.
+	// 1) Непроверенные чеки: needs_review ИЛИ без contact_id (иначе выпал бы из
+	//    суммы молча). Дедуп кросс-групповых копий (как в SummaryForPeriod), и
+	//    ИСКЛЮЧАЕМ те, чей платёж УЖЕ посчитан текстом — иначе «полный оборот»
+	//    задвоил бы их (тот же контакт+сумма+группа+период).
 	err := d.pool.QueryRow(ctx, `
-		SELECT COUNT(*), COALESCE(SUM(br.amount), 0)::float8
-		FROM bank_receipts br
-		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-		WHERE br.tx_date >= $1 AND br.tx_date < $2
-		  AND br.needs_review = true AND br.is_duplicate = false AND br.ignored = false
-		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
-		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+		SELECT COUNT(*), COALESCE(SUM(amount), 0)::float8 FROM (
+			SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+				br.amount
+			FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE br.tx_date >= $1 AND br.tx_date < $2
+			  AND (br.needs_review = true OR br.contact_id IS NULL)
+			  AND br.is_duplicate = false AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+			  AND NOT EXISTS (
+				SELECT 1 FROM transactions t
+				LEFT JOIN raw_messages trm ON trm.id = t.raw_message_id
+				WHERE t.contact_id = br.contact_id AND t.amount = br.amount
+				  AND t.ignored = false AND t.dup_pending = false
+				  AND t.tx_date >= $1 AND t.tx_date < $2
+				  AND COALESCE(trm.deleted, false) = false
+				  AND COALESCE(trm.wa_group_jid, '') = COALESCE(br.group_jid, '')
+			  )
+			ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text)
+		) dedup
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.NeedsReviewCount, &ex.NeedsReviewSum)
 	if err != nil {
 		return ex, err
 	}
-	// Придержанная наличка-повтор: ждёт ответа «новый или тот же?».
+	// 2) Придержанная наличка-повтор: ждёт ответа «новый или тот же?».
 	err = d.pool.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
 		FROM transactions t
@@ -1369,6 +1392,28 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.HeldCashCount, &ex.HeldCashSum)
+	if err != nil {
+		return ex, err
+	}
+	// 3) Текстовые платежи, отброшенные как ДУБЛЬ чека (тот же контакт+сумма+
+	//    группа+период, чек распознан и посчитан). Уже учтены как чек — показываем
+	//    информационно, чтобы владелец заметил, если это был ОТДЕЛЬНЫЙ платёж.
+	err = d.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
+		FROM transactions t
+		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		  AND t.is_cash = false AND t.dup_pending = false AND t.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
+		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
+		  AND EXISTS (
+			SELECT 1 FROM bank_receipts brd
+			WHERE brd.contact_id = t.contact_id AND brd.amount = t.amount
+			  AND brd.needs_review = false AND brd.is_duplicate = false AND brd.ignored = false
+			  AND brd.tx_date >= $1 AND brd.tx_date < $2
+			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+		  )
+	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.TextDupCount, &ex.TextDupSum)
 	return ex, err
 }
 

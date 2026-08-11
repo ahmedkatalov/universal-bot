@@ -2580,18 +2580,27 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 	// Сверка: что НЕ вошло в сбор и почему. Именно эти «тихие» исключения дают
 	// расхождение с ручным подсчётом (обычно на десятки тысяч) — бот не считает
 	// то, в чём не уверен, пока владелец не разберётся. Показываем суммы явно.
+	// Только в операционном режиме: ReportExclusions считает по дате операции, а
+	// в режиме «по дате чата» это смешало бы базы (сумма — по дате присылки).
 	reconNote := ""
-	if ex, err := b.db.ReportExclusions(ctx, from, to, groupJIDs); err == nil && (ex.NeedsReviewCount > 0 || ex.HeldCashCount > 0) {
-		var nb strings.Builder
-		nb.WriteString("\n\nℹ️ НЕ вошло в сбор (разберись — и засчитается):")
-		if ex.NeedsReviewCount > 0 {
-			fmt.Fprintf(&nb, "\n• Непроверенные чеки (не распознал клиента/сумму): %d шт на ~%.0f ₽ — ответь на вопросы бота «чей чек?» или суммой", ex.NeedsReviewCount, ex.NeedsReviewSum)
+	if !byChat {
+		if ex, err := b.db.ReportExclusions(ctx, from, to, groupJIDs); err == nil {
+			var nb strings.Builder
+			if ex.NeedsReviewCount > 0 || ex.HeldCashCount > 0 {
+				nb.WriteString("\n\nℹ️ НЕ вошло в сбор (разберись — и засчитается):")
+				if ex.NeedsReviewCount > 0 {
+					fmt.Fprintf(&nb, "\n• Непроверенные чеки (не распознал клиента/сумму): %d шт на ~%.0f ₽ — ответь на вопросы бота «чей чек?» или суммой", ex.NeedsReviewCount, ex.NeedsReviewSum)
+				}
+				if ex.HeldCashCount > 0 {
+					fmt.Fprintf(&nb, "\n• Придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽ — ответь «новый» / «тот же»", ex.HeldCashCount, ex.HeldCashSum)
+				}
+				fmt.Fprintf(&nb, "\nЕсли всё это твоё — полный оборот за период: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
+			}
+			if ex.TextDupCount > 0 {
+				fmt.Fprintf(&nb, "\n\nⓘ Текстовых платежей зачтено как дубль чека (уже в сумме, не дважды): %d шт на %.0f ₽. Если какой-то из них — ОТДЕЛЬНЫЙ платёж, скажи, зачту.", ex.TextDupCount, ex.TextDupSum)
+			}
+			reconNote = nb.String()
 		}
-		if ex.HeldCashCount > 0 {
-			fmt.Fprintf(&nb, "\n• Придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽ — ответь «новый» / «тот же»", ex.HeldCashCount, ex.HeldCashSum)
-		}
-		fmt.Fprintf(&nb, "\nЕсли всё это твоё — полный оборот за период: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
-		reconNote = nb.String()
 	}
 	notes := excludedNote + reconNote
 
@@ -2904,7 +2913,11 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	var contactIDPtr *int
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 	if err != nil {
+		// Без contact_id чек выпал бы из сбора молча (SummaryForPeriod требует
+		// contact_id). Помечаем needs_review — тогда он попадёт в раздел «не
+		// вошло» и не потеряется.
 		fmt.Println("Ошибка получения контакта для чека:", err)
+		needsReview = true
 	} else {
 		contactIDPtr = &contactID
 	}

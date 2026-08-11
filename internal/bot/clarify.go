@@ -478,9 +478,14 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	var contactIDPtr *int
 	if name != "" {
 		canonical, _ = b.aliases.ResolveName(name)
-		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
-			contactIDPtr = &cid
+		cid, err := b.db.GetOrCreateContact(ctx, canonical)
+		if err != nil {
+			// Не удалось создать контакт — не подтверждаем чек с NULL contact_id и
+			// needs_review=false (иначе выпал бы из сбора молча). Оставляем как есть,
+			// переспросим в следующий раз.
+			return false
 		}
+		contactIDPtr = &cid
 	}
 	found, amount, err := b.db.FillReceiptByMessage(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
 	if err != nil || !found {
