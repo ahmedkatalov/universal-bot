@@ -485,13 +485,12 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	if text == "" {
 		// OCR не дал текста вообще. Последний шанс — Claude смотрит на само
 		// изображение: handleBankReceipt с пустым текстом сразу уйдёт в
-		// вижн-фолбэк. В фоне, т.к. вижн-запрос занимает секунды.
+		// вижн-фолбэк. СИНХРОННО (как путь с OCR ниже): иначе строка чека ещё не
+		// в БД, когда придёт следующее сообщение-имя, и имя привяжется не к тому
+		// чеку (перепутает клиентов). Вижн-запрос секунды — обработчик их терпит.
 		if mediaBytes != nil && b.assistant != nil {
-			mb, me, chatJID, ts := mediaBytes, mediaExt, msg.Info.Chat, msg.Info.Timestamp
-			sender := msg.Info.Sender.String()
-			waMsgID := msg.Info.ID
 			payer, payerAmount := b.resolveReceiptPayer(ctx, msg, caption)
-			go b.handleBankReceipt(context.Background(), chatJID, sender, waMsgID, "", rawID, ts, mb, me, payer, payerAmount)
+			b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), msg.Info.ID, "", rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer, payerAmount)
 			return
 		}
 		fmt.Printf("Фото без распознанного текста (сообщение %d), нужна ручная проверка: %s\n", rawID, mediaPath)
@@ -576,7 +575,7 @@ func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawI
 	result := parser.ParseMessage(text)
 	isCashMsg := parser.IsCash(text) || cashHint
 	for _, tr := range result.Transactions {
-		canonical := b.aliases.Resolve(tr.RawName)
+		canonical, _ := b.aliases.ResolveName(tr.RawName)
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 		if err != nil {
 			fmt.Println("Ошибка получения контакта:", err)
@@ -2624,7 +2623,7 @@ func (b *Bot) handleCashPhoto(ctx context.Context, chat types.JID, senderJID, pa
 
 // recordCashPayment записывает наличный платёж (ФИО + сумма) в учёт.
 func (b *Bot) recordCashPayment(ctx context.Context, chat types.JID, payer string, amount float64, rawID int, txDate time.Time) {
-	canonical := b.aliases.Resolve(payer)
+	canonical, _ := b.aliases.ResolveName(payer)
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 	if err != nil {
 		fmt.Println("Наличка: ошибка контакта:", err)
@@ -2771,10 +2770,14 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 
 	// ResolveName умеет сопоставлять полные ФИО с чеков ("Милана Нажудовна К.")
 	// с короткими алиасами ("Милана") — по словам, а не только точным совпадением.
-	canonical, matched := b.aliases.ResolveName(rd.Recipient)
-	// Не нашли уверенного совпадения — на ручную проверку. Но если клиента
-	// назвал сам владелец (payerOverride), имени доверяем — проверка не нужна.
-	needsReview := !matched && payerOverride == ""
+	canonical, _ := b.aliases.ResolveName(rd.Recipient)
+	// Клиента знаем ТОЛЬКО если ФИО написали РЯДОМ с чеком (payerOverride).
+	// Получатель, напечатанный на чеке, — это владелец карты, а НЕ клиент
+	// (клиент мог попросить кого угодно сделать перевод). Поэтому совпадение
+	// получателя с алиасом НЕ означает, что клиент известен: без написанного
+	// ФИО отправляем чек на ручную проверку («чей это чек?»), иначе платёж молча
+	// уйдёт в сбор под владельцем карты — не под настоящим клиентом.
+	needsReview := payerOverride == ""
 
 	var contactIDPtr *int
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)

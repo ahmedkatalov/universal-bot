@@ -129,7 +129,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		if p.Amount <= 0 || name == "" {
 			continue
 		}
-		canonical := b.aliases.Resolve(name)
+		canonical, _ := b.aliases.ResolveName(name)
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 		if err != nil {
 			fmt.Println("ИИ-доразбор: ошибка контакта:", err)

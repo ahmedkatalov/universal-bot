@@ -732,7 +732,7 @@ func (b *Bot) recountEverything(ctx context.Context) (string, error) {
 			result := parser.ParseMessage(m.Body)
 			saved := 0
 			for _, tr := range result.Transactions {
-				canonical := b.aliases.Resolve(tr.RawName)
+				canonical, _ := b.aliases.ResolveName(tr.RawName)
 				contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 				if err != nil {
 					continue

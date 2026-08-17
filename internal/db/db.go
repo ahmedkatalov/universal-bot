@@ -1253,6 +1253,7 @@ func (d *DB) FixReceipt(ctx context.Context, kind string, id int, contactID *int
 		_, err := d.pool.Exec(ctx, `
 			UPDATE bank_receipts SET
 				contact_id    = COALESCE($2, contact_id),
+				card_owner    = CASE WHEN $3 = '' THEN card_owner ELSE COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')) END,
 				recipient_raw = COALESCE(NULLIF($3, ''), recipient_raw),
 				amount        = CASE WHEN $4 > 0 THEN $4 ELSE amount END,
 				tx_date       = COALESCE($5, tx_date),
