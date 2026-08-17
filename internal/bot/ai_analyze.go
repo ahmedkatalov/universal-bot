@@ -346,9 +346,11 @@ func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, h
 		recs = append(recs, r.rec)
 	}
 
-	// Фото наличных побеждает, если «наличкой» его назвало не меньше прочтений,
-	// чем «чеком» (в т.ч. когда чеков не вышло вовсе).
-	if cash != nil && cashVotes >= len(recs) {
+	// Фото наличных побеждает, только если «наличкой» его назвало СТРОГО больше
+	// прочтений, чем «чеком» (и когда чеков не вышло вовсе — тогда len(recs)=0).
+	// На РАВЕНСТВЕ голосов доверяем чеку: одно случайное «наличка»-прочтение не
+	// должно выкинуть реальный банковский перевод.
+	if cash != nil && cashVotes > len(recs) {
 		return *cash, true
 	}
 	if len(recs) == 0 {
@@ -374,12 +376,57 @@ func pickConsensusReceipt(recs []aiReceipt) aiReceipt {
 		return recs[0] // суммы никто не прочитал — вернём первое (получатель и т.п.)
 	}
 	winner := consensusAmount(amounts)
-	for _, r := range recs {
-		if r.Amount == winner {
-			return r
+	// Среди прочтений с выигравшей суммой берём САМОЕ полное (не первое попавшееся),
+	// чтобы к верной сумме не прицепился пустой получатель/кривая дата из другого
+	// прочтения, случайно совпавшего по сумме. Пустые поля добираем из остальных
+	// прочтений с той же суммой.
+	best := -1
+	bestScore := -1
+	for i := range recs {
+		if recs[i].Amount != winner {
+			continue
+		}
+		score := 0
+		for _, s := range []string{recs[i].Recipient, recs[i].Datetime, recs[i].Sender, recs[i].Bank, recs[i].Status, recs[i].DocNumber} {
+			if strings.TrimSpace(s) != "" {
+				score++
+			}
+		}
+		if score > bestScore {
+			bestScore, best = score, i
 		}
 	}
-	return recs[0]
+	if best < 0 {
+		return recs[0]
+	}
+	out := recs[best]
+	for i := range recs {
+		if recs[i].Amount != winner {
+			continue
+		}
+		if strings.TrimSpace(out.Recipient) == "" {
+			out.Recipient = recs[i].Recipient
+		}
+		if strings.TrimSpace(out.Datetime) == "" {
+			out.Datetime = recs[i].Datetime
+		}
+		if strings.TrimSpace(out.Sender) == "" {
+			out.Sender = recs[i].Sender
+		}
+		if strings.TrimSpace(out.Bank) == "" {
+			out.Bank = recs[i].Bank
+		}
+		if strings.TrimSpace(out.RecipientBank) == "" {
+			out.RecipientBank = recs[i].RecipientBank
+		}
+		if strings.TrimSpace(out.DocNumber) == "" {
+			out.DocNumber = recs[i].DocNumber
+		}
+		if strings.TrimSpace(out.Status) == "" {
+			out.Status = recs[i].Status
+		}
+	}
+	return out
 }
 
 // consensusAmount возвращает согласованную сумму: если какая-то встречается 2+
@@ -518,7 +565,16 @@ func parseAIDatetime(s string) (time.Time, bool) {
 	if s == "" {
 		return time.Time{}, false
 	}
-	for _, layout := range []string{"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02"} {
+	// Принимаем не только пробел-формат, но и ISO с «T», со смещением/зоной и
+	// точечный дд.мм.гггг — модель/OCR часто отдают именно так. Иначе верно
+	// прочитанная дата операции отбрасывалась, и чек датировался временем
+	// присылки в WhatsApp (уезжал не в тот день/период).
+	for _, layout := range []string{
+		"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02",
+		"2006-01-02T15:04:05", "2006-01-02T15:04",
+		time.RFC3339, "2006-01-02T15:04:05Z07:00",
+		"02.01.2006 15:04:05", "02.01.2006 15:04", "02.01.2006",
+	} {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
 			return t, true
 		}

@@ -173,7 +173,7 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 			if collector != "" {
 				body += " (собрал " + collector + ")"
 			}
-			rawID, err := b.db.SaveRawMessage(ctx, waMsgID, groupJID, "dictated@c.us", senderName, body, false, "", txDate)
+			rawID, _, err := b.db.SaveRawMessage(ctx, waMsgID, groupJID, "dictated@c.us", senderName, body, false, "", txDate)
 			if err != nil {
 				return "", fmt.Errorf("не удалось сохранить: %w", err)
 			}

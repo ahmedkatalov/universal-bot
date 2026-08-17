@@ -290,18 +290,21 @@ func (d *DB) Close() {
 	d.pool.Close()
 }
 
-// SaveRawMessage сохраняет сырое сообщение. Возвращает id записи.
-// waMessageID используется для идемпотентности — при повторной доставке
-// того же сообщения (whatsmeow иногда шлёт события повторно) запись не дублируется.
-func (d *DB) SaveRawMessage(ctx context.Context, waMessageID, groupJID, senderJID, senderName, body string, hasMedia bool, mediaPath string, receivedAt time.Time) (int, error) {
+// SaveRawMessage сохраняет сырое сообщение. Возвращает id записи и existed —
+// была ли такая запись УЖЕ (повторная доставка: whatsmeow иногда шлёт события
+// повторно). existed=true -> сообщение уже сохраняли; вызывающий должен НЕ
+// обрабатывать его снова, иначе платежи запишутся дважды. (xmax<>0 истинно,
+// когда строка обновилась по ON CONFLICT, т.е. это повторная доставка.)
+func (d *DB) SaveRawMessage(ctx context.Context, waMessageID, groupJID, senderJID, senderName, body string, hasMedia bool, mediaPath string, receivedAt time.Time) (int, bool, error) {
 	var id int
+	var existed bool
 	err := d.pool.QueryRow(ctx, `
 		INSERT INTO raw_messages (wa_message_id, wa_group_jid, sender_jid, sender_name, body, has_media, media_path, received_at)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		ON CONFLICT (wa_message_id) DO UPDATE SET wa_message_id = EXCLUDED.wa_message_id
-		RETURNING id
-	`, waMessageID, groupJID, senderJID, senderName, body, hasMedia, mediaPath, receivedAt).Scan(&id)
-	return id, err
+		RETURNING id, (xmax <> 0)
+	`, waMessageID, groupJID, senderJID, senderName, body, hasMedia, mediaPath, receivedAt).Scan(&id, &existed)
+	return id, existed, err
 }
 
 func (d *DB) MarkMessageParsed(ctx context.Context, rawMessageID int) error {

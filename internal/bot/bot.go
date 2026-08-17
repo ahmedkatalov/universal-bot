@@ -469,10 +469,16 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		}
 	}
 
-	rawID, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
+	rawID, existed, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
 		senderName, text, hasMedia, mediaPath, msg.Info.Timestamp)
 	if err != nil {
 		fmt.Println("Ошибка сохранения сообщения:", err)
+		return
+	}
+	if existed {
+		// Повторная доставка того же сообщения — уже сохраняли и обрабатывали.
+		// НЕ обрабатываем снова, иначе платежи/чек запишутся дважды. (Если запись
+		// не была разобрана из-за прошлого сбоя, её подхватит пересчёт по parsed=false.)
 		return
 	}
 
@@ -1157,11 +1163,12 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 		if senderName == "" {
 			senderName = msg.Info.Sender.User
 		}
-		rawID, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
+		rawID, existed, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
 			senderName, ocrText, true, mediaPath, msg.Info.Timestamp)
 		if err != nil {
 			fmt.Println("Ошибка сохранения фото-сообщения из лички:", err)
-		} else {
+		} else if !existed {
+			// existed -> повторная доставка, в очередь на дозагрузку не кладём дважды.
 			chatKey := msg.Info.Chat.String()
 			b.pendingMu.Lock()
 			b.pending[chatKey] = append(b.pending[chatKey], pendingReceipt{
@@ -2539,7 +2546,7 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 		// Записываем чек в учёт целевой группы. Синтетический ID сообщения,
 		// чтобы не конфликтовать с исходным по уникальности.
 		if parser.LooksLikeBankReceipt(text) {
-			rawID, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
+			rawID, _, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
 				"bot-forward", senderName, text, true, "", ts)
 			if err != nil {
 				fmt.Println("Ошибка сохранения пересланного чека:", err)
