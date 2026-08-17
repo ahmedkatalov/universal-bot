@@ -538,28 +538,61 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		return "За " + periodLabel + " распознанных чеков в учёте нет.", nil
 	}
 
+	// Кэш платежей по клиенту с пометкой «уже засчитан» — чтобы ОДИН платёж в
+	// программе не закрывал ДВА одинаковых чека (каждый чек потребляет свой
+	// платёж 1:1, а не просто «есть ли платёж на сумму»).
+	type usedPayments struct {
+		pays []cmf.Payment
+		used []bool
+	}
+	cache := map[string]*usedPayments{}
+
 	var added, missing, noClient []string
 	for _, r := range receipts {
-		clients, err := b.cmfLookupWithTypos(ctx, r.Name)
+		clients, exact, err := b.cmfLookupWithTypos(ctx, r.Name)
 		if err != nil {
 			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка поиска в программе)", r.Name, r.Amount))
 			continue
 		}
-		switch len(clients) {
-		case 0:
+		switch {
+		case len(clients) == 0:
 			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (клиента нет в программе)", r.Name, r.Amount))
-		case 1:
-			found, err := b.cmf.HasPaymentAround(ctx, clients[0].ID, r.Amount, r.TxDate, 5)
-			if err != nil {
-				noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка проверки платежа)", clients[0].FullName, r.Amount))
-				continue
+		case len(clients) == 1 && exact:
+			cid := clients[0].ID
+			up := cache[cid]
+			if up == nil {
+				pays, perr := b.cmf.PaymentsAround(ctx, cid, r.TxDate, 5)
+				if perr != nil {
+					noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка проверки платежа)", clients[0].FullName, r.Amount))
+					continue
+				}
+				up = &usedPayments{pays: pays, used: make([]bool, len(pays))}
+				cache[cid] = up
+			}
+			wantRub := int64(r.Amount + 0.5)
+			wantKop := int64(r.Amount*100 + 0.5)
+			matched := -1
+			for i, p := range up.pays {
+				if up.used[i] {
+					continue
+				}
+				if p.Amount == wantRub || p.Amount == wantKop {
+					matched = i
+					break
+				}
 			}
 			line := fmt.Sprintf("%s — %.0f ₽ (чек от %s)", clients[0].FullName, r.Amount, r.TxDate.Format("02.01"))
-			if found {
+			if matched >= 0 {
+				up.used[matched] = true
 				added = append(added, line)
 			} else {
 				missing = append(missing, line)
 			}
+		case len(clients) == 1 && !exact:
+			// Нашли по нечёткому совпадению одного слова — это может быть тёзка/
+			// однофамилец. НЕ утверждаем «внесён/не внесён»: показываем реального
+			// плательщика из чека и кандидата как подсказку для ручной проверки.
+			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (в программе точно не найден; похоже на «%s» — проверь вручную)", r.Name, r.Amount, clients[0].FullName))
 		default:
 			var names []string
 			for _, c := range clients {
@@ -586,15 +619,17 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	return sb.String(), nil
 }
 
-// cmfLookupWithTypos ищет клиента с допуском на опечатки (полная строка,
-// затем по отдельным словам имени).
-func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) ([]cmf.ClientInfo, error) {
-	clients, err := b.cmf.LookupClients(ctx, name)
+// cmfLookupWithTypos ищет клиента с допуском на опечатки. Возвращает exact:
+// true — точное совпадение всей строки имени; false — нашли только по ОТДЕЛЬНЫМ
+// словам (нечёткое, может быть однофамильцем/тёзкой). На нечётком совпадении
+// нельзя утверждать «внесён/не внесён» — только подсказать кандидата.
+func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) (clients []cmf.ClientInfo, exact bool, err error) {
+	clients, err = b.cmf.LookupClients(ctx, name)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(clients) > 0 {
-		return clients, nil
+		return clients, true, nil
 	}
 	seen := map[string]cmf.ClientInfo{}
 	for _, word := range strings.Fields(name) {
@@ -611,7 +646,7 @@ func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) ([]cmf.Client
 	for _, c := range seen {
 		out = append(out, c)
 	}
-	return out, nil
+	return out, false, nil
 }
 
 // cmfAddPaymentTool — внести платёж по чеку в программу рассрочек.
@@ -662,7 +697,7 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 				contractID = strings.TrimSpace(args.ContractID)
 				// branch неизвестен по id — найдём среди договоров клиента ниже
 			}
-			clients, err := b.cmfLookupWithTypos(ctx, strings.TrimSpace(args.ClientName))
+			clients, _, err := b.cmfLookupWithTypos(ctx, strings.TrimSpace(args.ClientName))
 			if err != nil {
 				return "", err
 			}

@@ -290,28 +290,56 @@ func (c *Client) ContractPayments(ctx context.Context, contractID, branchID stri
 	return out, nil
 }
 
-// HasPaymentAround проверяет, есть ли у клиента платёж на данную сумму
-// в окне ±windowDays вокруг даты чека. Сумма сравнивается и в рублях,
-// и в копейках (на случай, если cmf хранит в минорных единицах).
-func (c *Client) HasPaymentAround(ctx context.Context, clientID string, amount float64, txDate time.Time, windowDays int) (bool, error) {
+func abs64(x int64) int64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}
+
+// PaymentsAround возвращает ВСЕ платежи клиента (по всем договорам) в окне
+// ±windowDays вокруг даты чека — чтобы сверка сопоставляла чек↔платёж 1:1
+// (потребляя каждый платёж один раз), а не просто «есть ли платёж на сумму».
+func (c *Client) PaymentsAround(ctx context.Context, clientID string, txDate time.Time, windowDays int) ([]Payment, error) {
 	contracts, err := c.ClientContracts(ctx, clientID)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	from := txDate.AddDate(0, 0, -windowDays)
 	to := txDate.AddDate(0, 0, windowDays)
-	wantRub := int64(amount + 0.5)
-	wantKop := int64(amount*100 + 0.5)
+	var out []Payment
 	for _, contract := range contracts {
 		payments, err := c.ContractPayments(ctx, contract.ID, contract.BranchID, from, to)
 		if err != nil {
-			return false, err
+			return nil, err
 		}
-		for _, p := range payments {
-			if p.Amount == wantRub || p.Amount == wantKop {
-				return true, nil
-			}
+		out = append(out, payments...)
+	}
+	return out, nil
+}
+
+// HasPaymentAround проверяет, есть ли у клиента платёж на данную сумму
+// в окне ±windowDays вокруг даты чека. Используется для МЯГКОГО напоминания
+// «чек не внесён» — поэтому склоняемся к «внесён», чтобы не дёргать зря:
+// засчитываем и одиночный точный платёж, и случай, когда платёж внесли частями
+// или с округлением/комиссией (сумма платежей в окне сходится с чеком ±1).
+// Сумма сравнивается и в рублях, и в копейках (cmf может хранить минорные).
+func (c *Client) HasPaymentAround(ctx context.Context, clientID string, amount float64, txDate time.Time, windowDays int) (bool, error) {
+	pays, err := c.PaymentsAround(ctx, clientID, txDate, windowDays)
+	if err != nil {
+		return false, err
+	}
+	wantRub := int64(amount + 0.5)
+	wantKop := int64(amount*100 + 0.5)
+	var sum int64
+	for _, p := range pays {
+		if p.Amount == wantRub || p.Amount == wantKop {
+			return true, nil
 		}
+		sum += p.Amount
+	}
+	if abs64(sum-wantRub) <= 1 || abs64(sum-wantKop) <= 1 {
+		return true, nil
 	}
 	return false, nil
 }
