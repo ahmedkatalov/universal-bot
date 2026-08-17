@@ -1,22 +1,20 @@
-
 package bot
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go.mau.fi/whatsmeow/types"
 	"os"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
-	"unicode" 
-	"go.mau.fi/whatsmeow/types"
+	"unicode"
 
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/parser"
 )
-
 
 func containsDigit(lines []string) bool {
 	for _, l := range lines {
@@ -28,8 +26,6 @@ func containsDigit(lines []string) bool {
 	}
 	return false
 }
-
-
 
 func extractJSONBlock(s string) string {
 	iArr := strings.Index(s, "[")
@@ -56,10 +52,10 @@ type aiPayment struct {
 	Collector string  `json:"collector"` // кто ЗАБРАЛ наличку (ответственный), если указан
 }
 
-
 func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint bool) {
 	system := "Ты — модуль разбора платежей в WhatsApp-боте учёта финансов. " +
-		"Тебе дают строки из сообщения рабочей группы, которые не смог разобрать обычный парсер. " +
+		"Тебе дают сообщение из рабочей группы — в нём могут быть платежи (переводы и/или наличка) в ЛЮБОМ формате. " +
+		"Разбери их по СМЫСЛУ, как понял бы человек, а не по шаблону. " +
 		"Известные люди: " + strings.Join(b.aliases.Canonicals(), ", ") + ".\n\n" +
 		"Верни СТРОГО один JSON-объект вида " +
 		`{"payments":[{"name":"ФИО клиента","amount":12345,"cash":false,"collector":"","note":"","card":"втб|сбер|наличные|"}],"clarify":""}` + ".\n\n" +
@@ -72,7 +68,11 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		"• «У Усумова Рауфа забрал 31 т / Наличка» -> name:«Усумов Рауф», amount:31000, cash:true, collector:«» (кто забрал не назван — тот, кто пишет).\n" +
 		"• «Умхадижиев Рахман 170т✅» -> name:«Умхадижиев Рахман», amount:170000, cash:false.\n" +
 		"• «Манаев Шамиль 120т / Дебишов Хусен 60т» -> ДВА платежа.\n" +
-		"cash:true если есть слово наличка/наличными/нал/кэш/офис или «у ‹имя› забрал». collector — кто ФИЗИЧЕСКИ забрал наличку " +
+		"cash — наличные ли это. Реши ПО СМЫСЛУ, как человек, а НЕ по конкретным словам: наличка = деньги передали/принесли/" +
+		"забрали/сдали ФИЗИЧЕСКИ, из рук в руки (в офис, на руки, живыми, кэшем, деньгами занёс/принёс, «у ‹имя›», «отдал ‹имя›»). " +
+		"Перевод = деньги ушли через банк / на карту / чеком. Слова «наличка/нал» — лишь частые подсказки, но их МОЖЕТ НЕ БЫТЬ: " +
+		"если по контексту деньги отдали вживую — cash:true даже без слова «наличка». Явный банковский перевод/на карту — cash:false. " +
+		"collector — кто ФИЗИЧЕСКИ забрал наличку " +
 		"(«мансур взял», «отдал Адаму»); если не указан — пустая строка. Имя приводи к нормальному виду (именительный падеж: " +
 		"«У Усумова Рауфа» -> «Усумов Рауф»).\n" +
 		"Суммы и сокращения: 5к=5000, 25 тыщ=25000, 170т=170000, 31 т=31000, 120т=120000, лям=1000000, «косарь»=1000. " +
@@ -88,11 +88,14 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 
 	out, err := b.assistant.Complete(ctx, system, user)
 	if err != nil {
-		fmt.Println("ИИ-доразбор сообщения не удался:", err)
+		// Ассистент недоступен — не теряем платёж: откатываемся к обычному парсеру.
+		fmt.Println("ИИ-доразбор сообщения не удался, откат к обычному парсеру:", err)
+		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
 		return
 	}
 	block := extractJSONBlock(out)
 	if block == "" {
+		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
 		return
 	}
 	var parsed struct {
@@ -100,7 +103,8 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		Clarify  string      `json:"clarify"`
 	}
 	if err := json.Unmarshal([]byte(block), &parsed); err != nil {
-		fmt.Printf("ИИ-доразбор: не удалось разобрать JSON (%v): %s\n", err, block)
+		fmt.Printf("ИИ-доразбор: не удалось разобрать JSON (%v): %s — откат к обычному парсеру\n", err, block)
+		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
 		return
 	}
 	payments := parsed.Payments

@@ -534,51 +534,22 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// парсер разбирает ненадёжно и теряет контекст. Такое отдаём ЦЕЛИКОМ ИИ —
 	// он правильно свяжет ФИО, сумму, наличку и ответственного. Детерминированный
 	// разбор для таких сообщений НЕ применяем (иначе задвоение/мусор).
-	routedToAI := b.assistant != nil && parser.LooksMessyPayment(text, result)
+	// Любое сообщение-платёж отдаём ЦЕЛИКОМ ассистенту: он сам, как человек,
+	// понимает по смыслу — наличка это или перевод, кто клиент, сумма, кто забрал,
+	// в любом формате (не по жёстким словам-триггерам). Детерминированный парсер
+	// оставлен запасным путём: если ассистента нет или его вызов сорвётся,
+	// aiRescueUnparsed сам откатится к нему, чтобы платёж не потерялся.
+	hasPayment := len(result.Transactions) > 0 || parser.LooksMessyPayment(text, result)
+	routedToAI := b.assistant != nil && hasPayment
 	if routedToAI {
-		// Снимаем пометку «рядом было фото пачки денег» ЗДЕСЬ тоже — иначе она
-		// не гасится на этой ветке и позже ошибочно пометит наличкой чужой
-		// одиночный платёж. Если пометка свежая — эти платежи и есть наличка.
+		// Пометку «рядом было фото пачки денег» снимаем здесь: если она свежая —
+		// эти платежи и есть наличка (передаём подсказкой, но решает ассистент).
 		cashHint := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
 		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint)
-	} else {
-		// Наличка: помечено словом в тексте, либо рядом пришло фото пачки денег.
-		// Пометку фото-нала снимаем только когда в сообщении есть что записать как
-		// платёж (разобранные транзакции или строки на ИИ-доразбор) — на чистой
-		// болтовне не трогаем, она ждёт настоящий платёж.
-		hasPayload := len(result.Transactions) > 0 || (b.assistant != nil && containsDigit(result.Unparsed))
-		cashPhotoNear := hasPayload && b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
-		isCashMsg := parser.IsCash(text) || cashPhotoNear
-		for _, tr := range result.Transactions {
-			canonical := b.aliases.Resolve(tr.RawName)
-			contactID, err := b.db.GetOrCreateContact(ctx, canonical)
-			if err != nil {
-				fmt.Println("Ошибка получения контакта:", err)
-				continue
-			}
-			err = b.db.InsertTransaction(ctx, db.TransactionInput{
-				ContactID:    contactID,
-				RawName:      tr.RawName,
-				Amount:       tr.Amount,
-				Note:         tr.Note,
-				CardTo:       tr.CardTo,
-				IsCash:       isCashMsg,
-				RawMessageID: rawID,
-				TxDate:       msg.Info.Timestamp,
-				DupCheck:     b.cashDupCheckOn(),
-			})
-			if err != nil {
-				fmt.Println("Ошибка сохранения транзакции:", err)
-			}
-		}
-
-		if len(result.Unparsed) > 0 {
-			fmt.Printf("Не распознано (сообщение %d): %v\n", rawID, result.Unparsed)
-			if b.assistant != nil && containsDigit(result.Unparsed) {
-				unparsed := append([]string(nil), result.Unparsed...)
-				go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, unparsed, rawID, msg.Info.Timestamp, isCashMsg)
-			}
-		}
+	} else if len(result.Transactions) > 0 {
+		// Ассистента нет — пишем детерминированно (регулярка налички как запас).
+		cashPhotoNear := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
+		b.recordDeterministicPayments(ctx, text, rawID, msg.Info.Timestamp, cashPhotoNear)
 	}
 
 	_ = b.db.MarkMessageParsed(ctx, rawID)
@@ -589,6 +560,36 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	if !hasMedia && b.assistant != nil && !routedToAI && len(result.Transactions) == 0 &&
 		proactiveChatEnabled() && worthChimingIn(text) {
 		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
+	}
+}
+
+// recordDeterministicPayments — ЗАПАСНОЙ путь записи платежей без ассистента:
+// обычный парсер + регулярка налички. Основной путь — ассистент (понимает
+// наличку по смыслу); сюда попадаем, только если ассистента нет или его вызов
+// сорвался — чтобы платёж не потерялся из-за недоступности ИИ.
+func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawID int, txDate time.Time, cashHint bool) {
+	result := parser.ParseMessage(text)
+	isCashMsg := parser.IsCash(text) || cashHint
+	for _, tr := range result.Transactions {
+		canonical := b.aliases.Resolve(tr.RawName)
+		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
+		if err != nil {
+			fmt.Println("Ошибка получения контакта:", err)
+			continue
+		}
+		if err := b.db.InsertTransaction(ctx, db.TransactionInput{
+			ContactID:    contactID,
+			RawName:      tr.RawName,
+			Amount:       tr.Amount,
+			Note:         tr.Note,
+			CardTo:       tr.CardTo,
+			IsCash:       isCashMsg,
+			RawMessageID: rawID,
+			TxDate:       txDate,
+			DupCheck:     b.cashDupCheckOn(),
+		}); err != nil {
+			fmt.Println("Ошибка сохранения транзакции:", err)
+		}
 	}
 }
 
