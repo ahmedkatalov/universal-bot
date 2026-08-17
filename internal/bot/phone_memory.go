@@ -174,6 +174,10 @@ func (b *Bot) assignReceiptTool(chat types.JID) ai.Tool {
 				return "", fmt.Errorf("нужно имя, кто забрал деньги")
 			}
 			if strings.TrimSpace(args.MessageID) != "" {
+				// Владелец указал КОНКРЕТНЫЙ чек (свайпом). Ветка терминальная: если
+				// по этому сообщению чека нет (это фото налички/текст/пересланная
+				// копия), НЕ падаем в «последний чек» — иначе ответственный
+				// припишется к чужому, самому свежему чеку.
 				found, amount, recipient, err := b.db.SetReceiptCollectorByMessage(ctx, strings.TrimSpace(args.MessageID), collector)
 				if err != nil {
 					return "", err
@@ -181,6 +185,8 @@ func (b *Bot) assignReceiptTool(chat types.JID) ai.Tool {
 				if found {
 					return fmt.Sprintf("Записал: чек %s на %.0f ₽ забрал %s.", recipient, amount, collector), nil
 				}
+				return "В том сообщении банковского чека нет (возможно, это фото/текст/пересланная копия). " +
+					"Уточни сумму чека или ответь именно на нужный чек.", nil
 			}
 			found, amount, recipient, err := b.db.SetReceiptCollectorLatest(ctx, chat.String(), collector, args.Amount)
 			if err != nil {

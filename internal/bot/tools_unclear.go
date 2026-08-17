@@ -371,16 +371,26 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 			if err != nil {
 				return "", err
 			}
-			rows, err := b.db.ReceiptsLedger(ctx, from, toDay.AddDate(0, 0, 1), strings.TrimSpace(args.Person), groupJIDs, args.Limit)
+			// +1 к лимиту, чтобы понять, обрезан ли список (иначе «Итого по списку»
+			// читалось бы как итог за весь период, хотя это сумма лишь первых N).
+			rows, err := b.db.ReceiptsLedger(ctx, from, toDay.AddDate(0, 0, 1), strings.TrimSpace(args.Person), groupJIDs, args.Limit+1)
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}
 			if len(rows) == 0 {
 				return fmt.Sprintf("Чеков за %s — %s (%s) не нашлось.", from.Format("02.01.2006"), toDay.Format("02.01.2006"), groupLabel), nil
 			}
+			truncated := len(rows) > args.Limit
+			if truncated {
+				rows = rows[:args.Limit]
+			}
 			groups := b.joinedGroups(ctx)
 			var sb strings.Builder
-			fmt.Fprintf(&sb, "Журнал платежей %s — %s (%s), всего %d:\n", from.Format("02.01"), toDay.Format("02.01"), groupLabel, len(rows))
+			if truncated {
+				fmt.Fprintf(&sb, "Журнал платежей %s — %s (%s), показаны первые %d (есть ещё — сузь период или подними limit):\n", from.Format("02.01"), toDay.Format("02.01"), groupLabel, len(rows))
+			} else {
+				fmt.Fprintf(&sb, "Журнал платежей %s — %s (%s), всего %d:\n", from.Format("02.01"), toDay.Format("02.01"), groupLabel, len(rows))
+			}
 			var total float64
 			for _, r := range rows {
 				total += r.Amount
@@ -413,7 +423,11 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 				fmt.Fprintf(&sb, "• [%s] %s — клиент: %s — %.0f ₽%s%s — прислал: %s%s — группа: %s\n",
 					r.Kind, r.TxDate.Format("02.01 15:04"), client, r.Amount, card, bank, sender, collector, groupName)
 			}
-			fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
+			if truncated {
+				fmt.Fprintf(&sb, "Итого по ПОКАЗАННЫМ %d: %.0f ₽ (НЕ вся сумма за период — список обрезан).", len(rows), total)
+			} else {
+				fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
+			}
 			return sb.String(), nil
 		},
 	}

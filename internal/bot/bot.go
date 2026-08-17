@@ -1558,7 +1558,9 @@ func (b *Bot) cardsTool(chat types.JID) ai.Tool {
 				if err := report.GenerateCustom("Переводы по картам", "Период: "+periodLabel+" | "+groupLabel, []report.Section{section}, b.fontDir, outPath); err != nil {
 					return "", fmt.Errorf("ошибка генерации PDF: %w", err)
 				}
-				b.sendDocument(chat, outPath, "Карты_"+from.Format("2006-01-02")+".pdf")
+				if err := b.sendDocument(chat, outPath, "Карты_"+from.Format("2006-01-02")+".pdf"); err != nil {
+					return "", fmt.Errorf("не удалось отправить PDF по картам: %w", err)
+				}
 				return fmt.Sprintf("PDF по картам за %s (%s) отправлен: %d переводов на %.0f ₽.", periodLabel, groupLabel, count, total), nil
 			}
 
@@ -1695,7 +1697,9 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				if err := report.GenerateCustom("Отчёт: кто сколько чеков скинул", subtitle, []report.Section{section}, b.fontDir, outPath); err != nil {
 					return "", fmt.Errorf("ошибка генерации PDF: %w", err)
 				}
-				b.sendDocument(chat, outPath, "Чеки_по_отправителям_"+from.Format("2006-01-02")+".pdf")
+				if err := b.sendDocument(chat, outPath, "Чеки_по_отправителям_"+from.Format("2006-01-02")+".pdf"); err != nil {
+					return "", fmt.Errorf("не удалось отправить PDF по отправителям: %w", err)
+				}
 				return fmt.Sprintf("PDF с разбивкой по отправителям за %s (%s) отправлен: %d чек(ов) на %.0f ₽.", periodLabel, groupLabel, totalCount, totalSum), nil
 			}
 
@@ -1828,7 +1832,9 @@ func (b *Bot) customPDFTool(chat types.JID) ai.Tool {
 			if err := report.GenerateCustom(args.Title, args.Subtitle, sections, b.fontDir, outPath); err != nil {
 				return "", fmt.Errorf("ошибка генерации PDF: %w", err)
 			}
-			b.sendDocument(chat, outPath, sanitizeFileName(args.Title)+".pdf")
+			if err := b.sendDocument(chat, outPath, sanitizeFileName(args.Title)+".pdf"); err != nil {
+				return "", fmt.Errorf("не удалось отправить PDF: %w", err)
+			}
 			return "Готовый PDF «" + args.Title + "» отправлен в чат.", nil
 		},
 	}
@@ -1836,6 +1842,10 @@ func (b *Bot) customPDFTool(chat types.JID) ai.Tool {
 
 // formatRub форматирует сумму с разбивкой по разрядам для PDF-таблиц.
 func formatRub(v float64) string {
+	neg := v < 0
+	if neg {
+		v = -v
+	}
 	s := fmt.Sprintf("%.0f", v)
 	var out []byte
 	for i, c := range []byte(s) {
@@ -1844,7 +1854,11 @@ func formatRub(v float64) string {
 		}
 		out = append(out, c)
 	}
-	return string(out)
+	res := string(out)
+	if neg {
+		res = "-" + res
+	}
+	return res
 }
 
 // sanitizeFileName делает из заголовка безопасное имя файла.
@@ -2486,7 +2500,9 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 			return "", fmt.Errorf("ошибка генерации PDF: %w", err)
 		}
 		fileName := "Отчёт_" + from.Format("2006-01-02") + "_" + toDay.Format("2006-01-02") + ".pdf"
-		b.sendDocument(chat, outPath, fileName)
+		if err := b.sendDocument(chat, outPath, fileName); err != nil {
+			return "", fmt.Errorf("не удалось отправить PDF-отчёт: %w", err)
+		}
 		return "PDF-отчёт за " + periodLabel + " отправлен в чат." + notes, nil
 	}
 
@@ -2901,7 +2917,9 @@ func (b *Bot) sendMonthlyReport(ctx context.Context, chat types.JID) {
 		return
 	}
 
-	b.sendDocument(chat, outPath, "Отчёт_"+now.Format("2006-01-02")+".pdf")
+	if err := b.sendDocument(chat, outPath, "Отчёт_"+now.Format("2006-01-02")+".pdf"); err != nil {
+		b.sendText(chat, "Отчёт сформирован, но не удалось отправить файл — попробуйте ещё раз.")
+	}
 }
 
 func (b *Bot) sendText(chat types.JID, text string) {
@@ -2987,11 +3005,11 @@ func (b *Bot) sendImageWithCaption(chat types.JID, data []byte, caption string) 
 }
 
 // sendDocumentBytes отправляет документ (PDF-чек) из памяти.
-func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype string) {
+func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype string) error {
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaDocument)
 	if err != nil {
 		fmt.Println("Ошибка загрузки документа в WhatsApp:", err)
-		return
+		return fmt.Errorf("загрузка документа в WhatsApp: %w", err)
 	}
 	msg := &waProto.Message{
 		DocumentMessage: &waProto.DocumentMessage{
@@ -3009,22 +3027,23 @@ func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype 
 	resp, err := b.client.SendMessage(context.Background(), chat, msg)
 	if err != nil {
 		fmt.Println("Ошибка отправки документа:", err)
-		return
+		return fmt.Errorf("отправка документа: %w", err)
 	}
 	b.rememberSent(chat, resp.ID)
+	return nil
 }
 
-func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) {
+func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) error {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		fmt.Println("Ошибка чтения файла отчёта:", err)
-		return
+		return fmt.Errorf("чтение файла отчёта: %w", err)
 	}
 
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaDocument)
 	if err != nil {
 		fmt.Println("Ошибка загрузки файла в WhatsApp:", err)
-		return
+		return fmt.Errorf("загрузка файла в WhatsApp: %w", err)
 	}
 
 	msg := &waProto.Message{
@@ -3041,10 +3060,13 @@ func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) {
 		},
 	}
 
-	_, err = b.client.SendMessage(context.Background(), chat, msg)
+	resp, err := b.client.SendMessage(context.Background(), chat, msg)
 	if err != nil {
 		fmt.Println("Ошибка отправки документа:", err)
+		return fmt.Errorf("отправка документа: %w", err)
 	}
+	b.rememberSent(chat, resp.ID)
+	return nil
 }
 
 // extractText вытаскивает текст из разных типов сообщений whatsmeow

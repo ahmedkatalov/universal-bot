@@ -1405,8 +1405,9 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 				  AND COALESCE(trm.wa_group_jid, '') = COALESCE(br.group_jid, '')
 			  )
 			  -- И не добавляем, если тот же платёж уже посчитан РАСПОЗНАННОЙ копией
-			  -- в другой группе (кросс-пост по номеру документа) — иначе «полный
-			  -- оборот» задвоил бы его.
+			  -- в другой группе — иначе «Максимум» задвоил бы его. Сопоставляем по
+			  -- номеру документа, а если его нет — по синтетическому id пересылки
+			  -- (копия чека получает wa_message_id вида «<оригинал>-fwd-<группа>»).
 			  AND NOT EXISTS (
 				SELECT 1 FROM bank_receipts o
 				LEFT JOIN raw_messages orm ON orm.id = o.raw_message_id
@@ -1415,7 +1416,11 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 				  AND COALESCE(orm.deleted, false) = false
 				  AND o.tx_date >= $1 AND o.tx_date < $2
 				  AND ($3::text[] IS NULL OR o.group_jid = ANY($3))
-				  AND NULLIF(br.doc_number, '') IS NOT NULL AND o.doc_number = br.doc_number
+				  AND (
+					(NULLIF(br.doc_number, '') IS NOT NULL AND o.doc_number = br.doc_number)
+					OR (COALESCE(rm.wa_message_id, '') <> '' AND COALESCE(orm.wa_message_id, '') <> ''
+						AND starts_with(rm.wa_message_id, orm.wa_message_id || '-fwd-'))
+				  )
 			  )
 			ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text)
 		) dedup

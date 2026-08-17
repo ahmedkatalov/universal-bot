@@ -331,7 +331,9 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 				if err := report.GenerateCustom("Мои расходы", "Период: "+periodLabel, []report.Section{section}, b.fontDir, outPath); err != nil {
 					return "", fmt.Errorf("ошибка генерации PDF: %w", err)
 				}
-				b.sendDocument(chat, outPath, "Расходы_"+from.Format("2006-01-02")+"_"+toDay.Format("2006-01-02")+".pdf")
+				if err := b.sendDocument(chat, outPath, "Расходы_"+from.Format("2006-01-02")+"_"+toDay.Format("2006-01-02")+".pdf"); err != nil {
+					return "", fmt.Errorf("не удалось отправить PDF с расходами: %w", err)
+				}
 				return fmt.Sprintf("Отправил PDF с расходами за %s. Итого: %.0f ₽.", periodLabel, total), nil
 			}
 
