@@ -53,6 +53,16 @@ type aiPayment struct {
 }
 
 func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint bool) {
+	// Помечаем сообщение разобранным ТОЛЬКО по завершении записи. Если горутина
+	// упадёт с паникой — не помечаем, чтобы пересчёт (recount) переразобрал его и
+	// платёж не потерялся.
+	defer func() {
+		if r := recover(); r != nil {
+			fmt.Println("ИИ-доразбор: паника, оставляю сообщение на пересчёт:", r)
+			return
+		}
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+	}()
 	system := "Ты — модуль разбора платежей в WhatsApp-боте учёта финансов. " +
 		"Тебе дают сообщение из рабочей группы — в нём могут быть платежи (переводы и/или наличка) в ЛЮБОМ формате. " +
 		"Разбери их по СМЫСЛУ, как понял бы человек, а не по шаблону. " +
@@ -151,6 +161,12 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 	if saved > 0 {
 		fmt.Printf("ИИ-доразбор: сообщение %d — извлечено и сохранено %d платеж(ей), которые не понял обычный парсер\n", rawID, saved)
+	} else {
+		// ИИ ничего не записал (счёл болтовнёй ИЛИ все вставки не прошли). Если
+		// обычный парсер уверенно находит платёж в этих строках — записываем его,
+		// чтобы ложный отрицательный ИИ не проглотил реальный платёж. На настоящей
+		// болтовне парсер ничего не найдёт — вреда нет.
+		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
 	}
 }
 

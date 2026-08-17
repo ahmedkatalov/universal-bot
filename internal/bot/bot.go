@@ -552,7 +552,12 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		b.recordDeterministicPayments(ctx, text, rawID, msg.Info.Timestamp, cashPhotoNear)
 	}
 
-	_ = b.db.MarkMessageParsed(ctx, rawID)
+	// Для сообщений, ушедших в ИИ, отметку «разобрано» ставит сама горутина
+	// aiRescueUnparsed — ПОСЛЕ записи (и не ставит при панике), чтобы платёж
+	// пережил падение и переразобрался при пересчёте. Остальные помечаем сразу.
+	if !routedToAI {
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+	}
 
 	// Проактивное участие в разговоре: бот сам решает, когда вставить полезную
 	// реплику (в фоне). Пропускаем сообщения-платежи (это записи, не беседа) —
