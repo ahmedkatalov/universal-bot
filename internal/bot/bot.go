@@ -2794,6 +2794,23 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			GroupJID:     chat.String(),
 			TxDate:       txDate,
 		})
+		// Сразу флажим в группе: не распознал — просим помочь. Отмечаем «спросили»,
+		// чтобы клариф-цикл не переспрашивал, и привязываем ответ владельца (ФИО+
+		// сумма свайпом на этот чек) через fix. Чек при этом уже лежит как
+		// «непонятый» — придёт в список по запросу «скинь нераспознанные».
+		if askReceiptsEnabled() && waMsgID != "" {
+			what := "не прочитал ни сумму, ни получателя"
+			if rd.Amount == 0 && rd.Recipient != "" {
+				what = "не прочитал сумму"
+			} else if rd.Amount > 0 && rd.Recipient == "" {
+				what = "не прочитал, чей это чек (получателя)"
+			}
+			q := fmt.Sprintf("🤔 Не смог разобрать этот чек (%s). Помогите: ответьте на это сообщение "+
+				"ФИО клиента и суммой — например «Ахмед Каталов 15000». Или пришлите чек чётче и полным (не обрезанным).", what)
+			botMsgID := b.sendReply(chat, q, waMsgID, senderJID)
+			_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID)
+			b.registerClarifyAsk(botMsgID, waMsgID)
+		}
 		return
 	}
 

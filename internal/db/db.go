@@ -890,6 +890,22 @@ func (d *DB) MarkReceiptAsked(ctx context.Context, receiptID int) error {
 	return err
 }
 
+// MarkReceiptAskedByMessage помечает «уже спросили» чек по id его сообщения в
+// WhatsApp — когда бот сразу флажит нераспознанный чек прямо в группе, чтобы
+// клариф-цикл не переспросил о нём повторно.
+func (d *DB) MarkReceiptAskedByMessage(ctx context.Context, waMessageID string) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET clarify_asked = true
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false
+			ORDER BY br.id DESC LIMIT 1
+		)
+	`, waMessageID)
+	return err
+}
+
 // DuplicateWindow — окно вокруг времени операции, в котором совпадение
 // получателя и суммы считается вероятным повтором одного и того же чека
 // (например, кто-то по ошибке переслал одно и то же фото дважды).
