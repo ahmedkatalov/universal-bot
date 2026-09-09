@@ -1221,31 +1221,41 @@ type UnclearItem struct {
 
 // UnclearItems возвращает непонятые чеки и медиа-сообщения (свежие первыми).
 // groupJID — необязательный фильтр по группе.
-func (d *DB) UnclearItems(ctx context.Context, groupJID string, limit int) ([]UnclearItem, error) {
+// UnclearItems — непонятые ЧЕКИ. from/to (необязательно) фильтруют по дате
+// присылки в чат (received_at), чтобы «нераспознанные за сентябрь» не мешались с
+// августовскими. Ветка 'message' (медиа без чека/платежа) берёт ТОЛЬКО ещё не
+// обработанные (parsed=false): фото, которые бот классифицировал как НЕ чек
+// (паспорт, случайная картинка) или как наличку, помечаются parsed и сюда НЕ
+// попадают — иначе в «нераспознанных чеках» оказывались бы паспорта и фото денег.
+func (d *DB) UnclearItems(ctx context.Context, groupJID string, from, to *time.Time, limit int) ([]UnclearItem, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT 'receipt', br.id, COALESCE(br.group_jid, ''), COALESCE(br.recipient_raw, ''),
-		        COALESCE(br.amount, 0)::float8, br.tx_date, COALESCE(rm.media_path, ''),
+		        COALESCE(br.amount, 0)::float8, COALESCE(rm.received_at, br.tx_date), COALESCE(rm.media_path, ''),
 		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '')
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.needs_review = true AND br.ignored = false AND br.is_duplicate = false
 		  AND COALESCE(rm.deleted, false) = false
-		  AND ($1 = '' OR br.group_jid = $1))
+		  AND ($1 = '' OR br.group_jid = $1)
+		  AND ($3::timestamptz IS NULL OR COALESCE(rm.received_at, br.tx_date) >= $3)
+		  AND ($4::timestamptz IS NULL OR COALESCE(rm.received_at, br.tx_date) < $4))
 
 		UNION ALL
 
 		(SELECT 'message', rm.id, rm.wa_group_jid, '', 0, rm.received_at, COALESCE(rm.media_path, ''),
 		        COALESCE(NULLIF(rm.sender_name, ''), split_part(rm.sender_jid, '@', 1))
 		FROM raw_messages rm
-		WHERE rm.has_media = true AND rm.deleted = false
+		WHERE rm.has_media = true AND rm.deleted = false AND rm.parsed = false
 		  AND rm.media_path IS NOT NULL AND rm.media_path <> ''
 		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
 		  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id)
-		  AND ($1 = '' OR rm.wa_group_jid = $1))
+		  AND ($1 = '' OR rm.wa_group_jid = $1)
+		  AND ($3::timestamptz IS NULL OR rm.received_at >= $3)
+		  AND ($4::timestamptz IS NULL OR rm.received_at < $4))
 
 		ORDER BY 6 DESC
 		LIMIT $2
-	`, groupJID, limit)
+	`, groupJID, limit, from, to)
 	if err != nil {
 		return nil, err
 	}

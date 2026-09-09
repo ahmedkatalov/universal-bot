@@ -34,14 +34,36 @@ func dbTransactionFromParsed(tr parser.Transaction, contactID, rawID int, ts tim
 	}
 }
 
+// parseUnclearPeriod разбирает необязательный период (YYYY-MM-DD) для списка
+// непонятых чеков по дате присылки. Верхнюю границу делаем включительной (+1 день).
+func parseUnclearPeriod(fromStr, toStr string) (from, to *time.Time, err error) {
+	if s := strings.TrimSpace(fromStr); s != "" {
+		t, e := time.ParseInLocation("2006-01-02", s, time.Local)
+		if e != nil {
+			return nil, nil, fmt.Errorf("неверная дата начала %q, нужен формат ГГГГ-ММ-ДД", s)
+		}
+		from = &t
+	}
+	if s := strings.TrimSpace(toStr); s != "" {
+		t, e := time.ParseInLocation("2006-01-02", s, time.Local)
+		if e != nil {
+			return nil, nil, fmt.Errorf("неверная дата конца %q, нужен формат ГГГГ-ММ-ДД", s)
+		}
+		tt := t.AddDate(0, 0, 1)
+		to = &tt
+	}
+	return from, to, nil
+}
+
 // unclearTool — список чеков/фото, которые бот не смог уверенно разобрать.
 func (b *Bot) unclearTool() ai.Tool {
 	return ai.Tool{
 		Name: "list_unclear_receipts",
-		Description: "Показывает чеки и фото, которые бот НЕ смог уверенно разобрать (незнакомое имя получателя, " +
-			"не распозналась сумма, нечитаемое фото). Вызывай при вопросах 'какие чеки ты не понял', " +
-			"'что не распозналось', 'есть ли проблемные чеки'. У каждого элемента есть код вида receipt:12 или " +
-			"message:34 — используй его в send_unclear_file и fix_receipt.",
+		Description: "Показывает ЧЕКИ, которые бот НЕ смог уверенно разобрать (незнакомое имя получателя, " +
+			"не распозналась сумма, нечитаемое фото чека). Паспорта, случайные картинки и фото наличных сюда НЕ попадают. " +
+			"Вызывай при 'какие чеки ты не понял', 'что не распозналось', 'есть ли проблемные чеки'. " +
+			"Если владелец назвал период («за сентябрь», «сегодня», «за эту неделю») — передай from_date/to_date. " +
+			"У каждого элемента код вида receipt:12 или message:34 — используй его в send_unclear_file и fix_receipt.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -49,12 +71,16 @@ func (b *Bot) unclearTool() ai.Tool {
 					"type":        "string",
 					"description": "Название группы, если нужно только по ней. Пусто — по всем.",
 				},
+				"from_date": map[string]any{"type": "string", "description": "Начало периода включительно, YYYY-MM-DD (по дате присылки в чат). Пусто — без ограничения снизу."},
+				"to_date":   map[string]any{"type": "string", "description": "Конец периода включительно, YYYY-MM-DD. Пусто — без ограничения сверху."},
 			},
 			"required": []string{},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
-				Group string `json:"group"`
+				Group    string `json:"group"`
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
 			}
 			_ = json.Unmarshal(input, &args)
 			groupJID := ""
@@ -65,7 +91,11 @@ func (b *Bot) unclearTool() ai.Tool {
 				}
 				groupJID = jid.String()
 			}
-			items, err := b.db.UnclearItems(ctx, groupJID, 15)
+			from, to, err := parseUnclearPeriod(args.FromDate, args.ToDate)
+			if err != nil {
+				return "", err
+			}
+			items, err := b.db.UnclearItems(ctx, groupJID, from, to, 15)
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}
@@ -156,22 +186,27 @@ func (b *Bot) sendUnclearFileTool(chat types.JID) ai.Tool {
 func (b *Bot) sendUnclearFilesTool(chat types.JID) ai.Tool {
 	return ai.Tool{
 		Name: "send_unclear_files",
-		Description: "Присылает в этот чат ВСЕ файлы (фото/PDF) непонятых чеков из группы — тех, что бот не смог " +
-			"разобрать. Вызывай при 'скинь нераспознанные чеки из группы X', 'покажи все непонятые чеки', " +
-			"'пришли мне чеки, которые не понял'. Каждый файл подписан кодом (receipt:12) и тем, что не так — " +
-			"потом эти данные можно продиктовать через fix_receipt. group — по какой группе (пусто — по всем).",
+		Description: "Присылает в этот чат ВСЕ файлы (фото/PDF) непонятых ЧЕКОВ из группы — тех, что бот не смог " +
+			"разобрать. Паспорта, случайные фото и фото наличных сюда НЕ попадают. Вызывай при 'скинь нераспознанные " +
+			"чеки из группы X', 'покажи все непонятые чеки', 'пришли мне чеки, которые не понял'. Если владелец назвал " +
+			"период («за сентябрь», «сегодня») — ОБЯЗАТЕЛЬНО передай from_date/to_date, иначе пришлёшь не за тот месяц. " +
+			"Каждый файл подписан кодом (receipt:12) и тем, что не так — потом можно продиктовать через fix_receipt.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"group": map[string]any{"type": "string", "description": "Название группы (пусто — по всем)"},
-				"limit": map[string]any{"type": "integer", "description": "Сколько файлов прислать (по умолчанию 10, максимум 30)"},
+				"group":     map[string]any{"type": "string", "description": "Название группы (пусто — по всем)"},
+				"limit":     map[string]any{"type": "integer", "description": "Сколько файлов прислать (по умолчанию 10, максимум 30)"},
+				"from_date": map[string]any{"type": "string", "description": "Начало периода включительно, YYYY-MM-DD (по дате присылки). Пусто — без ограничения."},
+				"to_date":   map[string]any{"type": "string", "description": "Конец периода включительно, YYYY-MM-DD. Пусто — без ограничения."},
 			},
 			"required": []string{},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
-				Group string `json:"group"`
-				Limit int    `json:"limit"`
+				Group    string `json:"group"`
+				Limit    int    `json:"limit"`
+				FromDate string `json:"from_date"`
+				ToDate   string `json:"to_date"`
 			}
 			_ = json.Unmarshal(input, &args)
 			if args.Limit <= 0 || args.Limit > 30 {
@@ -185,7 +220,11 @@ func (b *Bot) sendUnclearFilesTool(chat types.JID) ai.Tool {
 				}
 				groupJID = jid.String()
 			}
-			items, err := b.db.UnclearItems(ctx, groupJID, args.Limit)
+			from, to, err := parseUnclearPeriod(args.FromDate, args.ToDate)
+			if err != nil {
+				return "", err
+			}
+			items, err := b.db.UnclearItems(ctx, groupJID, from, to, args.Limit)
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}

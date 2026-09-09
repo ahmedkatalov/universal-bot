@@ -2774,6 +2774,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			amt = payerAmount
 		}
 		b.handleCashPhoto(ctx, chat, senderJID, payerOverride, amt, receivedAt, rawID)
+		// Это наличка (фото денег), а НЕ нераспознанный чек — помечаем сообщение
+		// обработанным, чтобы оно не всплывало в списке «нераспознанные чеки».
+		_ = b.db.MarkMessageParsed(ctx, rawID)
 		return
 	}
 
@@ -2828,7 +2831,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// без частичных данных) — не засоряем "непонятые", просто выходим.
 		looksReceipt := parser.LooksLikeBankReceipt(text) || rd.Amount > 0 || rd.Recipient != "" || rd.DocNumber != ""
 		if !looksReceipt {
-			fmt.Printf("Медиа (сообщение %d) не распознано как чек — пропускаю (вероятно, не чек)\n", rawID)
+			fmt.Printf("Медиа (сообщение %d) не распознано как чек — пропускаю (вероятно, не чек: паспорт/фото/картинка)\n", rawID)
+			// Это НЕ чек — помечаем обработанным, чтобы паспорт/случайная картинка
+			// не попали в список «нераспознанные чеки».
+			_ = b.db.MarkMessageParsed(ctx, rawID)
 			return
 		}
 		fmt.Printf("Чек (сообщение %d): не удалось распознать сумму/получателя, нужна ручная проверка\n", rawID)
