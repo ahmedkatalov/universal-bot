@@ -140,6 +140,11 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_ask_msg_id TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.dup_ask_msg_id: %w", err)
 	}
+	// id вопроса «у кого наличка?» — чтобы ответ владельца привязался к наличке
+	// ДАЖЕ после перезапуска бота (связь cashAskMap в памяти теряется).
+	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_ask_msg_id TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки transactions.collector_ask_msg_id: %w", err)
+	}
 
 	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
 	if _, err := pool.Exec(ctx, `
@@ -557,10 +562,30 @@ func (d *DB) CountCashNeedingCollector(ctx context.Context, groupJID string, old
 	return n, err
 }
 
-// MarkTxCollectorAsked помечает, что про ответственного по этой наличке спросили.
-func (d *DB) MarkTxCollectorAsked(ctx context.Context, txID int) error {
-	_, err := d.pool.Exec(ctx, `UPDATE transactions SET collector_asked = true WHERE id = $1`, txID)
+// MarkTxCollectorAsked помечает, что про ответственного по этой наличке спросили,
+// и сохраняет id сообщения-вопроса — чтобы ответ владельца («у Нура») привязался
+// к нужной наличке даже после перезапуска бота (память cashAskMap теряется).
+func (d *DB) MarkTxCollectorAsked(ctx context.Context, txID int, askMsgID string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE transactions SET collector_asked = true, collector_ask_msg_id = $2 WHERE id = $1`, txID, nullIfEmpty(askMsgID))
 	return err
+}
+
+// TxByCollectorAskMsg находит наличку по id сообщения-вопроса «у кого наличка?» —
+// запасной путь, если связь потерялась из памяти (перезапуск бота).
+func (d *DB) TxByCollectorAskMsg(ctx context.Context, askMsgID string) (int, bool, error) {
+	if askMsgID == "" {
+		return 0, false, nil
+	}
+	var txID int
+	err := d.pool.QueryRow(ctx, `
+		SELECT id FROM transactions
+		WHERE collector_ask_msg_id = $1 AND COALESCE(collector, '') = '' AND ignored = false
+		ORDER BY id DESC LIMIT 1
+	`, askMsgID).Scan(&txID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	return txID, err == nil, err
 }
 
 // SetTxCollector записывает ответственного (кто забрал наличку) по id транзакции.

@@ -177,7 +177,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 						// сбое отправки (botMsgID == "") оставляем платёж в очереди —
 						// следующий цикл переспросит, иначе наличка навсегда без
 						// ответственного.
-						_ = b.db.MarkTxCollectorAsked(ctx, it.TxID)
+						_ = b.db.MarkTxCollectorAsked(ctx, it.TxID, botMsgID)
 						b.registerCashAsk(botMsgID, it.TxID)
 						asked++
 					}
@@ -444,6 +444,13 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		delete(b.clarify.cashAskMap, quotedID)
 	}
 	b.clarify.mu.Unlock()
+	if !isCashAsk {
+		// Связь могла потеряться из памяти (перезапуск бота) — ищем наличку в БД
+		// по id сообщения-вопроса, чтобы ответ владельца всё равно сработал.
+		if id, ok, _ := b.db.TxByCollectorAskMsg(ctx, quotedID); ok {
+			txID, isCashAsk = id, true
+		}
+	}
 	if isCashAsk {
 		return b.applyCashCollectorReply(ctx, msg.Info.Chat, txID, text)
 	}
