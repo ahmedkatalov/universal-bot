@@ -876,6 +876,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.personTool(),
 		b.customPDFTool(chat),
 		b.deleteMessagesTool(chat),
+		b.sendToGroupTool(),
 		b.forwardingTool(),
 		b.unclearTool(),
 		b.sendUnclearFileTool(chat),
@@ -2052,6 +2053,57 @@ func (b *Bot) deleteMessagesTool(chat types.JID) ai.Tool {
 				return "Нечего удалять — я не находил своих недавних сообщений там.", nil
 			}
 			return fmt.Sprintf("Удалил свои последние сообщения: %d.", deleted), nil
+		},
+	}
+}
+
+// sendToGroupTool — отправить ПРОИЗВОЛЬНОЕ сообщение, продиктованное владельцем,
+// в названную группу от имени бота. Только для владельца (админ-инструмент).
+func (b *Bot) sendToGroupTool() ai.Tool {
+	return ai.Tool{
+		Name: "send_to_group",
+		Description: "Отправляет ПРОИЗВОЛЬНЫЙ текст, который продиктовал владелец, в указанную группу от имени бота. " +
+			"Вызывай, когда владелец просит что-то написать/передать/объявить в группу: «напиши в группу Оплата КЛНТ …», " +
+			"«отправь в основную сообщение …», «передай в СБ, что …», «объяви работникам …». " +
+			"text — РОВНО тот текст, который нужно отправить, без своих добавлений и без кавычек-обёрток. " +
+			"group — название группы (понимает и «основная»/«главная»). Отправляй только то, что владелец явно просил.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"group": map[string]any{
+					"type":        "string",
+					"description": "Название группы-получателя (или «основная»/«главная»)",
+				},
+				"text": map[string]any{
+					"type":        "string",
+					"description": "Текст сообщения ТОЧНО как его надо отправить в группу",
+				},
+			},
+			"required": []string{"group", "text"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Group string `json:"group"`
+				Text  string `json:"text"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", err
+			}
+			text := strings.TrimSpace(args.Text)
+			if text == "" {
+				return "", fmt.Errorf("нечего отправлять — пустой текст")
+			}
+			if strings.TrimSpace(args.Group) == "" {
+				return "В какую группу отправить? Назови группу.", nil
+			}
+			jid, name, err := b.resolveTargetGroup(ctx, args.Group)
+			if err != nil {
+				return "", err
+			}
+			if id := b.sendTextReturnID(jid, text); id == "" {
+				return "", fmt.Errorf("не удалось отправить сообщение в «%s» — попробуй ещё раз", name)
+			}
+			return fmt.Sprintf("Отправил в «%s»:\n%s", name, text), nil
 		},
 	}
 }
