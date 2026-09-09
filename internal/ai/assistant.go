@@ -289,6 +289,25 @@ func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userTex
 	return contentString(parsed.Choices[0].Message.Content), nil
 }
 
+// Ping проверяет, что ОСНОВНАЯ модель реально отвечает (правильный id, живой
+// ключ, есть баланс). Нужен для стартовой самодиагностики: если модель молчит,
+// весь «ум» бота и чтение чеков ломаются — важно увидеть это в логах сразу.
+func (a *Assistant) Ping(ctx context.Context) error {
+	_, err := a.Complete(ctx, "Ответь одним словом.", "Скажи: ок")
+	return err
+}
+
+// PingVision проверяет, что модель ЗРЕНИЯ принимает картинки и отвечает (тем же
+// id, что и мозг, или отдельным OPENROUTER_VISION_MODEL). Если ломается — чеки
+// будут читаться плохо (падение на слабый OCR).
+func (a *Assistant) PingVision(ctx context.Context) error {
+	// Минимальный валидный PNG 1×1 — содержимое неважно, проверяем сам вызов.
+	img, _ := base64.StdEncoding.DecodeString(
+		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+	_, err := a.CompleteWithImage(ctx, "Ответь одним словом.", "Что-нибудь видно? Ответь: ок", img, "image/png")
+	return err
+}
+
 func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {
 	payload, err := json.Marshal(chatRequest{
 		Model:     a.model,

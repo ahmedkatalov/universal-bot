@@ -7,6 +7,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/bot"
@@ -133,6 +134,29 @@ func main() {
 		baseURL := envOr("OPENROUTER_BASE_URL", "")
 		assistant = ai.New(apiKey, model, visionModel, baseURL)
 		log.Println("Личный ассистент (OpenRouter) включён — отвечаю на сообщения в личку номеру бота")
+
+		// Самодиагностика на старте: реально ли отвечают модель и «зрение».
+		// Частая причина «бот тупит / не распознаёт чеки» — неверный id модели,
+		// протухший ключ или нулевой баланс OpenRouter: тогда чтение чеков молча
+		// падает на слабый OCR. Пусть это видно в логах сразу, не блокируя старт.
+		modelForLog := model
+		if modelForLog == "" {
+			modelForLog = "(по умолчанию)"
+		}
+		go func(a *ai.Assistant) {
+			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+			defer cancel()
+			if err := a.Ping(ctx); err != nil {
+				log.Printf("⚠️ ПРОВЕРКА МОДЕЛИ: основная модель %q НЕ отвечает: %v — проверь OPENROUTER_MODEL, ключ и баланс OpenRouter", modelForLog, err)
+			} else {
+				log.Println("Проверка модели: основная модель отвечает ✔")
+			}
+			if err := a.PingVision(ctx); err != nil {
+				log.Printf("⚠️ ПРОВЕРКА ЗРЕНИЯ: модель чтения чеков НЕ отвечает: %v — чеки будут распознаваться ПЛОХО (падение на OCR). Проверь OPENROUTER_VISION_MODEL / OPENROUTER_MODEL", err)
+			} else {
+				log.Println("Проверка зрения: модель чтения чеков (фото) отвечает ✔")
+			}
+		}(assistant)
 	} else {
 		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
 	}
