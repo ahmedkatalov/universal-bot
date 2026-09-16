@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1542,7 +1543,7 @@ func (b *Bot) cardsTool(chat types.JID) ai.Tool {
 			var total float64
 			var count int
 			for _, c := range cards {
-				total += c.Total
+				total += math.RoundToEven(c.Total) // сумма округлённых строк = «Итого» без дрейфа
 				count += c.Count
 			}
 
@@ -1679,7 +1680,7 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 			var totalSum float64
 			for _, s := range stats {
 				totalCount += s.Count
-				totalSum += s.Total
+				totalSum += math.RoundToEven(s.Total) // сумма округлённых строк = «Итого» без дрейфа
 			}
 
 			if args.Format == "pdf" {

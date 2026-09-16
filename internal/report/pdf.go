@@ -4,6 +4,7 @@ package report
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"time"
 
@@ -24,9 +25,7 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 
 	// ===== Таблица по картам/наличным (сводная) =====
 	cardTotals := map[string]float64{}
-	var grandTotal float64
 	for _, s := range summaries {
-		grandTotal += s.Total
 		for card, amt := range s.ByCard {
 			cardTotals[card] += amt
 		}
@@ -42,11 +41,16 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 
 	cardKeys := sortedKeys(cardTotals)
 	fill := false
+	// Итог = сумма ПОКАЗАННЫХ (округлённых) строк, а не полной суммы, — иначе
+	// при копейках строки не сходились бы с «Итого» на рубль-другой.
+	var cardSum float64
 	for _, card := range cardKeys {
-		drawRow(pdf, []string{card, formatMoney(cardTotals[card])}, []float64{130, 40}, fill)
+		r := math.RoundToEven(cardTotals[card])
+		drawRow(pdf, []string{card, formatMoney(r)}, []float64{130, 40}, fill)
+		cardSum += r
 		fill = !fill
 	}
-	drawTotalRow(pdf, "ИТОГО", formatMoney(grandTotal), []float64{130, 40})
+	drawTotalRow(pdf, "ИТОГО", formatMoney(cardSum), []float64{130, 40})
 
 	pdf.Ln(8)
 
@@ -64,11 +68,14 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 	sort.Slice(sortedSummaries, func(i, j int) bool {
 		return sortedSummaries[i].Total > sortedSummaries[j].Total
 	})
+	var peopleSum float64
 	for _, s := range sortedSummaries {
-		drawRow(pdf, []string{s.CanonicalName, fmt.Sprintf("%d", s.Count), formatMoney(s.Total)}, []float64{90, 40, 40}, fill)
+		r := math.RoundToEven(s.Total)
+		drawRow(pdf, []string{s.CanonicalName, fmt.Sprintf("%d", s.Count), formatMoney(r)}, []float64{90, 40, 40}, fill)
+		peopleSum += r
 		fill = !fill
 	}
-	drawTotalRow(pdf, "ИТОГО", formatMoney(grandTotal), []float64{130, 40})
+	drawTotalRow(pdf, "ИТОГО", formatMoney(peopleSum), []float64{130, 40})
 
 	return pdf.OutputFileAndClose(outPath)
 }

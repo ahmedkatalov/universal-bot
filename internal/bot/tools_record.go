@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -304,13 +305,18 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 			if err != nil {
 				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
 			}
-			items, total, err := b.db.ExpensesForPeriod(ctx, from, toDay.AddDate(0, 0, 1))
+			items, _, err := b.db.ExpensesForPeriod(ctx, from, toDay.AddDate(0, 0, 1))
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}
 			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
 			if len(items) == 0 {
 				return fmt.Sprintf("Расходов за %s не найдено.", periodLabel), nil
+			}
+			// Итог = сумма ПОКАЗАННЫХ (округлённых) строк, чтобы строки сходились с «Итого».
+			var total float64
+			for _, e := range items {
+				total += math.RoundToEven(e.Amount)
 			}
 
 			if strings.EqualFold(args.Format, "pdf") {

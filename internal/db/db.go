@@ -1708,7 +1708,8 @@ type LedgerRow struct {
 // КТО прислал и в какую ГРУППУ, а для налички — кто забрал. Фильтры: person, groupJIDs.
 func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person string, groupJIDs []string, limit int) ([]LedgerRow, error) {
 	rows, err := d.pool.Query(ctx, `
-		(SELECT 'чек' AS kind,
+		(SELECT DISTINCT ON (COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+		        'чек' AS kind,
 		        COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
 		        br.amount::float8 AS amount, br.tx_date,
 		        COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
@@ -1722,10 +1723,11 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
-		  AND br.is_duplicate = false AND br.ignored = false
+		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
 		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
 		  AND ($3 = '' OR COALESCE(c.canonical_name, br.recipient_raw, '') ILIKE '%' || $3 || '%')
-		  AND ($4::text[] IS NULL OR br.group_jid = ANY($4)))
+		  AND ($4::text[] IS NULL OR br.group_jid = ANY($4))
+		ORDER BY COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 
 		UNION ALL
 
@@ -2574,6 +2576,8 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 				WHERE br.tx_date >= $1 AND br.tx_date < $2
 				  AND br.is_duplicate = false
 				  AND br.ignored = false
+				  AND br.needs_review = false
+				  AND br.contact_id IS NOT NULL
 				  AND COALESCE(rm.deleted, false) = false
 				  AND br.amount > 0
 				  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
@@ -2639,6 +2643,8 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 				  AND br.tx_date >= $5 AND br.tx_date < $6
 				  AND br.is_duplicate = false
 				  AND br.ignored = false
+				  AND br.needs_review = false
+				  AND br.contact_id IS NOT NULL
 				  AND COALESCE(rm.deleted, false) = false
 				  AND br.amount > 0
 				  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
