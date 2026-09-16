@@ -94,6 +94,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS sender_bank TEXT",
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS sender_account TEXT",
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS card_owner TEXT",
+		// collector — кто ЗАБРАЛ деньги по чеку (ответственный). Отдельно от
+		// submitted_by (кто ПРИСЛАЛ чек в WhatsApp), чтобы «кто прислал» в журнале
+		// не подменялся ответственным.
+		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS collector TEXT",
 		// client_confirmed — клиент подтверждён (ФИО написали рядом или владелец
 		// ответил на вопрос). clarify_asked — бот уже спросил "чей чек".
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS client_confirmed BOOLEAN NOT NULL DEFAULT false",
@@ -1700,15 +1704,16 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		(SELECT 'чек' AS kind,
 		        COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
 		        br.amount::float8 AS amount, br.tx_date,
-		        COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
+		        COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
 		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
-		        '' AS collector,
+		        COALESCE(br.collector, '') AS collector,
 		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
 		        COALESCE(br.bank, '') AS bank,
 		        COALESCE(br.card_owner, '') AS card_owner
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
 		  AND br.is_duplicate = false AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
@@ -1720,7 +1725,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		(SELECT CASE WHEN t.is_cash THEN 'наличка' ELSE 'перевод' END AS kind,
 		        COALESCE(c.canonical_name, t.raw_name, '') AS client,
 		        t.amount::float8 AS amount, t.tx_date,
-		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		        COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
 		        COALESCE(t.collector, '') AS collector,
 		        COALESCE(rm.wa_group_jid, '') AS grp,
 		        COALESCE(t.card_to, '') AS bank,
@@ -1728,6 +1733,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND `+countableTextCondition+`
@@ -1774,12 +1780,13 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		        COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
 		        br.amount::float8 AS amount, br.tx_date,
 		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
-		        COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
+		        COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
 		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS who,
 		        COALESCE(br.doc_number, '') AS doc
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
 		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
 		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
@@ -1811,12 +1818,13 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		        COALESCE(c.canonical_name, tx.raw_name, '') AS client,
 		        tx.amount::float8 AS amount, tx.tx_date,
 		        COALESCE(rm.wa_group_jid, '') AS grp,
-		        COALESCE(NULLIF(tx.collector, ''), NULLIF(rm.sender_name, ''),
+		        COALESCE(NULLIF(tx.collector, ''), NULLIF(po.name, ''), NULLIF(rm.sender_name, ''),
 		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS who,
 		        '' AS doc
 		FROM transactions tx
 		JOIN raw_messages rm ON rm.id = tx.raw_message_id
 		LEFT JOIN contacts c ON c.id = tx.contact_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 		WHERE tx.tx_date >= $1 AND tx.tx_date < $2
 		  AND tx.is_cash = true AND tx.ignored = false AND tx.dup_pending = false
 		  AND COALESCE(rm.deleted, false) = false AND tx.amount > 0
@@ -1951,7 +1959,7 @@ func (d *DB) RemovePhoneOwner(ctx context.Context, phone string) (bool, error) {
 // Возвращает данные чека для подтверждения.
 func (d *DB) SetReceiptCollectorByMessage(ctx context.Context, waMessageID, collector string) (found bool, amount float64, recipient string, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET submitted_by = $2
+		UPDATE bank_receipts SET collector = $2
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -1974,7 +1982,7 @@ func (d *DB) SetReceiptCollectorByMessage(ctx context.Context, waMessageID, coll
 // сказанной сразу после отправки чека.
 func (d *DB) SetReceiptCollectorLatest(ctx context.Context, groupJID, collector string, amount float64) (found bool, gotAmount float64, recipient string, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET submitted_by = $2
+		UPDATE bank_receipts SET collector = $2
 		WHERE id = (
 			SELECT id FROM bank_receipts
 			WHERE group_jid = $1 AND is_duplicate = false AND ignored = false
@@ -2420,10 +2428,11 @@ func (d *DB) ChecksPostedOldOperation(ctx context.Context, from, to, monthStart,
 	rows, err := d.pool.Query(ctx, `
 		SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 			COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date,
-			COALESCE(NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '')
+			COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '')
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
 		WHERE rm.received_at >= $1 AND rm.received_at < $2
 		  AND (br.tx_date < $4 OR br.tx_date >= $5)
 		  AND br.needs_review = false AND br.is_duplicate = false AND br.ignored = false
@@ -2549,7 +2558,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			-- запостил, а не тот, кто переслал.
 			SELECT sender_name, phone, amount FROM (
 				SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
-					COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+					COALESCE(NULLIF(br.collector, ''), NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
 					split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
 					br.amount
 				FROM bank_receipts br
@@ -2613,7 +2622,7 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 		FROM (
 			SELECT sender_name, phone, amount FROM (
 				SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
-					COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
+					COALESCE(NULLIF(br.collector, ''), NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
 					split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
 					br.amount
 				FROM bank_receipts br
