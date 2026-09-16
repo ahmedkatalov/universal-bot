@@ -114,32 +114,66 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		user += "\n\nСуммы, которые ТОЧНО есть в тексте (бери их КАК ЕСТЬ, не пересчитывай и не дели): " + strings.Join(foundAmts, ", ") + " ₽."
 	}
 
-	out, err := b.assistant.Complete(ctx, system, user)
-	if err != nil {
-		// Ассистент недоступен — не теряем платёж: откатываемся к обычному парсеру.
-		fmt.Println("ИИ-доразбор сообщения не удался, откат к обычному парсеру:", err)
+	// 3-ФАЗНАЯ ПРОВЕРКА (само-согласованность): читаем сообщение НЕСКОЛЬКО раз
+	// независимо и берём согласованный результат. Так СУММА берётся медианой
+	// (разовая ошибка вроде «10.000»→5000 отсекается), а НАЛ/ПЕРЕВОД — по
+	// большинству голосов (одно случайное «наличка» не перепутает перевод).
+	n := paymentReads()
+	type runResult struct {
+		payments []aiPayment
+		clarify  string
+		ok       bool
+	}
+	ch := make(chan runResult, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			out, err := b.assistant.Complete(ctx, system, user)
+			if err != nil {
+				ch <- runResult{}
+				return
+			}
+			block := extractJSONBlock(out)
+			if block == "" {
+				ch <- runResult{}
+				return
+			}
+			var p struct {
+				Payments []aiPayment `json:"payments"`
+				Clarify  string      `json:"clarify"`
+			}
+			if err := json.Unmarshal([]byte(block), &p); err != nil {
+				ch <- runResult{}
+				return
+			}
+			ch <- runResult{payments: p.Payments, clarify: strings.TrimSpace(p.Clarify), ok: true}
+		}()
+	}
+	var runs [][]aiPayment
+	var clarifies []string
+	okRuns := 0
+	for i := 0; i < n; i++ {
+		r := <-ch
+		if !r.ok {
+			continue
+		}
+		okRuns++
+		runs = append(runs, r.payments)
+		if r.clarify != "" {
+			clarifies = append(clarifies, r.clarify)
+		}
+	}
+	if okRuns == 0 {
+		// Ни одно чтение не удалось — не теряем платёж, откат к обычному парсеру.
+		fmt.Println("ИИ-доразбор: ни одно чтение не удалось, откат к обычному парсеру")
 		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
 		return
 	}
-	block := extractJSONBlock(out)
-	if block == "" {
-		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
-		return
-	}
-	var parsed struct {
-		Payments []aiPayment `json:"payments"`
-		Clarify  string      `json:"clarify"`
-	}
-	if err := json.Unmarshal([]byte(block), &parsed); err != nil {
-		fmt.Printf("ИИ-доразбор: не удалось разобрать JSON (%v): %s — откат к обычному парсеру\n", err, block)
-		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
-		return
-	}
-	payments := parsed.Payments
 
-	// Страховка от ошибки ИИ в цифрах: если в сообщении РОВНО одна сумма и ИИ
-	// вернул РОВНО один платёж, но с другой суммой — берём сумму из текста
-	// (парсер читает её надёжно). Так «10.000р» больше не превратится в 5000.
+	payments := consensusPayments(runs, okRuns)
+
+	// Страховка от ошибки ИИ в цифрах: если в сообщении РОВНО одна сумма и на
+	// выходе РОВНО один платёж с другой суммой — берём сумму из текста
+	// (парсер читает её надёжно). Так «10.000р» точно не станет 5000.
 	if len(foundAmts) == 1 && len(payments) == 1 {
 		if det := parser.ExtractAmount(joined); det > 0 && payments[0].Amount != det {
 			fmt.Printf("ИИ-доразбор: сумма ИИ %.0f заменена на точную из текста %.0f\n", payments[0].Amount, det)
@@ -147,8 +181,12 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 	}
 
-	if q := strings.TrimSpace(parsed.Clarify); q != "" {
-		b.sendText(chat, "❓ "+q)
+	// Вопрос-уточнение задаём, только если платежей нет и его задало БОЛЬШИНСТВО
+	// чтений (иначе одно «неуверенное» чтение сыпало бы лишние вопросы).
+	if len(payments) == 0 {
+		if q := majorityString(clarifies, okRuns); q != "" {
+			b.sendText(chat, "❓ "+q)
+		}
 	}
 
 	saved := 0
@@ -196,6 +234,123 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// болтовне парсер ничего не найдёт — вреда нет.
 		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
 	}
+}
+
+// paymentReads — сколько независимых прочтений ТЕКСТОВОГО платежа делать
+// (само-согласованность): по умолчанию 3. PAYMENT_READS=1 отключает консенсус.
+func paymentReads() int {
+	if v := strings.TrimSpace(os.Getenv("PAYMENT_READS")); v != "" {
+		if k, err := strconv.Atoi(v); err == nil && k >= 1 && k <= 5 {
+			return k
+		}
+	}
+	return 3
+}
+
+// consensusPayments сводит несколько независимых прочтений платежей в один
+// согласованный список. Платежи группируются по каноничному имени клиента;
+// принимается платёж, встретившийся в БОЛЬШИНСТВЕ чтений (это отсеивает разовые
+// галлюцинации), сумма берётся медианой (устойчива к одному выбросу вроде
+// «10.000»→5000), признак наличка/перевод — строгим большинством голосов.
+func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
+	if okRuns <= 1 {
+		if len(runs) > 0 {
+			return runs[0]
+		}
+		return nil
+	}
+	type agg struct {
+		name      string
+		amounts   []float64
+		cashVotes int
+		total     int
+		collector map[string]int
+		card      map[string]int
+		note      string
+	}
+	byName := map[string]*agg{}
+	var order []string
+	for _, run := range runs {
+		for _, p := range run {
+			name := strings.TrimSpace(p.Name)
+			if p.Amount <= 0 || name == "" {
+				continue
+			}
+			key := strings.ToLower(strings.Join(strings.Fields(name), " "))
+			a := byName[key]
+			if a == nil {
+				a = &agg{name: name, collector: map[string]int{}, card: map[string]int{}}
+				byName[key] = a
+				order = append(order, key)
+			}
+			a.amounts = append(a.amounts, p.Amount)
+			if p.Cash {
+				a.cashVotes++
+			}
+			a.total++
+			if c := strings.TrimSpace(p.Collector); c != "" {
+				a.collector[c]++
+			}
+			if p.Card != "" {
+				a.card[p.Card]++
+			}
+			if a.note == "" {
+				a.note = p.Note
+			}
+		}
+	}
+	maj := okRuns/2 + 1 // строгое большинство прочтений
+	var out []aiPayment
+	for _, key := range order {
+		a := byName[key]
+		if a.total < maj {
+			continue // встретился меньше чем в большинстве чтений — вероятно, ошибка
+		}
+		out = append(out, aiPayment{
+			Name:      a.name,
+			Amount:    medianFloat(a.amounts),
+			Cash:      a.cashVotes*2 > a.total, // строгое большинство голосов «наличка»
+			Collector: mostCommonKey(a.collector),
+			Card:      mostCommonKey(a.card),
+			Note:      a.note,
+		})
+	}
+	return out
+}
+
+// medianFloat — медиана (нижняя середина), устойчивая к одному выбросу.
+func medianFloat(xs []float64) float64 {
+	if len(xs) == 0 {
+		return 0
+	}
+	s := append([]float64(nil), xs...)
+	sort.Float64s(s)
+	return s[(len(s)-1)/2]
+}
+
+// mostCommonKey — самый частый ключ в счётчике ("" если пусто).
+func mostCommonKey(m map[string]int) string {
+	best, bestN := "", 0
+	for k, c := range m {
+		if c > bestN {
+			best, bestN = k, c
+		}
+	}
+	return best
+}
+
+// majorityString — строка, встретившаяся в БОЛЬШИНСТВЕ из total (иначе "").
+func majorityString(vals []string, total int) string {
+	counts := map[string]int{}
+	for _, v := range vals {
+		counts[v]++
+	}
+	for v, c := range counts {
+		if c*2 > total {
+			return v
+		}
+	}
+	return ""
 }
 
 type aiReceipt struct {
