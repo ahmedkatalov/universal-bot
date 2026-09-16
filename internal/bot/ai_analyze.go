@@ -266,9 +266,14 @@ func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, b
 // aiVisionReceipt показывает файл чека (фото или PDF) модели "глазами" —
 // последний рубеж распознавания, когда OCR выдал кашу или вообще ничего.
 // Claude читает чек прямо с изображения: банк, получатель, сумма, дата.
-func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool) {
+// Возвращает (результат, ok, reachable). reachable=false означает, что модель
+// зрения НЕ дала вердикт (нет ассистента, не отрендерился PDF, ошибка вызова) —
+// тогда нельзя заключать «это не чек»: вызывающий не должен помечать сообщение
+// обработанным, иначе реальный чек потеряется при сбое API. reachable=true —
+// модель ответила (в т.ч. «это не чек / other»), вердикту можно верить.
+func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool, bool) {
 	if b.assistant == nil || len(media) == 0 {
-		return aiReceipt{}, false
+		return aiReceipt{}, false, false
 	}
 
 	img := media
@@ -277,7 +282,7 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint strin
 		rendered, err := renderPDFFirstPage(ctx, media)
 		if err != nil {
 			fmt.Println("Вижн-разбор: не удалось отрендерить PDF:", err)
-			return aiReceipt{}, false
+			return aiReceipt{}, false, false
 		}
 		img, mime = rendered, "image/png"
 	} else if len(img) >= 8 && string(img[:4]) == "\x89PNG" {
@@ -302,27 +307,29 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint strin
 	out, err := b.assistant.CompleteWithImage(ctx, system, userText, img, mime)
 	if err != nil {
 		fmt.Println("Вижн-разбор чека не удался:", err)
-		return aiReceipt{}, false
+		return aiReceipt{}, false, false // модель недоступна — вердикта нет
 	}
+	// Дальше модель ОТВЕТИЛА — вердикту можно верить (reachable=true), даже если
+	// она сказала «это не чек» или вернула кашу.
 	block := extractJSONBlock(out)
 	if block == "" {
-		return aiReceipt{}, false
+		return aiReceipt{}, false, true
 	}
 	var rec aiReceipt
 	if err := json.Unmarshal([]byte(block), &rec); err != nil {
 		fmt.Printf("Вижн-разбор: не удалось разобрать JSON (%v): %s\n", err, block)
-		return aiReceipt{}, false
+		return aiReceipt{}, false, true
 	}
 	// Фото наличных — это валидный результат (наличка), даже без суммы/получателя.
 	if rec.Kind == "cash" {
 		fmt.Printf("Вижн-разбор: на фото НАЛИЧНЫЕ деньги (сумма с фото: %.0f)\n", rec.Amount)
-		return rec, true
+		return rec, true, true
 	}
 	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" {
-		return aiReceipt{}, false
+		return aiReceipt{}, false, true
 	}
 	fmt.Printf("Вижн-разбор: Claude прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
-	return rec, true
+	return rec, true, true
 }
 
 // receiptVisionReads — сколько независимых прочтений чека делать за один раз
@@ -342,29 +349,34 @@ func receiptVisionReads() int {
 // ПАРАЛЛЕЛЬНО (задержка ≈ одного запроса) и выбирает согласованный результат:
 // сумму, которая совпала в большинстве прочтений, а если все разные — медианную
 // (устойчивую к одному выбросу). Так разовая ошибка распознавания не проходит.
-func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool) {
+func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool, bool) {
 	n := receiptVisionReads()
 	if n <= 1 {
 		return b.aiVisionReceipt(ctx, media, ext, hint)
 	}
 
 	type res struct {
-		rec aiReceipt
-		ok  bool
+		rec       aiReceipt
+		ok        bool
+		reachable bool
 	}
 	ch := make(chan res, n)
 	for i := 0; i < n; i++ {
 		go func() {
-			rec, ok := b.aiVisionReceipt(ctx, media, ext, hint)
-			ch <- res{rec, ok}
+			rec, ok, reachable := b.aiVisionReceipt(ctx, media, ext, hint)
+			ch <- res{rec, ok, reachable}
 		}()
 	}
 
 	var recs []aiReceipt
 	var cash *aiReceipt
 	cashVotes := 0
+	anyReachable := false
 	for i := 0; i < n; i++ {
 		r := <-ch
+		if r.reachable {
+			anyReachable = true
+		}
 		if !r.ok {
 			continue
 		}
@@ -382,15 +394,15 @@ func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, h
 	// На РАВЕНСТВЕ голосов доверяем чеку: одно случайное «наличка»-прочтение не
 	// должно выкинуть реальный банковский перевод.
 	if cash != nil && cashVotes > len(recs) {
-		return *cash, true
+		return *cash, true, true
 	}
 	if len(recs) == 0 {
-		return aiReceipt{}, false
+		return aiReceipt{}, false, anyReachable
 	}
 
 	pick := pickConsensusReceipt(recs)
 	fmt.Printf("Вижн-консенсус (%d чтений): выбрана сумма %.0f ₽ (получатель %q)\n", n, pick.Amount, pick.Recipient)
-	return pick, true
+	return pick, true, true
 }
 
 // pickConsensusReceipt выбирает из нескольких прочтений одно: по согласованной

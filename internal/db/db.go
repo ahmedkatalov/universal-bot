@@ -939,7 +939,6 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 		SELECT br.tx_date FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.amount = $1
-		  AND br.tx_date BETWEEN $2 AND $3
 		  AND (
 		    ($4::int IS NOT NULL AND br.contact_id = $4) OR
 		    ($4::int IS NULL AND br.recipient_raw = $5)
@@ -948,10 +947,18 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 		  AND br.is_duplicate = false
 		  AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
-		  -- номер документа не противоречит: совпадает, либо у одного из чеков его нет
-		  AND (COALESCE(br.doc_number, '') = '' OR $7 = '' OR br.doc_number = $7)
-		  -- код авторизации не противоречит
-		  AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8)
+		  AND (
+		    -- Либо чеки близки по времени операции И номер/код не противоречат
+		    -- (эвристика для чеков без читаемого идентификатора).
+		    ( br.tx_date BETWEEN $2 AND $3
+		      AND (COALESCE(br.doc_number, '') = '' OR $7 = '' OR br.doc_number = $7)
+		      AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8) )
+		    -- ЛИБО точно совпал сильный идентификатор (номер документа/код) — тогда
+		    -- это тот же чек, даже если время НЕ совпало (дата операции прочиталась
+		    -- не на всех копиях и одна упала на время сообщения).
+		    OR ($7 <> '' AND br.doc_number = $7)
+		    OR ($8 <> '' AND br.auth_code = $8)
+		  )
 		ORDER BY br.tx_date
 		LIMIT 1
 	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode).Scan(&existing)

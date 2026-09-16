@@ -1157,7 +1157,7 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 		}
 	}
 	if rd.Amount == 0 || rd.Recipient == "" {
-		if rec, ok := b.aiVisionReceipt(ctx, mediaBytes, ext, ocrText); ok {
+		if rec, ok, _ := b.aiVisionReceipt(ctx, mediaBytes, ext, ocrText); ok {
 			mergeAIReceipt(&rd, rec)
 		}
 	}
@@ -2729,15 +2729,22 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// там надёжный текстовый слой.
 	cashPhoto := false
 	cashAmount := 0.0
+	// visionUnavailable — модель зрения была нужна, но НЕ дала вердикт (сбой API).
+	// Тогда нельзя решать «это не чек» и молча помечать сообщение обработанным —
+	// иначе реальный чек потеряется при временном сбое. Оставим его в списке
+	// нераспознанных (parsed=false), чтобы можно было разобрать позже.
+	visionUnavailable := false
 	visionFirst := receiptVisionFirst() && media != nil && mediaExt != ".pdf" && b.assistant != nil
 	if visionFirst {
-		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
+		if rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
 				applyAIReceiptAuthoritative(&rd, rec)
 				fmt.Printf("Чек (сообщение %d): прочитан Claude с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
 			}
+		} else if !reachable {
+			visionUnavailable = true
 		}
 	}
 
@@ -2756,12 +2763,17 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// Claude само изображение. Пропускаем, если вижн уже отработал первым.
 	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
 	if !visionFirst && weakOCR && media != nil {
-		if rec, ok := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
+		if rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
-				mergeAIReceipt(&rd, rec)
+				// Вижн читает картинку напрямую — его сумму/поля считаем главнее
+				// кривого OCR (иначе на PDF/при выключенном vision-first ошибочная
+				// сумма из текстового слоя оставалась бы вместо верной с картинки).
+				applyAIReceiptAuthoritative(&rd, rec)
 			}
+		} else if !reachable {
+			visionUnavailable = true
 		}
 	}
 
@@ -2831,9 +2843,16 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// без частичных данных) — не засоряем "непонятые", просто выходим.
 		looksReceipt := parser.LooksLikeBankReceipt(text) || rd.Amount > 0 || rd.Recipient != "" || rd.DocNumber != ""
 		if !looksReceipt {
+			if visionUnavailable {
+				// Модель зрения не ответила (сбой API) — мы НЕ знаем, чек это или
+				// нет. НЕ помечаем обработанным, чтобы реальный чек не потерялся:
+				// останется в списке нераспознанных и его можно разобрать позже.
+				fmt.Printf("Медиа (сообщение %d): зрение недоступно — оставляю в нераспознанных, не теряю\n", rawID)
+				return
+			}
 			fmt.Printf("Медиа (сообщение %d) не распознано как чек — пропускаю (вероятно, не чек: паспорт/фото/картинка)\n", rawID)
-			// Это НЕ чек — помечаем обработанным, чтобы паспорт/случайная картинка
-			// не попали в список «нераспознанные чеки».
+			// Модель посмотрела и это НЕ чек — помечаем обработанным, чтобы паспорт/
+			// случайная картинка не попали в список «нераспознанные чеки».
 			_ = b.db.MarkMessageParsed(ctx, rawID)
 			return
 		}
