@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -211,11 +212,103 @@ func looseItems(body []byte) []json.RawMessage {
 	return nil
 }
 
-// ClientInfo — клиент из cmf.
+// --- Толерантный разбор ответов программы ---
+// Реальный API рассрочек может называть поля чуть иначе, чем ожидается, или
+// возвращать суммы строкой ("25000"/"25000.00"), а даты — в разных форматах.
+// Строгий разбор в таких случаях МОЛЧА давал бы пустые имена и нулевые суммы
+// (тогда сверка показывала бы «не внесён» на всё). Поэтому парсим гибко: берём
+// первое непустое из набора возможных ключей и понимаем число как число ИЛИ
+// строку. Известные (текущие) ключи всегда идут первыми — поведение не меняется.
+
+// jsonStr достаёт строковое значение по первому подходящему ключу.
+func jsonStr(m map[string]json.RawMessage, keys ...string) string {
+	for _, k := range keys {
+		if raw, ok := m[k]; ok {
+			var s string
+			if json.Unmarshal(raw, &s) == nil && strings.TrimSpace(s) != "" {
+				return strings.TrimSpace(s)
+			}
+			// число, пришедшее там, где ждём строку (например, id как число)
+			var n json.Number
+			if json.Unmarshal(raw, &n) == nil && n.String() != "" {
+				return n.String()
+			}
+		}
+	}
+	return ""
+}
+
+// jsonInt читает целое (сумму/номер) как число ИЛИ строку ("25000", "25000.00").
+func jsonInt(m map[string]json.RawMessage, keys ...string) int64 {
+	for _, k := range keys {
+		raw, ok := m[k]
+		if !ok {
+			continue
+		}
+		// null/пусто в этом ключе — НЕ считаем за 0, а пробуем следующий ключ.
+		// Иначе `{"amount":null,"sum":"25000"}` вернул бы 0 (json.Unmarshal null
+		// в float64 не ошибка и оставляет 0), и запасной ключ не сработал бы.
+		if t := strings.TrimSpace(string(raw)); t == "" || t == "null" {
+			continue
+		}
+		var f float64
+		if json.Unmarshal(raw, &f) == nil {
+			return int64(f + 0.5)
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil {
+			s = strings.TrimSpace(strings.ReplaceAll(s, " ", ""))
+			s = strings.ReplaceAll(s, ",", ".") // запятая — десятичный разделитель
+			if v, err := strconv.ParseFloat(s, 64); err == nil {
+				return int64(v + 0.5)
+			}
+		}
+	}
+	return 0
+}
+
+// jsonTime читает дату/время в нескольких форматах (RFC3339, «2006-01-02»,
+// unix-секунды). Пустое/непонятное -> нулевое время (для сопоставления не
+// критично: период фильтруется на стороне программы, сверяем по сумме).
+func jsonTime(m map[string]json.RawMessage, keys ...string) time.Time {
+	for _, k := range keys {
+		raw, ok := m[k]
+		if !ok {
+			continue
+		}
+		var s string
+		if json.Unmarshal(raw, &s) == nil && s != "" {
+			for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+				if t, err := time.Parse(layout, s); err == nil {
+					return t
+				}
+			}
+		}
+		var unix int64
+		if json.Unmarshal(raw, &unix) == nil && unix > 0 {
+			return time.Unix(unix, 0)
+		}
+	}
+	return time.Time{}
+}
+
+// ClientInfo — клиент из cmf. Теги json нужны для json.Marshal (сохранение
+// кандидатов в наблюдение); чтение идёт через UnmarshalJSON (толерантно к ключам).
 type ClientInfo struct {
 	ID       string `json:"id"`
 	FullName string `json:"full_name"`
 	Phone    string `json:"phone"`
+}
+
+func (ci *ClientInfo) UnmarshalJSON(data []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	ci.ID = jsonStr(m, "id", "client_id", "uuid", "_id")
+	ci.FullName = jsonStr(m, "full_name", "fullName", "name", "fio", "client_name", "client_full_name")
+	ci.Phone = jsonStr(m, "phone", "phone_number", "tel", "mobile")
+	return nil
 }
 
 // LookupClients ищет клиентов по подстроке имени (регистронезависимо).
@@ -246,6 +339,19 @@ type ContractRef struct {
 	Remaining   int64  `json:"remaining"`
 }
 
+func (cr *ContractRef) UnmarshalJSON(data []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	cr.ID = jsonStr(m, "id", "contract_id", "uuid", "_id")
+	cr.BranchID = jsonStr(m, "branch_id", "branchId", "branch", "point_id")
+	cr.Number = jsonInt(m, "number", "contract_number", "num")
+	cr.ProductName = jsonStr(m, "product_name", "productName", "product", "name")
+	cr.Remaining = jsonInt(m, "remaining", "remaining_amount", "balance", "debt")
+	return nil
+}
+
 // ClientContracts возвращает договоры клиента.
 func (c *Client) ClientContracts(ctx context.Context, clientID string) ([]ContractRef, error) {
 	body, err := c.get(ctx, "/api/contracts/client/"+url.PathEscape(clientID)+"/contracts-summary", nil, "")
@@ -264,8 +370,18 @@ func (c *Client) ClientContracts(ctx context.Context, clientID string) ([]Contra
 
 // Payment — платёж по договору.
 type Payment struct {
-	Amount int64     `json:"amount"`
+	Amount int64     `json:"amount"` // в единицах программы (рубли ИЛИ копейки)
 	PaidAt time.Time `json:"paid_at"`
+}
+
+func (p *Payment) UnmarshalJSON(data []byte) error {
+	var m map[string]json.RawMessage
+	if err := json.Unmarshal(data, &m); err != nil {
+		return err
+	}
+	p.Amount = jsonInt(m, "amount", "sum", "value", "amount_rub", "paid_amount", "payment_amount")
+	p.PaidAt = jsonTime(m, "paid_at", "paidAt", "date", "payment_date", "created_at")
+	return nil
 }
 
 // ContractPayments возвращает платежи договора за период. branchID уходит
@@ -349,10 +465,15 @@ func (c *Client) AddPayment(ctx context.Context, contractID, branchID string, am
 		token := c.token
 		c.tokenMu.Unlock()
 		if token == "" {
+			// Логинимся и СРАЗУ шлём в этой же итерации (не тратя попытку на
+			// continue) — иначе протухший токен получал бы всего один POST без
+			// повтора, и платёж мог не записаться при истёкшей сессии.
 			if err := c.login(ctx); err != nil {
 				return err
 			}
-			continue
+			c.tokenMu.Lock()
+			token = c.token
+			c.tokenMu.Unlock()
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/contract-payments/", bytes.NewReader(data))
 		if err != nil {

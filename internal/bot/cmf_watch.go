@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -363,37 +364,20 @@ func extractQuotedText(msg *events.Message) string {
 	return ""
 }
 
-// cmfResolveWatch ищет клиента в программе по имени (ILIKE-подстрока; для
-// опечаток — повторный поиск по отдельным словам). 0 совпадений -> unmatched,
-// 1 -> watch, несколько -> вопрос в группу.
+// cmfResolveWatch ищет клиента в программе по имени. Точное совпадение всей
+// строки -> привязываем и следим за платежом. Нечёткое (по словам, при опечатке)
+// НЕ привязываем вслепую — иначе напоминание/«внесён» уйдёт на, возможно, не
+// того клиента (тёзку/однофамильца): спрашиваем подтверждение в группе.
 func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, clientText string, amount float64) {
-	clients, err := b.cmf.LookupClients(ctx, clientText)
+	clients, exact, err := b.cmfLookupWithTypos(ctx, clientText)
 	if err != nil {
 		fmt.Println("cmf lookup:", err)
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "noname")
 		return
 	}
-	// Опечатки: полная строка не нашлась — ищем по каждому слову имени
-	// и собираем пересечение кандидатов.
-	if len(clients) == 0 {
-		seen := map[string]cmf.ClientInfo{}
-		for _, word := range strings.Fields(clientText) {
-			if len([]rune(word)) < 3 {
-				continue
-			}
-			if found, err := b.cmf.LookupClients(ctx, word); err == nil {
-				for _, c := range found {
-					seen[c.ID] = c
-				}
-			}
-		}
-		for _, c := range seen {
-			clients = append(clients, c)
-		}
-	}
 
-	switch len(clients) {
-	case 0:
+	switch {
+	case len(clients) == 0:
 		branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch)
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "unmatched")
 		note := ""
@@ -401,9 +385,17 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 			note = " Отнесла к точке «" + branch + "» (как договаривались для чеков, которых нет в программе)."
 		}
 		b.sendText(chat, fmt.Sprintf("🔎 Клиента %q в программе не нашла (чек на %.0f ₽).%s", clientText, amount, note))
-	case 1:
+	case len(clients) == 1 && exact:
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", clients[0].ID, clients[0].FullName, "", "watch")
 		fmt.Printf("cmf: чек на %.0f ₽ привязан к клиенту %s, ждём платёж в программе\n", amount, clients[0].FullName)
+	case len(clients) == 1 && !exact:
+		// Единственный кандидат найден по НЕЧЁТКОМУ совпадению (по словам) —
+		// возможен тёзка/опечатка. Не привязываем автоматически, спрашиваем.
+		candJSON, _ := json.Marshal(clients)
+		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", string(candJSON), "ambiguous")
+		b.sendText(chat, fmt.Sprintf(
+			"🔎 По чеку на %.0f ₽ (%s) точного совпадения в программе нет. Похоже на «%s» — если это он, ответьте на это сообщение его полным именем; если нет, напишите верное имя.",
+			amount, clientText, clients[0].FullName))
 	default:
 		names := make([]string, 0, len(clients))
 		for _, c := range clients {
@@ -566,9 +558,25 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	}
 	cache := map[string]*usedPayments{}
 
+	// Кэш поиска клиента по имени: у клиента за период часто несколько чеков —
+	// не дёргаем программу повторно (меньше нагрузка и меньше шанс сетевой ошибки).
+	type lookupResult struct {
+		clients []cmf.ClientInfo
+		exact   bool
+		err     error
+	}
+	lookupCache := map[string]lookupResult{}
+
 	var added, missing, noClient []string
 	for _, r := range receipts {
-		clients, exact, err := b.cmfLookupWithTypos(ctx, r.Name)
+		key := strings.ToLower(strings.Join(strings.Fields(r.Name), " "))
+		lr, ok := lookupCache[key]
+		if !ok {
+			c, ex, e := b.cmfLookupWithTypos(ctx, r.Name)
+			lr = lookupResult{clients: c, exact: ex, err: e}
+			lookupCache[key] = lr
+		}
+		clients, exact, err := lr.clients, lr.exact, lr.err
 		if err != nil {
 			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка поиска в программе)", r.Name, r.Amount))
 			continue
@@ -650,22 +658,66 @@ func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) (clients []cm
 	if len(clients) > 0 {
 		return clients, true, nil
 	}
-	seen := map[string]cmf.ClientInfo{}
-	for _, word := range strings.Fields(name) {
-		if len([]rune(word)) < 3 {
+	return b.cmfFuzzyByWords(ctx, name), false, nil
+}
+
+// cmfFuzzyByWords ищет клиента по ОТДЕЛЬНЫМ словам имени (на случай опечатки в
+// одном из слов) и ранжирует кандидатов по числу совпавших слов: оставляет тех,
+// кто совпал по МАКСИМАЛЬНОМУ числу слов. Так «Каталов Ахмед» с опечаткой
+// находит именно «Каталов Ахмед», а не всех Ахмедов И всех Каталовых сразу.
+// Слова короче 3 букв игнорируются. Результат отсортирован (стабильный вывод).
+func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) []cmf.ClientInfo {
+	if b.cmf == nil {
+		return nil
+	}
+	var words []string
+	for _, w := range strings.Fields(name) {
+		if len([]rune(w)) >= 3 {
+			words = append(words, w)
+		}
+	}
+	if len(words) == 0 {
+		return nil
+	}
+	byID := map[string]cmf.ClientInfo{}
+	score := map[string]int{}
+	for _, w := range words {
+		found, err := b.cmf.LookupClients(ctx, w)
+		if err != nil {
 			continue
 		}
-		if found, err := b.cmf.LookupClients(ctx, word); err == nil {
-			for _, c := range found {
-				seen[c.ID] = c
+		seenWord := map[string]bool{} // одно слово не должно давать +2 за дубли
+		for _, c := range found {
+			if c.ID == "" || seenWord[c.ID] {
+				continue
 			}
+			seenWord[c.ID] = true
+			byID[c.ID] = c
+			score[c.ID]++
 		}
 	}
-	var out []cmf.ClientInfo
-	for _, c := range seen {
-		out = append(out, c)
+	best := 0
+	for _, s := range score {
+		if s > best {
+			best = s
+		}
 	}
-	return out, false, nil
+	if best == 0 {
+		return nil
+	}
+	var out []cmf.ClientInfo
+	for id, c := range byID {
+		if score[id] == best {
+			out = append(out, c)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].FullName != out[j].FullName {
+			return out[i].FullName < out[j].FullName
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out
 }
 
 // cmfAddPaymentTool — внести платёж по чеку в программу рассрочек.
