@@ -712,6 +712,11 @@ func (b *Bot) fixReceiptTool() ai.Tool {
 			if kind == "message" && (args.Amount <= 0 || canonical == "") {
 				return "", fmt.Errorf("для фото без распознанных данных нужны и имя получателя, и сумма")
 			}
+			if kind == "receipt" && args.Amount <= 0 && canonical == "" && txDatePtr == nil {
+				// Пустая правка снимала бы needs_review, ничего не исправив: чек с
+				// нулевой суммой/без клиента «вернулся бы в учёт» пустым.
+				return "", fmt.Errorf("нечего править: укажите имя получателя, сумму или дату")
+			}
 
 			if err := b.db.FixReceipt(ctx, kind, id, contactIDPtr, canonical, args.Amount, txDatePtr); err != nil {
 				return "", fmt.Errorf("не удалось записать: %w", err)
@@ -796,17 +801,24 @@ func (b *Bot) recountEverything(ctx context.Context) (string, error) {
 			}
 			// Строки с цифрами, которые не взял парсер, — через ИИ (не больше
 			// 15 обращений за пересчёт, чтобы не жечь токены на старой болтовне).
+			// Отметку «разобрано» в этом случае ставит сам aiRescueUnparsed —
+			// и НЕ ставит, если платёж нашёлся, но не записался (чтобы следующий
+			// пересчёт вернулся к нему).
+			delegated := false
 			if saved == 0 && len(result.Unparsed) > 0 && containsDigit(result.Unparsed) && b.assistant != nil && aiCalls < 15 {
 				aiCalls++
 				jid, err := types.ParseJID(m.GroupJID)
 				if err == nil {
+					delegated = true
 					b.aiRescueUnparsed(ctx, jid, m.SenderName, result.Unparsed, m.ID, m.ReceivedAt, false)
 				}
 			}
 			if saved > 0 {
 				reParsed += saved
 			}
-			_ = b.db.MarkMessageParsed(ctx, m.ID)
+			if !delegated {
+				_ = b.db.MarkMessageParsed(ctx, m.ID)
+			}
 		}
 	} else {
 		fmt.Fprintf(&sb, "(не удалось перечитать сообщения: %v)\n", err)

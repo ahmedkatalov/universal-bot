@@ -149,6 +149,18 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_ask_msg_id TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.collector_ask_msg_id: %w", err)
 	}
+	// id вопроса «чей чек / какая сумма?» — чтобы ответ владельца на вопрос по
+	// чеку нашёл чек ДАЖЕ после перезапуска бота (askMap живёт только в памяти).
+	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS clarify_ask_msg_id TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки bank_receipts.clarify_ask_msg_id: %w", err)
+	}
+	// Свёрнутый чек (экран «Перевод выполнен» без даты/номера/получателя). Помечаем
+	// флагом, чтобы пришедший следом ПОЛНЫЙ чек на ту же сумму мог заменить его
+	// (SupersedeCollapsedReceipt) даже если владелец уже успел привязать к нему
+	// клиента — иначе один платёж посчитался бы дважды.
+	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS collapsed BOOLEAN NOT NULL DEFAULT false`); err != nil {
+		return fmt.Errorf("добавление колонки bank_receipts.collapsed: %w", err)
+	}
 
 	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
 	if _, err := pool.Exec(ctx, `
@@ -679,6 +691,7 @@ type BankReceiptInput struct {
 	GroupJID        string    // группа, к которой относится чек (для дозагрузки из лички — целевая группа)
 	SubmittedBy     string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
 	TxDate          time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
+	Collapsed       bool      // свёрнутый экран банка (без даты/номера/получателя) — ждёт полного чека
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
@@ -686,13 +699,77 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 		INSERT INTO bank_receipts
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
 			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
-			 client_confirmed, group_jid, submitted_by, tx_date)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+			 client_confirmed, group_jid, submitted_by, tx_date, collapsed)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
 		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
 		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
-		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate)
+		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed)
 	return err
+}
+
+// SupersededCollapsed — что вернул SupersedeCollapsedReceipt: нашли ли свёрнутый
+// чек, который заменяет полный, и его атрибуцию (если владелец уже назвал клиента
+// в ответ на свёрнутый) — чтобы перенести клиента на полный чек и не потерять сбор.
+type SupersededCollapsed struct {
+	Found           bool
+	ContactID       *int
+	RecipientRaw    string
+	ClientConfirmed bool
+}
+
+// SupersedeCollapsedReceipt — пришёл ПОЛНЫЙ чек на ту же сумму от того же
+// отправителя в той же группе: свёрнутый экран «Перевод выполнен», который он
+// прислал до этого, — это тот же платёж. Помечаем свёрнутый дублем, иначе он
+// навсегда висел бы в «не вошло» и задваивал «Максимум за период».
+//
+// Совпадение только когда ОТПРАВИТЕЛЬ ИЗВЕСТЕН (senderJID != "") — иначе
+// пересланный из другой группы чек (там senderJID пустой) пометил бы дублем
+// чужой свёрнутый платёж на ту же сумму и деньги молча пропали бы.
+//
+// Свёрнутые чеки помечены флагом collapsed — сопоставляем по нему, а НЕ по
+// needs_review/contact_id: владелец мог уже ответить ФИО на свёрнутый (тогда
+// contact_id заполнен, needs_review=false), и такой чек тоже нужно заменить.
+// Окно — 3 дня по ВРЕМЕНИ ПОЛУЧЕНИЯ сообщения (rm.received_at), а не created_at:
+// created_at — момент вставки ПОСЛЕ распознавания (вижн), он позже времени
+// сообщения, из-за чего быстрый «вот полный» и разбор бэклога не срабатывали.
+//
+// Возвращает атрибуцию заменённого свёрнутого чека: если он был привязан к
+// клиенту, вызывающий переносит клиента на полный чек (иначе платёж выпал бы).
+func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID string, amount float64, before time.Time) (SupersededCollapsed, error) {
+	var res SupersededCollapsed
+	if amount <= 0 || groupJID == "" || senderJID == "" {
+		return res, nil
+	}
+	var contactID *int
+	var recipientRaw string
+	var clientConfirmed bool
+	err := d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET is_duplicate = true
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+			  AND rm.sender_jid = $2
+			  AND br.amount = $3::numeric
+			  AND br.collapsed = true
+			  AND br.is_duplicate = false AND br.ignored = false
+			  AND rm.received_at >= $4::timestamptz - interval '3 days' AND rm.received_at <= $4::timestamptz
+			ORDER BY rm.received_at DESC LIMIT 1
+		)
+		RETURNING contact_id, COALESCE(recipient_raw, ''), client_confirmed
+	`, groupJID, senderJID, amount, before).Scan(&contactID, &recipientRaw, &clientConfirmed)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return res, nil
+		}
+		return res, err
+	}
+	res.Found = true
+	res.ContactID = contactID
+	res.RecipientRaw = recipientRaw
+	res.ClientConfirmed = clientConfirmed
+	return res, nil
 }
 
 // ClarifyReceipt — чек, по которому бот не уверен, чей это клиент, и хочет
@@ -750,6 +827,8 @@ func (d *DB) RecentSenderTexts(ctx context.Context, groupJID, senderJID string, 
 		WHERE wa_group_jid = $1 AND sender_jid = $2
 		  AND received_at >= $3 AND COALESCE(deleted, false) = false
 		  AND COALESCE(body, '') <> ''
+		  -- Только текстовые сообщения: подпись к фото/OCR-текст чека — не ФИО клиента.
+		  AND has_media = false
 		ORDER BY received_at DESC
 		LIMIT $4
 	`, groupJID, senderJID, since, limit)
@@ -823,34 +902,44 @@ func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan t
 //   - пустой ответ (только «да/верно») просто снимает флаги (подтверждение).
 //
 // Возвращает итоговую сумму чека.
-func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (bool, float64, error) {
+func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (found bool, amount_ float64, needsReview bool, err error) {
 	var got float64
-	err := d.pool.QueryRow(ctx, `
+	var nr bool
+	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
 			card_owner    = CASE WHEN $2 = '' THEN card_owner ELSE COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')) END,
 			recipient_raw = CASE WHEN $2 = '' THEN recipient_raw ELSE $2 END,
 			contact_id    = CASE WHEN $2 = '' THEN contact_id    ELSE $3 END,
-			amount        = CASE WHEN $4 > 0  THEN $4            ELSE amount END,
-			needs_review  = false,
+			-- $4::numeric ОБЯЗАТЕЛЕН: иначе Postgres выводит тип $4 как integer по
+			-- первому сравнению с 0, и pgx молча обрезает float64 (22000.50 -> 22000).
+			amount        = CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE amount END,
+			-- needs_review снимаем ТОЛЬКО если у чека есть И сумма, И ИЗВЕСТНЫЙ клиент.
+			-- «Известный» = имя назвали в этом ответе ($2<>'') ИЛИ клиент уже был
+			-- подтверждён. Ответ ОДНОЙ суммой на чек без клиента НЕ засчитывает его
+			-- под владельцем карты (contact_id там — печатный получатель, а не клиент):
+			-- иначе деньги молча падали в сбор не на того человека.
+			needs_review  = CASE WHEN (CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE amount END) > 0
+			                          AND ($2 <> '' OR client_confirmed)
+			                     THEN false ELSE true END,
 			-- Ответ ТОЛЬКО суммой (имя не назвали) НЕ подтверждает клиента: сумму
 			-- поправили, но кто клиент — всё ещё неизвестно, поэтому не гасим
 			-- флаги, чтобы бот мог спросить «чей это чек?». Имя в ответе или
 			-- простое «да/верно» — подтверждают.
-			client_confirmed = CASE WHEN $2 = '' AND $4 > 0 THEN client_confirmed ELSE true END,
-			clarify_asked    = CASE WHEN $2 = '' AND $4 > 0 THEN clarify_asked    ELSE true END
+			client_confirmed = CASE WHEN $2 = '' AND $4::numeric > 0 THEN client_confirmed ELSE true END,
+			clarify_asked    = CASE WHEN $2 = '' AND $4::numeric > 0 THEN clarify_asked    ELSE true END
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
 		)
-		RETURNING amount::float8
-	`, waMessageID, name, contactID, amount).Scan(&got)
+		RETURNING amount::float8, needs_review
+	`, waMessageID, name, contactID, amount).Scan(&got, &nr)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, nil
+		return false, 0, false, nil
 	}
 	if err != nil {
-		return false, 0, err
+		return false, 0, false, err
 	}
-	return true, got, nil
+	return true, got, nr, nil
 }
 
 // CountUnconfirmed — сколько чеков без подтверждённого клиента в группе старше
@@ -888,26 +977,82 @@ func (d *DB) GroupAmountMedian(ctx context.Context, groupJID string, since time.
 	return median, n, err
 }
 
-// MarkReceiptAsked помечает, что бот уже спросил про этот чек.
-func (d *DB) MarkReceiptAsked(ctx context.Context, receiptID int) error {
-	_, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET clarify_asked = true WHERE id = $1`, receiptID)
+// MarkReceiptAsked помечает, что бот уже спросил про этот чек, и запоминает id
+// сообщения-вопроса (askMsgID, может быть пустым) — по нему ответ владельца
+// найдёт чек даже после перезапуска бота.
+func (d *DB) MarkReceiptAsked(ctx context.Context, receiptID int, askMsgID string) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts
+		SET clarify_asked = true,
+		    clarify_ask_msg_id = COALESCE(NULLIF($2, ''), clarify_ask_msg_id)
+		WHERE id = $1
+	`, receiptID, askMsgID)
 	return err
 }
 
 // MarkReceiptAskedByMessage помечает «уже спросили» чек по id его сообщения в
 // WhatsApp — когда бот сразу флажит нераспознанный чек прямо в группе, чтобы
-// клариф-цикл не переспросил о нём повторно.
-func (d *DB) MarkReceiptAskedByMessage(ctx context.Context, waMessageID string) error {
+// клариф-цикл не переспросил о нём повторно. askMsgID — id вопроса бота (для
+// привязки ответа после перезапуска), может быть пустым.
+func (d *DB) MarkReceiptAskedByMessage(ctx context.Context, waMessageID, askMsgID string) error {
 	_, err := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET clarify_asked = true
+		UPDATE bank_receipts
+		SET clarify_asked = true,
+		    clarify_ask_msg_id = COALESCE(NULLIF($2, ''), clarify_ask_msg_id)
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false
 			ORDER BY br.id DESC LIMIT 1
 		)
-	`, waMessageID)
+	`, waMessageID, askMsgID)
 	return err
+}
+
+// ReceiptWaIDByAskMsg — по id сообщения-вопроса бота («чей чек?», «проверьте
+// сумму») находит wa_message_id самого чека. Резерв на случай, если связь в
+// памяти (askMap) потерялась после перезапуска.
+func (d *DB) ReceiptWaIDByAskMsg(ctx context.Context, askMsgID string) (string, bool, error) {
+	if askMsgID == "" {
+		return "", false, nil
+	}
+	var waID string
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(rm.wa_message_id, '')
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.clarify_ask_msg_id = $1
+		ORDER BY br.id DESC LIMIT 1
+	`, askMsgID).Scan(&waID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", false, nil
+		}
+		return "", false, err
+	}
+	return waID, waID != "", nil
+}
+
+// ClientAlreadyAttributedFrom — этот клиент уже привязан к ДРУГОМУ чеку того же
+// отправителя в группе за недавнее время? Нужно, чтобы ФИО из соседнего
+// сообщения не «прилипало» ко второму чеку: «Иванов» + чек1 + чек2 — Иванов
+// принадлежит чеку1, а чек2 надо спросить.
+func (d *DB) ClientAlreadyAttributedFrom(ctx context.Context, groupJID, senderJID string, contactID int, exceptWaMessageID string, since time.Time) (bool, error) {
+	var exists bool
+	err := d.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+			  AND rm.sender_jid = $2
+			  AND br.contact_id = $3
+			  AND COALESCE(rm.wa_message_id, '') <> $4
+			  AND rm.received_at >= $5
+			  AND br.is_duplicate = false AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+		)
+	`, groupJID, senderJID, contactID, exceptWaMessageID, since).Scan(&exists)
+	return exists, err
 }
 
 // DuplicateWindow — окно вокруг времени операции, в котором совпадение
@@ -1320,9 +1465,18 @@ func (d *DB) FixReceipt(ctx context.Context, kind string, id int, contactID *int
 				contact_id    = COALESCE($2, contact_id),
 				card_owner    = CASE WHEN $3 = '' THEN card_owner ELSE COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')) END,
 				recipient_raw = COALESCE(NULLIF($3, ''), recipient_raw),
-				amount        = CASE WHEN $4 > 0 THEN $4 ELSE amount END,
+				-- $4::numeric — иначе тип выводится как integer и копейки обрезаются.
+				amount        = CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE amount END,
 				tx_date       = COALESCE($5, tx_date),
-				needs_review  = false
+				-- Имя в правке подтверждает клиента (для будущих правок одной суммой).
+				client_confirmed = CASE WHEN $3 = '' THEN client_confirmed ELSE true END,
+				-- Снимаем needs_review ТОЛЬКО когда чек полный: есть сумма > 0 И
+				-- ИЗВЕСТНЫЙ клиент (имя дали в этой правке ИЛИ клиент уже подтверждён).
+				-- Правка одной суммой на чек без клиента НЕ засчитывает его под
+				-- владельцем карты (contact_id там — печатный получатель, не клиент).
+				needs_review  = NOT ( COALESCE($2, contact_id) IS NOT NULL
+				                      AND ($3 <> '' OR client_confirmed)
+				                      AND (CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE COALESCE(amount, 0) END) > 0 )
 			WHERE id = $1
 		`, id, contactID, recipientName, amount, txDate)
 		return err
@@ -1443,30 +1597,24 @@ type ReportExclusions struct {
 func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs []string) (ReportExclusions, error) {
 	var ex ReportExclusions
 	// 1) Непроверенные чеки: needs_review ИЛИ без contact_id (иначе выпал бы из
-	//    суммы молча). Дедуп кросс-групповых копий (как в SummaryForPeriod), и
-	//    ИСКЛЮЧАЕМ те, чей платёж УЖЕ посчитан текстом — иначе «полный оборот»
-	//    задвоил бы их (тот же контакт+сумма+группа+период).
+	//    суммы молча). Дедуп кросс-групповых копий (как в SummaryForPeriod).
+	//    Клиент непроверенного чека НЕИЗВЕСТЕН (contact_id там, если есть, — это
+	//    владелец карты или догадка), поэтому «уже посчитан текстом» до проверки
+	//    определить нельзя — раньше такой фильтр молча ПРЯТАЛ чеки из списка.
+	//    Дедуп с текстом происходит после проверки (countableTextCondition), а
+	//    «Максимум» — честная верхняя оценка: каждый непроверенный чек в списке.
 	err := d.pool.QueryRow(ctx, `
 		SELECT COUNT(*), COALESCE(SUM(amount), 0)::float8 FROM (
 			SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 				br.amount
 			FROM bank_receipts br
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-			WHERE br.tx_date >= $1 AND br.tx_date < $2
+			WHERE br.tx_date >= $1::timestamptz AND br.tx_date < $2::timestamptz
 			  AND (br.needs_review = true OR br.contact_id IS NULL)
 			  AND br.is_duplicate = false AND br.ignored = false
 			  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
 			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
-			  AND NOT EXISTS (
-				SELECT 1 FROM transactions t
-				LEFT JOIN raw_messages trm ON trm.id = t.raw_message_id
-				WHERE t.contact_id = br.contact_id AND t.amount = br.amount
-				  AND t.ignored = false AND t.dup_pending = false
-				  AND t.tx_date >= $1 AND t.tx_date < $2
-				  AND COALESCE(trm.deleted, false) = false
-				  AND COALESCE(trm.wa_group_jid, '') = COALESCE(br.group_jid, '')
-			  )
-			  -- И не добавляем, если тот же платёж уже посчитан РАСПОЗНАННОЙ копией
+			  -- Не добавляем, если тот же платёж уже посчитан РАСПОЗНАННОЙ копией
 			  -- в другой группе — иначе «Максимум» задвоил бы его. Сопоставляем по
 			  -- номеру документа, а если его нет — по синтетическому id пересылки
 			  -- (копия чека получает wa_message_id вида «<оригинал>-fwd-<группа>»).
@@ -1495,7 +1643,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
-		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
 		  AND t.is_cash = true AND t.dup_pending = true AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
@@ -1510,15 +1658,17 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
 		FROM transactions t
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
-		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
 		  AND t.is_cash = false AND t.dup_pending = false AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
+		  -- Зеркало countableTextCondition: чек-близнец ищем в ±2 дня от текста,
+		  -- а не в границах периода — иначе цифры «дубль» и «посчитано» расходились.
 		  AND EXISTS (
 			SELECT 1 FROM bank_receipts brd
 			WHERE brd.contact_id = t.contact_id AND brd.amount = t.amount
 			  AND brd.needs_review = false AND brd.is_duplicate = false AND brd.ignored = false
-			  AND brd.tx_date >= $1 AND brd.tx_date < $2
+			  AND brd.tx_date >= t.tx_date - interval '2 days' AND brd.tx_date < t.tx_date + interval '2 days'
 			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
 		  )
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.TextDupCount, &ex.TextDupSum)
@@ -2279,7 +2429,10 @@ const countableTextCondition = `(
 				  AND brd.amount = t.amount
 				  AND brd.needs_review = false
 				  AND brd.is_duplicate = false AND brd.ignored = false
-				  AND brd.tx_date >= $1 AND brd.tx_date < $2
+				  -- Парный чек ищем ОТНОСИТЕЛЬНО даты текста (±2 дня), а не в окне
+				  -- отчёта: иначе пара на границе месяца/дня считалась дважды двумя
+				  -- соседними отчётами, а одинаковая сумма месяц спустя — схлопывалась.
+				  AND brd.tx_date >= t.tx_date - interval '2 days' AND brd.tx_date < t.tx_date + interval '2 days'
 				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
 			)
 		)
@@ -2303,7 +2456,8 @@ const countableTextConditionByChat = `(
 				  AND brd.amount = t.amount
 				  AND brd.needs_review = false
 				  AND brd.is_duplicate = false AND brd.ignored = false
-				  AND brm.received_at >= $1 AND brm.received_at < $2
+				  -- ±2 дня относительно присылки текста (см. countableTextCondition).
+				  AND brm.received_at >= rm.received_at - interval '2 days' AND brm.received_at < rm.received_at + interval '2 days'
 				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
 			)
 		)
@@ -2315,7 +2469,10 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		FROM transactions t
 		JOIN contacts c ON c.id = t.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
-		WHERE t.tx_date >= $1 AND t.tx_date < $2
+		-- $1/$2 явно timestamptz: первое текстовое упоминание параметра задаёт его
+		-- тип, а transactions.tx_date — DATE. Без каста время границ отбрасывалось,
+		-- и ветка чеков (timestamptz) сравнивалась с полночью по TZ сервера.
+		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
 		  AND t.ignored = false
 		  AND `+countableTextCondition+`
 		  AND COALESCE(rm.deleted, false) = false

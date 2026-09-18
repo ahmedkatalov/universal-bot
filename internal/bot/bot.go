@@ -461,8 +461,13 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// в ассистента. Иначе ответ владельца («у Нура») уходил в ИИ, и тот отвечал
 	// не по делу («привязать может только владелец…»), а ответственный по наличке
 	// не записывался. Работает и без ассистента.
-	if !hasMedia && b.handleClarifyReply(ctx, msg, text) {
-		return
+	if !hasMedia {
+		// Если владелец обращается к боту по имени («Джарвис, …») — это диалог с
+		// ассистентом, даже если сообщение — ответ на вопрос бота. Иначе фраза
+		// вроде «Джарвис, покажи этот чек» ушла бы в клариф как «имя клиента».
+		if _, addressed := b.stripBotName(text); !addressed && b.handleClarifyReply(ctx, msg, text) {
+			return
+		}
 	}
 
 	// Обращение к боту по имени ("Джарвис скинь отчет") или ответом (реплаем)
@@ -558,16 +563,21 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// эти платежи и есть наличка (передаём подсказкой, но решает ассистент).
 		cashHint := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
 		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint)
-	} else if len(result.Transactions) > 0 {
+	}
+	keepUnparsed := false
+	if !routedToAI && len(result.Transactions) > 0 {
 		// Ассистента нет — пишем детерминированно (регулярка налички как запас).
 		cashPhotoNear := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
-		b.recordDeterministicPayments(ctx, text, rawID, msg.Info.Timestamp, cashPhotoNear)
+		saved, failed := b.recordDeterministicPayments(ctx, text, rawID, msg.Info.Timestamp, cashPhotoNear, false)
+		// Платежи нашли, но НИ ОДИН не записался (БД недоступна) — не помечаем
+		// разобранным, чтобы пересчёт вернулся к сообщению и платёж не пропал.
+		keepUnparsed = failed && saved == 0
 	}
 
 	// Для сообщений, ушедших в ИИ, отметку «разобрано» ставит сама горутина
 	// aiRescueUnparsed — ПОСЛЕ записи (и не ставит при панике), чтобы платёж
 	// пережил падение и переразобрался при пересчёте. Остальные помечаем сразу.
-	if !routedToAI {
+	if !routedToAI && !keepUnparsed {
 		_ = b.db.MarkMessageParsed(ctx, rawID)
 	}
 
@@ -584,14 +594,25 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 // обычный парсер + регулярка налички. Основной путь — ассистент (понимает
 // наличку по смыслу); сюда попадаем, только если ассистента нет или его вызов
 // сорвался — чтобы платёж не потерялся из-за недоступности ИИ.
-func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawID int, txDate time.Time, cashHint bool) {
+// Возвращает: сколько платежей записано и был ли хоть один сбой записи
+// (контакт/вставка) — по этому вызывающий решает, помечать ли сообщение
+// разобранным или оставить на пересчёт.
+// knownOnly=true пишет ТОЛЬКО платежи с распознанным клиентом (совпал алиас) —
+// используется, когда ИИ был доступен и вернул «не платёж»: тогда парсер служит
+// подстраховкой лишь для явных платежей известным людям (реальный платёж, что ИИ
+// пропустил), но НЕ превращает болтовню вроде «сказал взять 5000» в операцию.
+func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawID int, txDate time.Time, cashHint, knownOnly bool) (saved int, failed bool) {
 	result := parser.ParseMessage(text)
 	isCashMsg := parser.IsCash(text) || cashHint
 	for _, tr := range result.Transactions {
-		canonical, _ := b.aliases.ResolveName(tr.RawName)
+		canonical, matched := b.aliases.ResolveName(tr.RawName)
+		if knownOnly && !matched {
+			continue
+		}
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 		if err != nil {
 			fmt.Println("Ошибка получения контакта:", err)
+			failed = true
 			continue
 		}
 		if err := b.db.InsertTransaction(ctx, db.TransactionInput{
@@ -606,8 +627,12 @@ func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawI
 			DupCheck:     b.cashDupCheckOn(),
 		}); err != nil {
 			fmt.Println("Ошибка сохранения транзакции:", err)
+			failed = true
+			continue
 		}
+		saved++
 	}
+	return saved, failed
 }
 
 // proactiveChatEnabled — по умолчанию ВКЛючено: доверяем уму модели самой
@@ -753,8 +778,10 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 		}
 
 		// Пересылка чеков из лички по правилу source='dm' ("все чеки, что
-		// мне присылают, скидывай в группу такую-то").
-		if mediaBytes != nil && strings.TrimSpace(mediaText) != "" {
+		// мне присылают, скидывай в группу такую-то"). ТОЛЬКО от владельца:
+		// иначе любой, кто написал боту в личку, мог бы закинуть картинку в
+		// рабочую группу от имени бота.
+		if mediaBytes != nil && strings.TrimSpace(mediaText) != "" && b.isReportAdmin(msg.Info) {
 			senderName := msg.Info.PushName
 			if senderName == "" {
 				senderName = msg.Info.Sender.User
@@ -2796,6 +2823,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// ФИО, написанное рядом с чеком, важнее получателя на чеке — платёж
 	// относим к клиенту, которого назвал владелец. Получателя с чека
 	// (владельца карты) сохраняем отдельно в cardOwner для истории.
+	// receiptRecipient — получатель, как он НАПЕЧАТАН на чеке (до подмены на
+	// клиента): по нему решаем, похоже ли изображение на чек вообще.
+	receiptRecipient := rd.Recipient
 	cardOwner := ""
 	if payerOverride != "" {
 		cardOwner = rd.Recipient
@@ -2822,18 +2852,26 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	looksCollapsed := rd.DocNumber == "" && rd.Recipient == "" && payerOverride == ""
 	if rd.Amount > 0 && !rd.HasTxTime && media != nil && looksCollapsed {
 		fmt.Printf("Чек (сообщение %d): неполный (нет даты операции) — прошу развёрнутый\n", rawID)
-		_ = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
+		if err := b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 			RawMessageID: rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
 			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
-			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate,
-		})
+			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true,
+		}); err != nil {
+			fmt.Println("Ошибка сохранения неполного чека:", err)
+		}
 		if askReceiptsEnabled() && waMsgID != "" {
-			b.sendReply(chat, fmt.Sprintf(
+			botMsgID := b.sendReply(chat, fmt.Sprintf(
 				"🤔 Чек на %.0f ₽ пришёл НЕПОЛНЫМ (похоже на свёрнутый экран «Перевод выполнен»). Не видно главного: "+
 					"КОГДА (дата операции), НА КАКУЮ КАРТУ (получатель), ЧЬЁ ИМЯ (ФИО получателя). "+
 					"Раскрой чек в приложении банка (нажми «Сохранить чек» / «Подробнее», где видны дата, ФИО и карта) и пришли ПОЛНЫЙ — "+
-					"тогда учту правильно. Пока не засчитываю.",
+					"тогда учту правильно. Пока не засчитываю. Или ответьте на это сообщение ФИО клиента — засчитаю по дате сообщения.",
 				rd.Amount), waMsgID, senderJID)
+			// Уже спросили — клариф-цикл не должен переспрашивать «чей чек?» о том
+			// же экране. Ответ владельца (ФИО свайпом) привяжется через askMap/БД.
+			if botMsgID != "" {
+				_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
+				b.registerClarifyAsk(botMsgID, waMsgID)
+			}
 		}
 		return
 	}
@@ -2842,7 +2880,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// Ни парсер, ни ИИ по тексту, ни вижн ничего не вытащили. Если это
 		// не выглядело чеком вообще (случайная картинка без денежных полей и
 		// без частичных данных) — не засоряем "непонятые", просто выходим.
-		looksReceipt := parser.LooksLikeBankReceipt(text) || rd.Amount > 0 || rd.Recipient != "" || rd.DocNumber != ""
+		// Берём получателя, НАПЕЧАТАННОГО на чеке (receiptRecipient), а не подменённого
+		// клиента: иначе паспорт/фото с подписью-ФИО считалось бы «чеком без суммы»
+		// и попадало в «не смог разобрать».
+		looksReceipt := parser.LooksLikeBankReceipt(text) || rd.Amount > 0 || receiptRecipient != "" || rd.DocNumber != ""
 		if !looksReceipt {
 			if visionUnavailable {
 				// Модель зрения не ответила (сбой API) — мы НЕ знаем, чек это или
@@ -2886,8 +2927,12 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			q := fmt.Sprintf("🤔 Не смог разобрать этот чек (%s). Помогите: ответьте на это сообщение "+
 				"ФИО клиента и суммой — например «Ахмед Каталов 15000». Или пришлите чек чётче и полным (не обрезанным).", what)
 			botMsgID := b.sendReply(chat, q, waMsgID, senderJID)
-			_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID)
-			b.registerClarifyAsk(botMsgID, waMsgID)
+			// Помечаем «спросили» ТОЛЬКО если вопрос реально ушёл: при сбое
+			// отправки клариф-цикл спросит позже, иначе чек молча завис бы.
+			if botMsgID != "" {
+				_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
+				b.registerClarifyAsk(botMsgID, waMsgID)
+			}
 		}
 		return
 	}
@@ -2925,6 +2970,29 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		fmt.Println("Ошибка проверки дубля чека:", err)
 	}
 
+	// Если до этого тот же человек прислал СВЁРНУТЫЙ экран на ту же сумму (мы
+	// просили полный чек) — этот полный чек его заменяет: свёрнутый помечаем
+	// дублем, чтобы он не висел в «не вошло» и не задваивал «Максимум».
+	clientConfirmed := payerOverride != ""
+	if !isDuplicate {
+		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt); err != nil {
+			fmt.Println("Ошибка замены свёрнутого чека:", err)
+		} else if sup.Found {
+			fmt.Printf("Чек (сообщение %d): полный чек заменил ранее присланный свёрнутый на %.0f ₽\n", rawID, rd.Amount)
+			// Свёрнутый уже был привязан к клиенту (владелец ответил ФИО), а у этого
+			// полного чека клиента рядом нет — переносим клиента на него. Иначе платёж
+			// выпал бы из сбора: свёрнутый стал дублем, а полный остался бы без клиента.
+			if payerOverride == "" && sup.ContactID != nil && sup.ClientConfirmed {
+				cardOwner = rd.Recipient // печатный получатель полного чека
+				rd.Recipient = sup.RecipientRaw
+				canonical = sup.RecipientRaw
+				contactIDPtr = sup.ContactID
+				needsReview = false
+				clientConfirmed = true
+			}
+		}
+	}
+
 	err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 		RawMessageID:    rawID,
 		Bank:            rd.Bank,
@@ -2943,7 +3011,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		Status:          rd.Status,
 		NeedsReview:     needsReview,
 		IsDuplicate:     isDuplicate,
-		ClientConfirmed: payerOverride != "", // клиента назвал владелец — точно
+		ClientConfirmed: clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
 		GroupJID:        chat.String(),
 		TxDate:          txDate,
 	})

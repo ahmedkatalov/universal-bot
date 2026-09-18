@@ -156,8 +156,9 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 					}
 					text := fmt.Sprintf("🤔 Чей это чек? Получатель на чеке: %s, сумма %.0f ₽, %s. "+
 						"Ответьте на это сообщение именем клиента (кому засчитать).", owner, it.Amount, it.TxDate.Format("02.01 15:04"))
-					b.askClarify(ctx, jid, text, it)
-					asked++
+					if b.askClarify(ctx, jid, text, it) {
+						asked++
+					}
 				}
 			}
 		}
@@ -224,8 +225,9 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 				for _, it := range items {
 					text := "🤔 Не смог разобрать этот чек (не прочитал сумму). Ответьте на это сообщение " +
 						"суммой и ФИО клиента — например: «Ахмед Каталов 15000»."
-					b.askClarify(ctx, jid, text, it)
-					asked++
+					if b.askClarify(ctx, jid, text, it) {
+						asked++
+					}
 				}
 			}
 		}
@@ -259,9 +261,15 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		}
 		var contactIDPtr *int
 		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			// Это ФИО уже «ушло» на другой чек того же отправителя («Иванов» +
+			// чек1 + чек2: Иванов — это чек1). Второму чеку имя не приписываем —
+			// про него честно спросим.
+			if used, err := b.db.ClientAlreadyAttributedFrom(ctx, jid.String(), it.SenderJID, cid, it.WaMessageID, time.Now().Add(-30*time.Minute)); err == nil && used {
+				continue
+			}
 			contactIDPtr = &cid
 		}
-		if found, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
+		if found, _, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
 			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
 			return true
 		}
@@ -339,11 +347,41 @@ func parseCashDupAnswer(text string) (bool, bool) {
 }
 
 // askClarify отправляет вопрос цитатой на сам чек и запоминает связь
-// «id вопроса -> id сообщения чека», чтобы привязать ответ владельца.
-func (b *Bot) askClarify(ctx context.Context, jid types.JID, text string, it db.ClarifyReceipt) {
+// «id вопроса -> id сообщения чека» (в памяти И в БД), чтобы привязать ответ
+// владельца. Возвращает false, если вопрос не ушёл: тогда чек НЕ помечаем
+// «спросили» — следующий цикл переспросит, иначе он завис бы навсегда.
+func (b *Bot) askClarify(ctx context.Context, jid types.JID, text string, it db.ClarifyReceipt) bool {
 	botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
-	_ = b.db.MarkReceiptAsked(ctx, it.ID)
+	if botMsgID == "" {
+		return false
+	}
+	_ = b.db.MarkReceiptAsked(ctx, it.ID, botMsgID)
 	b.registerClarifyAsk(botMsgID, it.WaMessageID)
+	return true
+}
+
+// confirmReplies — ответы-подтверждения на вопрос бота («проверьте сумму» →
+// «верно»): ничего не меняем, просто принимаем.
+var confirmReplies = map[string]bool{
+	"да": true, "верно": true, "все верно": true, "всё верно": true, "ок": true, "окей": true,
+	"правильно": true, "да верно": true, "точно": true, "так и есть": true, "подтверждаю": true, "+": true,
+	"да, верно": true, "все правильно": true, "всё правильно": true,
+}
+
+// isConfirmReply — «да / верно / ок» на вопрос бота.
+func isConfirmReply(lower string) bool {
+	return confirmReplies[strings.Trim(lower, ".,!)👍✅ ")]
+}
+
+// isUnknownReply — «не знаю / хз / не помню»: владелец не может ответить сейчас.
+// Такой ответ НЕ должен превращаться в «имя клиента» и не снимает вопрос.
+func isUnknownReply(lower string) bool {
+	for _, m := range []string{"не знаю", "незнаю", "хз", "не помню", "непонятно", "не понял", "не в курсе", "без понятия"} {
+		if strings.Contains(lower, m) {
+			return true
+		}
+	}
+	return false
 }
 
 // registerClarifyAsk запоминает связь «id вопроса бота -> id сообщения чека»,
@@ -394,7 +432,13 @@ func (b *Bot) checkSuspiciousAmount(ctx context.Context, chat types.JID, waMsgID
 	text := fmt.Sprintf("🤔 Проверьте сумму: %.0f ₽ по этому чеку необычно большая для этой группы "+
 		"(обычно около %.0f ₽). Если это ошибка распознавания — ответьте на это сообщение верной суммой; "+
 		"если всё верно — напишите «верно».", amount, median)
-	b.registerClarifyAsk(b.sendReply(chat, text, waMsgID, senderJID), waMsgID)
+	botMsgID := b.sendReply(chat, text, waMsgID, senderJID)
+	if botMsgID != "" {
+		// Персистим связь «вопрос -> чек»: иначе после перезапуска бота ответ
+		// владельца («130000») не находил чек и завышенная сумма оставалась в сборе.
+		_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
+		b.registerClarifyAsk(botMsgID, waMsgID)
+	}
 }
 
 // handleClarifyReply — если владелец ответил (свайп) на вопрос бота "чей чек",
@@ -455,27 +499,56 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		return b.applyCashCollectorReply(ctx, msg.Info.Chat, txID, text)
 	}
 
+	// Связь «вопрос -> чек» НЕ снимаем при поиске: снимем только после успешной
+	// записи. Иначе непонятный/неполный ответ («хз», имя без суммы) навсегда
+	// отвязывал вопрос, и следующий нормальный ответ уходил в никуда.
 	b.clarify.mu.Lock()
 	receiptWaID, ok := b.clarify.askMap[quotedID]
-	if ok {
-		delete(b.clarify.askMap, quotedID)
-	}
 	b.clarify.mu.Unlock()
+	if !ok {
+		// Связь могла потеряться (перезапуск бота) — ищем чек по id вопроса в БД.
+		if waID, found, _ := b.db.ReceiptWaIDByAskMsg(ctx, quotedID); found {
+			receiptWaID, ok = waID, true
+		}
+	}
 	if !ok {
 		return false
 	}
+	lower := strings.ToLower(strings.TrimSpace(text))
+	if isConfirmReply(lower) {
+		// «верно/да» на «проверьте сумму» — оставляем как есть. Связь не снимаем:
+		// можно будет ещё поправить тем же ответом.
+		b.sendText(msg.Info.Chat, "Понял, оставляю как есть.")
+		return true
+	}
+	if isUnknownReply(lower) {
+		b.sendText(msg.Info.Chat, "Хорошо, оставлю этот чек в нераспознанных — можно вернуться к нему позже, ответив на этот же вопрос.")
+		return true
+	}
 
 	// Ответ бывает трёх видов: ФИО («Ахмед Каталов»), ФИО+сумма («Ахмед 15000»),
-	// или только сумма/подтверждение («50000», «да») — для правки подозрительной
-	// суммы. Имя берём без цифр; сумму — отдельно.
+	// или только сумма («50000») — для правки подозрительной/непрочитанной суммы.
+	// Имя берём без цифр; сумму — отдельно.
 	replyAmount := parser.ExtractAmount(text)
 	name, ok := looksLikeName(text)
-	if !ok && replyAmount == 0 {
-		// Нет ни ФИО-из-2-слов, ни суммы: возможно, одно имя («Ахмед») —
-		// но не служебное слово-подтверждение («да», «верно»).
-		candidate := strings.TrimSpace(text)
-		if candidate != "" && !nameStopwords[strings.ToLower(candidate)] {
-			name = candidate
+	if !ok {
+		// looksLikeName требует 2+ слов. Ответ «Ахмед 15000» или одно имя «Ахмед» —
+		// собираем имя из слов БЕЗ цифр, отбросив служебные слова. Работает и когда
+		// назвали сумму: раньше при сумме одно имя молча терялось и чек уходил в
+		// сбор без клиента (или вовсе не считался).
+		var words []string
+		for _, w := range strings.Fields(text) {
+			if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+				continue
+			}
+			lw := strings.ToLower(strings.Trim(w, ".,!?()«»\""))
+			if lw == "" || nameStopwords[lw] {
+				continue
+			}
+			words = append(words, w)
+		}
+		if len(words) > 0 {
+			name = strings.Join(words, " ")
 		}
 	}
 	if name == "" && replyAmount == 0 {
@@ -494,10 +567,28 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		}
 		contactIDPtr = &cid
 	}
-	found, amount, err := b.db.FillReceiptByMessage(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
+	found, amount, stillReview, err := b.db.FillReceiptByMessage(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
 	if err != nil || !found {
 		return false
 	}
+	if amount <= 0 {
+		// Клиента записали, но суммы у чека по-прежнему нет (не прочиталась) —
+		// без суммы он не войдёт в сбор. Просим сумму; связь с вопросом оставляем.
+		b.sendText(msg.Info.Chat, fmt.Sprintf("Записал клиента %s, но сумму по этому чеку так и не знаю — "+
+			"ответьте на этот же вопрос суммой (например «15000»), и чек войдёт в сбор.", canonical))
+		return true
+	}
+	if stillReview {
+		// Сумму поправили, но КЛИЕНТ всё ещё неизвестен (ответили одной суммой на
+		// чек без ФИО). Не засчитываем под владельцем карты — просим имя; связь с
+		// вопросом оставляем, чтобы владелец мог дослать ФИО тем же ответом.
+		b.sendText(msg.Info.Chat, fmt.Sprintf("Поправил сумму на %.0f ₽. А чей это чек? "+
+			"Ответьте на этот же вопрос ФИО клиента — тогда засчитаю.", amount))
+		return true
+	}
+	b.clarify.mu.Lock()
+	delete(b.clarify.askMap, quotedID)
+	b.clarify.mu.Unlock()
 	switch {
 	case canonical != "":
 		b.sendText(msg.Info.Chat, fmt.Sprintf("Записал: чек на %.0f ₽ — клиент %s.", amount, canonical))

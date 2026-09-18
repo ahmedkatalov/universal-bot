@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"go.mau.fi/whatsmeow/types"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -54,11 +55,17 @@ type aiPayment struct {
 
 func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint bool) {
 	// Помечаем сообщение разобранным ТОЛЬКО по завершении записи. Если горутина
-	// упадёт с паникой — не помечаем, чтобы пересчёт (recount) переразобрал его и
+	// упадёт с паникой ИЛИ платежи нашлись, но ни один не записался (БД
+	// недоступна) — не помечаем, чтобы пересчёт (recount) переразобрал его и
 	// платёж не потерялся.
+	keepUnparsed := false
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("ИИ-доразбор: паника, оставляю сообщение на пересчёт:", r)
+			return
+		}
+		if keepUnparsed {
+			fmt.Printf("ИИ-доразбор: сообщение %d — платёж найден, но не записан; оставляю на пересчёт\n", rawID)
 			return
 		}
 		_ = b.db.MarkMessageParsed(ctx, rawID)
@@ -100,11 +107,14 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// Детерминированно вытаскиваем суммы из текста и даём их ИИ ЯКОРЕМ — модели
 	// иногда ошибаются в цифрах («10.000р» прочитали как 5000). Парсер читает
 	// форматы сумм надёжно, поэтому передаём точные значения и просим не пересчитывать.
+	// Считаем ВСЕ денежные числа сообщения (не «первое в строке»): при «20000 +
+	// 5000» подсказка должна содержать оба, иначе ИИ подталкивался к неверному итогу.
 	joined := strings.Join(lines, "\n")
+	tokens := moneyTokens(joined)
 	var foundAmts []string
 	seenAmt := map[float64]bool{}
-	for _, ln := range strings.Split(joined, "\n") {
-		if a := parser.ExtractAmount(ln); a > 0 && !seenAmt[a] {
+	for _, a := range tokens {
+		if !seenAmt[a] {
 			seenAmt[a] = true
 			foundAmts = append(foundAmts, fmt.Sprintf("%.0f", a))
 		}
@@ -163,19 +173,23 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 	}
 	if okRuns == 0 {
-		// Ни одно чтение не удалось — не теряем платёж, откат к обычному парсеру.
+		// Ни одно чтение не удалось (ИИ недоступен) — вердикта НЕТ. Откат к парсеру,
+		// но если он ничего не записал — оставляем сообщение на пересчёт (не помечаем
+		// разобранным): реальный платёж не должен пропасть только потому, что ИИ лежал.
 		fmt.Println("ИИ-доразбор: ни одно чтение не удалось, откат к обычному парсеру")
-		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
+		saved, _ := b.recordDeterministicPayments(ctx, joined, rawID, txDate, cashHint, false)
+		keepUnparsed = saved == 0
 		return
 	}
 
 	payments := consensusPayments(runs, okRuns)
 
-	// Страховка от ошибки ИИ в цифрах: если в сообщении РОВНО одна сумма и на
-	// выходе РОВНО один платёж с другой суммой — берём сумму из текста
-	// (парсер читает её надёжно). Так «10.000р» точно не станет 5000.
-	if len(foundAmts) == 1 && len(payments) == 1 {
-		if det := parser.ExtractAmount(joined); det > 0 && payments[0].Amount != det {
+	// Страховка от ошибки ИИ в цифрах: если в сообщении РОВНО ОДНО денежное число
+	// (не «одна строка с суммой» — при «20000 + 5000» подмена ломала бы итог) и на
+	// выходе РОВНО один платёж с другой суммой — берём сумму из текста (парсер
+	// читает её надёжно). Так «10.000р» точно не станет 5000.
+	if len(tokens) == 1 && len(payments) == 1 {
+		if det := tokens[0]; det > 0 && payments[0].Amount != det {
 			fmt.Printf("ИИ-доразбор: сумма ИИ %.0f заменена на точную из текста %.0f\n", payments[0].Amount, det)
 			payments[0].Amount = det
 		}
@@ -190,6 +204,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 
 	saved := 0
+	insertFailed := false
 	for _, p := range payments {
 		name := strings.TrimSpace(p.Name)
 		if p.Amount <= 0 || name == "" {
@@ -199,6 +214,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 		if err != nil {
 			fmt.Println("ИИ-доразбор: ошибка контакта:", err)
+			insertFailed = true
 			continue
 		}
 		isCash := p.Cash || cashHint || parser.IsCash(strings.Join(lines, " ")+" "+p.Note+" "+p.Card)
@@ -221,19 +237,96 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		})
 		if err != nil {
 			fmt.Println("ИИ-доразбор: ошибка сохранения транзакции:", err)
+			insertFailed = true
 			continue
 		}
 		saved++
 	}
 	if saved > 0 {
 		fmt.Printf("ИИ-доразбор: сообщение %d — извлечено и сохранено %d платеж(ей), которые не понял обычный парсер\n", rawID, saved)
+	} else if insertFailed {
+		// ИИ ПОНЯЛ платежи, но ни один не записался (БД недоступна). Не теряем:
+		// оставляем на пересчёт. Детерминированно не дублируем — ИИ уже всё понял.
+		keepUnparsed = true
 	} else {
-		// ИИ ничего не записал (счёл болтовнёй ИЛИ все вставки не прошли). Если
-		// обычный парсер уверенно находит платёж в этих строках — записываем его,
-		// чтобы ложный отрицательный ИИ не проглотил реальный платёж. На настоящей
-		// болтовне парсер ничего не найдёт — вреда нет.
-		b.recordDeterministicPayments(ctx, strings.Join(lines, "\n"), rawID, txDate, cashHint)
+		// ИИ был ДОСТУПЕН и вернул ПУСТО — это осознанный вердикт «не платёж»
+		// (обсуждение/план: «сказал взять 5000»). Доверяем ему и НЕ пишем мусор.
+		// Подстраховка только для платежей ИЗВЕСТНЫМ клиентам (совпал алиас),
+		// которых ИИ мог ошибочно пропустить: болтовню это не заденет.
+		dsaved, dfailed := b.recordDeterministicPayments(ctx, joined, rawID, txDate, cashHint, true)
+		keepUnparsed = dsaved == 0 && dfailed
 	}
+}
+
+// reMoneyToken — числовые токены в тексте: «10.000», «72,600», «30 000», «31».
+var reMoneyToken = regexp.MustCompile(`\d[\d.,]*(?:[ \x{00a0}]\d{3})*`)
+
+// reDateLikeToken — «08.09», «8.9.26», «08.09.2026»: это дата, а не сумма.
+var reDateLikeToken = regexp.MustCompile(`^\d{1,2}\.\d{1,2}(?:\.\d{2,4})?$`)
+
+// reThousandsSuffix — суффикс тысяч/миллионов сразу после числа («31 т», «5к»,
+// «3 млн», «25 тысяч», «2 ляма», «5 косарей»). Хвосты склонений [а-яё]* — как в
+// parser.reShorthand (без них «тысяч/косарей/ляма» не распознавались). За
+// суффиксом не должна идти буква («т.е.» — не тысячи).
+var reThousandsSuffix = regexp.MustCompile(`(?i)^\s*(кк|к|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:$|\s|[^\p{L}\d\s](?:[^\p{L}]|$))`)
+
+// looksLikeClockToken — токен из 1–2 цифр вплотную к двоеточию (часы/минуты в
+// «12:30»). Так «12»/«30» из времени не считаются суммой, а «35.000» из
+// «наличными:35.000» (не 1–2 цифры) — считается.
+func looksLikeClockToken(text string, start, end int, tok string) bool {
+	if len(tok) < 1 || len(tok) > 2 {
+		return false
+	}
+	for _, r := range tok {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	if end < len(text) && text[end] == ':' {
+		return true
+	}
+	if start > 0 && text[start-1] == ':' {
+		return true
+	}
+	return false
+}
+
+// moneyTokens — «денежные» числа сообщения: с суффиксом тысяч/миллионов ИЛИ не
+// меньше 100 (и не похожие на дату/время). По их количеству решаем, ОДНА ли
+// сумма в сообщении: только тогда её можно безопасно навязать ИИ и подменить ею
+// результат; при нескольких числах («20000 + 5000») подмена ломала бы итог.
+func moneyTokens(text string) []float64 {
+	var out []float64
+	for _, m := range reMoneyToken.FindAllStringIndex(text, -1) {
+		tok := strings.Trim(text[m[0]:m[1]], ".,")
+		if tok == "" {
+			continue
+		}
+		// Суффикс проверяем ПЕРВЫМ: «1.5 млн» — сумма, а не дата; «22т» — тысячи.
+		suffix := reThousandsSuffix.FindStringSubmatch(text[m[1]:])
+		if suffix == nil && reDateLikeToken.MatchString(tok) {
+			continue // «08.09» без суффикса — дата
+		}
+		if suffix == nil && looksLikeClockToken(text, m[0], m[1], tok) {
+			continue // «12:30» — время
+		}
+		v := parser.ParseMoneyValue(tok)
+		if v <= 0 {
+			continue
+		}
+		if suffix != nil {
+			switch s := strings.ToLower(suffix[1]); {
+			case s == "кк" || strings.HasPrefix(s, "млн") || strings.HasPrefix(s, "лям"):
+				v *= 1_000_000
+			default: // к, т, тыс, тыщ, косар
+				v *= 1000
+			}
+		} else if v < 100 {
+			continue // мелкое число без суффикса — вряд ли сумма (номер, «за 2 месяца»)
+		}
+		out = append(out, v)
+	}
+	return out
 }
 
 // paymentReads — сколько независимых прочтений ТЕКСТОВОГО платежа делать
@@ -263,7 +356,7 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 		name      string
 		amounts   []float64
 		cashVotes int
-		total     int
+		total     int // в скольких ЧТЕНИЯХ встретился (ключ уникален в пределах чтения)
 		collector map[string]int
 		card      map[string]int
 		note      string
@@ -271,12 +364,21 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 	byName := map[string]*agg{}
 	var order []string
 	for _, run := range runs {
-		for _, p := range run {
+		// Одно имя ДВАЖДЫ в одном чтении («Ахмед 5000 / Ахмед 10000») — это два
+		// платежа: нумеруем их по возрастанию суммы, чтобы «#0» и «#1» совпадали
+		// между чтениями. Раньше оба сливались в один и «встречались 2 раза» в
+		// одном чтении — ложное большинство, и сумма — медиана двух РАЗНЫХ платежей.
+		sorted := append([]aiPayment(nil), run...)
+		sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Amount < sorted[j].Amount })
+		ordinal := map[string]int{}
+		for _, p := range sorted {
 			name := strings.TrimSpace(p.Name)
 			if p.Amount <= 0 || name == "" {
 				continue
 			}
-			key := strings.ToLower(strings.Join(strings.Fields(name), " "))
+			nameKey := strings.ToLower(strings.Join(strings.Fields(name), " "))
+			key := nameKey + "#" + strconv.Itoa(ordinal[nameKey])
+			ordinal[nameKey]++
 			a := byName[key]
 			if a == nil {
 				a = &agg{name: name, collector: map[string]int{}, card: map[string]int{}}

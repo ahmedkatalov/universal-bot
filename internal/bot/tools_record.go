@@ -200,7 +200,10 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				Collector:    collector,
 				RawMessageID: rawID,
 				TxDate:       txDate,
-				DupCheck:     b.cashDupCheckOn(),
+				// Владелец продиктовал платёж САМ и явно — вопрос «новый или тот же?»
+				// здесь неуместен: он придержал бы платёж из сбора до ответа на
+				// вопрос, который никто не увидит (запись идёт из лички).
+				DupCheck: false,
 			}); err != nil {
 				return "", fmt.Errorf("не удалось записать платёж: %w", err)
 			}
