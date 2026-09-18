@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -384,6 +385,54 @@ func isUnknownReply(lower string) bool {
 	return false
 }
 
+// clarifyNameFromReply разбирает ОТВЕТ (свайпом) на вопрос бота про чек: имя
+// клиента и/или сумму. deferToAI=true — ответ похож на вопрос или на целую
+// фразу («Записал чек?», «клиент X сумма Y дата Z»): его нельзя грубо разбирать
+// на «имя», лучше отдать ассистенту, который поймёт по смыслу (и запишет через
+// fix_receipt). Так вопрос владельца перестаёт превращаться в ФИО клиента.
+func clarifyNameFromReply(text string) (name string, amount float64, deferToAI bool) {
+	amount = parser.ExtractAmount(text)
+	// Вопрос («…?») — это не имя. Отдаём ассистенту.
+	if strings.Contains(text, "?") {
+		return "", amount, true
+	}
+	// Чистое ФИО (2+ слов) — берём как есть.
+	if n, ok := looksLikeName(text); ok {
+		return n, amount, false
+	}
+	// Иначе собираем кандидатов в имя: слова без цифр, очищенные от знаков/эмодзи,
+	// кроме служебных стоп-слов (глаголы, «клиент/сумма/дата», обращения к боту).
+	fields := strings.Fields(text)
+	var words []string
+	for _, w := range fields {
+		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+			continue
+		}
+		clean := strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
+		if clean == "" || nameStopwords[strings.ToLower(clean)] {
+			continue
+		}
+		// Слово-кандидат в имя должно начинаться с ЗАГЛАВНОЙ (имя собственное).
+		// Строчное слово в коротком ответе — это, скорее, частица/глагол из фразы
+		// («а не посчитал»), а не ФИО: отдаём ассистенту, не выдумывая имя.
+		if r := []rune(clean); !unicode.IsUpper(r[0]) {
+			return "", amount, true
+		}
+		words = append(words, clean)
+	}
+	// Как имя принимаем ТОЛЬКО короткий ответ: 1–3 слова-имени в реплике из ≤4
+	// слов («Ахмед», «Ахмед 15000»). Длинную фразу отдаём ассистенту — он
+	// разберёт правильно, а не склеит служебные слова в «имя».
+	switch {
+	case len(words) == 0:
+		return "", amount, false // имени нет; выше проверят, есть ли сумма
+	case len(words) <= 3 && len(fields) <= 4:
+		return strings.Join(words, " "), amount, false
+	default:
+		return "", amount, true
+	}
+}
+
 // registerClarifyAsk запоминает связь «id вопроса бота -> id сообщения чека»,
 // чтобы ответ владельца (свайпом на вопрос) привязался к нужному чеку.
 func (b *Bot) registerClarifyAsk(botMsgID, receiptWaID string) {
@@ -529,30 +578,14 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	// Ответ бывает трёх видов: ФИО («Ахмед Каталов»), ФИО+сумма («Ахмед 15000»),
 	// или только сумма («50000») — для правки подозрительной/непрочитанной суммы.
 	// Имя берём без цифр; сумму — отдельно.
-	replyAmount := parser.ExtractAmount(text)
-	name, ok := looksLikeName(text)
-	if !ok {
-		// looksLikeName требует 2+ слов. Ответ «Ахмед 15000» или одно имя «Ахмед» —
-		// собираем имя из слов БЕЗ цифр, отбросив служебные слова. Работает и когда
-		// назвали сумму: раньше при сумме одно имя молча терялось и чек уходил в
-		// сбор без клиента (или вовсе не считался).
-		var words []string
-		for _, w := range strings.Fields(text) {
-			if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
-				continue
-			}
-			lw := strings.ToLower(strings.Trim(w, ".,!?()«»\""))
-			if lw == "" || nameStopwords[lw] {
-				continue
-			}
-			words = append(words, w)
-		}
-		if len(words) > 0 {
-			name = strings.Join(words, " ")
-		}
+	name, replyAmount, deferToAI := clarifyNameFromReply(text)
+	if deferToAI {
+		// Похоже на вопрос/фразу, а не на ответ «имя/сумма» — отдаём ассистенту
+		// (он ответит по смыслу с контекстом чека), не выдёргивая «имя» из фразы.
+		return false
 	}
 	if name == "" && replyAmount == 0 {
-		return false // не смогли извлечь ни имя, ни сумму
+		return false // ни имени, ни суммы — пусть решает ассистент/следующий цикл
 	}
 	canonical := ""
 	var contactIDPtr *int

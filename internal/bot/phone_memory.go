@@ -136,6 +136,17 @@ func quotedSenderPhoneNote(msg *events.Message) string {
 	if id := ci.GetStanzaID(); id != "" {
 		parts = append(parts, "id сообщения "+id)
 	}
+	// Текст сообщения, на которое ответили (свайп): часто это вопрос бота «чей это
+	// чек / какая сумма» с данными чека. Даём его ассистенту, чтобы он понял, о
+	// КАКОМ чеке речь, и по нему нашёл нужный (list_unclear_receipts + fix_receipt),
+	// а не гадал. Обрезаем, чтобы не раздувать промпт.
+	if qt := strings.TrimSpace(extractQuotedText(msg)); qt != "" {
+		r := []rune(qt)
+		if len(r) > 200 {
+			qt = string(r[:200]) + "…"
+		}
+		parts = append(parts, "отвечает на сообщение: «"+qt+"»")
+	}
 	if len(parts) == 0 {
 		return ""
 	}

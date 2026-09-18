@@ -69,6 +69,23 @@ var nameStopwords = map[string]bool{
 	"принес": true, "забрал": true, "взял": true, "отдал": true,
 	"сегодня": true, "вчера": true, "сейчас": true, "только": true, "что": true,
 	"уже": true, "ещё": true, "еще": true, "тоже": true, "также": true,
+	// слова-обращения к боту и служебные из фраз-вопросов («Записал чек?»,
+	// «клиент X сумма Y дата Z») — чтобы вопрос/предложение не превращались в ФИО
+	"записал": true, "записала": true, "записали": true, "запиши": true,
+	"записать": true, "запись": true, "запиши-ка": true, "внёс?": true,
+	"клиент": true, "клиента": true, "клиенту": true, "клиентом": true,
+	"сумму": true, "суммы": true, "суммой": true, "дата": true, "дату": true,
+	"даты": true, "датой": true, "число": true, "числа": true, "время": true,
+	"секунд": true, "секунда": true, "секунды": true, "минут": true, "минута": true,
+	"минуты": true, "час": true, "часов": true, "почему": true, "зачем": true,
+	"когда": true, "где": true, "сколько": true, "чей": true, "чья": true,
+	"чьё": true, "чье": true, "чьи": true, "как": true, "какой": true, "какая": true,
+	"джарвис": true, "бот": true, "проверь": true, "покажи": true, "скажи": true,
+	"посчитал": true, "посчитала": true, "посчитай": true, "посчитать": true,
+	"считал": true, "считай": true, "посчитано": true, "почему-то": true,
+	// частицы/союзы — никогда не имена, часто в фразах-вопросах
+	"а": true, "но": true, "ну": true, "же": true, "ли": true, "бы": true,
+	"или": true, "то": true, "ни": true, "не": true, "разве": true, "неужели": true,
 }
 
 // looksLikeName проверяет, похожа ли строка на ФИО клиента. Требует 2+ слова
@@ -85,14 +102,16 @@ func looksLikeName(text string) (string, bool) {
 		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
 			continue
 		}
-		// эмодзи/символы без букв (✅, ✔, стрелки) — не часть имени
-		if strings.IndexFunc(w, unicode.IsLetter) < 0 {
+		// Обрезаем НЕбуквенные края слова: эмодзи/знаки, прилипшие к имени
+		// («акъуб✅» -> «акъуб», «Р.» -> «Р»). Слово без букв (✅, стрелка) -> пусто.
+		clean := strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
+		if clean == "" {
 			continue
 		}
-		if nameStopwords[strings.ToLower(w)] {
+		if nameStopwords[strings.ToLower(clean)] {
 			continue
 		}
-		nameWords = append(nameWords, w)
+		nameWords = append(nameWords, clean)
 	}
 	// Меньше 2 слов — это, скорее, реплика ("Ок"), а не ФИО клиента.
 	if len(nameWords) < 2 || len(nameWords) > 5 {
