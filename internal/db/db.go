@@ -2113,6 +2113,104 @@ func (d *DB) RemovePhoneOwner(ctx context.Context, phone string) (bool, error) {
 	return tag.RowsAffected() > 0, nil
 }
 
+// StoredMessage — сохранённое сообщение из группы (для «что писал номер X»).
+type StoredMessage struct {
+	GroupJID   string
+	Who        string // имя из памяти номеров или пуш-имя отправителя
+	Phone      string // номер отправителя (часть до @)
+	Body       string
+	HasMedia   bool
+	Deleted    bool // сообщение удалили в WhatsApp, но тело у нас осталось
+	ReceivedAt time.Time
+}
+
+// MessagesFrom возвращает СОХРАНЁННЫЕ сообщения отправителя по последним цифрам
+// номера и/или имени за период — ВКЛЮЧАЯ удалённые в WhatsApp (тело сохраняется
+// при получении и НЕ стирается при удалении). Так владелец может поднять, что
+// написал конкретный номер, даже если тот удалил сообщение «у всех».
+func (d *DB) MessagesFrom(ctx context.Context, phoneSuffix, nameLike string, from, to *time.Time, groupJID string, limit int) ([]StoredMessage, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT rm.wa_group_jid,
+		       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS who,
+		       split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+		       COALESCE(rm.body, ''), rm.has_media, COALESCE(rm.deleted, false), rm.received_at
+		FROM raw_messages rm
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+		WHERE ($1 = '' OR split_part(COALESCE(rm.sender_jid, ''), '@', 1) LIKE '%' || $1)
+		  AND ($2 = '' OR COALESCE(po.name, '') ILIKE '%' || $2 || '%' OR COALESCE(rm.sender_name, '') ILIKE '%' || $2 || '%')
+		  AND ($3::timestamptz IS NULL OR rm.received_at >= $3::timestamptz)
+		  AND ($4::timestamptz IS NULL OR rm.received_at < $4::timestamptz)
+		  AND ($5 = '' OR rm.wa_group_jid = $5)
+		ORDER BY rm.received_at DESC
+		LIMIT $6
+	`, phoneSuffix, nameLike, from, to, groupJID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []StoredMessage
+	for rows.Next() {
+		var m StoredMessage
+		if err := rows.Scan(&m.GroupJID, &m.Who, &m.Phone, &m.Body, &m.HasMedia, &m.Deleted, &m.ReceivedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// SenderCandidate — кандидат-получатель личного сообщения (реальный номер).
+type SenderCandidate struct {
+	Phone string
+	Name  string
+}
+
+// SenderCandidates ищет РЕАЛЬНЫЕ номера по последним цифрам и/или имени, чтобы
+// отправить личное сообщение по частичному номеру или имени. Берём ТОЛЬКО тех,
+// кто реально писал с видимого номера (@s.whatsapp.net): скрытые @lid и просто
+// записанные в память номера, которых мы не видели как реальных отправителей,
+// НЕ предлагаем — иначе личное сообщение могло бы уйти не тому (на псевдо-номер
+// lid или на чужой номер). Имя из памяти номеров всё равно подхватывается через
+// join, если этот человек когда-то писал с видимого номера.
+func (d *DB) SenderCandidates(ctx context.Context, phoneSuffix, nameLike string, limit int) ([]SenderCandidate, error) {
+	if limit <= 0 || limit > 50 {
+		limit = 10
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT phone, COALESCE(MAX(name), '') AS name
+		FROM (
+			SELECT split_part(rm.sender_jid, '@', 1) AS phone,
+			       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, '')) AS name,
+			       rm.received_at AS seen
+			FROM raw_messages rm
+			LEFT JOIN phone_owners po ON po.phone = split_part(rm.sender_jid, '@', 1)
+			WHERE COALESCE(rm.sender_jid, '') LIKE '%@s.whatsapp.net'
+			  AND ($1 = '' OR split_part(rm.sender_jid, '@', 1) LIKE '%' || $1)
+			  AND ($2 = '' OR COALESCE(po.name, '') ILIKE '%' || $2 || '%' OR COALESCE(rm.sender_name, '') ILIKE '%' || $2 || '%')
+		) t
+		WHERE length(phone) BETWEEN 10 AND 15
+		GROUP BY phone
+		ORDER BY MAX(seen) DESC NULLS LAST
+		LIMIT $3
+	`, phoneSuffix, nameLike, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []SenderCandidate
+	for rows.Next() {
+		var c SenderCandidate
+		if err := rows.Scan(&c.Phone, &c.Name); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
 // SetReceiptCollectorByMessage привязывает чек (по id сообщения WhatsApp)
 // к ответственному, который "забрал" деньги — заполняет submitted_by.
 // Возвращает данные чека для подтверждения.
