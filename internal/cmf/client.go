@@ -406,16 +406,14 @@ func (c *Client) ContractPayments(ctx context.Context, contractID, branchID stri
 	return out, nil
 }
 
-// PaymentsAround возвращает ВСЕ платежи клиента (по всем договорам) в окне
-// ±windowDays вокруг даты чека — чтобы сверка сопоставляла чек↔платёж 1:1
-// (потребляя каждый платёж один раз), а не просто «есть ли платёж на сумму».
-func (c *Client) PaymentsAround(ctx context.Context, clientID string, txDate time.Time, windowDays int) ([]Payment, error) {
+// PaymentsBetween возвращает ВСЕ платежи клиента (по всем договорам) за период
+// [from, to]. Основа для сверки: собираем все внесённые оплаты клиента разом и
+// сопоставляем с его чеками 1:1 (потребляя каждый платёж один раз).
+func (c *Client) PaymentsBetween(ctx context.Context, clientID string, from, to time.Time) ([]Payment, error) {
 	contracts, err := c.ClientContracts(ctx, clientID)
 	if err != nil {
 		return nil, err
 	}
-	from := txDate.AddDate(0, 0, -windowDays)
-	to := txDate.AddDate(0, 0, windowDays)
 	var out []Payment
 	for _, contract := range contracts {
 		payments, err := c.ContractPayments(ctx, contract.ID, contract.BranchID, from, to)
@@ -425,6 +423,11 @@ func (c *Client) PaymentsAround(ctx context.Context, clientID string, txDate tim
 		out = append(out, payments...)
 	}
 	return out, nil
+}
+
+// PaymentsAround возвращает платежи клиента в окне ±windowDays вокруг даты чека.
+func (c *Client) PaymentsAround(ctx context.Context, clientID string, txDate time.Time, windowDays int) ([]Payment, error) {
+	return c.PaymentsBetween(ctx, clientID, txDate.AddDate(0, 0, -windowDays), txDate.AddDate(0, 0, windowDays))
 }
 
 // HasPaymentAround проверяет, есть ли у клиента ОДИНОЧНЫЙ платёж на данную сумму

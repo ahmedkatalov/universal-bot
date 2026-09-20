@@ -549,101 +549,222 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		return "За " + periodLabel + " распознанных чеков в учёте нет.", nil
 	}
 
-	// Кэш платежей по клиенту с пометкой «уже засчитан» — чтобы ОДИН платёж в
-	// программе не закрывал ДВА одинаковых чека (каждый чек потребляет свой
-	// платёж 1:1, а не просто «есть ли платёж на сумму»).
-	type usedPayments struct {
-		pays []cmf.Payment
-		used []bool
-	}
-	cache := map[string]*usedPayments{}
-
-	// Кэш поиска клиента по имени: у клиента за период часто несколько чеков —
-	// не дёргаем программу повторно (меньше нагрузка и меньше шанс сетевой ошибки).
-	type lookupResult struct {
-		clients []cmf.ClientInfo
-		exact   bool
-		err     error
-	}
-	lookupCache := map[string]lookupResult{}
-
-	var added, missing, noClient []string
+	// Группируем чеки ПО КЛИЕНТУ (нормализованное имя), сохраняя порядок.
+	order := []string{}
+	buckets := map[string]*clientChecks{}
 	for _, r := range receipts {
 		key := strings.ToLower(strings.Join(strings.Fields(r.Name), " "))
-		lr, ok := lookupCache[key]
-		if !ok {
-			c, ex, e := b.cmfLookupWithTypos(ctx, r.Name)
-			lr = lookupResult{clients: c, exact: ex, err: e}
-			lookupCache[key] = lr
+		bk := buckets[key]
+		if bk == nil {
+			bk = &clientChecks{display: r.Name}
+			buckets[key] = bk
+			order = append(order, key)
 		}
-		clients, exact, err := lr.clients, lr.exact, lr.err
-		if err != nil {
-			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка поиска в программе)", r.Name, r.Amount))
-			continue
-		}
+		bk.checks = append(bk.checks, recCheck{amount: r.Amount, date: r.TxDate})
+	}
+
+	// Платежи клиента берём за ВЕСЬ период плюс запас — оплату часто вносят на
+	// несколько дней позже даты операции на чеке (владелец: «дата примерная»).
+	fetchFrom := from.AddDate(0, 0, -cmfMatchMarginDays)
+	fetchTo := to.AddDate(0, 0, cmfMatchMarginDays)
+
+	var problems []string  // клиенты, где есть НЕ внесённые чеки — подробно
+	var okLines []string   // клиенты, где всё внесено — компактно
+	var attention []string // клиента нет в программе / нечётко / неоднозначно
+	entered, notEntered := 0, 0
+
+	for _, key := range order {
+		bk := buckets[key]
+		clients, exact, err := b.cmfLookupWithTypos(ctx, bk.display)
 		switch {
+		case err != nil:
+			attention = append(attention, fmt.Sprintf("%s — ошибка поиска в программе (%s)", bk.display, checksBrief(bk.checks)))
+			continue
 		case len(clients) == 0:
-			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (клиента нет в программе)", r.Name, r.Amount))
-		case len(clients) == 1 && exact:
-			cid := clients[0].ID
-			up := cache[cid]
-			if up == nil {
-				pays, perr := b.cmf.PaymentsAround(ctx, cid, r.TxDate, 5)
-				if perr != nil {
-					noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (ошибка проверки платежа)", clients[0].FullName, r.Amount))
-					continue
-				}
-				up = &usedPayments{pays: pays, used: make([]bool, len(pays))}
-				cache[cid] = up
-			}
-			wantRub := int64(r.Amount + 0.5)
-			wantKop := int64(r.Amount*100 + 0.5)
-			matched := -1
-			for i, p := range up.pays {
-				if up.used[i] {
-					continue
-				}
-				if p.Amount == wantRub || p.Amount == wantKop {
-					matched = i
-					break
-				}
-			}
-			line := fmt.Sprintf("%s — %.0f ₽ (чек от %s)", clients[0].FullName, r.Amount, r.TxDate.Format("02.01"))
-			if matched >= 0 {
-				up.used[matched] = true
-				added = append(added, line)
-			} else {
-				missing = append(missing, line)
-			}
+			attention = append(attention, fmt.Sprintf("%s — в программе не найден (%s)", bk.display, checksBrief(bk.checks)))
+			continue
 		case len(clients) == 1 && !exact:
-			// Нашли по нечёткому совпадению одного слова — это может быть тёзка/
-			// однофамилец. НЕ утверждаем «внесён/не внесён»: показываем реального
-			// плательщика из чека и кандидата как подсказку для ручной проверки.
-			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (в программе точно не найден; похоже на «%s» — проверь вручную)", r.Name, r.Amount, clients[0].FullName))
-		default:
+			attention = append(attention, fmt.Sprintf("%s — точного совпадения нет, похоже на «%s», проверь вручную (%s)", bk.display, clients[0].FullName, checksBrief(bk.checks)))
+			continue
+		case len(clients) > 1:
 			var names []string
 			for _, c := range clients {
 				names = append(names, c.FullName)
 			}
-			noClient = append(noClient, fmt.Sprintf("%s — %.0f ₽ (несколько клиентов: %s)", r.Name, r.Amount, strings.Join(names, ", ")))
+			attention = append(attention, fmt.Sprintf("%s — несколько клиентов (%s), уточни (%s)", bk.display, strings.Join(names, ", "), checksBrief(bk.checks)))
+			continue
 		}
+
+		// Ровно один точный клиент — собираем его оплаты и сопоставляем 1:1.
+		client := clients[0]
+		pays, perr := b.cmf.PaymentsBetween(ctx, client.ID, fetchFrom, fetchTo)
+		if perr != nil {
+			attention = append(attention, fmt.Sprintf("%s — ошибка проверки платежей (%s)", client.FullName, checksBrief(bk.checks)))
+			continue
+		}
+		matches, unmatched, leftover, kopecks := matchChecksToPayments(bk.checks, pays)
+		entered += len(matches)
+		notEntered += len(unmatched)
+
+		if len(unmatched) == 0 {
+			okLines = append(okLines, fmt.Sprintf("%s — все %d внесены", client.FullName, len(bk.checks)))
+			continue
+		}
+		// Есть невнесённые — подробный блок с логикой сопоставления.
+		var blk strings.Builder
+		fmt.Fprintf(&blk, "%s:", client.FullName)
+		for _, m := range matches {
+			pd := ""
+			if !m.pay.PaidAt.IsZero() {
+				pd = " (оплата " + m.pay.PaidAt.Format("02.01") + ")"
+			}
+			fmt.Fprintf(&blk, "\n  ✅ чек %s · %.0f ₽ — внесён%s", m.check.date.Format("02.01"), m.check.amount, pd)
+		}
+		for _, uc := range unmatched {
+			fmt.Fprintf(&blk, "\n  ❌ чек %s · %.0f ₽ — НЕ внесён", uc.date.Format("02.01"), uc.amount)
+		}
+		// Оставшиеся оплаты (без чека) показываем как подсказку — только если знаем
+		// единицу суммы (были совпадения); иначе только число, чтобы не путать.
+		if len(leftover) > 0 {
+			if len(matches) > 0 {
+				for _, lp := range leftover {
+					amt := float64(lp.Amount)
+					if kopecks {
+						amt /= 100
+					}
+					when := ""
+					if !lp.PaidAt.IsZero() {
+						when = lp.PaidAt.Format("02.01") + " · "
+					}
+					fmt.Fprintf(&blk, "\n  ⚠️ в программе есть оплата %s%.0f ₽ без чека", when, amt)
+				}
+			} else {
+				fmt.Fprintf(&blk, "\n  ⚠️ в программе есть %d внесённых оплат(ы), не совпавших с чеками — проверь вручную", len(leftover))
+			}
+		}
+		problems = append(problems, blk.String())
 	}
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "Сверка с программой за %s (чеков: %d):\n\n", periodLabel, len(receipts))
-	if len(missing) > 0 {
-		fmt.Fprintf(&sb, "❌ НЕ внесены в программу (%d):\n- %s\n\n", len(missing), strings.Join(missing, "\n- "))
+	if len(problems) > 0 {
+		sb.WriteString(strings.Join(problems, "\n\n"))
+		sb.WriteString("\n\n")
 	}
-	if len(noClient) > 0 {
-		fmt.Fprintf(&sb, "⚠️ Требуют внимания (%d):\n- %s\n\n", len(noClient), strings.Join(noClient, "\n- "))
+	if len(attention) > 0 {
+		fmt.Fprintf(&sb, "⚠️ Требуют внимания:\n- %s\n\n", strings.Join(attention, "\n- "))
 	}
-	if len(added) > 0 {
-		fmt.Fprintf(&sb, "✅ Уже внесены (%d):\n- %s\n", len(added), strings.Join(added, "\n- "))
+	if len(okLines) > 0 {
+		fmt.Fprintf(&sb, "✅ Полностью внесены:\n- %s\n\n", strings.Join(okLines, "\n- "))
 	}
-	if len(missing) == 0 && len(noClient) == 0 {
-		sb.WriteString("Все чеки внесены в программу ✅")
+	fmt.Fprintf(&sb, "Итого: внесено чеков %d, НЕ внесено %d", entered, notEntered)
+	if len(attention) > 0 {
+		fmt.Fprintf(&sb, ", клиентов на ручную проверку %d", len(attention))
 	}
+	sb.WriteString(".")
 	return sb.String(), nil
+}
+
+// cmfMatchMarginDays — на сколько дней шире периода берём оплаты клиента при
+// сверке: оплату вносят не в день чека, а на несколько дней позже/раньше.
+const cmfMatchMarginDays = 14
+
+// recCheck — распознанный чек для сопоставления с оплатами программы.
+type recCheck struct {
+	amount float64
+	date   time.Time
+}
+
+// clientChecks — все чеки одного клиента за период сверки.
+type clientChecks struct {
+	display string // имя из чека (для поиска и показа, пока не нашли в программе)
+	checks  []recCheck
+}
+
+// cmfMatch — сопоставленная пара чек↔оплата.
+type cmfMatch struct {
+	check recCheck
+	pay   cmf.Payment
+}
+
+// checksBrief — краткое перечисление чеков клиента (для строки «требуют внимания»).
+func checksBrief(checks []recCheck) string {
+	parts := make([]string, 0, len(checks))
+	for _, c := range checks {
+		parts = append(parts, fmt.Sprintf("%s · %.0f ₽", c.date.Format("02.01"), c.amount))
+	}
+	if len(parts) == 1 {
+		return "чек " + parts[0]
+	}
+	return fmt.Sprintf("%d чек(ов): %s", len(parts), strings.Join(parts, ", "))
+}
+
+// matchChecksToPayments сопоставляет чеки клиента с его оплатами в программе 1:1
+// по СУММЕ (в рублях или копейках), предпочитая БЛИЖАЙШУЮ по дате оплату (даты
+// приблизительные — оплату вносят на несколько дней позже/раньше чека). Одна
+// оплата закрывает не более одного чека. Возвращает совпавшие пары, невнесённые
+// чеки, оставшиеся (без чека) оплаты и признак, что суммы программы — в копейках.
+func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmfMatch, unmatched []recCheck, leftover []cmf.Payment, kopecks bool) {
+	usedPay := make([]bool, len(pays))
+	matchedTo := make([]int, len(checks))
+	for i := range matchedTo {
+		matchedTo[i] = -1
+	}
+	type pair struct {
+		ci, pj int
+		dist   time.Duration
+		kop    bool
+	}
+	const noDate = time.Duration(1) << 62 // оплата без даты — сопоставляем в последнюю очередь
+	var pairs []pair
+	for ci, c := range checks {
+		wantRub := int64(c.amount + 0.5)
+		wantKop := int64(c.amount*100 + 0.5)
+		for pj, p := range pays {
+			kop := false
+			switch {
+			case p.Amount == wantRub:
+			case p.Amount == wantKop:
+				kop = true
+			default:
+				continue
+			}
+			dist := noDate
+			if !p.PaidAt.IsZero() {
+				if dist = p.PaidAt.Sub(c.date); dist < 0 {
+					dist = -dist
+				}
+			}
+			pairs = append(pairs, pair{ci, pj, dist, kop})
+		}
+	}
+	// Ближайшие по дате пары — в первую очередь; жадно назначаем 1:1.
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].dist < pairs[j].dist })
+	kopVotes := 0
+	for _, pr := range pairs {
+		if matchedTo[pr.ci] >= 0 || usedPay[pr.pj] {
+			continue
+		}
+		matchedTo[pr.ci] = pr.pj
+		usedPay[pr.pj] = true
+		if pr.kop {
+			kopVotes++
+		}
+	}
+	for ci, c := range checks {
+		if matchedTo[ci] >= 0 {
+			matches = append(matches, cmfMatch{check: c, pay: pays[matchedTo[ci]]})
+		} else {
+			unmatched = append(unmatched, c)
+		}
+	}
+	for pj, p := range pays {
+		if !usedPay[pj] {
+			leftover = append(leftover, p)
+		}
+	}
+	kopecks = kopVotes*2 > len(matches)
+	return
 }
 
 // cmfLookupWithTypos ищет клиента с допуском на опечатки. Возвращает exact:
