@@ -563,16 +563,13 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		bk.checks = append(bk.checks, recCheck{amount: r.Amount, date: r.TxDate})
 	}
 
-	// Платежи клиента берём за ВЕСЬ период плюс запас — оплату часто вносят на
-	// несколько дней позже даты операции на чеке (владелец: «дата примерная»).
-	fetchFrom := from.AddDate(0, 0, -cmfMatchMarginDays)
-	fetchTo := to.AddDate(0, 0, cmfMatchMarginDays)
-
-	var problems []string  // клиенты, где есть НЕ внесённые чеки — подробно
-	var okLines []string   // клиенты, где всё внесено — компактно
-	var attention []string // клиента нет в программе / нечётко / неоднозначно
-	entered, notEntered := 0, 0
-
+	// Резолвим каждое имя в клиента программы и СВОДИМ по ID клиента: один человек
+	// под двумя написаниями (ФИО из чека vs подпись рядом) — это один клиент, и его
+	// чеки должны делить общий набор оплат (иначе одна оплата «закрыла» бы чек в
+	// каждой группе — ложное «внесён»). Не разрешившиеся имена — в «требуют внимания».
+	var attention []string
+	cidOrder := []string{}
+	cidGroups := map[string]*clientChecks{}
 	for _, key := range order {
 		bk := buckets[key]
 		clients, exact, err := b.cmfLookupWithTypos(ctx, bk.display)
@@ -594,25 +591,43 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 			attention = append(attention, fmt.Sprintf("%s — несколько клиентов (%s), уточни (%s)", bk.display, strings.Join(names, ", "), checksBrief(bk.checks)))
 			continue
 		}
-
-		// Ровно один точный клиент — собираем его оплаты и сопоставляем 1:1.
 		client := clients[0]
-		pays, perr := b.cmf.PaymentsBetween(ctx, client.ID, fetchFrom, fetchTo)
+		g := cidGroups[client.ID]
+		if g == nil {
+			g = &clientChecks{display: client.FullName}
+			cidGroups[client.ID] = g
+			cidOrder = append(cidOrder, client.ID)
+		}
+		g.checks = append(g.checks, bk.checks...)
+	}
+
+	// Платежи клиента берём за период плюс запас по датам (оплату вносят позже дня
+	// чека); в самом сопоставлении окно сужается асимметрично (см. matchChecks...).
+	fetchFrom := from.AddDate(0, 0, -cmfGapBackwardDays)
+	fetchTo := to.AddDate(0, 0, cmfGapForwardDays)
+
+	var problems []string // клиенты, где есть НЕ внесённые чеки — подробно
+	var okLines []string  // клиенты, где всё внесено — компактно
+	entered, notEntered := 0, 0
+
+	for _, cid := range cidOrder {
+		g := cidGroups[cid]
+		pays, perr := b.cmf.PaymentsBetween(ctx, cid, fetchFrom, fetchTo)
 		if perr != nil {
-			attention = append(attention, fmt.Sprintf("%s — ошибка проверки платежей (%s)", client.FullName, checksBrief(bk.checks)))
+			attention = append(attention, fmt.Sprintf("%s — ошибка проверки платежей (%s)", g.display, checksBrief(g.checks)))
 			continue
 		}
-		matches, unmatched, leftover, kopecks := matchChecksToPayments(bk.checks, pays)
+		matches, unmatched, leftover, kopecks := matchChecksToPayments(g.checks, pays)
 		entered += len(matches)
 		notEntered += len(unmatched)
 
 		if len(unmatched) == 0 {
-			okLines = append(okLines, fmt.Sprintf("%s — все %d внесены", client.FullName, len(bk.checks)))
+			okLines = append(okLines, fmt.Sprintf("%s — все %d внесены", g.display, len(g.checks)))
 			continue
 		}
 		// Есть невнесённые — подробный блок с логикой сопоставления.
 		var blk strings.Builder
-		fmt.Fprintf(&blk, "%s:", client.FullName)
+		fmt.Fprintf(&blk, "%s:", g.display)
 		for _, m := range matches {
 			pd := ""
 			if !m.pay.PaidAt.IsZero() {
@@ -665,9 +680,14 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	return sb.String(), nil
 }
 
-// cmfMatchMarginDays — на сколько дней шире периода берём оплаты клиента при
-// сверке: оплату вносят не в день чека, а на несколько дней позже/раньше.
-const cmfMatchMarginDays = 14
+// Окно сопоставления чек↔оплата по дате. Оплату в программу вносят в день чека
+// или ПОЗЖЕ (получили чек — внесли), поэтому вперёд допускаем до 20 дней, а назад
+// (оплата раньше даты чека) — лишь небольшой допуск на перекос дат. Так оплату
+// прошлого месяца (у клиента фикс. платёж) не припишем к чеку этого месяца.
+const (
+	cmfGapForwardDays  = 20
+	cmfGapBackwardDays = 3
+)
 
 // recCheck — распознанный чек для сопоставления с оплатами программы.
 type recCheck struct {
@@ -699,12 +719,49 @@ func checksBrief(checks []recCheck) string {
 	return fmt.Sprintf("%d чек(ов): %s", len(parts), strings.Join(parts, ", "))
 }
 
+// paymentsInKopecks решает ОДИН раз, в каких единицах программа хранит суммы:
+// считает, сколько чеков находят оплату при трактовке «рубли» против «копейки»
+// (×100), и берёт большее. Единая единица важна: иначе одна оплата совпала бы с
+// двумя чеками, чьи суммы различаются ровно в 100 раз (10000₽ и 100₽), и жадное
+// сопоставление «украло» бы платёж, ложно пометив настоящий чек невнесённым.
+func paymentsInKopecks(checks []recCheck, pays []cmf.Payment) bool {
+	rub, kop := 0, 0
+	for _, c := range checks {
+		wr := int64(c.amount + 0.5)
+		wk := int64(c.amount*100 + 0.5)
+		for _, p := range pays {
+			if p.Amount == wr {
+				rub++
+				break
+			}
+		}
+		for _, p := range pays {
+			if p.Amount == wk {
+				kop++
+				break
+			}
+		}
+	}
+	return kop > rub
+}
+
 // matchChecksToPayments сопоставляет чеки клиента с его оплатами в программе 1:1
-// по СУММЕ (в рублях или копейках), предпочитая БЛИЖАЙШУЮ по дате оплату (даты
-// приблизительные — оплату вносят на несколько дней позже/раньше чека). Одна
-// оплата закрывает не более одного чека. Возвращает совпавшие пары, невнесённые
-// чеки, оставшиеся (без чека) оплаты и признак, что суммы программы — в копейках.
+// по СУММЕ (в ЕДИНОЙ единице — рубли или копейки, определяется по всему набору),
+// предпочитая БЛИЖАЙШУЮ по дате оплату в допустимом окне [-назад, +вперёд] дней
+// (оплату вносят в день чека или позже). Одна оплата закрывает не более одного
+// чека. Возвращает совпавшие пары, невнесённые чеки, оставшиеся (без чека) оплаты
+// и признак, что суммы программы — в копейках.
 func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmfMatch, unmatched []recCheck, leftover []cmf.Payment, kopecks bool) {
+	kopecks = paymentsInKopecks(checks, pays)
+	want := func(amount float64) int64 {
+		if kopecks {
+			return int64(amount*100 + 0.5)
+		}
+		return int64(amount + 0.5)
+	}
+	forward := time.Duration(cmfGapForwardDays) * 24 * time.Hour
+	backward := time.Duration(cmfGapBackwardDays) * 24 * time.Hour
+
 	usedPay := make([]bool, len(pays))
 	matchedTo := make([]int, len(checks))
 	for i := range matchedTo {
@@ -712,44 +769,39 @@ func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmf
 	}
 	type pair struct {
 		ci, pj int
-		dist   time.Duration
-		kop    bool
+		key    time.Duration // близость по дате (модуль); для оплат без даты — в конец
 	}
-	const noDate = time.Duration(1) << 62 // оплата без даты — сопоставляем в последнюю очередь
+	const noDate = time.Duration(1) << 62
 	var pairs []pair
 	for ci, c := range checks {
-		wantRub := int64(c.amount + 0.5)
-		wantKop := int64(c.amount*100 + 0.5)
+		w := want(c.amount)
 		for pj, p := range pays {
-			kop := false
-			switch {
-			case p.Amount == wantRub:
-			case p.Amount == wantKop:
-				kop = true
-			default:
+			if p.Amount != w {
 				continue
 			}
-			dist := noDate
+			key := noDate // оплата без распознанной даты — годится, но в последнюю очередь
 			if !p.PaidAt.IsZero() {
-				if dist = p.PaidAt.Sub(c.date); dist < 0 {
-					dist = -dist
+				delta := p.PaidAt.Sub(c.date)
+				if delta > forward || delta < -backward {
+					continue // оплата вне окна по дате — это не платёж по этому чеку
+				}
+				if key = delta; key < 0 {
+					key = -key
 				}
 			}
-			pairs = append(pairs, pair{ci, pj, dist, kop})
+			pairs = append(pairs, pair{ci, pj, key})
 		}
 	}
-	// Ближайшие по дате пары — в первую очередь; жадно назначаем 1:1.
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].dist < pairs[j].dist })
-	kopVotes := 0
+	// Ближайшие по дате пары — в первую очередь; жадно назначаем 1:1. Единая
+	// единица делает граф разбитым на компоненты одной суммы, где такой жадный
+	// выбор даёт максимум совпадений.
+	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
 	for _, pr := range pairs {
 		if matchedTo[pr.ci] >= 0 || usedPay[pr.pj] {
 			continue
 		}
 		matchedTo[pr.ci] = pr.pj
 		usedPay[pr.pj] = true
-		if pr.kop {
-			kopVotes++
-		}
 	}
 	for ci, c := range checks {
 		if matchedTo[ci] >= 0 {
@@ -763,7 +815,6 @@ func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmf
 			leftover = append(leftover, p)
 		}
 	}
-	kopecks = kopVotes*2 > len(matches)
 	return
 }
 

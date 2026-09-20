@@ -65,4 +65,33 @@ func TestMatchChecksToPayments(t *testing.T) {
 	if len(un) != 0 || len(left) != 1 || left[0].Amount != 5000 {
 		t.Fatalf("leftover: unmatched=%d leftover=%d, ожидали 0/1 (оплата 5000 без чека)", len(un), len(left))
 	}
+
+	// 6) Единая единица: чек 100 ₽ НЕ должен «украсть» оплату 10000 ₽ (×100).
+	//    Обе оплаты в рублях -> оба чека внесены, ничего не потеряно.
+	m, un, left, kop2 := matchChecksToPayments(
+		[]recCheck{{amount: 10000, date: d(1)}, {amount: 100, date: d(2)}},
+		[]cmf.Payment{{Amount: 10000, PaidAt: d(3)}, {Amount: 100, PaidAt: d(4)}},
+	)
+	if len(m) != 2 || len(un) != 0 || len(left) != 0 || kop2 {
+		t.Fatalf("двойная единица: matches=%d unmatched=%d leftover=%d kopecks=%v, ожидали 2/0/0/false", len(m), len(un), len(left), kop2)
+	}
+
+	// 7) Оплата ПРОШЛОГО месяца (та же сумма) НЕ засчитывает чек этого месяца.
+	jul20 := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	m, un, _, _ = matchChecksToPayments(
+		[]recCheck{{amount: 20000, date: d(20)}}, // чек 20 августа
+		[]cmf.Payment{{Amount: 20000, PaidAt: jul20}},
+	)
+	if len(m) != 0 || len(un) != 1 {
+		t.Fatalf("кросс-месяц: matches=%d unmatched=%d, ожидали 0/1 (июльская оплата не закрывает августовский чек)", len(m), len(un))
+	}
+
+	// 8) Оплата раньше чека в пределах допуска (−3 дня) засчитывается.
+	m, un, _, _ = matchChecksToPayments(
+		[]recCheck{{amount: 30000, date: d(10)}},
+		[]cmf.Payment{{Amount: 30000, PaidAt: d(8)}},
+	)
+	if len(m) != 1 || len(un) != 0 {
+		t.Fatalf("оплата на 2 дня раньше: matches=%d unmatched=%d, ожидали 1/0", len(m), len(un))
+	}
 }
