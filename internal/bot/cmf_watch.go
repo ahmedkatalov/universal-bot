@@ -762,24 +762,28 @@ func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmf
 	forward := time.Duration(cmfGapForwardDays) * 24 * time.Hour
 	backward := time.Duration(cmfGapBackwardDays) * 24 * time.Hour
 
-	usedPay := make([]bool, len(pays))
-	matchedTo := make([]int, len(checks))
-	for i := range matchedTo {
-		matchedTo[i] = -1
-	}
-	type pair struct {
+	const noDate = time.Duration(1) << 62 // оплата без даты — годится, но в последнюю очередь
+
+	// Для каждого чека — подходящие оплаты (совпала сумма и дата в окне), от
+	// БЛИЖАЙШЕЙ по дате к дальней. Пара — ребро двудольного графа.
+	adj := make([][]int, len(checks))
+	type gpair struct {
 		ci, pj int
-		key    time.Duration // близость по дате (модуль); для оплат без даты — в конец
+		key    time.Duration
 	}
-	const noDate = time.Duration(1) << 62
-	var pairs []pair
+	var gpairs []gpair
 	for ci, c := range checks {
 		w := want(c.amount)
+		type cand struct {
+			pj  int
+			key time.Duration
+		}
+		var cs []cand
 		for pj, p := range pays {
 			if p.Amount != w {
 				continue
 			}
-			key := noDate // оплата без распознанной даты — годится, но в последнюю очередь
+			key := noDate
 			if !p.PaidAt.IsZero() {
 				delta := p.PaidAt.Sub(c.date)
 				if delta > forward || delta < -backward {
@@ -789,29 +793,68 @@ func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmf
 					key = -key
 				}
 			}
-			pairs = append(pairs, pair{ci, pj, key})
+			cs = append(cs, cand{pj, key})
+		}
+		sort.Slice(cs, func(a, b int) bool { return cs[a].key < cs[b].key })
+		for _, x := range cs {
+			adj[ci] = append(adj[ci], x.pj)
+			gpairs = append(gpairs, gpair{ci, x.pj, x.key})
 		}
 	}
-	// Ближайшие по дате пары — в первую очередь; жадно назначаем 1:1. Единая
-	// единица делает граф разбитым на компоненты одной суммы, где такой жадный
-	// выбор даёт максимум совпадений.
-	sort.Slice(pairs, func(i, j int) bool { return pairs[i].key < pairs[j].key })
-	for _, pr := range pairs {
-		if matchedTo[pr.ci] >= 0 || usedPay[pr.pj] {
-			continue
-		}
-		matchedTo[pr.ci] = pr.pj
-		usedPay[pr.pj] = true
+
+	matchPay := make([]int, len(pays)) // оплата pj -> чек ci (или -1)
+	for j := range matchPay {
+		matchPay[j] = -1
 	}
+	matchCheck := make([]int, len(checks)) // чек ci -> оплата pj (или -1)
+	for i := range matchCheck {
+		matchCheck[i] = -1
+	}
+
+	// Фаза 1: жадно по близости даты — предпочтение ближайшей оплате (при равной
+	// мощности решает, какой именно чек считать внесённым).
+	sort.SliceStable(gpairs, func(i, j int) bool { return gpairs[i].key < gpairs[j].key })
+	for _, pr := range gpairs {
+		if matchCheck[pr.ci] == -1 && matchPay[pr.pj] == -1 {
+			matchCheck[pr.ci] = pr.pj
+			matchPay[pr.pj] = pr.ci
+		}
+	}
+
+	// Фаза 2: дополняющие пути (алгоритм Куна) доводят число совпадений до
+	// МАКСИМУМА. Окно по датам делает граф неполным, поэтому одного жадного прохода
+	// мало: чек с единственной доступной оплатой мог бы остаться без пары, хотя
+	// оплата есть — тогда бы вышло ложное «НЕ внесён».
+	var augment func(ci int, seen []bool) bool
+	augment = func(ci int, seen []bool) bool {
+		for _, pj := range adj[ci] {
+			if seen[pj] {
+				continue
+			}
+			seen[pj] = true
+			if matchPay[pj] == -1 || augment(matchPay[pj], seen) {
+				matchPay[pj] = ci
+				matchCheck[ci] = pj
+				return true
+			}
+		}
+		return false
+	}
+	for ci := range checks {
+		if matchCheck[ci] == -1 {
+			augment(ci, make([]bool, len(pays)))
+		}
+	}
+
 	for ci, c := range checks {
-		if matchedTo[ci] >= 0 {
-			matches = append(matches, cmfMatch{check: c, pay: pays[matchedTo[ci]]})
+		if matchCheck[ci] >= 0 {
+			matches = append(matches, cmfMatch{check: c, pay: pays[matchCheck[ci]]})
 		} else {
 			unmatched = append(unmatched, c)
 		}
 	}
 	for pj, p := range pays {
-		if !usedPay[pj] {
+		if matchPay[pj] == -1 {
 			leftover = append(leftover, p)
 		}
 	}

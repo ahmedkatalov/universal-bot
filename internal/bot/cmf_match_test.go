@@ -94,4 +94,16 @@ func TestMatchChecksToPayments(t *testing.T) {
 	if len(m) != 1 || len(un) != 0 {
 		t.Fatalf("оплата на 2 дня раньше: matches=%d unmatched=%d, ожидали 1/0", len(m), len(un))
 	}
+
+	// 9) Максимум совпадений при неполном графе (окно по датам): два чека 15000
+	//    (10.08 и 01.08) и две оплаты 15000 (10.08 и 25.08). Пара 01.08↔25.08 вне
+	//    окна (+24 дн). Жадность закрыла бы 10.08↔10.08 и оставила бы 01.08 без
+	//    пары, хотя оба платежа реальны. Дополняющий путь даёт 2 совпадения.
+	m, un, left, _ = matchChecksToPayments(
+		[]recCheck{{amount: 15000, date: d(10)}, {amount: 15000, date: d(1)}},
+		[]cmf.Payment{{Amount: 15000, PaidAt: d(10)}, {Amount: 15000, PaidAt: d(25)}},
+	)
+	if len(m) != 2 || len(un) != 0 || len(left) != 0 {
+		t.Fatalf("максимум совпадений: matches=%d unmatched=%d leftover=%d, ожидали 2/0/0 (оба чека внесены)", len(m), len(un), len(left))
+	}
 }
