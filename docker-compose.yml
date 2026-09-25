@@ -94,8 +94,19 @@ services:
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
       WHATSAPP_PROXY: ${WHATSAPP_PROXY:-}
+      # СЕКРЕТНЫЙ файл (например «доступы к проектам»): бот отдаёт его ТОЛЬКО в
+      # личке, ТОЛЬКО номерам из SECRET_FILE_RECIPIENTS, по секретному коду и
+      # ПОСЛЕ подтверждения «да». Файл кладётся в папку ./secret (она в .gitignore,
+      # в git НЕ попадает). Код — в .env (SECRET_FILE_CODE, тоже не в git); хранится
+      # у бота только как SHA-256, не логируется. ПУСТОЙ код => функция ВЫКЛючена.
+      SECRET_FILE_PATH: ${SECRET_FILE_PATH:-/app/secret/dostupy.pdf}
+      SECRET_FILE_NAME: ${SECRET_FILE_NAME:-Доступы к проектам.pdf}
+      SECRET_FILE_RECIPIENTS: ${SECRET_FILE_RECIPIENTS:-89287836800,89899171578,89280032462}
+      SECRET_FILE_CODE: ${SECRET_FILE_CODE:-}
     volumes:
       - bot_data:/app/data
+      # Папка с секретным файлом — только чтение. Положи сюда PDF (см. ./secret).
+      - ./secret:/app/secret:ro
     # При первом запуске QR-код печатается в логи контейнера:
     #   docker compose logs -f bot   (или docker-compose на старых версиях)
     # его нужно отсканировать с телефона (WhatsApp -> Связанные устройства)

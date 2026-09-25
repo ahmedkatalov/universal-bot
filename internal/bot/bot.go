@@ -96,6 +96,18 @@ type Bot struct {
 
 	// Проактивные вопросы "чей это чек" и привязка ответов к чекам.
 	clarify *clarifyState
+
+	// Секретный файл (например, «доступы к проектам»): отдаётся ТОЛЬКО в личке,
+	// ТОЛЬКО номерам из secretRecipients, по секретному коду и после подтверждения
+	// «да». Сам код НЕ храним — только его SHA-256 (secretCodeSHA). Всё выключено,
+	// если не задан код/файл/получатели.
+	secretHasCode    bool
+	secretCodeSHA    [32]byte
+	secretFilePath   string
+	secretFileName   string
+	secretRecipients map[string]bool
+	secretAskMu      sync.Mutex
+	secretAsk        map[string]time.Time // sender JID user -> когда спросили подтверждение
 }
 
 // pendingName — ФИО, написанное отправителем, пока без чека. amount — сумма,
@@ -195,7 +207,8 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		clarify:       newClarifyState(),
 	}
 
-	b.loadHistory(ctx) // восстановить память диалогов ассистента после рестарта
+	b.loadSecretFileConfig() // секретный файл (доступы) — выдача по коду в личке
+	b.loadHistory(ctx)       // восстановить память диалогов ассистента после рестарта
 
 	client.AddEventHandler(b.handleEvent)
 	go b.cmfWatcherLoop() // сверка чеков с программой рассрочек (no-op, если cmf == nil)
@@ -326,6 +339,11 @@ func (b *Bot) handleEvent(evt interface{}) {
 	}
 
 	if !msg.Info.IsGroup {
+		// Выдача секретного файла (по коду, для белого списка номеров) —
+		// ДО логирования и до всего остального, чтобы код не попал в логи/БД.
+		if b.handleSecretFile(msg) {
+			return
+		}
 		// Личный чат с номером бота — если настроен ассистент, отвечаем.
 		// В отдельной горутине: ответ ИИ может занимать десятки секунд,
 		// и он не должен блокировать разбор сообщений из групп.
