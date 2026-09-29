@@ -866,7 +866,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	isAdmin := b.isReportAdmin(msg.Info)
 	staticSys, dynSys := b.buildAssistantSystemPromptFor(ctx, isAdmin)
-	tools := b.assistantTools(ctx, chat, types.NewJID(msg.Info.Sender.User, types.DefaultUserServer), isAdmin, false)
+	tools := b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, false)
 
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
@@ -919,6 +919,20 @@ func (b *Bot) isReportAdmin(info types.MessageInfo) bool {
 		return true // список не задан — ограничение выключено
 	}
 	return b.reportAdmins[info.Sender.User] || b.reportAdmins[info.SenderAlt.User]
+}
+
+// ownerPersonalJID — ЛИЧНЫЙ (телефонный) JID отправителя для «напоминай мне»:
+// берём Sender, если он уже в phone-форме (@s.whatsapp.net); иначе SenderAlt
+// (PN-форма). WhatsApp часто адресует отправителя скрытым LID (@lid), и тогда
+// Sender.User — это LID, а не номер: слать на <lid>@s.whatsapp.net нельзя.
+func ownerPersonalJID(info types.MessageInfo) types.JID {
+	if info.Sender.Server == types.DefaultUserServer && info.Sender.User != "" {
+		return info.Sender.ToNonAD()
+	}
+	if info.SenderAlt.Server == types.DefaultUserServer && info.SenderAlt.User != "" {
+		return info.SenderAlt.ToNonAD()
+	}
+	return info.Sender.ToNonAD()
 }
 
 // assistantTools собирает набор инструментов ассистента с учётом прав:
@@ -1060,7 +1074,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	}
 	userText := senderName + ": " + query + quotedSenderPhoneNote(msg)
 
-	tools := b.assistantTools(ctx, chat, types.NewJID(msg.Info.Sender.User, types.DefaultUserServer), isAdmin, true)
+	tools := b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, true)
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
 	if err != nil {
