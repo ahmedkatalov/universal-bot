@@ -224,6 +224,35 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("создание таблицы phone_owners: %w", err)
 	}
 
+	// Durable-очередь «имён без чека» (ФИО клиента, присланное ПЕРЕД чеком).
+	// Раньше жила только в памяти и терялась при рестарте — теперь переживает
+	// перезапуск, а порядок выдачи идёт по времени сообщения WhatsApp (received_at),
+	// а не по времени обработки, поэтому FIFO чек↔имя не зависит от того, какая
+	// горутина/OCR закончилась первой. Съеденные/протухшие записи чистит уборщик.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS pending_client_names (
+			id             SERIAL PRIMARY KEY,
+			group_jid      TEXT NOT NULL,
+			sender_jid     TEXT NOT NULL,
+			name           TEXT NOT NULL,
+			amount         DOUBLE PRECISION NOT NULL DEFAULT 0,
+			raw_message_id INTEGER,
+			received_at    TIMESTAMPTZ NOT NULL,
+			consumed       BOOLEAN NOT NULL DEFAULT false,
+			consumed_at    TIMESTAMPTZ,
+			created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы pending_client_names: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_pending_names_queue
+		ON pending_client_names (group_jid, sender_jid, received_at)
+		WHERE consumed = false
+	`); err != nil {
+		return fmt.Errorf("индекс pending_client_names: %w", err)
+	}
+
 	// Наличные платежи: помечаем текстовые транзакции, которые реально наличка
 	// (а не переписанный текстом чек), чтобы отчёты считали их в сбор. Флаг
 	// проставляется при вставке; для уже накопленных данных — разовый backfill
@@ -1726,7 +1755,7 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 		  AND rm.sender_jid = $2
-		  AND br.created_at > $3
+		  AND rm.received_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
 		LIMIT 1
@@ -1738,7 +1767,9 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 }
 
 // ReattributeOldestUnconfirmedReceipt привязывает клиента к САМОМУ СТАРОМУ
-// неподтверждённому чеку от отправителя (FIFO — по порядку сообщений в чате).
+// неподтверждённому чеку от отправителя (FIFO). Порядок — по времени сообщения
+// WhatsApp (rm.received_at), а не по времени вставки строки: так привязка не
+// зависит от того, какая горутина/OCR закончилась первой, и переживает рестарт.
 func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
 	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
@@ -1749,10 +1780,10 @@ func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, 
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 			  AND rm.sender_jid = $2
-			  AND br.created_at > $3
+			  AND rm.received_at >= $3::timestamptz
 			  AND br.client_confirmed = false
 			  AND br.is_duplicate = false AND br.ignored = false
-			ORDER BY br.created_at ASC
+			ORDER BY rm.received_at ASC, br.id ASC
 			LIMIT 1
 		)
 		RETURNING amount::float8
@@ -1764,6 +1795,87 @@ func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, 
 		return false, 0, err
 	}
 	return true, amount, nil
+}
+
+// EnqueuePendingName сохраняет ФИО клиента, присланное ПЕРЕД чеком, в durable
+// очередь (переживает рестарт). Порядок выдачи — по времени сообщения WhatsApp
+// (received_at), а не по времени вставки. Держим не больше 20 несъеденных имён
+// на отправителя (старые гасим), чтобы «висяки» не копились.
+func (d *DB) EnqueuePendingName(ctx context.Context, groupJID, senderJID, name string, amount float64, rawMessageID int, receivedAt time.Time) error {
+	var rid any
+	if rawMessageID > 0 {
+		rid = rawMessageID
+	}
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO pending_client_names (group_jid, sender_jid, name, amount, raw_message_id, received_at)
+		VALUES ($1, $2, $3, $4, $5, $6)
+	`, groupJID, senderJID, name, amount, rid, receivedAt); err != nil {
+		return err
+	}
+	_, _ = d.pool.Exec(ctx, `
+		UPDATE pending_client_names SET consumed = true, consumed_at = now()
+		WHERE id IN (
+			SELECT id FROM pending_client_names
+			WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false
+			ORDER BY received_at DESC, id DESC OFFSET 20
+		)
+	`, groupJID, senderJID)
+	return nil
+}
+
+// TakePendingName атомарно забирает САМОЕ РАННЕЕ (по времени сообщения) ждущее
+// имя от group+sender, не старше окна (received_at >= since), и помечает его
+// съеденным в той же операции. FOR UPDATE SKIP LOCKED: два чека, пришедшие
+// одновременно от одного отправителя, не заберут одно и то же имя. ok=false,
+// если очередь пуста или всё протухло.
+func (d *DB) TakePendingName(ctx context.Context, groupJID, senderJID string, since time.Time) (name string, amount float64, ok bool, err error) {
+	return d.takePendingName(ctx, groupJID, senderJID, since, false)
+}
+
+// TakePendingNameWithAmount — как TakePendingName, но берёт только имя С СУММОЙ
+// (>0): для случая «фото наличных пришло ПОСЛЕ строки ФИО+сумма».
+func (d *DB) TakePendingNameWithAmount(ctx context.Context, groupJID, senderJID string, since time.Time) (name string, amount float64, ok bool, err error) {
+	return d.takePendingName(ctx, groupJID, senderJID, since, true)
+}
+
+func (d *DB) takePendingName(ctx context.Context, groupJID, senderJID string, since time.Time, requireAmount bool) (string, float64, bool, error) {
+	amountCond := ""
+	if requireAmount {
+		amountCond = "AND amount > 0"
+	}
+	var name string
+	var amount float64
+	err := d.pool.QueryRow(ctx, `
+		UPDATE pending_client_names SET consumed = true, consumed_at = now()
+		WHERE id = (
+			SELECT id FROM pending_client_names
+			WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false
+			  AND received_at >= $3::timestamptz `+amountCond+`
+			ORDER BY received_at ASC, id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING name, amount
+	`, groupJID, senderJID, since).Scan(&name, &amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", 0, false, nil
+	}
+	if err != nil {
+		return "", 0, false, err
+	}
+	return name, amount, true, nil
+}
+
+// PurgePendingNames чистит очередь: удаляет съеденные и протухшие записи.
+func (d *DB) PurgePendingNames(ctx context.Context, olderThan time.Time) (int64, error) {
+	tag, err := d.pool.Exec(ctx, `
+		DELETE FROM pending_client_names
+		WHERE consumed = true OR received_at < $1::timestamptz
+	`, olderThan)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // ReattributeReceiptByMessage переписывает получателя у чека, на который

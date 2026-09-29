@@ -160,57 +160,40 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 			return name, parser.ExtractAmount(quoted)
 		}
 	}
-	// 3. Имя из очереди (FIFO) — самое старое из написанных перед чеком.
-	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
-	b.pendingNameMu.Lock()
-	q := b.pendingNames[key]
-	// Отбрасываем протухшие (старше 6 минут) с головы очереди.
-	for len(q) > 0 && time.Since(q[0].at) > 6*time.Minute {
-		q = q[1:]
-	}
-	if len(q) > 0 {
-		name, amount := q[0].name, q[0].amount
-		b.pendingNames[key] = q[1:]
-		b.pendingNameMu.Unlock()
+	// 3. Имя из durable-очереди (FIFO) — самое РАННЕЕ по времени сообщения из
+	// написанных перед чеком, не старше окна спаривания. Очередь в БD, поэтому
+	// переживает рестарт; забор атомарный (не отдаст одно имя двум чекам).
+	since := time.Now().Add(-b.pairWindow)
+	if name, amount, ok, err := b.db.TakePendingName(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), since); err != nil {
+		fmt.Println("Очередь имён: ошибка выборки:", err)
+	} else if ok {
 		return name, amount
 	}
-	b.pendingNames[key] = q
-	b.pendingNameMu.Unlock()
 	return "", 0
 }
 
-// enqueuePendingName кладёт имя в конец очереди (имя ПЕРЕД будущим чеком).
-// amount — сумма из того же сообщения (0, если её не было).
-func (b *Bot) enqueuePendingName(msg *events.Message, name string, amount float64) {
-	key := msg.Info.Chat.String() + "|" + msg.Info.Sender.String()
-	b.pendingNameMu.Lock()
-	q := b.pendingNames[key]
-	q = append(q, pendingName{name: name, amount: amount, at: time.Now()})
-	if len(q) > 20 {
-		q = q[len(q)-20:]
+// enqueuePendingName кладёт имя в durable-очередь (имя ПЕРЕД будущим чеком).
+// amount — сумма из того же сообщения (0, если её не было). Порядок — по времени
+// сообщения WhatsApp (msg.Info.Timestamp), не по времени обработки.
+func (b *Bot) enqueuePendingName(ctx context.Context, msg *events.Message, name string, amount float64, rawID int) {
+	if err := b.db.EnqueuePendingName(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(),
+		name, amount, rawID, msg.Info.Timestamp); err != nil {
+		fmt.Println("Очередь имён: ошибка сохранения:", err)
 	}
-	b.pendingNames[key] = q
-	b.pendingNameMu.Unlock()
 }
 
-// consumePendingNameCash достаёт из очереди самое РАННЕЕ ждущее имя С СУММОЙ от
-// данного отправителя (для случая «фото наличных пришло после ФИО+сумма»).
-// Порядок с головы совпадает с resolveReceiptPayer (FIFO) — чтобы фото денег и
-// приходящие следом чеки разбирали очередь в одном порядке, а не крест-накрест.
-func (b *Bot) consumePendingNameCash(chat types.JID, senderJID string) (string, float64, bool) {
-	key := chat.String() + "|" + senderJID
-	b.pendingNameMu.Lock()
-	defer b.pendingNameMu.Unlock()
-	q := b.pendingNames[key]
-	for i := 0; i < len(q); i++ {
-		if q[i].amount > 0 && time.Since(q[i].at) <= cashLinkWindow {
-			name := q[i].name
-			amount := q[i].amount
-			b.pendingNames[key] = append(q[:i], q[i+1:]...)
-			return name, amount, true
-		}
+// consumePendingNameCash достаёт из durable-очереди самое РАННЕЕ ждущее имя С
+// СУММОЙ от отправителя (для случая «фото наличных пришло после ФИО+сумма»).
+// Порядок совпадает с resolveReceiptPayer (FIFO) — чтобы фото денег и приходящие
+// следом чеки разбирали очередь в одном порядке, а не крест-накрест.
+func (b *Bot) consumePendingNameCash(ctx context.Context, chat types.JID, senderJID string) (string, float64, bool) {
+	since := time.Now().Add(-cashLinkWindow)
+	name, amount, ok, err := b.db.TakePendingNameWithAmount(ctx, chat.String(), senderJID, since)
+	if err != nil {
+		fmt.Println("Очередь имён (нал): ошибка выборки:", err)
+		return "", 0, false
 	}
-	return "", 0, false
+	return name, amount, ok
 }
 
 // handleNameMessage разбирает сообщение-имя (ФИО без чека) и по порядку
@@ -221,7 +204,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	chat := msg.Info.Chat
 	sender := msg.Info.Sender.String()
 	quotedID := extractQuotedStanzaID(msg)
-	since := time.Now().Add(-6 * time.Minute)
+	since := time.Now().Add(-b.pairWindow)
 	amount := parser.ExtractAmount(text) // сумма из того же сообщения, если была
 
 	// Есть ли ждущий чек (ответ на чек или неподтверждённый чек от отправителя)?
@@ -253,7 +236,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 		}
 		// Иначе имя (возможно с суммой) — в очередь: перед будущим чеком или
 		// фото наличных.
-		b.enqueuePendingName(msg, name, amount)
+		b.enqueuePendingName(ctx, msg, name, amount, rawID)
 		return true
 	}
 
@@ -271,7 +254,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 			// Свайп пришёлся НЕ на чек (например, на вопрос бота, чья привязка уже
 			// вытеснена из askMap) — не привязываем вслепую к самому старому чеку
 			// (это дало бы неверную атрибуцию). Запоминаем имя как ждущее.
-			b.enqueuePendingName(msg, name, amount)
+			b.enqueuePendingName(ctx, msg, name, amount, rawID)
 			return true
 		}
 	}
@@ -281,7 +264,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 		found, _, err := b.db.ReattributeOldestUnconfirmedReceipt(ctx, chat.String(), sender, since, canonical, contactIDPtr)
 		if err != nil || !found {
 			// Не нашли чек — на всякий случай запомним имя как ждущее.
-			b.enqueuePendingName(msg, name, amount)
+			b.enqueuePendingName(ctx, msg, name, amount, rawID)
 			return true
 		}
 	}
@@ -289,7 +272,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 
 	// Дополнительно обновляем наблюдение сверки, если программа подключена.
 	if b.cmf != nil {
-		if watchID, wok, err := b.db.LatestNonameWatch(ctx, chat.String(), msg.Info.Sender.String(), time.Now().Add(-6*time.Minute)); err == nil && wok {
+		if watchID, wok, err := b.db.LatestNonameWatch(ctx, chat.String(), msg.Info.Sender.String(), since); err == nil && wok {
 			_ = b.db.UpdateCmfWatch(ctx, watchID, canonical, "", "", "", "lookup")
 			var amount float64
 			if ws, err := b.db.ListCmfWatches(ctx, []string{"lookup"}, 50); err == nil {

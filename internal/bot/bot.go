@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -77,11 +78,11 @@ type Bot struct {
 	sentMu   sync.Mutex
 	sentMsgs map[string][]string // chat JID -> последние отправленные IDs
 
-	// Очередь "имён без чека" (FIFO): ФИО клиентов, написанные ПЕРЕД чеками.
-	// Ключ groupJID|senderJID. Очередь нужна, когда имена и чеки идут пачками
-	// в любом чередовании — пары строятся по порядку сообщений.
-	pendingNameMu sync.Mutex
-	pendingNames  map[string][]pendingName
+	// Окно спаривания чек↔имя (по времени сообщения WhatsApp). Настраивается через
+	// RECEIPT_PAIR_WINDOW_MINUTES (по умолчанию 15 мин). Явный свайп-ответ на чек
+	// работает и вне окна. Сама очередь «имён без чека» теперь durable (в БД,
+	// таблица pending_client_names) и переживает рестарт — не в памяти.
+	pairWindow time.Duration
 
 	// Фото пачки наличных денег = пометка "это наличка" для соседнего платежа
 	// «ФИО+сумма». Фото может прийти ДО или ПОСЛЕ текста, поэтому запоминаем
@@ -108,15 +109,6 @@ type Bot struct {
 	secretRecipients map[string]bool
 	secretAskMu      sync.Mutex
 	secretAsk        map[string]time.Time // sender JID user -> когда спросили подтверждение
-}
-
-// pendingName — ФИО, написанное отправителем, пока без чека. amount — сумма,
-// если она была в том же сообщении («Шошуков Руслан 22т»): нужна, чтобы при
-// приходе фото наличных записать наличку на эту сумму.
-type pendingName struct {
-	name   string
-	amount float64
-	at     time.Time
 }
 
 // pendingReceipt — распознанный чек из лички, ожидающий команды "запомнить".
@@ -201,19 +193,47 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		history:       make(map[string][]ai.Turn),
 		pending:       make(map[string][]pendingReceipt),
 		sentMsgs:      make(map[string][]string),
-		pendingNames:  make(map[string][]pendingName),
 		pendingCash:   make(map[string]time.Time),
 		lastProactive: make(map[string]time.Time),
 		clarify:       newClarifyState(),
+		pairWindow:    receiptPairWindow(),
 	}
 
 	b.loadSecretFileConfig() // секретный файл (доступы) — выдача по коду в личке
 	b.loadHistory(ctx)       // восстановить память диалогов ассистента после рестарта
 
 	client.AddEventHandler(b.handleEvent)
-	go b.cmfWatcherLoop() // сверка чеков с программой рассрочек (no-op, если cmf == nil)
-	go b.clarifyLoop()    // проактивные вопросы "чей это чек"
+	go b.cmfWatcherLoop()      // сверка чеков с программой рассрочек (no-op, если cmf == nil)
+	go b.clarifyLoop()         // проактивные вопросы "чей это чек"
+	go b.pendingNamesJanitor() // уборка durable-очереди «имён без чека»
 	return b, nil
+}
+
+// receiptPairWindow — окно спаривания чек↔имя по времени сообщения WhatsApp.
+// RECEIPT_PAIR_WINDOW_MINUTES (по умолчанию 15). Явный свайп-ответ работает и вне окна.
+func receiptPairWindow() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("RECEIPT_PAIR_WINDOW_MINUTES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 24*60 {
+			return time.Duration(n) * time.Minute
+		}
+	}
+	return 15 * time.Minute
+}
+
+// pendingNamesJanitor раз в 30 минут чистит durable-очередь «имён без чека»
+// (съеденные и протухшие записи), чтобы таблица не росла бесконечно.
+func (b *Bot) pendingNamesJanitor() {
+	t := time.NewTicker(30 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		if n, err := b.db.PurgePendingNames(ctx, time.Now().Add(-2*time.Hour)); err != nil {
+			fmt.Println("Очередь имён: ошибка уборки:", err)
+		} else if n > 0 {
+			fmt.Printf("Очередь имён: удалено %d старых/съеденных записей\n", n)
+		}
+		cancel()
+	}
 }
 
 // loadHistory поднимает сохранённую в БД историю диалогов ассистента в память
@@ -2745,7 +2765,7 @@ func (b *Bot) handleCashPhoto(ctx context.Context, chat types.JID, senderJID, pa
 	}
 	// 3. payer не определился (в подписи/очереди не было имени) — берём самое
 	// раннее ждущее «ФИО+сумма» из очереди.
-	if name, amt, ok := b.consumePendingNameCash(chat, senderJID); ok {
+	if name, amt, ok := b.consumePendingNameCash(ctx, chat, senderJID); ok {
 		b.recordCashPayment(ctx, chat, name, amt, rawID, receivedAt)
 		return
 	}

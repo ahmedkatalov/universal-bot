@@ -102,6 +102,24 @@ CREATE TABLE IF NOT EXISTS forward_rules (
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- Durable-очередь «имён без чека»: ФИО клиента, присланное ПЕРЕД чеком.
+-- Переживает рестарт; порядок выдачи — по времени сообщения WhatsApp (received_at).
+CREATE TABLE IF NOT EXISTS pending_client_names (
+    id             SERIAL PRIMARY KEY,
+    group_jid      TEXT NOT NULL,
+    sender_jid     TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    amount         DOUBLE PRECISION NOT NULL DEFAULT 0,
+    raw_message_id INTEGER,
+    received_at    TIMESTAMPTZ NOT NULL,
+    consumed       BOOLEAN NOT NULL DEFAULT false,
+    consumed_at    TIMESTAMPTZ,
+    created_at     TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pending_names_queue
+    ON pending_client_names (group_jid, sender_jid, received_at)
+    WHERE consumed = false;
+
 -- Стартовый набор контактов и алиасов на основе твоих реальных сообщений.
 INSERT INTO contacts (canonical_name) VALUES
     ('Наличка'), ('Ахмед'), ('Милана'), ('Яхита'), ('Нажуд'),
