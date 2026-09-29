@@ -1878,6 +1878,101 @@ func (d *DB) PurgePendingNames(ctx context.Context, olderThan time.Time) (int64,
 	return tag.RowsAffected(), nil
 }
 
+// ReceiptIdentity — «отпечаток» чека для поиска того же чека в других группах.
+type ReceiptIdentity struct {
+	Found        bool
+	ID           int
+	DocNumber    string
+	AuthCode     string
+	Bank         string
+	RecipientRaw string
+	Amount       float64
+	TxDate       time.Time
+	Client       string // ФИО клиента (по attribution), для показа
+}
+
+// ReceiptByWaMessageID находит чек по id ЕГО сообщения WhatsApp (когда владелец
+// свайпнул на сам чек и спросил «в какую ещё группу его отправляли»).
+func (d *DB) ReceiptByWaMessageID(ctx context.Context, waMessageID string) (ReceiptIdentity, error) {
+	var r ReceiptIdentity
+	err := d.pool.QueryRow(ctx, `
+		SELECT br.id, COALESCE(br.doc_number,''), COALESCE(br.auth_code,''), COALESCE(br.bank,''),
+		       COALESCE(br.recipient_raw,''), br.amount::float8, br.tx_date,
+		       COALESCE(c.canonical_name, br.recipient_raw, '')
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE rm.wa_message_id = $1
+		ORDER BY br.id DESC
+		LIMIT 1
+	`, waMessageID).Scan(&r.ID, &r.DocNumber, &r.AuthCode, &r.Bank, &r.RecipientRaw, &r.Amount, &r.TxDate, &r.Client)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	r.Found = true
+	return r, nil
+}
+
+// ReceiptOccurrence — одно появление чека (в какой группе, когда, кто прислал).
+type ReceiptOccurrence struct {
+	GroupJID    string
+	ReceivedAt  time.Time
+	Submitter   string
+	Method      string // по чему совпало: «номер документа» / «код авторизации» / «банк+сумма+время»
+	IsDuplicate bool
+}
+
+// FindReceiptOccurrences ищет ВСЕ появления ТОГО ЖЕ чека (во всех группах). Тот
+// же чек определяется строгим идентификатором (номер документа или код
+// авторизации); если их нет — безопасным запасным совпадением банк+сумма+время
+// операции (с точностью до 90 секунд) + получатель. Разные платежи с одинаковой
+// суммой НЕ считаются одним чеком (нужен строгий id или точное совпадение времени).
+func (d *DB) FindReceiptOccurrences(ctx context.Context, ident ReceiptIdentity) ([]ReceiptOccurrence, error) {
+	if !ident.Found {
+		return nil, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(br.group_jid, rm.wa_group_jid, ''),
+		       COALESCE(rm.received_at, br.created_at),
+		       COALESCE(NULLIF(po.name,''), NULLIF(br.submitted_by,''), NULLIF(rm.sender_name,''), ''),
+		       br.is_duplicate,
+		       CASE
+		         WHEN $1 <> '' AND COALESCE(br.doc_number,'') = $1 THEN 'номер документа'
+		         WHEN $2 <> '' AND COALESCE(br.auth_code,'') = $2 THEN 'код авторизации'
+		         ELSE 'банк+сумма+время'
+		       END
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid,''), '@', 1)
+		WHERE br.ignored = false
+		  AND (
+		    ($1 <> '' AND COALESCE(br.doc_number,'') = $1)
+		    OR ($2 <> '' AND COALESCE(br.auth_code,'') = $2)
+		    OR ($1 = '' AND $2 = ''
+		        AND COALESCE(br.bank,'') = $3 AND br.amount = $4::numeric
+		        AND abs(extract(epoch FROM br.tx_date - $5::timestamptz)) <= 90
+		        AND COALESCE(br.recipient_raw,'') = $6)
+		  )
+		ORDER BY COALESCE(rm.received_at, br.created_at) ASC
+	`, ident.DocNumber, ident.AuthCode, ident.Bank, ident.Amount, ident.TxDate, ident.RecipientRaw)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReceiptOccurrence
+	for rows.Next() {
+		var o ReceiptOccurrence
+		if err := rows.Scan(&o.GroupJID, &o.ReceivedAt, &o.Submitter, &o.IsDuplicate, &o.Method); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
+}
+
 // ReattributeReceiptByMessage переписывает получателя у чека, на который
 // ответили (свайп), — по id сообщения WhatsApp.
 func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int) (found bool, amount float64, err error) {

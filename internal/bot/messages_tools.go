@@ -134,6 +134,87 @@ func (b *Bot) findMessagesTool() ai.Tool {
 	}
 }
 
+// findReceiptOccurrencesTool — «в какую ещё группу отправляли ЭТОТ чек».
+// Определяет чек по id сообщения, на которое ответил владелец (свайп), и находит
+// все его появления во всех группах по строгому идентификатору (номер документа/
+// код авторизации), а без него — по банк+сумма+время операции. Только владельцу.
+func (b *Bot) findReceiptOccurrencesTool() ai.Tool {
+	return ai.Tool{
+		Name: "find_receipt_occurrences",
+		Description: "Показывает, в какие ЕЩЁ группы отправляли ИМЕННО ЭТОТ чек (тот же самый). Вызывай, когда " +
+			"владелец ответил (свайпом) на конкретный чек и спрашивает «в какую ещё группу его отправляли», " +
+			"«где ещё этот чек», «дублировали ли этот чек». Передавай message_id из [Контекст ответа: ... id " +
+			"сообщения XXX] текущего сообщения владельца. НЕ переспрашивай сумму/клиента/дату — чек уже определён " +
+			"по сообщению, на которое ответили.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"message_id": map[string]any{"type": "string", "description": "id сообщения-чека из [Контекст ответа], на который ответил владелец"},
+			},
+			"required": []string{},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				MessageID string `json:"message_id"`
+			}
+			_ = json.Unmarshal(input, &args)
+			msgID := strings.TrimSpace(args.MessageID)
+			if msgID == "" {
+				return "Ответь (свайпом) на сам чек и спроси ещё раз — так я пойму, о каком именно чеке речь.", nil
+			}
+			ident, err := b.db.ReceiptByWaMessageID(ctx, msgID)
+			if err != nil {
+				return "", fmt.Errorf("поиск чека: %w", err)
+			}
+			if !ident.Found {
+				return "По этому сообщению чек у меня не сохранён (возможно, это не чек или он ещё не распознан). " +
+					"Ответь на сам чек — тогда найду его появления в других группах.", nil
+			}
+			occ, err := b.db.FindReceiptOccurrences(ctx, ident)
+			if err != nil {
+				return "", fmt.Errorf("поиск появлений чека: %w", err)
+			}
+			groups := b.joinedGroups(ctx)
+			gname := func(jid string) string {
+				if j, err := types.ParseJID(jid); err == nil {
+					if n, ok := groups[j]; ok && n != "" {
+						return n
+					}
+				}
+				if jid == "" {
+					return "личка/без группы"
+				}
+				return jid
+			}
+			who := ident.Client
+			if who == "" {
+				who = ident.RecipientRaw
+			}
+			head := fmt.Sprintf("Чек %s на %.0f ₽ (операция %s)", who, ident.Amount, ident.TxDate.Format("02.01 15:04"))
+			if len(occ) <= 1 {
+				if len(occ) == 1 {
+					return head + fmt.Sprintf(" был только в одной группе — «%s». В другие группы его не отправляли.", gname(occ[0].GroupJID)), nil
+				}
+				return head + " я нашёл только по этому сообщению; в других группах его нет.", nil
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "%s отправляли в %d групп(ы) — совпало по «%s»:\n", head, len(occ), occ[0].Method)
+			for _, o := range occ {
+				dup := ""
+				if o.IsDuplicate {
+					dup = " (помечен дублем)"
+				}
+				sub := o.Submitter
+				if sub == "" {
+					sub = "—"
+				}
+				fmt.Fprintf(&sb, "• «%s» — %s, прислал %s%s\n", gname(o.GroupJID), o.ReceivedAt.Format("02.01 15:04"), sub, dup)
+			}
+			return sb.String(), nil
+		},
+	}
+}
+
 // lastDigits возвращает последние n цифр строки (для короткой подписи номера).
 func lastDigits(s string, n int) string {
 	r := []rune(s)
