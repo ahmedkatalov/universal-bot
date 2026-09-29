@@ -120,6 +120,27 @@ CREATE INDEX IF NOT EXISTS idx_pending_names_queue
     ON pending_client_names (group_jid, sender_jid, received_at)
     WHERE consumed = false;
 
+-- Планировщик напоминаний/сообщений (разовые и повторяющиеся). Переживает
+-- рестарт; выполнение идемпотентно (срок сдвигается атомарно перед отправкой).
+CREATE TABLE IF NOT EXISTS scheduled_jobs (
+    id           SERIAL PRIMARY KEY,
+    created_by   TEXT NOT NULL,
+    kind         TEXT NOT NULL,          -- once | daily | weekly
+    target_kind  TEXT NOT NULL,          -- me | here | group | person
+    target       TEXT NOT NULL,          -- JID получателя
+    target_label TEXT NOT NULL DEFAULT '',
+    message      TEXT NOT NULL,
+    next_run_at  TIMESTAMPTZ NOT NULL,
+    at_hour      INT NOT NULL DEFAULT 0,
+    at_minute    INT NOT NULL DEFAULT 0,
+    weekday      INT NOT NULL DEFAULT -1, -- 0=вс..6=сб (для weekly)
+    active       BOOLEAN NOT NULL DEFAULT true,
+    last_run_at  TIMESTAMPTZ,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+    ON scheduled_jobs (next_run_at) WHERE active = true;
+
 -- Стартовый набор контактов и алиасов на основе твоих реальных сообщений.
 INSERT INTO contacts (canonical_name) VALUES
     ('Наличка'), ('Ахмед'), ('Милана'), ('Яхита'), ('Нажуд'),

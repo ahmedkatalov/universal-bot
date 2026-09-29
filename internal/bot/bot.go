@@ -206,6 +206,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	go b.cmfWatcherLoop()      // сверка чеков с программой рассрочек (no-op, если cmf == nil)
 	go b.clarifyLoop()         // проактивные вопросы "чей это чек"
 	go b.pendingNamesJanitor() // уборка durable-очереди «имён без чека»
+	go b.schedulerLoop()       // планировщик напоминаний/сообщений
 	return b, nil
 }
 
@@ -865,7 +866,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	isAdmin := b.isReportAdmin(msg.Info)
 	staticSys, dynSys := b.buildAssistantSystemPromptFor(ctx, isAdmin)
-	tools := b.assistantTools(ctx, chat, isAdmin, false)
+	tools := b.assistantTools(ctx, chat, types.NewJID(msg.Info.Sender.User, types.DefaultUserServer), isAdmin, false)
 
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
@@ -924,7 +925,7 @@ func (b *Bot) isReportAdmin(info types.MessageInfo) bool {
 // финансовые инструменты доступны только админам отчётности.
 // groupDefault — JID группы для корректировок (в личке пусто),
 // inGroup — вызов из группы (там нет дозагрузки чеков).
-func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGroup bool) []ai.Tool {
+func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types.JID, isAdmin, inGroup bool) []ai.Tool {
 	if !isAdmin {
 		// Не-админам — только поиск по конкретному человеку (проверить,
 		// прошёл ли чек) и никакой сводной отчётности.
@@ -946,6 +947,9 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, isAdmin, inGro
 		b.sendToPersonTool(),
 		b.findMessagesTool(),
 		b.findReceiptOccurrencesTool(),
+		b.scheduleReminderTool(chat, ownerJID),
+		b.listRemindersTool(),
+		b.cancelReminderTool(),
 		b.forwardingTool(),
 		b.unclearTool(),
 		b.sendUnclearFileTool(chat),
@@ -1056,7 +1060,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	}
 	userText := senderName + ": " + query + quotedSenderPhoneNote(msg)
 
-	tools := b.assistantTools(ctx, chat, isAdmin, true)
+	tools := b.assistantTools(ctx, chat, types.NewJID(msg.Info.Sender.User, types.DefaultUserServer), isAdmin, true)
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
 	if err != nil {
@@ -1477,6 +1481,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 • phone_memory и assign_receipt_collector привязывают номер WhatsApp или конкретный чек к тому, кто забрал деньги — так он и показывается в senders_report. Номер бери из слов владельца или из [Контекст ответа: ...], если он ответил свайпом на чек.
 • find_messages показывает, ЧТО присылал конкретный номер или человек — в том числе УДАЛЁННЫЕ в WhatsApp сообщения (я сохраняю каждое сообщение сразу при получении). На «что тебе написал номер …92», «покажи сообщения этого номера», «что он удалил» — вызывай find_messages (по последним цифрам номера и/или имени, можно за период). НЕ отвечай, что «нет функции показать сообщения» — она есть.
 • find_receipt_occurrences отвечает «в какую ещё группу отправляли ЭТОТ чек». Если владелец ответил (свайпом) на сам чек — бери message_id из [Контекст ответа] и вызывай этот инструмент; НЕ переспрашивай сумму/клиента/дату, чек уже определён по сообщению.
+• schedule_reminder / list_reminders / cancel_reminder — напоминания и сообщения по расписанию (переживают перезапуск). Ты УМЕЕШЬ напоминать: «каждый день в 10 отправляй мне …», «через час напомни …», «в пятницу в 9 …», «отправь Мухаммаду в 18:00 …» → schedule_reminder (kind once/daily/weekly, время ЧЧ:ММ или in_minutes, кому target me/here/group/person). НЕ говори, что не умеешь напоминать.
 • send_to_person отправляет продиктованный владельцем текст ЛИЧНО человеку (в личку) — «напиши номеру … лично», «отправь Расулу в личку». send_to_group — то же, но в группу. Отправляй ровно продиктованный текст и только по явной просьбе владельца.
 
 УМНЫЕ ВОПРОСЫ. Спрашивай ТОЛЬКО недостающее, одним коротким вопросом. Если клиент и сумма ясны, а неизвестно лишь кто забрал наличку — спроси только «У кого эта наличка?», не переспрашивая клиента и сумму. Что уже ясно — не переспрашивай; чего реально не хватает — не выдумывай.

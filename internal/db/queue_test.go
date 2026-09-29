@@ -67,26 +67,47 @@ func TestPendingNameFIFO(t *testing.T) {
 	}
 }
 
-// TestPendingNameWindow — имя старше окна не берётся (защита от привязки к чеку
-// из совсем другого времени), а свежее — берётся.
+// TestPendingNameWindow — запись, ВСТАВЛЕННАЯ давно (created_at вне окна), не
+// берётся; свежая — берётся. Окно считается по времени появления записи.
 func TestPendingNameWindow(t *testing.T) {
 	d := testDB(t)
 	ctx := context.Background()
 	grp, snd := uniqueScope("window")
 
-	if err := d.EnqueuePendingName(ctx, grp, snd, "Старое Имя", 0, 0, time.Now().Add(-40*time.Minute)); err != nil {
+	// Явно вставляем запись с created_at 40 минут назад (вне окна 15 мин).
+	old := time.Now().Add(-40 * time.Minute)
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO pending_client_names (group_jid, sender_jid, name, amount, received_at, created_at)
+		VALUES ($1,$2,$3,0,$4,$5)`, grp, snd, "Старое Имя", old, old); err != nil {
 		t.Fatal(err)
 	}
 	since := time.Now().Add(-15 * time.Minute)
 	if _, _, ok, _ := d.TakePendingName(ctx, grp, snd, since); ok {
-		t.Errorf("имя старше окна (40 мин > 15) не должно браться")
+		t.Errorf("запись, вставленная 40 мин назад (вне окна 15), не должна браться")
 	}
-	// Свежее имя берётся.
+	// Свежая запись берётся.
 	if err := d.EnqueuePendingName(ctx, grp, snd, "Свежее Имя", 0, 0, time.Now().Add(-2*time.Minute)); err != nil {
 		t.Fatal(err)
 	}
 	if n, _, ok, _ := d.TakePendingName(ctx, grp, snd, since); !ok || n != "Свежее Имя" {
-		t.Errorf("свежее имя должно взяться, получили %q ok=%v", n, ok)
+		t.Errorf("свежая запись должна взяться, получили %q ok=%v", n, ok)
+	}
+}
+
+// TestPendingNameBacklogEligible — регрессионный: имя с ОЧЕНЬ старым временем
+// сообщения (офлайн-догрузка), но только что вставленное, ДОЛЖНО браться —
+// окно по created_at, а не по received_at. Иначе после простоя ничего не парится.
+func TestPendingNameBacklogEligible(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	grp, snd := uniqueScope("backlog")
+	// received_at 30 мин назад (сообщение из офлайна), created_at = сейчас (вставка).
+	if err := d.EnqueuePendingName(ctx, grp, snd, "Догруженное Имя", 0, 0, time.Now().Add(-30*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	since := time.Now().Add(-15 * time.Minute)
+	if n, _, ok, _ := d.TakePendingName(ctx, grp, snd, since); !ok || n != "Догруженное Имя" {
+		t.Errorf("догруженное имя (старое received_at, свежий created_at) должно браться, got %q ok=%v", n, ok)
 	}
 }
 

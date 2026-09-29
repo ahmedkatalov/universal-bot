@@ -253,6 +253,37 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("индекс pending_client_names: %w", err)
 	}
 
+	// Планировщик напоминаний/сообщений: разовые и повторяющиеся (ежедневно/
+	// еженедельно) задания. Переживают рестарт; выполнение идемпотентно (задание
+	// «сдвигается» на следующий срок атомарно перед отправкой, поэтому после
+	// перезапуска одно и то же не уходит дважды).
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS scheduled_jobs (
+			id           SERIAL PRIMARY KEY,
+			created_by   TEXT NOT NULL,
+			kind         TEXT NOT NULL,          -- once | daily | weekly
+			target_kind  TEXT NOT NULL,          -- me | here | group | person
+			target       TEXT NOT NULL,          -- JID получателя
+			target_label TEXT NOT NULL DEFAULT '',
+			message      TEXT NOT NULL,
+			next_run_at  TIMESTAMPTZ NOT NULL,
+			at_hour      INT NOT NULL DEFAULT 0,
+			at_minute    INT NOT NULL DEFAULT 0,
+			weekday      INT NOT NULL DEFAULT -1, -- 0=вс..6=сб (для weekly)
+			active       BOOLEAN NOT NULL DEFAULT true,
+			last_run_at  TIMESTAMPTZ,
+			created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
+		)
+	`); err != nil {
+		return fmt.Errorf("создание таблицы scheduled_jobs: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
+		ON scheduled_jobs (next_run_at) WHERE active = true
+	`); err != nil {
+		return fmt.Errorf("индекс scheduled_jobs: %w", err)
+	}
+
 	// Наличные платежи: помечаем текстовые транзакции, которые реально наличка
 	// (а не переписанный текстом чек), чтобы отчёты считали их в сбор. Флаг
 	// проставляется при вставке; для уже накопленных данных — разовый backfill
@@ -1755,7 +1786,7 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 		  AND rm.sender_jid = $2
-		  AND rm.received_at >= $3::timestamptz
+		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
 		LIMIT 1
@@ -1780,7 +1811,11 @@ func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, 
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 			  AND rm.sender_jid = $2
-			  AND rm.received_at >= $3::timestamptz
+			  -- Окно (право на спаривание) — по времени ПОЯВЛЕНИЯ строки (created_at):
+			  -- при офлайн-догрузке пачка чеков с ОЧЕНЬ старым временем сообщения всё
+			  -- равно только что вставлена и должна париться. Порядок FIFO — по
+			  -- времени сообщения WhatsApp (received_at), чтобы не зависеть от OCR.
+			  AND br.created_at >= $3::timestamptz
 			  AND br.client_confirmed = false
 			  AND br.is_duplicate = false AND br.ignored = false
 			ORDER BY rm.received_at ASC, br.id ASC
@@ -1845,12 +1880,15 @@ func (d *DB) takePendingName(ctx context.Context, groupJID, senderJID string, si
 	}
 	var name string
 	var amount float64
+	// Окно — по времени ПОЯВЛЕНИЯ записи (created_at, = времени обработки), а не по
+	// времени сообщения: пачка имён, догруженная после простоя, вставлена только
+	// что и должна париться. Порядок FIFO — по времени сообщения WhatsApp (received_at).
 	err := d.pool.QueryRow(ctx, `
 		UPDATE pending_client_names SET consumed = true, consumed_at = now()
 		WHERE id = (
 			SELECT id FROM pending_client_names
 			WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false
-			  AND received_at >= $3::timestamptz `+amountCond+`
+			  AND created_at >= $3::timestamptz `+amountCond+`
 			ORDER BY received_at ASC, id ASC
 			FOR UPDATE SKIP LOCKED
 			LIMIT 1
@@ -1948,11 +1986,15 @@ func (d *DB) FindReceiptOccurrences(ctx context.Context, ident ReceiptIdentity) 
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid,''), '@', 1)
 		WHERE br.ignored = false
+		  -- Сумма обязана совпасть ВСЕГДА: банки переиспользуют короткие коды
+		  -- авторизации, а номер документа может пересекаться между банками — без
+		  -- сверки суммы это склеило бы РАЗНЫЕ платежи в «один чек».
+		  AND br.amount = $4::numeric
 		  AND (
 		    ($1 <> '' AND COALESCE(br.doc_number,'') = $1)
 		    OR ($2 <> '' AND COALESCE(br.auth_code,'') = $2)
 		    OR ($1 = '' AND $2 = ''
-		        AND COALESCE(br.bank,'') = $3 AND br.amount = $4::numeric
+		        AND COALESCE(br.bank,'') = $3
 		        AND abs(extract(epoch FROM br.tx_date - $5::timestamptz)) <= 90
 		        AND COALESCE(br.recipient_raw,'') = $6)
 		  )
