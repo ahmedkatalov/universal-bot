@@ -434,9 +434,12 @@ func (a *Assistant) Ping(ctx context.Context) error {
 // id, что и мозг, или отдельным OPENROUTER_VISION_MODEL). Если ломается — чеки
 // будут читаться плохо (падение на слабый OCR).
 func (a *Assistant) PingVision(ctx context.Context) error {
-	// Минимальный валидный PNG 1×1 — содержимое неважно, проверяем сам вызов.
+	// Валидный PNG 64×64 (шахматка): содержимое неважно, проверяем сам вызов.
+	// Раньше был 1×1 — некоторые шлюзы (напр. odirouter) отклоняют вырожденную
+	// картинку как «битую» (400 Upstream rejected), из-за чего проверка зрения
+	// ложно падала, хотя реальные чеки читаются нормально.
 	img, _ := base64.StdEncoding.DecodeString(
-		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==")
+		"iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAAAh0lEQVR4nOzXwQnEIAAF0c2yxWj/xViO24A5TwLvHY2XISD83xjjc7LWOp7POR91/3s8fREBNQE1AbVr73388LT3/u7+6/+AgJqAmoDaZQ/EBNQE1ATU7IGagJqAmoCaPVATUBNQE1CzB2oCagJqAmr2QE1ATUBNQM0eqAmoCagJqP0DAAD//9CjYlDZqnHYAAAAAElFTkSuQmCC")
 	_, err := a.CompleteWithImage(ctx, "Ответь одним словом.", "Что-нибудь видно? Ответь: ок", img, "image/png")
 	return err
 }
