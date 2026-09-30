@@ -86,20 +86,19 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 		_ = b.db.BumpReceiptRetry(ctx, it.ID, "зрение всё ещё недоступно", next, max)
 		return
 	}
-	switch {
-	case !ok || rec.Kind == "" || rec.Kind == "other":
-		// Модель посмотрела: это НЕ чек — снимаем с учёта и с очереди.
-		_ = b.db.ResolveReceiptRetry(ctx, it.ID, "not_receipt", true)
-		fmt.Printf("Повтор чека #%d: перечитал — оказалось не чек, убрал из нераспознанных\n", it.ID)
-		return
-	case rec.Kind == "cash" || rec.Amount <= 0:
-		// Наличка или всё ещё без суммы — как чек не заполняем, ещё попытка.
+	// ВАЖНО: ok=false у vision означает «не смог прочитать поля», а НЕ «это точно
+	// не чек». Никогда не прячем/не удаляем чек по такому сигналу — иначе можно
+	// потерять настоящий, но размытый чек. Оставляем needs_review, пробуем ещё;
+	// после лимита -> 'failed', но чек ОСТАЁТСЯ видимым для ручной проверки.
+	var rd parser.ReceiptData
+	if ok {
+		applyAIReceiptAuthoritative(&rd, rec)
+	}
+	if !ok || rec.Kind == "cash" || rd.Amount <= 0 {
 		next := time.Now().Add(retryBackoff(it.Attempts))
-		_ = b.db.BumpReceiptRetry(ctx, it.ID, "сумма всё ещё не распозналась", next, max)
+		_ = b.db.BumpReceiptRetry(ctx, it.ID, "перечитал, но чек не распознался", next, max)
 		return
 	}
-	var rd parser.ReceiptData
-	applyAIReceiptAuthoritative(&rd, rec)
 	if err := b.db.FillReceiptFromRetry(ctx, it.ID, db.RecognizedReceipt{
 		Bank: rd.Bank, Recipient: rd.Recipient, Sender: rd.Sender,
 		DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Status: rd.Status,

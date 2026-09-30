@@ -87,8 +87,13 @@ func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedRecei
 			doc_number    = COALESCE(NULLIF($5,''), doc_number),
 			auth_code     = COALESCE(NULLIF($6,''), auth_code),
 			status        = COALESCE(NULLIF($7,''), status),
-			amount        = CASE WHEN $8::numeric > 0 THEN $8::numeric ELSE amount END,
-			commission    = CASE WHEN $9::numeric > 0 THEN $9::numeric ELSE commission END,
+			-- Сумму заполняем ТОЛЬКО если её ещё нет (amount = 0). Никогда не
+			-- перезаписываем уже известную сумму — иначе автоповтор мог бы откатить
+			-- ручную правку владельца (manually supplied correction outranks AI).
+			amount        = CASE WHEN amount > 0 THEN amount
+			                     WHEN $8::numeric > 0 THEN $8::numeric ELSE amount END,
+			commission    = CASE WHEN commission > 0 THEN commission
+			                     WHEN $9::numeric > 0 THEN $9::numeric ELSE commission END,
 			tx_date       = CASE WHEN $11 THEN $10::timestamptz ELSE tx_date END,
 			collapsed     = false,
 			recognition_status = 'ok',

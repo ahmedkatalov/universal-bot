@@ -83,6 +83,35 @@ func TestReceiptRetryLifecycle(t *testing.T) {
 	}
 }
 
+// TestFillReceiptFromRetryKeepsExistingAmount — регрессионный: автоповтор НЕ
+// перезаписывает уже известную сумму (ручную правку владельца).
+func TestFillReceiptFromRetryKeepsExistingAmount(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	tag := fmt.Sprintf("%d", time.Now().UnixNano())
+	txd := time.Now().Truncate(time.Second)
+	var rid, brid int
+	_ = d.pool.QueryRow(ctx, `INSERT INTO raw_messages (wa_message_id, wa_group_jid, sender_jid, received_at) VALUES ($1,$2,$3,$4) RETURNING id`,
+		"wa3-"+tag, "grp3-"+tag, "s3-"+tag+"@s.whatsapp.net", txd).Scan(&rid)
+	// Владелец уже поправил сумму на 21500 и подтвердил клиента.
+	_ = d.pool.QueryRow(ctx, `INSERT INTO bank_receipts (raw_message_id, amount, needs_review, client_confirmed, recipient_raw, tx_date, recognition_status, next_retry_at) VALUES ($1,21500,false,true,'Клиент',$2,'pending',$3) RETURNING id`,
+		rid, txd, time.Now()).Scan(&brid)
+
+	// Автоповтор «перечитал» сумму как 215000 — НЕ должен затирать 21500.
+	if err := d.FillReceiptFromRetry(ctx, brid, RecognizedReceipt{Bank: "Т-Банк", Recipient: "Другой", Amount: 215000, TxDate: txd, HasTxDate: true}); err != nil {
+		t.Fatal(err)
+	}
+	var amount float64
+	var recipient string
+	_ = d.pool.QueryRow(ctx, `SELECT amount::float8, recipient_raw FROM bank_receipts WHERE id=$1`, brid).Scan(&amount, &recipient)
+	if amount != 21500 {
+		t.Errorf("сумма затёрта автоповтором: %.0f (ожидали 21500)", amount)
+	}
+	if recipient != "Клиент" {
+		t.Errorf("подтверждённый клиент затёрт: %q (ожидали Клиент)", recipient)
+	}
+}
+
 // TestBumpReceiptRetryGivesUp — при исчерпании лимита статус становится 'failed'.
 func TestBumpReceiptRetryGivesUp(t *testing.T) {
 	d := testDB(t)
