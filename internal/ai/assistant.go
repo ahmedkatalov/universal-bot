@@ -576,7 +576,10 @@ func runTool(ctx context.Context, tools []Tool, call toolCall) string {
 		}
 		out, err := t.Handle(ctx, json.RawMessage(call.Function.Arguments))
 		if err != nil {
-			return "Ошибка: " + err.Error()
+			// Явный сигнал модели: действие НЕ выполнено. Нельзя выдавать за успех —
+			// нужно честно сказать владельцу, что не вышло и почему.
+			return "ИНСТРУМЕНТ НЕ ВЫПОЛНЕН — ошибка: " + err.Error() +
+				". Действие НЕ сделано: честно скажи это владельцу и не пиши, что выполнил."
 		}
 		return out
 	}

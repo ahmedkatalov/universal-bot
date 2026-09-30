@@ -1476,6 +1476,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 — Не выдумывай числа, суммы, клиентов, банки, получателей налички. Суммы и итоги не считай в уме — бери их из инструментов, они читают точные данные из базы.
 — Когда владелец ДИКТУЕТ платёж («Джабраилов наличными 22400», «Рахман 170т», «Ибрагим наличка 35000 отдал Адаму») — реально запиши каждый через record_payment, а не отвечай «записал» на словах. Наличными = kind:cash, иначе transfer; «отдал X» / «X взял» = collector.
 — Записи в программу рассрочек (cmf_add_payment), дозагрузку чеков (save_pending_receipts) и прочие изменения учёта делай ТОЛЬКО по явной просьбе владельца.
+— НЕ выдавай неуспех за успех. Отчитывайся ровно о том, что ПОДТВЕРДИЛ инструмент. Если инструмент вернул ошибку/«НЕ ВЫПОЛНЕН»/«не удалось» — прямо скажи, что действие НЕ сделано и что именно не вышло. Никогда не пиши «удалил», «записал», «внёс в программу», «проверил», «отправил», если соответствующий инструмент это не подтвердил. Не придумывай, что «сделаю позже»/«дам программе минуту» — ты не можешь отложить действие, если для этого не создано напоминание (schedule_reminder).
 
 СБОР СЧИТАЕТСЯ ОДИН РАЗ. Два источника: банковские чеки и текст «ФИО+сумма». Работник часто шлёт и чек, и рядом переписывает его текстом — это ОДИН платёж, не два. Правило: распознанный чек считается всегда; текст «ФИО+сумма» считается, ТОЛЬКО ЕСЛИ парного чека (тот же человек и сумма) нет — тогда это единственная запись о платеже, и он не теряется (например, чек не распознался); если пара-чек есть, текст-дубль отбрасывается. НАЛИЧКА считается всегда и отдельно — это текст с пометкой «наличка/нал/кэш», «офис» (сдал в офис), «у ‹имя›» («Ахмед 10000 у Дени») либо рядом фото пачки денег. Итог не задваивается и не теряется. Если сумма не сходится с ручным подсчётом — предложи прислать PDF со всеми позициями и сверить построчно.
 
@@ -2142,9 +2143,13 @@ func (b *Bot) deleteMessagesTool(chat types.JID) ai.Tool {
 				}
 				target = jid
 			}
-			deleted := b.deleteOwnMessages(ctx, target, args.Count)
-			if deleted == 0 {
+			deleted, attempted := b.deleteOwnMessages(ctx, target, args.Count)
+			if attempted == 0 {
 				return "Нечего удалять — я не находил своих недавних сообщений там.", nil
+			}
+			if deleted < attempted {
+				// Часть отзывов не прошла — НЕ выдаём за успех, говорим честно.
+				return fmt.Sprintf("НЕ УДАЛОСЬ удалить: WhatsApp отклонил отзыв (%d из %d). Сообщи владельцу, что удаление не прошло.", attempted-deleted, attempted), nil
 			}
 			return fmt.Sprintf("Удалил свои последние сообщения: %d.", deleted), nil
 		},
@@ -3193,7 +3198,10 @@ func (b *Bot) rememberSent(chat types.JID, id string) {
 
 // deleteOwnMessages отзывает ("удаляет у всех") последние n сообщений бота
 // в чате. Возвращает, сколько удалил.
-func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) int {
+// deleteOwnMessages отзывает последние n своих сообщений в чате. Возвращает,
+// сколько РЕАЛЬНО отозвано (deleted) и сколько пыталось (attempted) — чтобы
+// вызывающий честно сообщил, если WhatsApp отклонил отзыв (не выдавал за успех).
+func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) (deleted, attempted int) {
 	key := chat.String()
 	b.sentMu.Lock()
 	ids := b.sentMsgs[key]
@@ -3204,7 +3212,7 @@ func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) int 
 	b.sentMsgs[key] = ids[:len(ids)-n]
 	b.sentMu.Unlock()
 
-	deleted := 0
+	attempted = len(toDelete)
 	for i := len(toDelete) - 1; i >= 0; i-- {
 		if _, err := b.client.SendMessage(ctx, chat, b.client.BuildRevoke(chat, types.EmptyJID, toDelete[i])); err != nil {
 			fmt.Println("Ошибка удаления своего сообщения:", err)
@@ -3212,7 +3220,7 @@ func (b *Bot) deleteOwnMessages(ctx context.Context, chat types.JID, n int) int 
 		}
 		deleted++
 	}
-	return deleted
+	return deleted, attempted
 }
 
 // sendImageBytes отправляет фото (например, пересланный чек) в чат.
