@@ -11,9 +11,12 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -31,7 +34,103 @@ const (
 	// временных сбоях (обрыв сети, таймаут, 429/5xx). Без этого один сетевой
 	// «икание» рушил весь ответ бота; с ретраями — переживает.
 	maxHTTPAttempts = 3
+
+	defaultChatMaxTokens   = 3072 // диалог/инструменты: нужен запас на аргументы инструментов
+	defaultVisionMaxTokens = 1024 // чтение чека: ответ короткий, 3000 токенов не нужны
 )
+
+// ProviderError — ошибка ИИ-провайдера с ЧИСТЫМ сообщением для пользователя и
+// техническими деталями для логов. Детали (сырой текст OpenRouter, ключи, коды)
+// в WhatsApp НЕ показываем — только короткое человеческое User-сообщение.
+type ProviderError struct {
+	Category string // timeout | rate_limit | server | credits | context | model | malformed | other
+	User     string // короткое человеческое сообщение (можно слать в чат)
+	Detail   string // технические детали (только в лог)
+}
+
+func (e *ProviderError) Error() string { return "ai(" + e.Category + "): " + e.Detail }
+
+// UserMessage возвращает ЧИСТОЕ сообщение для чата: для ProviderError — его
+// User; иначе общий вежливый текст. Технические детали в чат не попадают.
+func UserMessage(err error) string {
+	if err == nil {
+		return ""
+	}
+	var pe *ProviderError
+	if errors.As(err, &pe) && pe.User != "" {
+		return pe.User
+	}
+	return "Не получилось ответить — что-то с ИИ-сервисом. Попробуй ещё раз через минуту."
+}
+
+// classifyProviderError разбирает ответ провайдера в категорию и человеческое
+// сообщение. providerMsg — текст ошибки от OpenRouter (в лог), transportErr —
+// сетевой сбой, если был. status — HTTP-код (0, если сети не было).
+func classifyProviderError(status int, providerMsg string, transportErr error) *ProviderError {
+	m := strings.ToLower(providerMsg)
+	detail := providerMsg
+	if status > 0 {
+		detail = fmt.Sprintf("%d: %s", status, providerMsg)
+	}
+	has := func(subs ...string) bool {
+		for _, s := range subs {
+			if strings.Contains(m, s) {
+				return true
+			}
+		}
+		return false
+	}
+	switch {
+	case transportErr != nil:
+		return &ProviderError{"timeout", "Сеть подвисла, не достучался до ИИ. Попробуй ещё раз через минуту.", transportErr.Error()}
+	case status == http.StatusTooManyRequests || has("rate limit", "rate-limit", "too many requests"):
+		return &ProviderError{"rate_limit", "Слишком много запросов к ИИ подряд — чуть перегружено. Повтори через минуту.", detail}
+	case status == http.StatusPaymentRequired || has("credit", "insufficient", "quota", "billing", "payment"):
+		return &ProviderError{"credits", "Не могу ответить: на балансе ИИ-сервиса закончились средства — нужно пополнить OpenRouter.", detail}
+	case has("maximum context", "context length", "context_length", "too long") || (status == http.StatusBadRequest && has("token")):
+		return &ProviderError{"context", "Слишком длинный запрос для ИИ. Сформулируй короче или разбей на части.", detail}
+	case status == http.StatusNotFound || has("no endpoints", "no allowed providers", "model not found", "unavailable", "not a valid model"):
+		return &ProviderError{"model", "Модель ИИ сейчас недоступна. Попробуй позже.", detail}
+	case status >= 500:
+		return &ProviderError{"server", "ИИ-сервис сейчас недоступен (это на их стороне). Попробуй чуть позже.", detail}
+	case has("parse", "malformed", "unexpected"):
+		return &ProviderError{"malformed", "ИИ вернул непонятный ответ. Повтори запрос.", detail}
+	default:
+		return &ProviderError{"other", "Не получилось ответить — что-то с ИИ-сервисом. Попробуй ещё раз.", detail}
+	}
+}
+
+// shouldFallback — стоит ли пробовать следующую модель из цепочки при этой
+// ошибке. Смена модели помогает при недоступности/перегрузке/сбоях провайдера,
+// но НЕ при нехватке баланса (общий кошелёк) и слишком длинном контексте.
+func shouldFallback(category string) bool {
+	switch category {
+	case "server", "model", "timeout", "rate_limit":
+		return true
+	default:
+		return false
+	}
+}
+
+// splitModels разбирает список моделей из env (через запятую).
+func splitModels(raw string) []string {
+	var out []string
+	for _, p := range strings.Split(raw, ",") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func envInt(key string, def int) int {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return def
+}
 
 // Turn — одна реплика в истории личного диалога.
 type Turn struct {
@@ -55,6 +154,14 @@ type Assistant struct {
 	visionModel string // чтение чеков (зрение); по умолчанию совпадает с model
 	baseURL     string
 	http        *http.Client
+
+	// Резервные модели: если основная недоступна/перегружена/отвечает 5xx, бот
+	// пробует их по очереди (OPENROUTER_FALLBACK_MODELS / _VISION_FALLBACK_MODELS).
+	fallbackModels       []string
+	visionFallbackModels []string
+	// Лимит токенов ответа по типу запроса (OPENROUTER_MAX_TOKENS / _VISION_MAX_TOKENS).
+	chatMaxTokens   int
+	visionMaxTokens int
 }
 
 // New создаёт клиента OpenRouter. apiKey — значение OPENROUTER_API_KEY.
@@ -76,11 +183,15 @@ func New(apiKey, model, visionModel, baseURL string) *Assistant {
 		baseURL = defaultBaseURL
 	}
 	return &Assistant{
-		apiKey:      apiKey,
-		model:       model,
-		visionModel: visionModel,
-		baseURL:     strings.TrimRight(baseURL, "/"),
-		http:        &http.Client{Timeout: 90 * time.Second},
+		apiKey:               apiKey,
+		model:                model,
+		visionModel:          visionModel,
+		baseURL:              strings.TrimRight(baseURL, "/"),
+		http:                 &http.Client{Timeout: 90 * time.Second},
+		fallbackModels:       splitModels(os.Getenv("OPENROUTER_FALLBACK_MODELS")),
+		visionFallbackModels: splitModels(os.Getenv("OPENROUTER_VISION_FALLBACK_MODELS")),
+		chatMaxTokens:        envInt("OPENROUTER_MAX_TOKENS", defaultChatMaxTokens),
+		visionMaxTokens:      envInt("OPENROUTER_VISION_MAX_TOKENS", defaultVisionMaxTokens),
 	}
 }
 
@@ -278,34 +389,37 @@ type visionRequest struct {
 // изображение (фото чека) и отвечает по нему. mimeType — "image/jpeg"
 // или "image/png".
 func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userText string, image []byte, mimeType string) (string, error) {
-	payload, err := json.Marshal(visionRequest{
-		Model: a.visionModel,
-		Messages: []visionMessage{
-			{Role: "system", Content: systemPrompt},
-			{Role: "user", Content: []visionContentPart{
-				{Type: "text", Text: userText},
-				{Type: "image_url", ImageURL: &visionImgURL{
-					URL: "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(image),
+	dataURL := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(image)
+	models := append([]string{a.visionModel}, a.visionFallbackModels...)
+	var lastErr error
+	for _, model := range models {
+		payload, err := json.Marshal(visionRequest{
+			Model: model,
+			Messages: []visionMessage{
+				{Role: "system", Content: systemPrompt},
+				{Role: "user", Content: []visionContentPart{
+					{Type: "text", Text: userText},
+					{Type: "image_url", ImageURL: &visionImgURL{URL: dataURL}},
 				}},
-			}},
-		},
-		MaxTokens: 1024,
-	})
-	if err != nil {
-		return "", err
+			},
+			MaxTokens: a.visionMaxTokens,
+		})
+		if err != nil {
+			return "", err
+		}
+		body, status, terr := a.postCompletions(ctx, payload)
+		msg, cerr := interpretText(body, status, terr)
+		if cerr == nil {
+			return msg, nil
+		}
+		lastErr = cerr
+		var pe *ProviderError
+		if errors.As(cerr, &pe) && shouldFallback(pe.Category) {
+			continue // пробуем следующую vision-модель
+		}
+		return "", cerr
 	}
-
-	parsed, status, err := a.postCompletions(ctx, payload)
-	if err != nil {
-		return "", err
-	}
-	if parsed.Error != nil {
-		return "", fmt.Errorf("openrouter: %s", parsed.Error.Message)
-	}
-	if status != http.StatusOK || len(parsed.Choices) == 0 {
-		return "", fmt.Errorf("openrouter вернул %d", status)
-	}
-	return contentString(parsed.Choices[0].Message.Content), nil
+	return "", lastErr
 }
 
 // Ping проверяет, что ОСНОВНАЯ модель реально отвечает (правильный id, живой
@@ -328,87 +442,131 @@ func (a *Assistant) PingVision(ctx context.Context) error {
 }
 
 func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {
-	payload, err := json.Marshal(chatRequest{
-		Model:     a.model,
-		Messages:  messages,
-		Tools:     tools,
-		MaxTokens: 3072,
-	})
-	if err != nil {
-		return chatMessage{}, "", err
+	models := append([]string{a.model}, a.fallbackModels...)
+	var lastErr error
+	for _, model := range models {
+		payload, err := json.Marshal(chatRequest{
+			Model:     model,
+			Messages:  messages,
+			Tools:     tools,
+			MaxTokens: a.chatMaxTokens,
+		})
+		if err != nil {
+			return chatMessage{}, "", err
+		}
+		body, status, terr := a.postCompletions(ctx, payload)
+		msg, finish, cerr := interpretChat(body, status, terr)
+		if cerr == nil {
+			return msg, finish, nil
+		}
+		lastErr = cerr
+		var pe *ProviderError
+		if errors.As(cerr, &pe) && shouldFallback(pe.Category) {
+			continue // основная модель недоступна/перегружена — пробуем резервную
+		}
+		return chatMessage{}, "", cerr
 	}
+	return chatMessage{}, "", lastErr
+}
 
-	parsed, status, err := a.postCompletions(ctx, payload)
-	if err != nil {
-		return chatMessage{}, "", err
+// interpretChat превращает сырой ответ HTTP в сообщение модели или в
+// классифицированную ProviderError (чистое сообщение + детали в лог).
+func interpretChat(body []byte, status int, transportErr error) (chatMessage, string, error) {
+	if transportErr != nil {
+		return chatMessage{}, "", classifyProviderError(0, transportErr.Error(), transportErr)
+	}
+	var parsed chatResponse
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		// Тело не-JSON (часто у 5xx/429/HTML-страниц) — классифицируем по статусу.
+		return chatMessage{}, "", classifyProviderError(status, snippet(body), nil)
 	}
 	if parsed.Error != nil {
-		return chatMessage{}, "", fmt.Errorf("openrouter: %s", parsed.Error.Message)
+		return chatMessage{}, "", classifyProviderError(status, parsed.Error.Message, nil)
 	}
 	if status != http.StatusOK {
-		return chatMessage{}, "", fmt.Errorf("openrouter вернул %d", status)
+		return chatMessage{}, "", classifyProviderError(status, snippet(body), nil)
 	}
 	if len(parsed.Choices) == 0 {
-		return chatMessage{}, "", fmt.Errorf("openrouter: пустой ответ")
+		return chatMessage{}, "", &ProviderError{Category: "malformed", User: "ИИ вернул пустой ответ. Повтори запрос.", Detail: "empty choices"}
 	}
-
 	choice := parsed.Choices[0]
 	return choice.Message, choice.FinishReason, nil
 }
 
-// postCompletions отправляет уже сериализованный запрос на /chat/completions
-// и повторяет попытку при временных сбоях: обрыв сети, таймаут, ответы 429 и
-// 5xx. Возвращает разобранный ответ и HTTP-статус последней попытки. Ошибки
-// уровня приложения (200 с error в теле, 4xx кроме 429) не ретраятся — их
-// разбирают вызывающие. backoff растёт (≈0.6s, 1.2s), но упирается в ctx.
-func (a *Assistant) postCompletions(ctx context.Context, payload []byte) (chatResponse, int, error) {
+// interpretText — как interpretChat, но для запросов без инструментов (Complete,
+// зрение): возвращает текст ответа.
+func interpretText(body []byte, status int, transportErr error) (string, error) {
+	msg, _, err := interpretChat(body, status, transportErr)
+	if err != nil {
+		return "", err
+	}
+	return contentString(msg.Content), nil
+}
+
+// postCompletions отправляет запрос на /chat/completions и повторяет попытку при
+// временных сбоях (обрыв сети, таймаут, 429, 5xx). Возвращает СЫРОЕ тело и статус
+// последней попытки — классификацию/разбор делает вызывающий (interpretChat).
+// transportErr != nil только если ответа так и не получили (сеть/таймаут).
+// backoff растёт (≈0.6s, 1.2s), но упирается в ctx.
+func (a *Assistant) postCompletions(ctx context.Context, payload []byte) (body []byte, status int, transportErr error) {
 	var lastErr error
+	var lastStatus int
+	var lastBody []byte
 	for attempt := 0; attempt < maxHTTPAttempts; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return chatResponse{}, 0, ctx.Err()
+				return nil, 0, ctx.Err()
 			case <-time.After(time.Duration(attempt) * 600 * time.Millisecond):
 			}
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
 		if err != nil {
-			return chatResponse{}, 0, err
+			return nil, 0, err
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+a.apiKey)
 
 		resp, err := a.http.Do(req)
 		if err != nil {
-			// Сетевой сбой/таймаут — если контекст ещё жив, пробуем снова.
-			lastErr = fmt.Errorf("openrouter: %w", err)
+			lastErr = err
 			if ctx.Err() != nil {
-				return chatResponse{}, 0, ctx.Err()
+				return nil, 0, ctx.Err()
 			}
-			continue
+			continue // сетевой сбой — если контекст жив, пробуем снова
 		}
 
-		body, err := io.ReadAll(resp.Body)
+		b, rerr := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("openrouter: чтение ответа: %w", err)
+		if rerr != nil {
+			lastErr = rerr
 			continue
 		}
+		lastStatus, lastBody = resp.StatusCode, b
 
 		// Временная перегрузка провайдера — стоит повторить.
 		if resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500 {
-			lastErr = fmt.Errorf("openrouter вернул %d: %s", resp.StatusCode, string(body))
+			lastErr = fmt.Errorf("status %d", resp.StatusCode)
 			continue
 		}
-
-		var parsed chatResponse
-		if err := json.Unmarshal(body, &parsed); err != nil {
-			return chatResponse{}, resp.StatusCode, fmt.Errorf("openrouter: не удалось разобрать ответ (%d): %s", resp.StatusCode, string(body))
-		}
-		return parsed, resp.StatusCode, nil
+		return b, resp.StatusCode, nil
 	}
-	return chatResponse{}, 0, lastErr
+	// Ретраи исчерпаны: если хоть раз получили ответ (429/5xx) — отдаём его на
+	// классификацию по статусу; иначе это чистый сетевой сбой.
+	if lastStatus > 0 {
+		return lastBody, lastStatus, nil
+	}
+	return nil, 0, lastErr
+}
+
+// snippet укорачивает текст для логов (не тащим гигантские тела в детали ошибки).
+func snippet(b []byte) string {
+	s := strings.TrimSpace(string(b))
+	if len(s) > 300 {
+		s = s[:300] + "…"
+	}
+	return s
 }
 
 func runTool(ctx context.Context, tools []Tool, call toolCall) string {

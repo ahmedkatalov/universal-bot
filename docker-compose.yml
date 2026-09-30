@@ -45,6 +45,13 @@ services:
       # распознавание). Хочешь удешевить распознавание, не трогая ум отчётов —
       # поставь дешёвую, напр. anthropic/claude-haiku-4.5.
       OPENROUTER_VISION_MODEL: ${OPENROUTER_VISION_MODEL:-}
+      # Резервные модели (через запятую), если основная недоступна/перегружена/5xx.
+      # Пусто = без резерва. Указывай реальные id из каталога OpenRouter.
+      OPENROUTER_FALLBACK_MODELS: ${OPENROUTER_FALLBACK_MODELS:-}
+      OPENROUTER_VISION_FALLBACK_MODELS: ${OPENROUTER_VISION_FALLBACK_MODELS:-}
+      # Лимит токенов ответа по типу запроса (чтение чека короткое).
+      OPENROUTER_MAX_TOKENS: ${OPENROUTER_MAX_TOKENS:-3072}
+      OPENROUTER_VISION_MAX_TOKENS: ${OPENROUTER_VISION_MAX_TOKENS:-1024}
       # Имя, по которому к боту обращаются в группах: "Джарвис скинь отчет"
       BOT_NAME: ${BOT_NAME:-Джарвис}
       # Кто может писать боту в личку (ассистент, дозагрузка чеков) — номера

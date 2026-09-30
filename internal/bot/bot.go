@@ -874,8 +874,8 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
 	if err != nil {
-		fmt.Println("Ошибка ответа Claude:", err)
-		b.sendText(chat, "Не получилось ответить: "+err.Error())
+		fmt.Println("Ошибка ответа Claude:", err) // технические детали — только в лог
+		b.sendText(chat, ai.UserMessage(err))     // в чат — чистое человеческое сообщение
 		return
 	}
 
@@ -1078,8 +1078,8 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
 	if err != nil {
-		fmt.Println("Ошибка ответа ассистента в группе:", err)
-		b.sendText(chat, "Не получилось ответить: "+err.Error())
+		fmt.Println("Ошибка ответа ассистента в группе:", err) // детали — в лог
+		b.sendText(chat, ai.UserMessage(err))                  // в чат — чистое сообщение
 		return
 	}
 
