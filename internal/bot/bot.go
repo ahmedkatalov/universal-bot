@@ -207,6 +207,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	go b.clarifyLoop()         // проактивные вопросы "чей это чек"
 	go b.pendingNamesJanitor() // уборка durable-очереди «имён без чека»
 	go b.schedulerLoop()       // планировщик напоминаний/сообщений
+	go b.receiptRetryLoop()    // автоповтор распознавания чеков (если зрение падало)
 	return b, nil
 }
 
@@ -2924,6 +2925,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		}); err != nil {
 			fmt.Println("Ошибка сохранения неполного чека:", err)
 		}
+		if visionUnavailable {
+			// Зрение было недоступно — поставим на автоповтор распознавания.
+			_ = b.db.MarkReceiptForRetry(ctx, rawID, "vision unavailable (collapsed)", time.Now().Add(retryBackoff(0)))
+		}
 		if askReceiptsEnabled() && waMsgID != "" {
 			botMsgID := b.sendReply(chat, fmt.Sprintf(
 				"🤔 Чек на %.0f ₽ пришёл НЕПОЛНЫМ (похоже на свёрнутый экран «Перевод выполнен»). Не видно главного: "+
@@ -2978,6 +2983,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			GroupJID:     chat.String(),
 			TxDate:       txDate,
 		})
+		if visionUnavailable {
+			// Зрение было недоступно — ставим на автоповтор распознавания.
+			_ = b.db.MarkReceiptForRetry(ctx, rawID, "vision unavailable", time.Now().Add(retryBackoff(0)))
+		}
 		// Сразу флажим в группе: не распознал — просим помочь. Отмечаем «спросили»,
 		// чтобы клариф-цикл не переспрашивал, и привязываем ответ владельца (ФИО+
 		// сумма свайпом на этот чек) через fix. Чек при этом уже лежит как

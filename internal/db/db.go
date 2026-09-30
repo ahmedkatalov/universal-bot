@@ -284,6 +284,27 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("индекс scheduled_jobs: %w", err)
 	}
 
+	// Фоновый повтор распознавания чеков: если в момент прихода чека модель
+	// зрения была недоступна (сбой API/сети), чек всё равно сохраняется как
+	// needs_review, а эти поля позволяют перечитать его позже, когда ИИ вернётся,
+	// и заполнить сумму/получателя, не заставляя работника переслать чек.
+	for _, ddl := range []string{
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS recognition_status TEXT NOT NULL DEFAULT 'ok'`,
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS recognition_attempts INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ`,
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS last_recognition_error TEXT`,
+	} {
+		if _, err := pool.Exec(ctx, ddl); err != nil {
+			return fmt.Errorf("миграция recognition-полей чеков: %w", err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `
+		CREATE INDEX IF NOT EXISTS idx_receipts_retry
+		ON bank_receipts (next_retry_at) WHERE recognition_status = 'pending'
+	`); err != nil {
+		return fmt.Errorf("индекс повтора распознавания: %w", err)
+	}
+
 	// Наличные платежи: помечаем текстовые транзакции, которые реально наличка
 	// (а не переписанный текстом чек), чтобы отчёты считали их в сбор. Флаг
 	// проставляется при вставке; для уже накопленных данных — разовый backfill

@@ -100,6 +100,8 @@ services:
       # Окно спаривания чек↔имя клиента (минуты) по времени сообщения WhatsApp.
       # Очередь «имён без чека» durable (в БД) и переживает рестарт. По умолчанию 15.
       RECEIPT_PAIR_WINDOW_MINUTES: ${RECEIPT_PAIR_WINDOW_MINUTES:-15}
+      # Сколько раз перечитывать чек в фоне, если зрение падало при его приходе.
+      RECEIPT_RETRY_MAX: ${RECEIPT_RETRY_MAX:-6}
       OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}
