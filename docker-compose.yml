@@ -106,6 +106,12 @@ services:
       RECEIPT_PAIR_WINDOW_MINUTES: ${RECEIPT_PAIR_WINDOW_MINUTES:-15}
       # Сколько раз перечитывать чек в фоне, если зрение падало при его приходе.
       RECEIPT_RETRY_MAX: ${RECEIPT_RETRY_MAX:-6}
+      # Разовое ВОССТАНОВЛЕНИЕ данных из истории WhatsApp. По умолчанию 0 (выкл).
+      # Включай (=1) только на время импорта: при следующей привязке бот МОЛЧА
+      # (без сообщений в группы) разберёт присланную историю в чеки/платежи.
+      # Вернёт лишь недавнее окно (что WhatsApp ещё хранит) и потратит баланс на
+      # чтение чеков. После импорта верни 0 и пересобери.
+      IMPORT_HISTORY: ${IMPORT_HISTORY:-0}
       OCR_PROVIDER: ${OCR_PROVIDER:-tesseract}
       YANDEX_OCR_API_KEY: ${YANDEX_OCR_API_KEY:-}
       YANDEX_FOLDER_ID: ${YANDEX_FOLDER_ID:-}

@@ -84,6 +84,10 @@ type Bot struct {
 	// таблица pending_client_names) и переживает рестарт — не в памяти.
 	pairWindow time.Duration
 
+	// importHistory — разовый импорт истории из WhatsApp (IMPORT_HISTORY=1).
+	// Включается вручную на время восстановления данных; по умолчанию выключен.
+	importHistory bool
+
 	// Фото пачки наличных денег = пометка "это наличка" для соседнего платежа
 	// «ФИО+сумма». Фото может прийти ДО или ПОСЛЕ текста, поэтому запоминаем
 	// недавнее фото-нала по отправителю (ключ groupJID|senderJID -> время).
@@ -197,6 +201,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		lastProactive: make(map[string]time.Time),
 		clarify:       newClarifyState(),
 		pairWindow:    receiptPairWindow(),
+		importHistory: os.Getenv("IMPORT_HISTORY") == "1",
 	}
 
 	b.loadSecretFileConfig() // секретный файл (доступы) — выдача по коду в личке
@@ -320,6 +325,16 @@ func (b *Bot) handleEvent(evt interface{}) {
 				fmt.Printf("Группа: %q — %s\n", name, jid)
 			}
 		}()
+		return
+	}
+
+	// Импорт истории (только когда явно включён IMPORT_HISTORY=1): при привязке
+	// WhatsApp присылает недавнюю историю чатов — молча (без сообщений в группы!)
+	// разбираем из неё чеки/платежи, чтобы вернуть данные после потери сервера.
+	if hs, ok := evt.(*events.HistorySync); ok {
+		if b.importHistory {
+			go b.importHistorySync(hs.Data)
+		}
 		return
 	}
 
