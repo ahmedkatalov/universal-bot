@@ -371,7 +371,7 @@ func (b *Bot) handleEvent(evt interface{}) {
 		// и он не должен блокировать разбор сообщений из групп.
 		fmt.Printf("Личное сообщение от %s (chat=%s, fromMe=%v): %q\n",
 			msg.Info.Sender, msg.Info.Chat, msg.Info.IsFromMe, extractText(msg.Message))
-		if b.ownerNumbers != nil && !b.ownerNumbers[msg.Info.Sender.User] {
+		if b.ownerNumbers != nil && !senderInSet(b.ownerNumbers, msg.Info) {
 			fmt.Println("Отправитель не в списке OWNER_NUMBERS — личка проигнорирована")
 			return
 		}
@@ -919,7 +919,21 @@ func (b *Bot) isReportAdmin(info types.MessageInfo) bool {
 	if len(b.reportAdmins) == 0 {
 		return true // список не задан — ограничение выключено
 	}
-	return b.reportAdmins[info.Sender.User] || b.reportAdmins[info.SenderAlt.User]
+	return senderInSet(b.reportAdmins, info)
+}
+
+// senderInSet проверяет, входит ли отправитель (по номеру телефона) в набор,
+// сверяя И основной JID, И альтернативный, с нормализацией номера. WhatsApp часто
+// адресует отправителя через скрытый LID (@lid), а реальный номер кладёт в
+// SenderAlt — поэтому сверять только Sender.User нельзя (владелец не распознаётся).
+func senderInSet(set map[string]bool, info types.MessageInfo) bool {
+	if set[normalizePhone(info.Sender.User)] {
+		return true
+	}
+	if info.SenderAlt.User != "" && set[normalizePhone(info.SenderAlt.User)] {
+		return true
+	}
+	return false
 }
 
 // ownerPersonalJID — ЛИЧНЫЙ (телефонный) JID отправителя для «напоминай мне»:
