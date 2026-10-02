@@ -444,6 +444,28 @@ func (d *DB) SenderPhoneByMessageID(ctx context.Context, waMessageID string) (st
 	return phone, err
 }
 
+// OldestMessageInfo возвращает НАСТОЯЩИЙ (не пересланный ботом) самый ранний
+// wa_message_id и время для группы — якорь для запроса более старой истории с
+// телефона (on-demand history sync). ok=false — по группе сообщений ещё нет.
+func (d *DB) OldestMessageInfo(ctx context.Context, groupJID string) (waID string, ts time.Time, ok bool, err error) {
+	err = d.pool.QueryRow(ctx, `
+		SELECT wa_message_id, received_at
+		FROM raw_messages
+		WHERE wa_group_jid = $1
+		  AND COALESCE(wa_message_id, '') <> ''
+		  AND position('-fwd-' in wa_message_id) = 0
+		ORDER BY received_at ASC
+		LIMIT 1
+	`, groupJID).Scan(&waID, &ts)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	return waID, ts, true, nil
+}
+
 func (d *DB) MarkMessageParsed(ctx context.Context, rawMessageID int) error {
 	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET parsed = true WHERE id = $1`, rawMessageID)
 	return err
@@ -2880,6 +2902,38 @@ func (d *DB) ListContacts(ctx context.Context) ([]string, error) {
 			return nil, err
 		}
 		out = append(out, name)
+	}
+	return out, rows.Err()
+}
+
+// ContactStat — контакт с числом привязанных записей (для поиска дублей:
+// при слиянии оставляем того, у кого записей больше — меньше риск потерять связь).
+type ContactStat struct {
+	Name    string
+	Records int // чеки + платежи (не удалённые/не дубли)
+}
+
+// ContactsWithCounts возвращает все контакты и сколько к каждому привязано
+// учётных записей. Нужен для «разбери дубли»: бот группирует похожие имена.
+func (d *DB) ContactsWithCounts(ctx context.Context) ([]ContactStat, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT c.canonical_name,
+		       (SELECT COUNT(*) FROM bank_receipts br WHERE br.contact_id = c.id AND br.is_duplicate = false AND br.ignored = false)
+		     + (SELECT COUNT(*) FROM transactions t WHERE t.contact_id = c.id AND t.ignored = false) AS records
+		FROM contacts c
+		ORDER BY c.canonical_name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ContactStat
+	for rows.Next() {
+		var s ContactStat
+		if err := rows.Scan(&s.Name, &s.Records); err != nil {
+			return nil, err
+		}
+		out = append(out, s)
 	}
 	return out, rows.Err()
 }

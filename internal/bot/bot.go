@@ -88,6 +88,12 @@ type Bot struct {
 	// Включается вручную на время восстановления данных; по умолчанию выключен.
 	importHistory bool
 
+	// On-demand перечитывание истории группы ПО КОМАНДЕ владельца (не по env-флагу):
+	// пока окно активно, входящие HistorySync разбираем и отчитываемся владельцу.
+	onDemandMu      sync.Mutex
+	onDemandUntil   time.Time
+	onDemandReplyTo types.JID
+
 	// Фото пачки наличных денег = пометка "это наличка" для соседнего платежа
 	// «ФИО+сумма». Фото может прийти ДО или ПОСЛЕ текста, поэтому запоминаем
 	// недавнее фото-нала по отправителю (ключ groupJID|senderJID -> время).
@@ -332,8 +338,16 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// WhatsApp присылает недавнюю историю чатов — молча (без сообщений в группы!)
 	// разбираем из неё чеки/платежи, чтобы вернуть данные после потери сервера.
 	if hs, ok := evt.(*events.HistorySync); ok {
-		if b.importHistory {
-			go b.importHistorySync(hs.Data)
+		onDemand, replyTo := b.onDemandHistoryActive()
+		if b.importHistory || onDemand {
+			go func() {
+				seen, rc, pay := b.importHistorySync(hs.Data)
+				// По команде «перечитай группу» отчитываемся владельцу в личку —
+				// но только если реально что-то подтянули (чтобы не слать пустые).
+				if onDemand && !replyTo.IsEmpty() && (rc+pay) > 0 {
+					b.sendText(replyTo, fmt.Sprintf("Подтянул из истории группы: разобрал сообщений %d, новых чеков %d, платежей %d.", seen, rc, pay))
+				}
+			}()
 		}
 		return
 	}
@@ -1084,6 +1098,8 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 		b.findReceiptOccurrencesTool(),
 		b.whoseReceiptTool(chat),
 		b.mergeClientsTool(),
+		b.reviewDuplicatesTool(),
+		b.rereadGroupTool(chat),
 		b.scheduleReminderTool(chat, ownerJID),
 		b.listRemindersTool(),
 		b.cancelReminderTool(),

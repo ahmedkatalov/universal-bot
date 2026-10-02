@@ -13,6 +13,7 @@ import (
 	"sort"
 	"time"
 
+	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 
@@ -20,9 +21,51 @@ import (
 	"whatsapp-bot/internal/parser"
 )
 
-func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) {
+// onDemandHistoryActive — открыто ли окно приёма on-demand истории (по команде
+// владельца) и кому слать итог.
+func (b *Bot) onDemandHistoryActive() (bool, types.JID) {
+	b.onDemandMu.Lock()
+	defer b.onDemandMu.Unlock()
+	if time.Now().Before(b.onDemandUntil) {
+		return true, b.onDemandReplyTo
+	}
+	return false, types.JID{}
+}
+
+// requestGroupHistory просит ТЕЛЕФОН прислать более старые сообщения группы
+// (on-demand history sync). Ответ придёт асинхронно событием HistorySync и
+// разберётся обычным путём; итог уйдёт владельцу (replyTo). Best-effort: если
+// телефон офлайн или истории больше нет — просто ничего не придёт.
+func (b *Bot) requestGroupHistory(ctx context.Context, groupJID, replyTo types.JID, count int) error {
+	if b.client == nil || b.client.Store.ID == nil {
+		return fmt.Errorf("WhatsApp не подключён")
+	}
+	waID, ts, ok, err := b.db.OldestMessageInfo(ctx, groupJID.String())
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("по этой группе у меня ещё нет сохранённых сообщений — не от чего отталкиваться")
+	}
+	anchor := &types.MessageInfo{
+		MessageSource: types.MessageSource{Chat: groupJID, IsFromMe: false},
+		ID:            waID,
+		Timestamp:     ts,
+	}
+	// Окно приёма открываем ДО отправки, чтобы не упустить быстрый ответ телефона.
+	b.onDemandMu.Lock()
+	b.onDemandUntil = time.Now().Add(3 * time.Minute)
+	b.onDemandReplyTo = replyTo
+	b.onDemandMu.Unlock()
+
+	req := b.client.BuildHistorySyncRequest(anchor, count)
+	_, err = b.client.SendMessage(ctx, b.client.Store.ID.ToNonAD(), req, whatsmeow.SendRequestExtra{Peer: true})
+	return err
+}
+
+func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receiptsN, paymentsN int) {
 	if data == nil {
-		return
+		return 0, 0, 0
 	}
 	ctx := context.Background()
 	var seen, receipts, payments int
@@ -106,6 +149,7 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) {
 		}
 	}
 	fmt.Printf("Импорт истории завершён: разобрано сообщений %d, чеков %d, текстовых платежей %d\n", seen, receipts, payments)
+	return seen, receipts, payments
 }
 
 func histTS(hm *waHistorySync.HistorySyncMsg) uint64 {

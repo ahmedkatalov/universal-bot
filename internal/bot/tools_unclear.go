@@ -739,6 +739,78 @@ func (b *Bot) fixReceiptTool() ai.Tool {
 
 // recountTool — полный пересчёт: повторное сопоставление имён, доразбор
 // нераспознанных сообщений, актуализация учёта.
+// rereadGroupTool — «перечитай группу / возьми заново чеки из группы». Делает
+// две вещи: (1) СРАЗУ заново прогоняет все сохранённые сообщения через разбор
+// (ловит чеки, что упустил старый разбор) — надёжно; (2) просит ТЕЛЕФОН прислать
+// более старую историю группы (on-demand) — если там есть ещё чеки, подтянет в
+// фоне. Только владельцу/админам.
+func (b *Bot) rereadGroupTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "reread_group",
+		Description: "Заново берёт информацию (чеки/платежи) из группы по запросу владельца: «перечитай группу», " +
+			"«возьми заново чеки из группы сб», «подтяни чеки заново», «пересмотри сообщения группы». Сначала заново " +
+			"разбирает уже сохранённые сообщения (ловит пропущенное), затем просит телефон прислать более старую " +
+			"историю группы — если телефон онлайн и там ещё есть сообщения, бот подтянет их в фоне и отчитается. " +
+			"Можно указать group (пусто = текущая группа, либо все, если пишут из лички).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"group": map[string]any{"type": "string", "description": "Название группы (пусто = эта группа; в личке без указания — все группы)"},
+			},
+			"required": []string{},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Group string `json:"group"`
+			}
+			_ = json.Unmarshal(input, &args)
+
+			// 1) Надёжная часть: заново разобрать сохранённые сообщения.
+			recountMsg, err := b.recountEverything(ctx)
+			if err != nil {
+				return "", err
+			}
+
+			// 2) Определяем, у каких групп просить более старую историю с телефона.
+			var targets []types.JID
+			if strings.TrimSpace(args.Group) != "" {
+				jids, _, gerr := b.resolveGroups(ctx, args.Group)
+				if gerr != nil {
+					return "", gerr
+				}
+				for _, j := range jids {
+					if jid, e := types.ParseJID(j); e == nil {
+						targets = append(targets, jid)
+					}
+				}
+			} else if chat.Server == types.GroupServer {
+				targets = []types.JID{chat}
+			} else {
+				for jid := range b.joinedGroups(ctx) {
+					if b.isAllowedGroup(jid) {
+						targets = append(targets, jid)
+					}
+				}
+			}
+
+			requested := 0
+			for _, jid := range targets {
+				if err := b.requestGroupHistory(ctx, jid, chat, 200); err == nil {
+					requested++
+				}
+			}
+
+			out := recountMsg
+			if requested > 0 {
+				out += "\n\nТакже попросил телефон прислать более старую историю " +
+					fmt.Sprintf("(%d групп(ы))", requested) +
+					" — если там есть ещё чеки и телефон онлайн, подтяну в фоне и напишу, сколько нашёл."
+			}
+			return out, nil
+		},
+	}
+}
+
 func (b *Bot) recountTool() ai.Tool {
 	return ai.Tool{
 		Name: "recount_everything",
