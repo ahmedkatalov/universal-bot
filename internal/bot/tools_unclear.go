@@ -810,7 +810,10 @@ func (b *Bot) recountEverything(ctx context.Context) (string, error) {
 				jid, err := types.ParseJID(m.GroupJID)
 				if err == nil {
 					delegated = true
-					b.aiRescueUnparsed(ctx, jid, m.SenderName, result.Unparsed, m.ID, m.ReceivedAt, false)
+					// paymentLikely=false: при ПЕРЕСЧЁТЕ старых сообщений публичный
+					// «❓» не задаём — иначе бот задним числом засыпал бы группы
+					// вопросами по давним сообщениям. Платёж, если он есть, ИИ запишет.
+					b.aiRescueUnparsed(ctx, jid, m.SenderName, result.Unparsed, m.ID, m.ReceivedAt, false, false)
 				}
 			}
 			if saved > 0 {

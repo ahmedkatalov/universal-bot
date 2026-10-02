@@ -460,6 +460,103 @@ func (d *DB) GetOrCreateContact(ctx context.Context, canonicalName string) (int,
 	return id, err
 }
 
+// resolveContact находит контакт по имени: сначала точное совпадение каноничного
+// имени (без учёта регистра), иначе ЕДИНСТВЕННОЕ частичное. Возвращает понятную
+// ошибку, если не найден или неоднозначен — чтобы владелец уточнил.
+func (d *DB) resolveContact(ctx context.Context, name string) (id int, canonical string, err error) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return 0, "", fmt.Errorf("пустое имя")
+	}
+	err = d.pool.QueryRow(ctx, `SELECT id, canonical_name FROM contacts WHERE lower(canonical_name)=lower($1)`, name).Scan(&id, &canonical)
+	if err == nil {
+		return id, canonical, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return 0, "", err
+	}
+	rows, err := d.pool.Query(ctx, `SELECT id, canonical_name FROM contacts WHERE canonical_name ILIKE '%'||$1||'%' ORDER BY canonical_name LIMIT 3`, name)
+	if err != nil {
+		return 0, "", err
+	}
+	defer rows.Close()
+	var ids []int
+	var names []string
+	for rows.Next() {
+		var i int
+		var n string
+		if err := rows.Scan(&i, &n); err != nil {
+			return 0, "", err
+		}
+		ids = append(ids, i)
+		names = append(names, n)
+	}
+	switch len(ids) {
+	case 0:
+		return 0, "", fmt.Errorf("клиент %q не найден", name)
+	case 1:
+		return ids[0], names[0], nil
+	default:
+		return 0, "", fmt.Errorf("по «%s» несколько клиентов (%s) — назови полное имя", name, strings.Join(names, ", "))
+	}
+}
+
+// MergeContacts объединяет контакт-ДУБЛИКАТ fromName в toName: переносит все его
+// чеки и платежи на toName, старое имя делает синонимом нового и удаляет пустой
+// контакт. Нужен владельцу, чтобы руками исправить задвоение одного человека
+// (разные написания ФИО создали два контакта). Всё в одной транзакции (или всё,
+// или ничего). Возвращает число перенесённых записей и каноничные имена обоих.
+func (d *DB) MergeContacts(ctx context.Context, fromName, toName string) (moved int, fromCanonical, toCanonical string, err error) {
+	fromID, fromCanonical, err := d.resolveContact(ctx, fromName)
+	if err != nil {
+		return 0, "", "", err
+	}
+	toID, toCanonical, err := d.resolveContact(ctx, toName)
+	if err != nil {
+		return 0, "", "", err
+	}
+	if fromID == toID {
+		return 0, fromCanonical, toCanonical, fmt.Errorf("«%s» и «%s» — это уже один контакт, объединять нечего", fromCanonical, toCanonical)
+	}
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer tx.Rollback(ctx)
+
+	ct, err := tx.Exec(ctx, `UPDATE transactions SET contact_id=$1 WHERE contact_id=$2`, toID, fromID)
+	if err != nil {
+		return 0, "", "", err
+	}
+	moved += int(ct.RowsAffected())
+	cr, err := tx.Exec(ctx, `UPDATE bank_receipts SET contact_id=$1 WHERE contact_id=$2`, toID, fromID)
+	if err != nil {
+		return 0, "", "", err
+	}
+	moved += int(cr.RowsAffected())
+	// Переносим алиасы старого контакта на новый (пропуская те, что уже есть у нового).
+	if _, err = tx.Exec(ctx, `
+		UPDATE contact_aliases SET contact_id=$1
+		WHERE contact_id=$2 AND alias NOT IN (SELECT alias FROM contact_aliases WHERE contact_id=$1)`, toID, fromID); err != nil {
+		return 0, "", "", err
+	}
+	// Старое каноничное имя — синонимом нового, чтобы будущие упоминания старого
+	// написания находили объединённый контакт.
+	if _, err = tx.Exec(ctx, `
+		INSERT INTO contact_aliases (contact_id, alias) VALUES ($1, lower($2))
+		ON CONFLICT (alias) DO NOTHING`, toID, fromCanonical); err != nil {
+		return 0, "", "", err
+	}
+	// Удаляем опустевший контакт (оставшиеся его алиасы уйдут каскадом).
+	if _, err = tx.Exec(ctx, `DELETE FROM contacts WHERE id=$1`, fromID); err != nil {
+		return 0, "", "", err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return 0, "", "", err
+	}
+	return moved, fromCanonical, toCanonical, nil
+}
+
 // LoadAliases возвращает все пары (alias -> canonical_name) для инициализации AliasMap при старте.
 func (d *DB) LoadAliases(ctx context.Context) (map[string]string, error) {
 	rows, err := d.pool.Query(ctx, `
@@ -2969,6 +3066,27 @@ const countableTextConditionByChat = `(
 		)
 	)`
 
+// fwdDedupNotExists отбрасывает ПЕРЕСЛАННУЮ копию чека (её wa_message_id вида
+// «<оригинал>-fwd-<группа>»), если ОРИГИНАЛ присутствует и посчитан в той же
+// выборке. Нужно потому, что пересланная копия распознаётся заново и может дать
+// ДРУГОЙ номер документа/дату — тогда ключ DISTINCT ON расходится и обе копии
+// выживают, задваивая сумму в сводке по всем группам. Это условие — В ДОПОЛНЕНИЕ
+// к DISTINCT ON. Фильтр групп на оригинале ОБЯЗАТЕЛЕН ($3), иначе отчёт по одной
+// группе зря прятал бы копию, найдя оригинал в другой. Требует в основном запросе
+// алиасы br (чек) и rm (его raw_messages) и параметры $1/$2 (период tx_date), $3
+// (группы) — как в SummaryForPeriod/CardTotals/SenderStats.
+const fwdDedupNotExists = `AND NOT EXISTS (
+			SELECT 1 FROM bank_receipts o
+			JOIN raw_messages orm ON orm.id = o.raw_message_id
+			WHERE o.id <> br.id
+			  AND o.needs_review = false AND o.is_duplicate = false AND o.ignored = false
+			  AND COALESCE(orm.deleted, false) = false
+			  AND o.tx_date >= $1 AND o.tx_date < $2
+			  AND ($3::text[] IS NULL OR o.group_jid = ANY($3))
+			  AND COALESCE(rm.wa_message_id, '') <> '' AND COALESCE(orm.wa_message_id, '') <> ''
+			  AND starts_with(rm.wa_message_id, orm.wa_message_id || '-fwd-')
+		)`
+
 func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
@@ -2998,6 +3116,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		  AND COALESCE(rm.deleted, false) = false
 		  AND br.contact_id IS NOT NULL
 		  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+		  `+fwdDedupNotExists+`
 		ORDER BY COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 	`, from, to, groupSliceArg(groupJIDs))
 	if err != nil {
@@ -3170,6 +3289,7 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 			  AND COALESCE(rm.deleted, false) = false
 			  AND br.amount > 0
 			  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+			  `+fwdDedupNotExists+`
 			ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text)
 		) dedup
 	`, from, to, groupSliceArg(groupJIDs))
@@ -3244,6 +3364,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 				  AND COALESCE(rm.deleted, false) = false
 				  AND br.amount > 0
 				  AND ($3::text[] IS NULL OR br.group_jid = ANY($3))
+				  `+fwdDedupNotExists+`
 				ORDER BY COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text), br.created_at
 			) bank_dedup
 

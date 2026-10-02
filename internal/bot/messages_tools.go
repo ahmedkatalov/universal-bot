@@ -309,6 +309,47 @@ func (b *Bot) whoseReceiptTool(chat types.JID) ai.Tool {
 	}
 }
 
+// mergeClientsTool — «объедини X и Y»: сливает два контакта одного человека в
+// один (исправление задвоения из-за разных написаний ФИО). Только владельцу.
+func (b *Bot) mergeClientsTool() ai.Tool {
+	return ai.Tool{
+		Name: "merge_clients",
+		Description: "Объединяет ДВА контакта ОДНОГО человека в один, когда из-за разных написаний ФИО появились " +
+			"дубликаты: все чеки и платежи с «from» переносятся на «to», старое имя становится синонимом нового. " +
+			"Вызывай ТОЛЬКО по явной команде владельца: «объедини Ахмеда Катаева и Ахмеда К.», «это один человек, слей их», " +
+			"«убери дубликат X, оставь Y». from — имя-дубликат (его убрать), to — имя, которое оставить. " +
+			"Это меняет отчёты — не вызывай по догадке, только когда владелец прямо просит объединить.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"from": map[string]any{"type": "string", "description": "Имя-дубликат, который убрать (перенести с него)"},
+				"to":   map[string]any{"type": "string", "description": "Имя, которое оставить (на него перенести)"},
+			},
+			"required": []string{"from", "to"},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				From string `json:"from"`
+				To   string `json:"to"`
+			}
+			if err := json.Unmarshal(input, &args); err != nil {
+				return "", err
+			}
+			from, to := strings.TrimSpace(args.From), strings.TrimSpace(args.To)
+			if from == "" || to == "" {
+				return "Назови оба имени: какого дубликата убрать (from) и в кого объединить (to).", nil
+			}
+			moved, fromC, toC, err := b.db.MergeContacts(ctx, from, to)
+			if err != nil {
+				return "", err // честная ошибка владельцу (не найден/неоднозначно/это один контакт)
+			}
+			// Будущие упоминания старого написания теперь ведут к объединённому контакту.
+			b.aliases.Add(fromC, toC)
+			return fmt.Sprintf("Объединил «%s» → «%s». Перенёс записей: %d. Теперь это один клиент во всех отчётах.", fromC, toC, moved), nil
+		},
+	}
+}
+
 // lastDigits возвращает последние n цифр строки (для короткой подписи номера).
 func lastDigits(s string, n int) string {
 	r := []rune(s)

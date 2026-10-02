@@ -617,13 +617,20 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// в любом формате (не по жёстким словам-триггерам). Детерминированный парсер
 	// оставлен запасным путём: если ассистента нет или его вызов сорвётся,
 	// aiRescueUnparsed сам откатится к нему, чтобы платёж не потерялся.
+	// РЕШАЕТ ИИ, а не регулярка: раньше сообщение уходило в ИИ ТОЛЬКО если
+	// детерминированный парсер уже признал его платежом (hasPayment). Платёж в
+	// необычном формате, который парсер не поймал, молча терялся. Теперь ИИ видит и
+	// «возможный платёж» (есть цифра/денежное слово) — и сам решает по смыслу,
+	// платёж это или болтовня. Для НЕ-платёжеподобных по цифре сообщений публичный
+	// вопрос «❓» подавляется (paymentLikely=false), чтобы не допрашивать болтовню.
+	// Детерминированный парсер остаётся запасным путём (ассистента нет/вызов упал).
 	hasPayment := len(result.Transactions) > 0 || parser.LooksMessyPayment(text, result)
-	routedToAI := b.assistant != nil && hasPayment
+	routedToAI := b.assistant != nil && (hasPayment || mightBePayment(text))
 	if routedToAI {
 		// Пометку «рядом было фото пачки денег» снимаем здесь: если она свежая —
 		// эти платежи и есть наличка (передаём подсказкой, но решает ассистент).
 		cashHint := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
-		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint)
+		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint, hasPayment)
 	}
 	keepUnparsed := false
 	if !routedToAI && len(result.Transactions) > 0 {
@@ -649,6 +656,31 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		proactiveChatEnabled() && worthChimingIn(text) {
 		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
 	}
+}
+
+// mightBePayment — грубый фильтр «возможно, это платёж»: есть цифра (возможная
+// сумма) или денежное слово. Нужен, чтобы отдать ИИ на разбор даже те сообщения,
+// которые детерминированный парсер не признал платежом (необычный формат) — ИИ сам
+// решит по смыслу. Специально ШИРОКИЙ: ложное срабатывание безопасно (ИИ вернёт
+// «не платёж» и ничего не запишет, а публичный вопрос подавлен), а пропуск
+// реального платежа — нет. Пустую болтовню без цифр/денег сюда не тянем.
+func mightBePayment(text string) bool {
+	for _, r := range text {
+		if r >= '0' && r <= '9' {
+			return true
+		}
+	}
+	low := strings.ToLower(text)
+	for _, w := range []string{
+		"тысяч", "тыщ", "косар", "лям", "перевёл", "перевел", "перевод", "скинул",
+		"скину", "оплат", "внёс", "внес", "налич", "нал ", "отдал", "занёс", "занес",
+		"принёс", "принес", "сдал", "кинул", "забрал",
+	} {
+		if strings.Contains(low, w) {
+			return true
+		}
+	}
+	return false
 }
 
 // recordDeterministicPayments — ЗАПАСНОЙ путь записи платежей без ассистента:
@@ -1036,6 +1068,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 		b.findMessagesTool(),
 		b.findReceiptOccurrencesTool(),
 		b.whoseReceiptTool(chat),
+		b.mergeClientsTool(),
 		b.scheduleReminderTool(chat, ownerJID),
 		b.listRemindersTool(),
 		b.cancelReminderTool(),

@@ -53,7 +53,11 @@ type aiPayment struct {
 	Collector string  `json:"collector"` // кто ЗАБРАЛ наличку (ответственный), если указан
 }
 
-func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint bool) {
+// paymentLikely — был ли текст ПОХОЖ на платёж по детерминированным признакам
+// (нашёл парсер / «грязный платёж»). Если нет (сообщение отдали ИИ «на всякий
+// случай», потому что в нём была цифра/денежное слово), публичный вопрос-уточнение
+// «❓…» НЕ задаём — чтобы обычная болтовня с числом не вызывала допрос в группе.
+func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint, paymentLikely bool) {
 	// Помечаем сообщение разобранным ТОЛЬКО по завершении записи. Если горутина
 	// упадёт с паникой ИЛИ платежи нашлись, но ни один не записался (БД
 	// недоступна) — не помечаем, чтобы пересчёт (recount) переразобрал его и
@@ -121,7 +125,8 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 	user := "Отправитель сообщения: " + senderName + "\nСтроки:\n" + joined
 	if len(foundAmts) > 0 {
-		user += "\n\nСуммы, которые ТОЧНО есть в тексте (бери их КАК ЕСТЬ, не пересчитывай и не дели): " + strings.Join(foundAmts, ", ") + " ₽."
+		user += "\n\nЧисла-суммы, найденные в тексте (подсказка по ФОРМАТУ — бери как есть, не пересчитывай и не дели; " +
+			"но какие из них относятся к платежам, реши САМ по смыслу): " + strings.Join(foundAmts, ", ") + " ₽."
 	}
 
 	// 3-ФАЗНАЯ ПРОВЕРКА (само-согласованность): читаем сообщение НЕСКОЛЬКО раз
@@ -195,9 +200,11 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 	}
 
-	// Вопрос-уточнение задаём, только если платежей нет и его задало БОЛЬШИНСТВО
-	// чтений (иначе одно «неуверенное» чтение сыпало бы лишние вопросы).
-	if len(payments) == 0 {
+	// Вопрос-уточнение задаём, только если платежей нет, его задало БОЛЬШИНСТВО
+	// чтений И сообщение вообще было похоже на платёж. Последнее важно: теперь ИИ
+	// получает и «просто сообщения с цифрой» (чтобы не упустить платёж в необычном
+	// формате) — по такой болтовне переспрашивать в группе нельзя.
+	if paymentLikely && len(payments) == 0 {
 		if q := majorityString(clarifies, okRuns); q != "" {
 			b.sendText(chat, "❓ "+q)
 		}
@@ -302,6 +309,38 @@ func looksLikeClockToken(text string, start, end int, tok string) bool {
 // меньше 100 (и не похожие на дату/время). По их количеству решаем, ОДНА ли
 // сумма в сообщении: только тогда её можно безопасно навязать ИИ и подменить ею
 // результат; при нескольких числах («20000 + 5000») подмена ломала бы итог.
+// digitCount — сколько цифр в строке (чтобы отличить телефон/счёт от суммы).
+func digitCount(s string) int {
+	n := 0
+	for _, r := range s {
+		if r >= '0' && r <= '9' {
+			n++
+		}
+	}
+	return n
+}
+
+// precededByNonAmountMarker — перед числом стоит маркер НЕ-суммы (номер договора/
+// счёта или телефон): такое число — не деньги. Смотрим короткое окно слева.
+// «карту/номер/год» НЕ фильтруем намеренно — там часто стоит реальная сумма
+// («на карту 50000»), и их отбрасывание потеряло бы платёж.
+func precededByNonAmountMarker(text string, start int) bool {
+	if start > 0 && text[start-1] == '+' {
+		return true // +7… — телефон
+	}
+	lo := start - 24
+	if lo < 0 {
+		lo = 0
+	}
+	ctx := strings.ToLower(text[lo:start])
+	for _, w := range []string{"договор", "счёт", "счет", "№", "тел", "телефон"} {
+		if strings.Contains(ctx, w) {
+			return true
+		}
+	}
+	return false
+}
+
 func moneyTokens(text string) []float64 {
 	var out []float64
 	for _, m := range reMoneyToken.FindAllStringIndex(text, -1) {
@@ -316,6 +355,12 @@ func moneyTokens(text string) []float64 {
 		}
 		if suffix == nil && looksLikeClockToken(text, m[0], m[1], tok) {
 			continue // «12:30» — время
+		}
+		if suffix == nil && digitCount(tok) >= 10 {
+			continue // 10+ цифр — телефон/счёт/карта, а не сумма
+		}
+		if suffix == nil && precededByNonAmountMarker(text, m[0]) {
+			continue // номер договора/счёта/телефон («договор 12345», «+7...») — не сумма
 		}
 		v := parser.ParseMoneyValue(tok)
 		if v <= 0 {
