@@ -592,6 +592,21 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// чеке (там может быть владелец карты, а не клиент).
 		payer, payerAmount := b.resolveReceiptPayer(ctx, msg, caption)
 		b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), msg.Info.ID, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer, payerAmount)
+		// Если в ПОДПИСИ к чеку есть обращение к боту («Джарвис, чей это чек?»,
+		// «Джарвис запиши на Ахмеда») — отвечаем ассистентом. Раньше команда в
+		// подписи к фото терялась: ветка ассистента работала только для текста без
+		// медиа. Сам чек уже ПРИНЯТ в учёт строкой выше (никогда не теряем), поэтому
+		// просим ассистента не записывать его повторно, а при надобности привязать/
+		// исправить уже записанный — assign/fix работают по существующему чеку.
+		if b.assistant != nil {
+			if query, ok := b.stripBotName(caption); ok && strings.TrimSpace(query) != "" {
+				note := query + "\n\n[Это была ПОДПИСЬ к фото чека. Чек уже автоматически ПРИНЯТ в учёт — " +
+					"повторно через record_payment его НЕ записывай. Если владелец просит привязать к клиенту или " +
+					"исправить — используй assign_receipt_collector/fix_receipt по последнему чеку. " +
+					"Распознанный текст чека:]\n" + text
+				go b.handleGroupAssistant(context.Background(), msg, note)
+			}
+		}
 		return
 	}
 
@@ -1829,6 +1844,15 @@ func (b *Bot) cardsTool(chat types.JID) ai.Tool {
 				fmt.Fprintf(&sb, "- %s%s: %.0f ₽ (%d переводов)\n", c.CardOwner, bank, c.Total, c.Count)
 			}
 			fmt.Fprintf(&sb, "Итого: %.0f ₽ (%d переводов)", total, count)
+			// Сверка с «сбором по людям»: на картах учитываются ВСЕ поступившие
+			// чеки, а в сбор по людям — только с подтверждённым клиентом. Если есть
+			// непроверенные/несопоставленные чеки, поясняем разницу, чтобы владелец
+			// не думал, что цифры «по картам» и «по людям» должны сходиться.
+			if strings.TrimSpace(args.Card) == "" {
+				if ex, err := b.db.ReportExclusions(ctx, from, toDay.AddDate(0, 0, 1), groupJIDs); err == nil && ex.NeedsReviewSum > 0 {
+					fmt.Fprintf(&sb, "\n(Из них непроверенных/несопоставленных чеков на %.0f ₽ — на картах они есть, но в сбор по людям ещё НЕ вошли, пока не подтвердишь клиента.)", ex.NeedsReviewSum)
+				}
+			}
 			return sb.String(), nil
 		},
 	}

@@ -6,6 +6,7 @@ package bot
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"strings"
@@ -283,6 +284,11 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID int, text string) bool {
 	collector := extractCollectorName(text)
 	if collector == "" {
+		// Детерминированный разбор не справился с нестандартной формулировкой —
+		// спрашиваем ИИ (он поймёт «да Шамиль его забрал, он в офисе был» и т.п.).
+		collector = b.aiCashCollector(ctx, text)
+	}
+	if collector == "" {
 		return false
 	}
 	if canon, ok := b.aliases.ResolveName(collector); ok {
@@ -294,6 +300,57 @@ func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID 
 	}
 	b.sendText(chat, fmt.Sprintf("Записал: наличка %s %.0f ₽ — забрал %s.", client, amount, collector))
 	return true
+}
+
+// aiCashCollector — ИИ-запас для ответа «у кого наличка / кто забрал»: достаёт
+// имя забравшего из свободной формулировки, которую не осилил extractCollectorName
+// («да её Шамиль в офисе принял» -> «Шамиль»). Пусто — не названо/ИИ недоступен.
+func (b *Bot) aiCashCollector(ctx context.Context, reply string) string {
+	if b.assistant == nil {
+		return ""
+	}
+	sys := "Владельцу задали вопрос «у кого наличка / кто забрал деньги». Из его ответа выдели ИМЯ того, кто " +
+		"ЗАБРАЛ/ПРИНЯЛ наличку — это человек ИЛИ место (офис, кафе, точка). Приведи в именительный падеж " +
+		"(«Шамиля» -> «Шамиль»). Если в ответе никого не назвали — пусто. Верни СТРОГО JSON {\"collector\":\"имя или пусто\"}."
+	out, err := b.assistant.Complete(ctx, sys, reply)
+	if err != nil {
+		return ""
+	}
+	var p struct {
+		Collector string `json:"collector"`
+	}
+	if blk := extractJSONBlock(out); blk != "" {
+		_ = json.Unmarshal([]byte(blk), &p)
+	}
+	return strings.TrimSpace(p.Collector)
+}
+
+// aiCashDupDecision — ИИ-запас для ответа на «повтор налички: новый или тот же?».
+// Возвращает (resolved, isNew): resolved=false — ИИ тоже не понял, переспросим.
+func (b *Bot) aiCashDupDecision(ctx context.Context, reply string) (resolved, isNew bool) {
+	if b.assistant == nil {
+		return false, false
+	}
+	sys := "Владельцу задали вопрос про ПОВТОР налички: это НОВЫЙ отдельный платёж или ТОТ ЖЕ (повтор, не считать)? " +
+		"По его ответу реши. Верни СТРОГО JSON {\"decision\":\"new|same|unclear\"}: " +
+		"new — новый/отдельный/засчитать/ещё один; same — тот же/повтор/дубль/не считать; unclear — непонятно."
+	out, err := b.assistant.Complete(ctx, sys, reply)
+	if err != nil {
+		return false, false
+	}
+	var p struct {
+		Decision string `json:"decision"`
+	}
+	if blk := extractJSONBlock(out); blk != "" {
+		_ = json.Unmarshal([]byte(blk), &p)
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Decision)) {
+	case "new":
+		return true, true
+	case "same":
+		return true, false
+	}
+	return false, false
 }
 
 // cashCollectorMarkers — слова-обёртки вокруг имени в ответе «у Дени», «Мансур взял».
@@ -550,6 +607,12 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	}
 	if isDupAsk {
 		resolved, isNew := parseCashDupAnswer(text)
+		if !resolved && b.assistant != nil {
+			// Нестандартный ответ — пусть ИИ решит по смыслу «новый или тот же».
+			if r, n := b.aiCashDupDecision(ctx, text); r {
+				resolved, isNew = r, n
+			}
+		}
 		if !resolved {
 			b.sendText(msg.Info.Chat, "Ответьте, пожалуйста, «новый» (засчитать отдельно) или «тот же» (повтор, не считать).")
 			return true // оставляем связь — можно ответить ещё раз на тот же вопрос

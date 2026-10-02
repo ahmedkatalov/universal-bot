@@ -351,6 +351,15 @@ func ParseReceipt(text string) ReceiptData {
 		}
 	}
 
+	// ЧИСТАЯ сумма перевода важнее того, что схватил построчный разбор. Построчно
+	// побеждает ПЕРВАЯ подходящая строка, поэтому «Итого»/«Сумма списания»,
+	// напечатанные ВЫШЕ (и иногда включающие комиссию), перебивали настоящую
+	// «Сумма перевода» ниже. Явную сумму перевода/операции/платежа берём как
+	// итоговую (комиссию НЕ вычитаем — банк берёт её сверх).
+	if net, ok := netTransferAmount(lines); ok {
+		rd.Amount = net
+	}
+
 	// Формат СБП-перевода (ВТБ и другие банки часто пишут это фразой, а не текстом
 	// с логотипом — логотип на скриншоте это картинка, OCR его не прочитает).
 	// ФИО получателя обычно идёт следующей строкой, без явного лейбла "Получатель".
@@ -384,6 +393,43 @@ func ParseReceipt(text string) ReceiptData {
 	}
 
 	return rd
+}
+
+// netAmountRules — лейблы ЧИСТОЙ суммы перевода (без комиссии), в порядке
+// предпочтения. Отдельно от fieldRules, чтобы не трогать общий построчный разбор.
+var netAmountRules = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^сумма\s+перевода\s*:?\s*(.*)$`),
+	regexp.MustCompile(`(?i)^сумма\s+операции\s*:?\s*(.*)$`),
+	regexp.MustCompile(`(?i)^сумма\s+платежа\s*:?\s*(.*)$`),
+	regexp.MustCompile(`(?i)^перевод\s+по\s+сбп\s*:?\s*(.*)$`),
+}
+
+// netTransferAmount ищет ЧИСТУЮ сумму перевода (по лейблу назначения), игнорируя
+// «Итого»/«Сумма списания»/«Сумма прописью». Возвращает первое валидное значение.
+func netTransferAmount(lines []string) (float64, bool) {
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		for _, re := range netAmountRules {
+			m := re.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			value := strings.TrimSpace(m[1])
+			if value == "" {
+				value = nextNonEmptyLine(lines, i+1)
+			}
+			if value == "" || isFieldLabel(value) {
+				continue
+			}
+			if v := ParseMoneyValue(value); v > 0 {
+				return v, true
+			}
+		}
+	}
+	return 0, false
 }
 
 func applyField(rd *ReceiptData, field, value string) {
