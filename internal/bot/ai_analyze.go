@@ -204,7 +204,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// чтений И сообщение вообще было похоже на платёж. Последнее важно: теперь ИИ
 	// получает и «просто сообщения с цифрой» (чтобы не упустить платёж в необычном
 	// формате) — по такой болтовне переспрашивать в группе нельзя.
-	if paymentLikely && len(payments) == 0 {
+	if paymentLikely && len(payments) == 0 && !b.groupSilent(chat) {
 		if q := majorityString(clarifies, okRuns); q != "" {
 			b.sendText(chat, "❓ "+q)
 		}

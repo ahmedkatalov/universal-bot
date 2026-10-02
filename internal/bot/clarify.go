@@ -141,6 +141,9 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 		if !b.isAllowedGroup(jid) {
 			continue
 		}
+		if b.groupSilent(jid) {
+			continue // владелец попросил молчать в этой группе — вопросов не задаём
+		}
 		// 1. Чеки без имени клиента — «чей это чек?».
 		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
 			items, err := b.db.UnconfirmedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
@@ -569,6 +572,9 @@ func suspiciousAmountCheckEnabled() bool {
 func (b *Bot) checkSuspiciousAmount(ctx context.Context, chat types.JID, waMsgID, senderJID string, amount float64) {
 	if !suspiciousAmountCheckEnabled() || waMsgID == "" || amount < suspiciousFloor {
 		return
+	}
+	if b.groupSilent(chat) {
+		return // в этой группе бот молчит по просьбе владельца
 	}
 	median, n, err := b.db.GroupAmountMedian(ctx, chat.String(), time.Now().AddDate(0, -3, 0))
 	if err != nil || n < suspiciousMinCount || median <= 0 || amount <= median*suspiciousMultiple {

@@ -88,6 +88,14 @@ type Bot struct {
 	// Включается вручную на время восстановления данных; по умолчанию выключен.
 	importHistory bool
 
+	// muted — группы, где бот МОЛЧИТ: не шлёт САМ (без обращения) ни вопросов
+	// «чей чек/у кого наличка», ни предупреждений, ни проактивных реплик. Учёт
+	// при этом продолжает идти молча, а на прямое обращение бот отвечает.
+	// Ключ — JID группы; "*" = молчать во ВСЕХ группах. Переживает рестарт
+	// (хранится в bot_settings). Управляется командой владельца.
+	mutedMu sync.Mutex
+	muted   map[string]bool
+
 	// On-demand перечитывание истории группы ПО КОМАНДЕ владельца (не по env-флагу):
 	// пока окно активно, входящие HistorySync разбираем и отчитываемся владельцу.
 	onDemandMu      sync.Mutex
@@ -208,10 +216,12 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		clarify:       newClarifyState(),
 		pairWindow:    receiptPairWindow(),
 		importHistory: os.Getenv("IMPORT_HISTORY") == "1",
+		muted:         map[string]bool{},
 	}
 
 	b.loadSecretFileConfig() // секретный файл (доступы) — выдача по коду в личке
 	b.loadHistory(ctx)       // восстановить память диалогов ассистента после рестарта
+	b.loadMutedGroups(ctx)   // в каких группах бот молчит (не пишет сам) — по команде владельца
 
 	client.AddEventHandler(b.handleEvent)
 	go b.cmfWatcherLoop()      // сверка чеков с программой рассрочек (no-op, если cmf == nil)
@@ -383,8 +393,10 @@ func (b *Bot) handleEvent(evt interface{}) {
 		}
 		if txN+rcN > 0 {
 			fmt.Printf("Сообщение %s удалено — из учёта убрано платежей: %d, чеков: %d\n", revokedID, txN, rcN)
-			b.sendText(msg.Info.Chat, fmt.Sprintf(
-				"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
+			if !b.groupSilent(msg.Info.Chat) {
+				b.sendText(msg.Info.Chat, fmt.Sprintf(
+					"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
+			}
 		}
 		return
 	}
@@ -781,6 +793,9 @@ func worthChimingIn(text string) bool {
 // maybeChimeIn решает через ИИ, стоит ли вставить реплику в групповой разговор,
 // и если да — пишет её. С кулдауном на группу, чтобы не флудить.
 func (b *Bot) maybeChimeIn(ctx context.Context, chat types.JID, senderName, text string) {
+	if b.groupSilent(chat) {
+		return // в этой группе бот молчит — проактивные реплики не вставляем
+	}
 	key := chat.String()
 	b.proactiveMu.Lock()
 	if last, ok := b.lastProactive[key]; ok && time.Since(last) < proactiveCooldown {
@@ -1100,6 +1115,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 		b.mergeClientsTool(),
 		b.reviewDuplicatesTool(),
 		b.rereadGroupTool(chat),
+		b.muteGroupTool(chat),
 		b.scheduleReminderTool(chat, ownerJID),
 		b.listRemindersTool(),
 		b.cancelReminderTool(),
