@@ -492,8 +492,15 @@ func (c *Client) ClientContracts(ctx context.Context, clientID string) ([]Contra
 
 // Payment — платёж по договору.
 type Payment struct {
-	Amount int64     `json:"amount"` // в единицах программы (рубли ИЛИ копейки)
-	PaidAt time.Time `json:"paid_at"`
+	Amount    int64     `json:"amount"`     // в единицах программы (рубли ИЛИ копейки)
+	PaidAt    time.Time `json:"paid_at"`    // дата оплаты (как указал оператор)
+	CreatedAt time.Time `json:"created_at"` // когда ВНЕСЛИ в программу (если программа отдаёт)
+
+	// Договор (рассрочка), к которому относится оплата — заполняет PaymentsBetween,
+	// чтобы сверка показывала, в КАКУЮ рассрочку клиента ушла оплата.
+	ContractID     string `json:"contract_id,omitempty"`
+	ContractNumber int64  `json:"contract_number,omitempty"`
+	Product        string `json:"product,omitempty"`
 }
 
 func (p *Payment) UnmarshalJSON(data []byte) error {
@@ -503,6 +510,8 @@ func (p *Payment) UnmarshalJSON(data []byte) error {
 	}
 	p.Amount = jsonInt(m, "amount", "sum", "value", "amount_rub", "paid_amount", "payment_amount")
 	p.PaidAt = jsonTime(m, "paid_at", "paidAt", "date", "payment_date", "created_at")
+	p.CreatedAt = jsonTime(m, "created_at", "createdAt", "entered_at", "inserted_at")
+	p.ContractID = jsonStr(m, "contract_id", "contractId")
 	return nil
 }
 
@@ -541,6 +550,11 @@ func (c *Client) PaymentsBetween(ctx context.Context, clientID string, from, to 
 		payments, err := c.ContractPayments(ctx, contract.ID, contract.BranchID, from, to)
 		if err != nil {
 			return nil, err
+		}
+		for i := range payments {
+			payments[i].ContractID = contract.ID
+			payments[i].ContractNumber = contract.Number
+			payments[i].Product = contract.ProductName
 		}
 		out = append(out, payments...)
 	}

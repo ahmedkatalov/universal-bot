@@ -1955,6 +1955,90 @@ func (d *DB) ReceiptsForPeriod(ctx context.Context, from, to time.Time, groupJID
 	return out, rows.Err()
 }
 
+// ReconReceipt — чек для сверки с программой, со служебными полями: чтобы склеить
+// копии ОДНОГО чека из разных групп (пересылка) и отсеять неподтверждённые (у них
+// «имя» — это владелец карты, а не клиент).
+type ReconReceipt struct {
+	ID          int
+	Name        string
+	Amount      float64
+	TxDate      time.Time
+	GroupJID    string
+	DocNumber   string
+	WaMessageID string
+	NeedsReview bool
+}
+
+// ReceiptsForReconcile — все действующие чеки за [from, to) по ВСЕМ группам (для
+// полной картины клиента при сверке; фильтр по группе применяет вызывающий).
+func (d *DB) ReceiptsForReconcile(ctx context.Context, from, to time.Time) ([]ReconReceipt, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.id, COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date,
+		       COALESCE(br.group_jid,''), COALESCE(br.doc_number,''), COALESCE(rm.wa_message_id,''),
+		       br.needs_review
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.tx_date >= $1 AND br.tx_date < $2
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND br.amount > 0
+		ORDER BY br.tx_date
+	`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReconReceipt
+	for rows.Next() {
+		var r ReconReceipt
+		if err := rows.Scan(&r.ID, &r.Name, &r.Amount, &r.TxDate, &r.GroupJID, &r.DocNumber, &r.WaMessageID, &r.NeedsReview); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// ReconCash — наличка/текстовый платёж клиента для сверки (только те, что идут в
+// сбор: не дубль чека, не придержанный повтор).
+type ReconCash struct {
+	ID       int
+	Name     string
+	Amount   float64
+	TxDate   time.Time
+	GroupJID string
+}
+
+// CashForReconcile — засчитываемые текстовые платежи/наличка за [from, to).
+func (d *DB) CashForReconcile(ctx context.Context, from, to time.Time) ([]ReconCash, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT t.id, c.canonical_name, t.amount::float8, t.tx_date::timestamptz, COALESCE(rm.wa_group_jid,'')
+		FROM transactions t
+		JOIN contacts c ON c.id = t.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
+		  AND t.ignored = false
+		  AND t.amount > 0
+		  AND COALESCE(rm.deleted, false) = false
+		  AND `+countableTextCondition+`
+		ORDER BY t.tx_date
+	`, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ReconCash
+	for rows.Next() {
+		var r ReconCash
+		if err := rows.Scan(&r.ID, &r.Name, &r.Amount, &r.TxDate, &r.GroupJID); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
 // HasUnconfirmedReceiptFrom — есть ли свежий чек БЕЗ подтверждённого клиента
 // от этого отправителя, ждущий имени. Так отличаем "имя после чека" (есть
 // ждущий чек -> привязать) от "имя перед чеком" (нет -> запомнить в очередь).
