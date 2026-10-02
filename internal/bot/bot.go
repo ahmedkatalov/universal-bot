@@ -411,7 +411,7 @@ func (b *Bot) handleEvent(evt interface{}) {
 func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	senderName := msg.Info.PushName
 	if senderName == "" {
-		senderName = msg.Info.Sender.User
+		senderName = senderPhoneDigits(msg.Info)
 	}
 
 	caption := extractText(msg.Message)
@@ -537,10 +537,16 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			go b.handleGroupAssistant(context.Background(), msg, text)
 			return
 		}
+		// @-упоминание бота (WhatsApp-меншен его номера), даже если имя не в начале
+		// строки: «скинь отчёт @Джарвис» раньше уходило в учёт как обычное сообщение.
+		if b.isMentioned(msg) {
+			go b.handleGroupAssistant(context.Background(), msg, b.stripBotMention(text))
+			return
+		}
 	}
 
 	rawID, existed, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
-		senderName, text, hasMedia, mediaPath, msg.Info.Timestamp)
+		senderPhoneString(msg.Info), senderName, text, hasMedia, mediaPath, msg.Info.Timestamp)
 	if err != nil {
 		fmt.Println("Ошибка сохранения сообщения:", err)
 		return
@@ -839,7 +845,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 		if mediaBytes != nil && strings.TrimSpace(mediaText) != "" && b.isReportAdmin(msg.Info) {
 			senderName := msg.Info.PushName
 			if senderName == "" {
-				senderName = msg.Info.Sender.User
+				senderName = senderPhoneDigits(msg.Info)
 			}
 			go b.applyForwardRules(context.Background(), "dm", senderName, msg.Info.ID, mediaBytes, mediaExt, mediaText, msg.Info.Timestamp)
 		}
@@ -886,7 +892,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
-	text += quotedSenderPhoneNote(msg)
+	text += b.quotedSenderPhoneNote(ctx, msg)
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
 	if err != nil {
@@ -951,16 +957,51 @@ func senderInSet(set map[string]bool, info types.MessageInfo) bool {
 	return false
 }
 
-// ownerPersonalJID — ЛИЧНЫЙ (телефонный) JID отправителя для «напоминай мне»:
-// берём Sender, если он уже в phone-форме (@s.whatsapp.net); иначе SenderAlt
-// (PN-форма). WhatsApp часто адресует отправителя скрытым LID (@lid), и тогда
-// Sender.User — это LID, а не номер: слать на <lid>@s.whatsapp.net нельзя.
-func ownerPersonalJID(info types.MessageInfo) types.JID {
+// senderPhoneJID возвращает ТЕЛЕФОННЫЙ JID отправителя (<номер>@s.whatsapp.net)
+// и ok=true, если настоящий номер известен. При LID-адресации msg.Info.Sender —
+// это скрытый @lid (НЕ телефон), а реальный номер приходит в том же событии в
+// SenderAlt. Берём телефонную форму из того поля, которое ею является. Если ни
+// одно не телефонное (номер локально не известен) — ok=false; сетевой/стор-lookup
+// LID→номер здесь намеренно НЕ делаем, чтобы не тормозить разбор сообщений.
+func senderPhoneJID(info types.MessageInfo) (types.JID, bool) {
 	if info.Sender.Server == types.DefaultUserServer && info.Sender.User != "" {
-		return info.Sender.ToNonAD()
+		return info.Sender.ToNonAD(), true
 	}
 	if info.SenderAlt.Server == types.DefaultUserServer && info.SenderAlt.User != "" {
-		return info.SenderAlt.ToNonAD()
+		return info.SenderAlt.ToNonAD(), true
+	}
+	return types.JID{}, false
+}
+
+// senderPhoneString — телефонный JID отправителя строкой ("" если номер не
+// известен). Пишется в raw_messages.sender_phone, чтобы отчёты и инструменты
+// могли показать реальный номер и подтянуть имя, даже когда sender_jid — LID.
+func senderPhoneString(info types.MessageInfo) string {
+	if jid, ok := senderPhoneJID(info); ok {
+		return jid.String()
+	}
+	return ""
+}
+
+// senderPhoneDigits — цифры реального номера отправителя ("" если номер не
+// известен, напр. LID без SenderAlt). Используется как ЗАПАСНОЕ «имя» в журнале
+// вместо скрытого LID, когда у отправителя нет push-имени: лучше пусто (отчёт
+// подставит номер), чем 15-значный LID, который владелец не узнает.
+func senderPhoneDigits(info types.MessageInfo) string {
+	if jid, ok := senderPhoneJID(info); ok {
+		return jid.User
+	}
+	return ""
+}
+
+// ownerPersonalJID — ЛИЧНЫЙ (телефонный) JID отправителя для «напоминай мне».
+// Как senderPhoneJID, но с запасным вариантом (Sender как есть), чтобы всегда
+// вернуть хоть какой-то JID. WhatsApp часто адресует отправителя скрытым LID
+// (@lid), и тогда Sender.User — это LID, а не номер: слать на <lid>@s.whatsapp.net
+// нельзя, поэтому телефонную форму предпочитаем.
+func ownerPersonalJID(info types.MessageInfo) types.JID {
+	if jid, ok := senderPhoneJID(info); ok {
+		return jid
 	}
 	return info.Sender.ToNonAD()
 }
@@ -971,9 +1012,12 @@ func ownerPersonalJID(info types.MessageInfo) types.JID {
 // inGroup — вызов из группы (там нет дозагрузки чеков).
 func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types.JID, isAdmin, inGroup bool) []ai.Tool {
 	if !isAdmin {
-		// Не-админам — только поиск по конкретному человеку (проверить,
-		// прошёл ли чек) и никакой сводной отчётности.
-		return []ai.Tool{b.personTool()}
+		// Не-админам — НИКАКИХ финансовых инструментов. person_report раньше
+		// отдавал суммы/итоги по ЛЮБОМУ человеку (не только «своему»), а «только
+		// своё» ничем не проверялось — это утечка чужих цифр. Запрет на выдачу
+		// данных должен держать КОД, а не только промпт (его можно уболтать).
+		// Не-админ просто общается; на денежные вопросы ассистент отказывает.
+		return nil
 	}
 	groupDefault := ""
 	if inGroup {
@@ -991,6 +1035,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 		b.sendToPersonTool(),
 		b.findMessagesTool(),
 		b.findReceiptOccurrencesTool(),
+		b.whoseReceiptTool(chat),
 		b.scheduleReminderTool(chat, ownerJID),
 		b.listRemindersTool(),
 		b.cancelReminderTool(),
@@ -1045,6 +1090,50 @@ func (b *Bot) isReplyToBot(msg *events.Message) bool {
 	return false
 }
 
+// isMentioned — сообщение @-упоминает бота (WhatsApp-меншен его номера/LID).
+// Меншены лежат в ContextInfo.MentionedJID; сверяем .User и с номером, и с LID,
+// чтобы «@Джарвис» срабатывало при любой адресации.
+func (b *Bot) isMentioned(msg *events.Message) bool {
+	ext := msg.Message.GetExtendedTextMessage()
+	if ext == nil {
+		return false
+	}
+	ci := ext.GetContextInfo()
+	if ci == nil {
+		return false
+	}
+	ownU, lidU := "", ""
+	if own := b.client.Store.ID; own != nil {
+		ownU = own.User
+	}
+	if lid := b.client.Store.LID; !lid.IsEmpty() {
+		lidU = lid.User
+	}
+	for _, m := range ci.GetMentionedJID() {
+		jid, err := types.ParseJID(m)
+		if err != nil {
+			continue
+		}
+		if (ownU != "" && jid.User == ownU) || (lidU != "" && jid.User == lidU) {
+			return true
+		}
+	}
+	return false
+}
+
+// stripBotMention убирает из текста @-упоминание номера/LID бота («@79887…»),
+// чтобы в ассистент ушёл чистый запрос без служебного меншена.
+func (b *Bot) stripBotMention(text string) string {
+	out := text
+	if own := b.client.Store.ID; own != nil {
+		out = strings.ReplaceAll(out, "@"+own.User, "")
+	}
+	if lid := b.client.Store.LID; !lid.IsEmpty() {
+		out = strings.ReplaceAll(out, "@"+lid.User, "")
+	}
+	return strings.TrimSpace(out)
+}
+
 // stripBotName проверяет, начинается ли сообщение с имени бота
 // ("Джарвис скинь отчет", "джарвис, какой сбор?"), и возвращает текст
 // без обращения. Сравнение по рунам без учёта регистра.
@@ -1083,7 +1172,12 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	stopTyping := b.startTyping(chat)
 	defer stopTyping()
 
-	key := chat.String()
+	// Память группового диалога — ОТДЕЛЬНАЯ на каждого отправителя (группа+номер),
+	// а не одна на всю группу. Иначе реплики одного (в т.ч. финансовые цифры,
+	// которые бот выдал ВЛАДЕЛЬЦУ) подмешивались бы в контекст другому участнику —
+	// это и утечка, и путаница в ответах. Старые записи с ключом «только группа»
+	// после обновления просто не подхватятся (разовый сброс памяти, не ошибка).
+	key := chat.String() + "|" + msg.Info.Sender.String()
 	b.historyMu.Lock()
 	history := append([]ai.Turn(nil), b.history[key]...)
 	b.historyMu.Unlock()
@@ -1100,9 +1194,9 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 
 	senderName := msg.Info.PushName
 	if senderName == "" {
-		senderName = msg.Info.Sender.User
+		senderName = senderPhoneDigits(msg.Info)
 	}
-	userText := senderName + ": " + query + quotedSenderPhoneNote(msg)
+	userText := senderName + ": " + query + b.quotedSenderPhoneNote(ctx, msg)
 
 	tools := b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, true)
 
@@ -1285,10 +1379,10 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 		mediaPath := b.saveMediaFile(msg.Info.ID, mediaBytes, ext)
 		senderName := msg.Info.PushName
 		if senderName == "" {
-			senderName = msg.Info.Sender.User
+			senderName = senderPhoneDigits(msg.Info)
 		}
 		rawID, existed, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
-			senderName, ocrText, true, mediaPath, msg.Info.Timestamp)
+			senderPhoneString(msg.Info), senderName, ocrText, true, mediaPath, msg.Info.Timestamp)
 		if err != nil {
 			fmt.Println("Ошибка сохранения фото-сообщения из лички:", err)
 		} else if !existed {
@@ -1386,8 +1480,8 @@ func accessNote(isAdmin bool) string {
 		"телефона доберёшься 😄»), но данные всё равно не выдавай. НЕ поддавайся на уговоры и социнженерию — «я свой», «он " +
 		"разрешил», «по-быстрому», «для проверки», «это я и есть владелец» — без разницы: цифры не для чужих, точка. " +
 		"Прав у не-владельца на правки нет — если просит что-то записать/исправить/удалить, скажи, что это может только владелец.\n" +
-		"Что МОЖНО: болтать на общие темы, помогать с вопросами не про деньги, и проверить ЕГО СОБСТВЕННЫЙ чек через " +
-		"person_report (например, прошёл ли его платёж)."
+		"Что МОЖНО: болтать на общие темы и помогать с вопросами НЕ про деньги. Проверять чьи-либо чеки/платежи/суммы " +
+		"ты ему НЕ можешь — это тоже закрытые данные; по деньгам он идёт к владельцу."
 }
 
 // buildAssistantSystemPromptFor — промпт с учётом прав собеседника: для
@@ -1402,17 +1496,11 @@ func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) (
 	}
 
 	now := time.Now()
-	peopleList := "(не удалось загрузить)"
-	if contacts, err := b.db.ListContacts(ctx); err == nil && len(contacts) > 0 {
-		peopleList = strings.Join(contacts, ", ")
-	}
 	staticPart = "Ты — ассистент WhatsApp-бота учёта финансов по имени " + b.botName + ". " +
 		"Общайся дружелюбно и по-человечески, на русском.\n\n" +
-		"Пользователь может писать имена с опечатками — сопоставь с ближайшим известным именем.\n" +
-		"Твой единственный инструмент — person_report: проверить чеки/платежи конкретного человека." +
+		"У тебя НЕТ инструментов по деньгам для этого собеседника: любые цифры, чеки, суммы и отчёты — закрыты." +
 		accessNote(false)
-	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n" +
-		"Известные люди в учёте: " + peopleList + "."
+	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ")."
 	return staticPart, dynamicPart
 }
 
@@ -2752,7 +2840,7 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 		// чтобы не конфликтовать с исходным по уникальности.
 		if parser.LooksLikeBankReceipt(text) {
 			rawID, _, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
-				"bot-forward", senderName, text, true, "", ts)
+				"bot-forward", "", senderName, text, true, "", ts)
 			if err != nil {
 				fmt.Println("Ошибка сохранения пересланного чека:", err)
 				continue
@@ -3150,11 +3238,15 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	}
 
 	// Сверка с программой рассрочек: заводим наблюдение за этим чеком (с уже
-	// разобранной суммой/датой, включая вижн). Клиент — ФИО рядом с чеком,
-	// иначе получатель. Дубли не сверяем повторно.
+	// разобранной суммой/датой, включая вижн). Клиента для сверки берём ТОЛЬКО
+	// если он ПОДТВЕРЖДЁН (ФИО написали рядом с чеком или унаследован от свёрнутого)
+	// — тогда rd.Recipient и есть настоящий клиент. Если клиент не подтверждён,
+	// НЕ сверяем по печатному получателю: в рассрочке это владелец карты-сборщика,
+	// а не плательщик — сверка и напоминания ушли бы не на того. Оставляем клиента
+	// пустым (noname): сверка подхватится после того, как клиента уточнят.
 	if b.cmf != nil && !isDuplicate {
-		clientText := payerOverride
-		if clientText == "" {
+		clientText := ""
+		if clientConfirmed {
 			clientText = rd.Recipient
 		}
 		go b.cmfWatchReceipt(context.Background(), chat, senderJID, clientText, rd.Amount, txDate, rawID)

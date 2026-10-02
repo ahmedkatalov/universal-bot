@@ -343,10 +343,43 @@ func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem strin
 	if err != nil {
 		return "", fmt.Errorf("openrouter: превышен лимит вызовов инструментов: %w", err)
 	}
-	if out := strings.TrimSpace(contentString(respMsg.Content)); out != "" {
+	out := strings.TrimSpace(contentString(respMsg.Content))
+	// Если модель на этом (итоговом) шаге СНОВА просит инструменты — значит работа
+	// НЕ закончена, а новые вызовы мы уже не выполняем. НЕЛЬЗЯ выдавать это за успех:
+	// честно говорим, что осталось недоделанное, и предлагаем продолжить.
+	if len(respMsg.ToolCalls) > 0 {
+		pending := toolCallNames(respMsg.ToolCalls)
+		if out == "" {
+			return "Не успел доделать всё за один заход — осталось: " + pending +
+				". Напиши «продолжай», и я доведу до конца.", nil
+		}
+		return out + "\n\n⚠️ Успел не всё: осталось " + pending + ". Напиши «продолжай» — доделаю.", nil
+	}
+	if out != "" {
 		return out, nil
 	}
-	return "Сделал, что успел: лимит действий за один запрос исчерпан. Спроси ещё раз — продолжу.", nil
+	// Модель не вернула ни текста, ни новых действий — не знаем точно, всё ли
+	// сделано. НЕ заявляем успех: нейтральная честная формулировка.
+	return "Сделал по тому, что успел за один заход. Если чего-то не хватило — напиши, продолжу.", nil
+}
+
+// toolCallNames — список имён инструментов (для честного «осталось: …»), без
+// дублей и в порядке первого появления.
+func toolCallNames(calls []toolCall) string {
+	seen := map[string]bool{}
+	var names []string
+	for _, c := range calls {
+		n := c.Function.Name
+		if n == "" || seen[n] {
+			continue
+		}
+		seen[n] = true
+		names = append(names, n)
+	}
+	if len(names) == 0 {
+		return "незавершённые действия"
+	}
+	return strings.Join(names, ", ")
 }
 
 // Complete — одиночный запрос без инструментов и истории: системный промпт

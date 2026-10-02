@@ -217,7 +217,14 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			insertFailed = true
 			continue
 		}
-		isCash := p.Cash || cashHint || parser.IsCash(strings.Join(lines, " ")+" "+p.Note+" "+p.Card)
+		// Наличка или перевод — РЕШАЕТ ИИ (p.Cash): он понимает по смыслу. cashHint —
+		// это реальный сигнал «рядом было фото пачки денег» (consumePendingCash),
+		// его оставляем. А вот parser.IsCash — грубая регулярка: ловит «офис», «у
+		// Адама» (кто забрал) и т.п. и РАНЬШЕ насильно помечала обычный ПЕРЕВОД
+		// наличкой. Наличка пропускает дедуп «текст↔чек», поэтому такой перевод,
+		// присланный и чеком, и текстом, считался ДВАЖДЫ. Регулярку как авторитет
+		// держим только в запасном пути без ИИ (recordDeterministicPayments).
+		isCash := p.Cash || cashHint
 		card := p.Card
 		if isCash && card == "" {
 			card = "наличные"

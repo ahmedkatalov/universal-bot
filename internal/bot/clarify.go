@@ -396,6 +396,14 @@ func clarifyNameFromReply(text string) (name string, amount float64, deferToAI b
 	if strings.Contains(text, "?") {
 		return "", amount, true
 	}
+	// Фраза-исправление, а не имя: ответ вроде «нет, это не Ахмед, а Магомед»
+	// после отсева стоп-слов склеился бы в ложное ФИО «Ахмед Магомед». Если есть
+	// явные маркеры фразы (отрицание «не/нет», ведущее противопоставление «а/но»,
+	// или длиннее имени) — отдаём ассистенту: он поймёт, кого имел в виду владелец,
+	// и запишет через fix_receipt, а не выдумает клиента из обрывков.
+	if looksLikeCorrectionSentence(text) {
+		return "", amount, true
+	}
 	// Чистое ФИО (2+ слов) — берём как есть.
 	if n, ok := looksLikeName(text); ok {
 		return n, amount, false
@@ -431,6 +439,37 @@ func clarifyNameFromReply(text string) (name string, amount float64, deferToAI b
 	default:
 		return "", amount, true
 	}
+}
+
+// looksLikeCorrectionSentence распознаёт ответ-ИСПРАВЛЕНИЕ (а не ФИО): отрицание
+// «не/нет» где угодно («это не Ахмед»), ведущая частица-противопоставление
+// («а Магомед», «но Иван»), или длина больше имени (>4 слов). Такое нельзя грубо
+// разбирать на имя — смысл теряется; отдаём ассистенту. Обычные ФИО (в т.ч. с
+// ведущим «Клиент»/«Это» и отчеством) под эти маркеры не попадают.
+func looksLikeCorrectionSentence(text string) bool {
+	fields := strings.Fields(strings.TrimSpace(text))
+	if len(fields) == 0 {
+		return false
+	}
+	if len(fields) > 4 { // ФИО — максимум 3–4 слова; длиннее это фраза
+		return true
+	}
+	norm := func(w string) string {
+		return strings.ToLower(strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) }))
+	}
+	// Отрицание где угодно в коротком ответе = исправление («это НЕ Ахмед», «НЕ он»).
+	for _, w := range fields {
+		switch norm(w) {
+		case "не", "нет", "неа":
+			return true
+		}
+	}
+	// Ведущее противопоставление («а Магомед», «но Иван», «ну Расул»).
+	switch norm(fields[0]) {
+	case "а", "но", "ну":
+		return true
+	}
+	return false
 }
 
 // registerClarifyAsk запоминает связь «id вопроса бота -> id сообщения чека»,

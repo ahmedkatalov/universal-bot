@@ -86,7 +86,12 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) {
 				}
 			}
 
-			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), sender.User, text, img != nil || isPDFDoc, mediaPath, ts)
+			// Реальный номер — только если участник в телефонной форме (не LID).
+			senderPhone := ""
+			if sender.Server == types.DefaultUserServer && sender.User != "" {
+				senderPhone = sender.ToNonAD().String()
+			}
+			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), senderPhone, sender.User, text, img != nil || isPDFDoc, mediaPath, ts)
 			if err != nil || existed {
 				continue // уже было (идемпотентно) или ошибка — не дублируем
 			}

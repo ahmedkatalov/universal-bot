@@ -114,6 +114,16 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки deleted: %w", err)
 	}
+	// Реальный телефон отправителя (в форме <номер>@s.whatsapp.net). При новой
+	// адресации WhatsApp (LID) sender_jid — это СКРЫТЫЙ идентификатор @lid, а
+	// настоящий номер приходит в том же событии (SenderAlt). Храним его отдельно,
+	// чтобы отчёты показывали реальный номер и подтягивали имя из phone_owners,
+	// даже когда sender_jid — LID. Пусто/NULL = номер не известен (старые строки,
+	// пересланные ботом копии, надиктованные платежи). sender_jid НЕ трогаем —
+	// на нём держатся ключи спаривания (pending_client_names, cmf_watch и т.п.).
+	if _, err := pool.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS sender_phone TEXT`); err != nil {
+		return fmt.Errorf("добавление колонки sender_phone: %w", err)
+	}
 	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.ignored: %w", err)
 	}
@@ -397,16 +407,41 @@ func (d *DB) Close() {
 // повторно). existed=true -> сообщение уже сохраняли; вызывающий должен НЕ
 // обрабатывать его снова, иначе платежи запишутся дважды. (xmax<>0 истинно,
 // когда строка обновилась по ON CONFLICT, т.е. это повторная доставка.)
-func (d *DB) SaveRawMessage(ctx context.Context, waMessageID, groupJID, senderJID, senderName, body string, hasMedia bool, mediaPath string, receivedAt time.Time) (int, bool, error) {
+// senderPhone — реальный телефон отправителя (<номер>@s.whatsapp.net) или ""
+// если не известен (LID без SenderAlt, пересланная копия, надиктовка). Пишется
+// отдельно от senderJID (который может быть LID), чтобы отчёты и инструменты
+// могли показать настоящий номер.
+func (d *DB) SaveRawMessage(ctx context.Context, waMessageID, groupJID, senderJID, senderPhone, senderName, body string, hasMedia bool, mediaPath string, receivedAt time.Time) (int, bool, error) {
 	var id int
 	var existed bool
 	err := d.pool.QueryRow(ctx, `
-		INSERT INTO raw_messages (wa_message_id, wa_group_jid, sender_jid, sender_name, body, has_media, media_path, received_at)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-		ON CONFLICT (wa_message_id) DO UPDATE SET wa_message_id = EXCLUDED.wa_message_id
+		INSERT INTO raw_messages (wa_message_id, wa_group_jid, sender_jid, sender_phone, sender_name, body, has_media, media_path, received_at)
+		VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8, $9)
+		ON CONFLICT (wa_message_id) DO UPDATE SET
+			-- повторная доставка того же сообщения: не перетираем, но если номер
+			-- не был известен, а теперь известен — дозаполняем (не ухудшаем данные).
+			sender_phone = COALESCE(raw_messages.sender_phone, NULLIF(EXCLUDED.sender_phone, ''))
 		RETURNING id, (xmax <> 0)
-	`, waMessageID, groupJID, senderJID, senderName, body, hasMedia, mediaPath, receivedAt).Scan(&id, &existed)
+	`, waMessageID, groupJID, senderJID, senderPhone, senderName, body, hasMedia, mediaPath, receivedAt).Scan(&id, &existed)
 	return id, existed, err
+}
+
+// SenderPhoneByMessageID возвращает РЕАЛЬНЫЙ номер (цифры) отправителя исходного
+// сообщения по его wa_message_id, или "" если номер не известен (сообщения нет в
+// базе, либо отправитель был LID и настоящий номер не пойман). Используется, когда
+// владелец свайпом отвечает на чьё-то сообщение: по id цитаты достаём телефон, не
+// принимая LID за номер.
+func (d *DB) SenderPhoneByMessageID(ctx context.Context, waMessageID string) (string, error) {
+	var phone string
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(split_part(COALESCE(NULLIF(sender_phone, ''),
+			CASE WHEN sender_jid LIKE '%@s.whatsapp.net' THEN sender_jid END), '@', 1), '')
+		FROM raw_messages WHERE wa_message_id = $1
+	`, waMessageID).Scan(&phone)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return phone, err
 }
 
 func (d *DB) MarkMessageParsed(ctx context.Context, rawMessageID int) error {
@@ -1468,7 +1503,7 @@ func (d *DB) UnclearItems(ctx context.Context, groupJID string, from, to *time.T
 	rows, err := d.pool.Query(ctx, `
 		(SELECT 'receipt', br.id, COALESCE(br.group_jid, ''), COALESCE(br.recipient_raw, ''),
 		        COALESCE(br.amount, 0)::float8, COALESCE(rm.received_at, br.tx_date), COALESCE(rm.media_path, ''),
-		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '')
+		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), '')
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.needs_review = true AND br.ignored = false AND br.is_duplicate = false
@@ -1480,7 +1515,7 @@ func (d *DB) UnclearItems(ctx context.Context, groupJID string, from, to *time.T
 		UNION ALL
 
 		(SELECT 'message', rm.id, rm.wa_group_jid, '', 0, rm.received_at, COALESCE(rm.media_path, ''),
-		        COALESCE(NULLIF(rm.sender_name, ''), split_part(rm.sender_jid, '@', 1))
+		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1))
 		FROM raw_messages rm
 		WHERE rm.has_media = true AND rm.deleted = false AND rm.parsed = false
 		  AND rm.media_path IS NOT NULL AND rm.media_path <> ''
@@ -1747,9 +1782,13 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		  -- а не в границах периода — иначе цифры «дубль» и «посчитано» расходились.
 		  AND EXISTS (
 			SELECT 1 FROM bank_receipts brd
+			LEFT JOIN raw_messages brm ON brm.id = brd.raw_message_id
 			WHERE brd.contact_id = t.contact_id AND brd.amount = t.amount
 			  AND brd.needs_review = false AND brd.is_duplicate = false AND brd.ignored = false
-			  AND brd.tx_date >= t.tx_date - interval '2 days' AND brd.tx_date < t.tx_date + interval '2 days'
+			  AND COALESCE(brm.deleted, false) = false
+			  -- Зеркало countableTextCondition: пара по времени ПРИСЫЛКИ (±2 дня).
+			  AND COALESCE(brm.received_at, brd.tx_date) >= COALESCE(rm.received_at, t.tx_date::timestamptz) - interval '2 days'
+			  AND COALESCE(brm.received_at, brd.tx_date) <  COALESCE(rm.received_at, t.tx_date::timestamptz) + interval '2 days'
 			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
 		  )
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.TextDupCount, &ex.TextDupSum)
@@ -1975,6 +2014,66 @@ func (d *DB) ReceiptByWaMessageID(ctx context.Context, waMessageID string) (Rece
 	return r, nil
 }
 
+// ReceiptSender — кто и с какого РЕАЛЬНОГО номера прислал чек (для ответа на
+// «с какого номера этот чек / чей это чек»). SenderPhone — цифры настоящего
+// номера ("" если не пойман: старая строка, LID без SenderAlt, пересланная
+// ботом копия). SenderName — имя из памяти номеров или подпись в WhatsApp.
+type ReceiptSender struct {
+	Found       bool
+	Amount      float64
+	Recipient   string // получатель, напечатанный на чеке (часто владелец карты)
+	Client      string // привязанный клиент (ФИО), если известен
+	TxDate      time.Time
+	ReceivedAt  time.Time
+	SenderPhone string
+	SenderName  string
+	GroupJID    string
+}
+
+const receiptSenderSelect = `
+	SELECT COALESCE(br.amount,0)::float8,
+	       COALESCE(br.recipient_raw,''),
+	       COALESCE(c.canonical_name,''),
+	       br.tx_date,
+	       COALESCE(rm.received_at, br.tx_date),
+	       COALESCE(split_part(COALESCE(NULLIF(rm.sender_phone,''),
+	           CASE WHEN rm.sender_jid LIKE '%@s.whatsapp.net' THEN rm.sender_jid END), '@', 1), ''),
+	       COALESCE(NULLIF(po.name,''), NULLIF(rm.sender_name,''), ''),
+	       COALESCE(br.group_jid,'')
+	FROM bank_receipts br
+	LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+	LEFT JOIN contacts c ON c.id = br.contact_id
+	LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone,''), rm.sender_jid, ''), '@', 1)`
+
+func scanReceiptSender(row pgx.Row) (ReceiptSender, error) {
+	var r ReceiptSender
+	err := row.Scan(&r.Amount, &r.Recipient, &r.Client, &r.TxDate, &r.ReceivedAt, &r.SenderPhone, &r.SenderName, &r.GroupJID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	r.Found = true
+	return r, nil
+}
+
+// ReceiptSenderByMessageID — кто прислал ИМЕННО этот чек (по id его сообщения,
+// на которое владелец ответил свайпом).
+func (d *DB) ReceiptSenderByMessageID(ctx context.Context, waMessageID string) (ReceiptSender, error) {
+	return scanReceiptSender(d.pool.QueryRow(ctx, receiptSenderSelect+`
+		WHERE rm.wa_message_id = $1 ORDER BY br.id DESC LIMIT 1`, waMessageID))
+}
+
+// LatestReceiptSender — кто прислал ПОСЛЕДНИЙ чек в группе (когда владелец
+// спрашивает «с какого номера последний чек», не отвечая на конкретный).
+func (d *DB) LatestReceiptSender(ctx context.Context, groupJID string) (ReceiptSender, error) {
+	return scanReceiptSender(d.pool.QueryRow(ctx, receiptSenderSelect+`
+		WHERE ($1 = '' OR br.group_jid = $1)
+		  AND COALESCE(rm.deleted,false) = false
+		ORDER BY COALESCE(rm.received_at, br.tx_date) DESC LIMIT 1`, groupJID))
+}
+
 // ReceiptOccurrence — одно появление чека (в какой группе, когда, кто прислал).
 type ReceiptOccurrence struct {
 	GroupJID    string
@@ -2005,7 +2104,7 @@ func (d *DB) FindReceiptOccurrences(ctx context.Context, ident ReceiptIdentity) 
 		       END
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid,''), '@', 1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE br.ignored = false
 		  -- Сумма обязана совпасть ВСЕГДА: банки переиспользуют короткие коды
 		  -- авторизации, а номер документа может пересекаться между банками — без
@@ -2133,7 +2232,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		        COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
 		        br.amount::float8 AS amount, br.tx_date,
 		        COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
-		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		                 split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), '') AS submitted_by,
 		        COALESCE(br.collector, '') AS collector,
 		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
 		        COALESCE(br.bank, '') AS bank,
@@ -2141,7 +2240,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
 		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
 		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
@@ -2154,7 +2253,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		(SELECT CASE WHEN t.is_cash THEN 'наличка' ELSE 'перевод' END AS kind,
 		        COALESCE(c.canonical_name, t.raw_name, '') AS client,
 		        t.amount::float8 AS amount, t.tx_date,
-		        COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS submitted_by,
+		        COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), '') AS submitted_by,
 		        COALESCE(t.collector, '') AS collector,
 		        COALESCE(rm.wa_group_jid, '') AS grp,
 		        COALESCE(t.card_to, '') AS bank,
@@ -2162,7 +2261,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND `+countableTextCondition+`
@@ -2210,12 +2309,12 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		        br.amount::float8 AS amount, br.tx_date,
 		        COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
 		        COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''),
-		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS who,
+		                 split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), '') AS who,
 		        COALESCE(br.doc_number, '') AS doc
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE br.tx_date >= $1 AND br.tx_date < $2
 		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
 		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
@@ -2248,12 +2347,12 @@ func (d *DB) ChecksMissingFromGroup(ctx context.Context, targetJID string, from,
 		        tx.amount::float8 AS amount, tx.tx_date,
 		        COALESCE(rm.wa_group_jid, '') AS grp,
 		        COALESCE(NULLIF(tx.collector, ''), NULLIF(po.name, ''), NULLIF(rm.sender_name, ''),
-		                 split_part(COALESCE(rm.sender_jid, ''), '@', 1), '') AS who,
+		                 split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), '') AS who,
 		        '' AS doc
 		FROM transactions tx
 		JOIN raw_messages rm ON rm.id = tx.raw_message_id
 		LEFT JOIN contacts c ON c.id = tx.contact_id
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE tx.tx_date >= $1 AND tx.tx_date < $2
 		  AND tx.is_cash = true AND tx.ignored = false AND tx.dup_pending = false
 		  AND COALESCE(rm.deleted, false) = false AND tx.amount > 0
@@ -2405,11 +2504,11 @@ func (d *DB) MessagesFrom(ctx context.Context, phoneSuffix, nameLike string, fro
 	rows, err := d.pool.Query(ctx, `
 		SELECT rm.wa_group_jid,
 		       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS who,
-		       split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+		       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
 		       COALESCE(rm.body, ''), rm.has_media, COALESCE(rm.deleted, false), rm.received_at
 		FROM raw_messages rm
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
-		WHERE ($1 = '' OR split_part(COALESCE(rm.sender_jid, ''), '@', 1) LIKE '%' || $1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
+		WHERE ($1 = '' OR split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) LIKE '%' || $1)
 		  AND ($2 = '' OR COALESCE(po.name, '') ILIKE '%' || $2 || '%' OR COALESCE(rm.sender_name, '') ILIKE '%' || $2 || '%')
 		  AND ($3::timestamptz IS NULL OR rm.received_at >= $3::timestamptz)
 		  AND ($4::timestamptz IS NULL OR rm.received_at < $4::timestamptz)
@@ -2440,28 +2539,33 @@ type SenderCandidate struct {
 
 // SenderCandidates ищет РЕАЛЬНЫЕ номера по последним цифрам и/или имени, чтобы
 // отправить личное сообщение по частичному номеру или имени. Берём ТОЛЬКО тех,
-// кто реально писал с видимого номера (@s.whatsapp.net): скрытые @lid и просто
-// записанные в память номера, которых мы не видели как реальных отправителей,
-// НЕ предлагаем — иначе личное сообщение могло бы уйти не тому (на псевдо-номер
-// lid или на чужой номер). Имя из памяти номеров всё равно подхватывается через
-// join, если этот человек когда-то писал с видимого номера.
+// у кого известен настоящий телефон: либо сохранён sender_phone (из SenderAlt —
+// так находятся и LID-отправители, чей реальный номер мы поймали), либо
+// sender_jid уже в видимой форме @s.whatsapp.net. Голый @lid как номер НЕ
+// предлагаем — иначе личное сообщение ушло бы на псевдо-номер. Имя из памяти
+// номеров подхватывается join'ом по этому же реальному телефону.
 func (d *DB) SenderCandidates(ctx context.Context, phoneSuffix, nameLike string, limit int) ([]SenderCandidate, error) {
 	if limit <= 0 || limit > 50 {
 		limit = 10
 	}
+	// realPhone — реальный телефон отправителя: предпочитаем sender_phone, иначе
+	// sender_jid, НО только если он телефонной формы (@s.whatsapp.net); для голого
+	// @lid даёт NULL, и такая строка отсеивается (кандидатом не станет).
+	const realPhone = `split_part(COALESCE(NULLIF(rm.sender_phone, ''),
+		CASE WHEN rm.sender_jid LIKE '%@s.whatsapp.net' THEN rm.sender_jid END), '@', 1)`
 	rows, err := d.pool.Query(ctx, `
 		SELECT phone, COALESCE(MAX(name), '') AS name
 		FROM (
-			SELECT split_part(rm.sender_jid, '@', 1) AS phone,
+			SELECT `+realPhone+` AS phone,
 			       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, '')) AS name,
 			       rm.received_at AS seen
 			FROM raw_messages rm
-			LEFT JOIN phone_owners po ON po.phone = split_part(rm.sender_jid, '@', 1)
-			WHERE COALESCE(rm.sender_jid, '') LIKE '%@s.whatsapp.net'
-			  AND ($1 = '' OR split_part(rm.sender_jid, '@', 1) LIKE '%' || $1)
+			LEFT JOIN phone_owners po ON po.phone = `+realPhone+`
+			WHERE (NULLIF(rm.sender_phone, '') IS NOT NULL OR rm.sender_jid LIKE '%@s.whatsapp.net')
+			  AND ($1 = '' OR `+realPhone+` LIKE '%' || $1)
 			  AND ($2 = '' OR COALESCE(po.name, '') ILIKE '%' || $2 || '%' OR COALESCE(rm.sender_name, '') ILIKE '%' || $2 || '%')
 		) t
-		WHERE length(phone) BETWEEN 10 AND 15
+		WHERE phone IS NOT NULL AND length(phone) BETWEEN 10 AND 15
 		GROUP BY phone
 		ORDER BY MAX(seen) DESC NULLS LAST
 		LIMIT $3
@@ -2711,6 +2815,9 @@ func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *tim
 			FROM bank_receipts br
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE br.contact_id = c.id
+			  -- needs_review=false — как в сборе (SummaryForPeriod): неподтверждённые
+			  -- чеки в «всего» не считаем, иначе отчёт по человеку расходится со сбором.
+			  AND br.needs_review = false
 			  AND br.is_duplicate = false AND br.ignored = false
 			  AND COALESCE(rm.deleted, false) = false
 			  AND ($2::timestamptz IS NULL OR br.tx_date >= $2)
@@ -2725,6 +2832,25 @@ func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *tim
 			WHERE tx.contact_id = c.id
 			  AND tx.ignored = false
 			  AND COALESCE(rm.deleted, false) = false
+			  -- Дедуп «текст↔чек» как в сборе (countableTextCondition, с учётом
+			  -- удалённого чека): текст-дубль распознанного чека в «всего» не
+			  -- задваиваем. Наличка и тексты без парного чека считаются как обычно.
+			  AND tx.dup_pending = false
+			  AND (
+			    tx.is_cash = true
+			    OR NOT EXISTS (
+			      SELECT 1 FROM bank_receipts brd
+			      LEFT JOIN raw_messages brm ON brm.id = brd.raw_message_id
+			      WHERE brd.contact_id = tx.contact_id
+			        AND brd.amount = tx.amount
+			        AND brd.needs_review = false
+			        AND brd.is_duplicate = false AND brd.ignored = false
+			        AND COALESCE(brm.deleted, false) = false
+			        AND COALESCE(brm.received_at, brd.tx_date) >= COALESCE(rm.received_at, tx.tx_date::timestamptz) - interval '2 days'
+			        AND COALESCE(brm.received_at, brd.tx_date) <  COALESCE(rm.received_at, tx.tx_date::timestamptz) + interval '2 days'
+			        AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+			    )
+			  )
 			  AND ($2::timestamptz IS NULL OR tx.tx_date >= $2)
 			  AND ($3::timestamptz IS NULL OR tx.tx_date < $3)
 			  AND ($4 = '' OR rm.wa_group_jid = $4)
@@ -2793,14 +2919,24 @@ const countableTextCondition = `(
 			t.is_cash = true
 			OR NOT EXISTS (
 				SELECT 1 FROM bank_receipts brd
+				-- LEFT (не INNER): у чеков из импорта/ручных raw_message_id может быть
+				-- NULL — такой чек всё равно должен прятать свой текст-дубль.
+				LEFT JOIN raw_messages brm ON brm.id = brd.raw_message_id
 				WHERE brd.contact_id = t.contact_id
 				  AND brd.amount = t.amount
 				  AND brd.needs_review = false
 				  AND brd.is_duplicate = false AND brd.ignored = false
-				  -- Парный чек ищем ОТНОСИТЕЛЬНО даты текста (±2 дня), а не в окне
-				  -- отчёта: иначе пара на границе месяца/дня считалась дважды двумя
-				  -- соседними отчётами, а одинаковая сумма месяц спустя — схлопывалась.
-				  AND brd.tx_date >= t.tx_date - interval '2 days' AND brd.tx_date < t.tx_date + interval '2 days'
+				  -- Удалённый в WhatsApp чек из сбора уже исключён (ветка чеков),
+				  -- поэтому он НЕ должен продолжать прятать свой текст-дубль — иначе
+				  -- из сбора пропадал бы весь платёж (и чек, и текст).
+				  AND COALESCE(brm.deleted, false) = false
+				  -- Пару ищем по ВРЕМЕНИ ПРИСЫЛКИ (±2 дня): когда чек и его текст-дубль
+				  -- ПОПАЛИ в чат, а не по дате операции на чеке. Иначе СТАРЫЙ чек
+				  -- (операция недели назад), присланный сегодня вместе с сегодняшним
+				  -- текстом, не спаривался — и оба считались (задвоение). Для чеков без
+				  -- сообщения (импорт/ручные) запасной ориентир — дата операции.
+				  AND COALESCE(brm.received_at, brd.tx_date) >= COALESCE(rm.received_at, t.tx_date::timestamptz) - interval '2 days'
+				  AND COALESCE(brm.received_at, brd.tx_date) <  COALESCE(rm.received_at, t.tx_date::timestamptz) + interval '2 days'
 				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
 			)
 		)
@@ -2824,6 +2960,8 @@ const countableTextConditionByChat = `(
 				  AND brd.amount = t.amount
 				  AND brd.needs_review = false
 				  AND brd.is_duplicate = false AND brd.ignored = false
+				  -- Удалённый чек не прячет свой текст-дубль (см. countableTextCondition).
+				  AND COALESCE(brm.deleted, false) = false
 				  -- ±2 дня относительно присылки текста (см. countableTextCondition).
 				  AND brm.received_at >= rm.received_at - interval '2 days' AND brm.received_at < rm.received_at + interval '2 days'
 				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
@@ -2966,7 +3104,7 @@ func (d *DB) ChecksPostedOldOperation(ctx context.Context, from, to, monthStart,
 		FROM bank_receipts br
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE rm.received_at >= $1 AND rm.received_at < $2
 		  AND (br.tx_date < $4 OR br.tx_date >= $5)
 		  AND br.needs_review = false AND br.is_duplicate = false AND br.ignored = false
@@ -3093,11 +3231,11 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			SELECT sender_name, phone, amount FROM (
 				SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 					COALESCE(NULLIF(br.collector, ''), NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
-					split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+					split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
 					br.amount
 				FROM bank_receipts br
 				LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-				LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+				LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 				WHERE br.tx_date >= $1 AND br.tx_date < $2
 				  AND br.is_duplicate = false
 				  AND br.ignored = false
@@ -3113,11 +3251,11 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 
 			SELECT
 				COALESCE(NULLIF(t.collector, ''), NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
-				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+				split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
 				t.amount
 			FROM transactions t
 			JOIN raw_messages rm ON rm.id = t.raw_message_id
-			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 			WHERE t.tx_date >= $1 AND t.tx_date < $2
 			  AND t.ignored = false
 			  AND `+countableTextCondition+`
@@ -3159,11 +3297,11 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 			SELECT sender_name, phone, amount FROM (
 				SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 					COALESCE(NULLIF(br.collector, ''), NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
-					split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+					split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
 					br.amount
 				FROM bank_receipts br
 				LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-				LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+				LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 				WHERE rm.received_at >= $1 AND rm.received_at < $2
 				  AND br.tx_date >= $5 AND br.tx_date < $6
 				  AND br.is_duplicate = false
@@ -3180,11 +3318,11 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 
 			SELECT
 				COALESCE(NULLIF(t.collector, ''), NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender_name,
-				split_part(COALESCE(rm.sender_jid, ''), '@', 1) AS phone,
+				split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
 				t.amount
 			FROM transactions t
 			JOIN raw_messages rm ON rm.id = t.raw_message_id
-			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(rm.sender_jid, ''), '@', 1)
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 			WHERE rm.received_at >= $1 AND rm.received_at < $2
 			  AND t.ignored = false
 			  AND `+countableTextConditionByChat+`

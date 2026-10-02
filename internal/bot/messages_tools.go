@@ -13,6 +13,7 @@ import (
 	"go.mau.fi/whatsmeow/types"
 
 	"whatsapp-bot/internal/ai"
+	"whatsapp-bot/internal/db"
 )
 
 // onlyDigits оставляет из строки только цифры (для «последних цифр номера»).
@@ -209,6 +210,99 @@ func (b *Bot) findReceiptOccurrencesTool() ai.Tool {
 					sub = "—"
 				}
 				fmt.Fprintf(&sb, "• «%s» — %s, прислал %s%s\n", gname(o.GroupJID), o.ReceivedAt.Format("02.01 15:04"), sub, dup)
+			}
+			return sb.String(), nil
+		},
+	}
+}
+
+// whoseReceiptTool — «с какого номера пришёл этот чек / чей это чек». Определяет
+// чек по id сообщения (свайп владельца) или берёт последний чек в группе и
+// показывает РЕАЛЬНЫЙ номер отправителя и имя. Только владельцу/админам.
+func (b *Bot) whoseReceiptTool(chat types.JID) ai.Tool {
+	return ai.Tool{
+		Name: "whose_receipt",
+		Description: "Отвечает, С КАКОГО НОМЕРА и КЕМ прислан чек: 'с какого номера этот чек', 'чей это чек', " +
+			"'кто его скинул', 'номер отправителя этого чека'. Если владелец ОТВЕТИЛ (свайпом) на сам чек — передай " +
+			"message_id из [Контекст ответа: ... id сообщения XXX]. Если спрашивает про последний чек — укажи group " +
+			"(или оставь пусто для текущей группы). Возвращает настоящий телефон отправителя (не скрытый id) и имя, " +
+			"если оно известно. Номер есть только у чеков, пришедших ПОСЛЕ обновления: у старых он не сохранён.",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"message_id": map[string]any{"type": "string", "description": "id сообщения-чека из [Контекст ответа], если владелец ответил на сам чек"},
+				"group":      map[string]any{"type": "string", "description": "Название группы для «последнего чека» (пусто = текущая/эта группа)"},
+			},
+			"required": []string{},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				MessageID string `json:"message_id"`
+				Group     string `json:"group"`
+			}
+			_ = json.Unmarshal(input, &args)
+			msgID := strings.TrimSpace(args.MessageID)
+
+			// Выбираем источник: конкретный чек по id (свайп), иначе последний в группе.
+			var out db.ReceiptSender
+			var err error
+			if msgID != "" {
+				out, err = b.db.ReceiptSenderByMessageID(ctx, msgID)
+				if err != nil {
+					return "", fmt.Errorf("поиск чека: %w", err)
+				}
+			} else {
+				groupJID := ""
+				if strings.TrimSpace(args.Group) != "" {
+					jid, _, e := b.resolveGroup(ctx, args.Group)
+					if e != nil {
+						return "", e
+					}
+					groupJID = jid.String()
+				} else if chat.Server == types.GroupServer {
+					groupJID = chat.String()
+				}
+				out, err = b.db.LatestReceiptSender(ctx, groupJID)
+				if err != nil {
+					return "", fmt.Errorf("поиск последнего чека: %w", err)
+				}
+			}
+
+			if !out.Found {
+				if msgID != "" {
+					return "По этому сообщению чек у меня не сохранён (возможно, это не чек или он ещё не распознан). Ответь (свайпом) на сам чек.", nil
+				}
+				return "Чеков в этой группе у меня пока нет — не могу сказать, с какого номера.", nil
+			}
+
+			who := out.Client
+			if who == "" {
+				who = out.Recipient
+			}
+			if who == "" {
+				who = "чек"
+			}
+			groups := b.joinedGroups(ctx)
+			gname := out.GroupJID
+			if j, e := types.ParseJID(out.GroupJID); e == nil {
+				if n, ok := groups[j]; ok && n != "" {
+					gname = n
+				}
+			}
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Чек %s на %.0f ₽ (операция %s, прислан %s", who, out.Amount, out.TxDate.Format("02.01 15:04"), out.ReceivedAt.Format("02.01 15:04"))
+			if gname != "" {
+				fmt.Fprintf(&sb, " в «%s»", gname)
+			}
+			sb.WriteString(").\n")
+			if out.SenderPhone != "" {
+				if out.SenderName != "" {
+					fmt.Fprintf(&sb, "Отправитель: %s, номер +%s.", out.SenderName, out.SenderPhone)
+				} else {
+					fmt.Fprintf(&sb, "Номер отправителя: +%s.", out.SenderPhone)
+				}
+			} else {
+				sb.WriteString("Настоящий номер отправителя не сохранён — этот чек пришёл при скрытой адресации WhatsApp или ещё до обновления, где номер не записывался.")
 			}
 			return sb.String(), nil
 		},

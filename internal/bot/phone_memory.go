@@ -116,9 +116,17 @@ func (b *Bot) phoneMemoryTool(chat types.JID) ai.Tool {
 }
 
 // quotedSenderPhoneNote — если владелец ответил (свайпом) на чужое сообщение,
-// возвращает подсказку с номером его отправителя и id сообщения, чтобы
+// возвращает подсказку с РЕАЛЬНЫМ номером его отправителя и id сообщения, чтобы
 // "этот номер"/"этот чек" сработали по контексту. Пусто, если это не ответ.
-func quotedSenderPhoneNote(msg *events.Message) string {
+//
+// ВАЖНО: при LID-адресации ci.Participant — это скрытый @lid, а НЕ телефон.
+// Называть его «номером отправителя» нельзя: иначе по команде «запомни этот
+// номер» LID уйдёт в память номеров как телефон и навсегда испортит привязку.
+// Поэтому номер берём так: если participant уже телефонной формы — его; иначе
+// достаём пойманный реальный номер из базы по id цитируемого сообщения. Если
+// настоящий номер не известен — его просто НЕ называем (id сообщения даём
+// всегда, по нему всё равно можно сослаться на чек).
+func (b *Bot) quotedSenderPhoneNote(ctx context.Context, msg *events.Message) string {
 	ext := msg.Message.GetExtendedTextMessage()
 	if ext == nil {
 		return ""
@@ -128,13 +136,25 @@ func quotedSenderPhoneNote(msg *events.Message) string {
 		return ""
 	}
 	var parts []string
+	phone := ""
 	if participant := ci.GetParticipant(); participant != "" {
-		if jid, err := types.ParseJID(participant); err == nil && jid.User != "" {
-			parts = append(parts, "номер отправителя +"+jid.User)
+		if jid, err := types.ParseJID(participant); err == nil && jid.Server == types.DefaultUserServer && jid.User != "" {
+			phone = jid.User // уже телефон (@s.whatsapp.net)
 		}
 	}
-	if id := ci.GetStanzaID(); id != "" {
-		parts = append(parts, "id сообщения "+id)
+	stanza := ci.GetStanzaID()
+	if phone == "" && stanza != "" && b.db != nil {
+		// participant был LID (или пуст) — пробуем достать реальный номер,
+		// пойманный при приёме исходного сообщения (SenderAlt).
+		if p, err := b.db.SenderPhoneByMessageID(ctx, stanza); err == nil {
+			phone = p
+		}
+	}
+	if phone != "" {
+		parts = append(parts, "номер отправителя +"+phone)
+	}
+	if stanza != "" {
+		parts = append(parts, "id сообщения "+stanza)
 	}
 	// Текст сообщения, на которое ответили (свайп): часто это вопрос бота «чей это
 	// чек / какая сумма» с данными чека. Даём его ассистенту, чтобы он понял, о

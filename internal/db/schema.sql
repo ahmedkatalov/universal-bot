@@ -19,7 +19,8 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     id            SERIAL PRIMARY KEY,
     wa_message_id TEXT UNIQUE,        -- ID сообщения в WhatsApp, для идемпотентности
     wa_group_jid  TEXT NOT NULL,
-    sender_jid    TEXT NOT NULL,
+    sender_jid    TEXT NOT NULL,      -- JID отправителя как есть; при LID-адресации это скрытый @lid, НЕ телефон
+    sender_phone  TEXT,               -- реальный телефон (<номер>@s.whatsapp.net) из SenderAlt; NULL = не известен
     sender_name   TEXT,
     body          TEXT,
     has_media     BOOLEAN NOT NULL DEFAULT false,
