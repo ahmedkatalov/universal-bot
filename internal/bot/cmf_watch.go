@@ -370,7 +370,7 @@ func extractQuotedText(msg *events.Message) string {
 // НЕ привязываем вслепую — иначе напоминание/«внесён» уйдёт на, возможно, не
 // того клиента (тёзку/однофамильца): спрашиваем подтверждение в группе.
 func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, clientText string, amount float64) {
-	clients, exact, err := b.cmfLookupWithTypos(ctx, clientText)
+	clients, kind, err := b.cmfLookupWithTypos(ctx, clientText)
 	if err != nil {
 		fmt.Println("cmf lookup:", err)
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "noname")
@@ -378,7 +378,7 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 	}
 
 	switch {
-	case len(clients) == 0:
+	case kind == cmfNoMatch:
 		branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch)
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "unmatched")
 		note := ""
@@ -386,12 +386,14 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 			note = " Отнесла к точке «" + branch + "» (как договаривались для чеков, которых нет в программе)."
 		}
 		b.sendText(chat, fmt.Sprintf("🔎 Клиента %q в программе не нашла (чек на %.0f ₽).%s", clientText, amount, note))
-	case len(clients) == 1 && exact:
+	case kind == cmfExact || kind == cmfStrong:
+		// Точное ИЛИ уверенное нечёткое (опечатка/склонение, но кандидат явно один)
+		// — привязываем к клиенту и ждём его платёж в программе. Это и есть «как
+		// человек предположить»: «Каталова»/«Котолов» → «Ахмед Каталов».
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", clients[0].ID, clients[0].FullName, "", "watch")
-		fmt.Printf("cmf: чек на %.0f ₽ привязан к клиенту %s, ждём платёж в программе\n", amount, clients[0].FullName)
-	case len(clients) == 1 && !exact:
-		// Единственный кандидат найден по НЕЧЁТКОМУ совпадению (по словам) —
-		// возможен тёзка/опечатка. Не привязываем автоматически, спрашиваем.
+		fmt.Printf("cmf: чек на %.0f ₽ привязан к клиенту %s (совпадение: %v), ждём платёж\n", amount, clients[0].FullName, kind)
+	case len(clients) == 1:
+		// Слабое совпадение — возможен тёзка. Не привязываем вслепую, спрашиваем.
 		candJSON, _ := json.Marshal(clients)
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", string(candJSON), "ambiguous")
 		b.sendText(chat, fmt.Sprintf(
@@ -431,6 +433,15 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		fmt.Println("cmf: ошибка выборки наблюдений:", err)
 		return
 	}
+	// Собираем неотмеченные по ГРУППЕ, чтобы послать ОДНО напоминание со списком
+	// клиентов, а не по сообщению на каждый чек (меньше шума, как просил владелец).
+	type rem struct {
+		client string
+		amount float64
+		date   time.Time
+	}
+	byGroup := map[string][]rem{}
+	var order []string
 	for _, w := range due {
 		found, err := b.cmf.HasPaymentAround(ctx, w.ClientID, w.Amount, w.TxDate, 5)
 		if err != nil {
@@ -443,11 +454,33 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 			continue
 		}
 		_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "reminded")
-		if jid, err := types.ParseJID(w.GroupJID); err == nil {
-			b.sendText(jid, fmt.Sprintf(
-				"⏰ Напоминание: чек от %s на %.0f ₽ (клиент %s) до сих пор НЕ добавлен в программу к рассрочке клиента. Не забудьте внести.",
-				w.TxDate.Format("02.01.2006"), w.Amount, w.ClientName))
+		if _, ok := byGroup[w.GroupJID]; !ok {
+			order = append(order, w.GroupJID)
 		}
+		byGroup[w.GroupJID] = append(byGroup[w.GroupJID], rem{w.ClientName, w.Amount, w.TxDate})
+	}
+
+	for _, gj := range order {
+		jid, err := types.ParseJID(gj)
+		if err != nil {
+			continue
+		}
+		if b.groupSilent(jid) {
+			continue // в этой группе бот молчит — напоминания не шлём
+		}
+		items := byGroup[gj]
+		var sb strings.Builder
+		if len(items) == 1 {
+			it := items[0]
+			fmt.Fprintf(&sb, "⏰ Занесите, пожалуйста, оплату в программу: чек от %s на %.0f ₽ — клиент %s (в рассрочке пока НЕ отмечен).",
+				it.date.Format("02.01"), it.amount, it.client)
+		} else {
+			sb.WriteString("⏰ Занесите, пожалуйста, оплаты этих клиентов в программу (чеки пришли, но в рассрочке пока НЕ отмечены):")
+			for _, it := range items {
+				fmt.Fprintf(&sb, "\n• %s — %.0f ₽ (чек %s)", it.client, it.amount, it.date.Format("02.01"))
+			}
+		}
+		b.sendText(jid, sb.String())
 	}
 }
 
@@ -573,18 +606,21 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	cidGroups := map[string]*clientChecks{}
 	for _, key := range order {
 		bk := buckets[key]
-		clients, exact, err := b.cmfLookupWithTypos(ctx, bk.display)
+		clients, kind, err := b.cmfLookupWithTypos(ctx, bk.display)
 		switch {
 		case err != nil:
 			attention = append(attention, fmt.Sprintf("%s — ошибка поиска в программе (%s)", bk.display, checksBrief(bk.checks)))
 			continue
-		case len(clients) == 0:
+		case kind == cmfNoMatch:
 			attention = append(attention, fmt.Sprintf("%s — в программе не найден (%s)", bk.display, checksBrief(bk.checks)))
 			continue
-		case len(clients) == 1 && !exact:
+		case kind == cmfExact || kind == cmfStrong:
+			// Точное или уверенное нечёткое — считаем совпадением и сверяем платежи
+			// (опечатка/склонение в имени больше не повод сказать «не найден»).
+		case len(clients) == 1:
 			attention = append(attention, fmt.Sprintf("%s — точного совпадения нет, похоже на «%s», проверь вручную (%s)", bk.display, clients[0].FullName, checksBrief(bk.checks)))
 			continue
-		case len(clients) > 1:
+		default:
 			var names []string
 			for _, c := range clients {
 				names = append(names, c.FullName)
@@ -862,79 +898,8 @@ func matchChecksToPayments(checks []recCheck, pays []cmf.Payment) (matches []cmf
 	return
 }
 
-// cmfLookupWithTypos ищет клиента с допуском на опечатки. Возвращает exact:
-// true — точное совпадение всей строки имени; false — нашли только по ОТДЕЛЬНЫМ
-// словам (нечёткое, может быть однофамильцем/тёзкой). На нечётком совпадении
-// нельзя утверждать «внесён/не внесён» — только подсказать кандидата.
-func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) (clients []cmf.ClientInfo, exact bool, err error) {
-	clients, err = b.cmf.LookupClients(ctx, name)
-	if err != nil {
-		return nil, false, err
-	}
-	if len(clients) > 0 {
-		return clients, true, nil
-	}
-	return b.cmfFuzzyByWords(ctx, name), false, nil
-}
-
-// cmfFuzzyByWords ищет клиента по ОТДЕЛЬНЫМ словам имени (на случай опечатки в
-// одном из слов) и ранжирует кандидатов по числу совпавших слов: оставляет тех,
-// кто совпал по МАКСИМАЛЬНОМУ числу слов. Так «Каталов Ахмед» с опечаткой
-// находит именно «Каталов Ахмед», а не всех Ахмедов И всех Каталовых сразу.
-// Слова короче 3 букв игнорируются. Результат отсортирован (стабильный вывод).
-func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) []cmf.ClientInfo {
-	if b.cmf == nil {
-		return nil
-	}
-	var words []string
-	for _, w := range strings.Fields(name) {
-		if len([]rune(w)) >= 3 {
-			words = append(words, w)
-		}
-	}
-	if len(words) == 0 {
-		return nil
-	}
-	byID := map[string]cmf.ClientInfo{}
-	score := map[string]int{}
-	for _, w := range words {
-		found, err := b.cmf.LookupClients(ctx, w)
-		if err != nil {
-			continue
-		}
-		seenWord := map[string]bool{} // одно слово не должно давать +2 за дубли
-		for _, c := range found {
-			if c.ID == "" || seenWord[c.ID] {
-				continue
-			}
-			seenWord[c.ID] = true
-			byID[c.ID] = c
-			score[c.ID]++
-		}
-	}
-	best := 0
-	for _, s := range score {
-		if s > best {
-			best = s
-		}
-	}
-	if best == 0 {
-		return nil
-	}
-	var out []cmf.ClientInfo
-	for id, c := range byID {
-		if score[id] == best {
-			out = append(out, c)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].FullName != out[j].FullName {
-			return out[i].FullName < out[j].FullName
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out
-}
+// cmfLookupWithTypos и cmfFuzzyByWords вынесены в cmf_fuzzy.go (сопоставление с
+// допуском на опечатки в буквах и склонения).
 
 // cmfAddPaymentTool — внести платёж по чеку в программу рассрочек.
 func (b *Bot) cmfAddPaymentTool() ai.Tool {
@@ -984,7 +949,7 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 				contractID = strings.TrimSpace(args.ContractID)
 				// branch неизвестен по id — найдём среди договоров клиента ниже
 			}
-			clients, _, err := b.cmfLookupWithTypos(ctx, strings.TrimSpace(args.ClientName))
+			clients, kind, err := b.cmfLookupWithTypos(ctx, strings.TrimSpace(args.ClientName))
 			if err != nil {
 				return "", err
 			}
@@ -997,6 +962,11 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 					names = append(names, c.FullName)
 				}
 				return "Под это имя подходит несколько клиентов: " + strings.Join(names, "; ") + ". Уточни полное имя.", nil
+			}
+			// ЗАПИСЬ в программу — на СЛАБОМ совпадении не вносим вслепую (можно
+			// записать не тому). Просим подтвердить точное имя найденного кандидата.
+			if kind == cmfWeak && contractID == "" {
+				return fmt.Sprintf("Точного совпадения по «%s» в программе нет, похоже на «%s». Если это он — повтори с его ПОЛНЫМ именем (как в программе), тогда внесу.", args.ClientName, clients[0].FullName), nil
 			}
 			contracts, err := b.cmf.ClientContracts(ctx, clients[0].ID)
 			if err != nil {
