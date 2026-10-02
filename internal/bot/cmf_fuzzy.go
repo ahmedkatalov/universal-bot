@@ -193,7 +193,7 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 
 	byID := map[string]cmf.ClientInfo{}
 	queries := cmfQueryVariants(qWords)
-	const maxQueries = 12
+	const maxQueries = 6 // меньше запросов на имя: не забиваем программу (в сверке десятки имён)
 	for i, q := range queries {
 		if i >= maxQueries {
 			break

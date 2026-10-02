@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -26,22 +27,44 @@ type Client struct {
 
 	tokenMu sync.Mutex
 	token   string
+
+	// Короткий кэш поиска клиентов: сверка за период ищет одни и те же имена/
+	// основы много раз («ещё раз» — снова все), и без кэша бот засыпал бы
+	// программу сотнями одинаковых запросов (риск упереться в лимит частоты).
+	cacheMu     sync.Mutex
+	lookupCache map[string]lookupEntry
 }
+
+type lookupEntry struct {
+	at  time.Time
+	res []ClientInfo
+}
+
+const lookupCacheTTL = 3 * time.Minute
+
+// readRetries — сколько раз пробуем ЧИТАЮЩИЙ запрос при временном сбое (сеть,
+// перегрузка, 5xx). Запись платежа НЕ повторяем: при таймауте платёж мог уже
+// записаться, и повтор задвоил бы его в программе.
+const readRetries = 3
 
 // NewFromEnv создаёт клиента из CMF_API_URL / CMF_EMAIL / CMF_PASSWORD.
 // Возвращает nil, если переменные не заданы (интеграция выключена).
 func NewFromEnv() *Client {
 	base := strings.TrimRight(strings.TrimSpace(os.Getenv("CMF_API_URL")), "/")
+	// Пути запросов уже начинаются с /api. Если адрес задали с хвостом «/api»
+	// (частая ошибка), получилось бы /api/api/... → 404 на КАЖДЫЙ запрос.
+	base = strings.TrimRight(strings.TrimSuffix(base, "/api"), "/")
 	email := strings.TrimSpace(os.Getenv("CMF_EMAIL"))
 	pass := strings.TrimSpace(os.Getenv("CMF_PASSWORD"))
 	if base == "" || email == "" || pass == "" {
 		return nil
 	}
 	return &Client{
-		baseURL:  base,
-		email:    email,
-		password: pass,
-		http:     &http.Client{Timeout: 30 * time.Second},
+		baseURL:     base,
+		email:       email,
+		password:    pass,
+		http:        &http.Client{Timeout: 30 * time.Second},
+		lookupCache: map[string]lookupEntry{},
 	}
 }
 
@@ -62,7 +85,7 @@ type loginResponse struct {
 }
 
 func (c *Client) login(ctx context.Context) error {
-	body, err := c.postJSON(ctx, "/api/auth/login", map[string]string{
+	body, err := c.postJSON(ctx, "вход", "/api/auth/login", map[string]string{
 		"email":    c.email,
 		"password": c.password,
 	})
@@ -72,7 +95,7 @@ func (c *Client) login(ctx context.Context) error {
 
 	var parsed loginResponse
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return fmt.Errorf("cmf login: не удалось разобрать ответ: %w", err)
+		return &APIError{Op: "вход", Status: http.StatusOK, Body: "непонятный ответ: " + truncate(string(body), 120)}
 	}
 
 	token := firstNonEmpty(parsed.Token, parsed.AccessToken)
@@ -89,22 +112,22 @@ func (c *Client) login(ctx context.Context) error {
 			}
 		}
 		userID := firstNonEmpty(chosen.UserID, parsed.User.ID)
-		selBody, err := c.postJSON(ctx, "/api/auth/select-profile", map[string]string{
+		selBody, err := c.postJSON(ctx, "вход", "/api/auth/select-profile", map[string]string{
 			"user_id":    userID,
 			"profile_id": chosen.ID,
 		})
 		if err != nil {
-			return fmt.Errorf("cmf select-profile: %w", err)
+			return err
 		}
 		var sel loginResponse
 		if err := json.Unmarshal(selBody, &sel); err != nil {
-			return fmt.Errorf("cmf select-profile: не удалось разобрать ответ: %w", err)
+			return &APIError{Op: "вход", Status: http.StatusOK, Body: "непонятный ответ выбора профиля"}
 		}
 		token = firstNonEmpty(sel.Token, sel.AccessToken)
 	}
 
 	if token == "" {
-		return fmt.Errorf("cmf login: в ответе нет токена: %s", truncate(string(body), 200))
+		return &APIError{Op: "вход", Status: http.StatusOK, Body: "в ответе нет токена"}
 	}
 	c.tokenMu.Lock()
 	c.token = token
@@ -112,24 +135,54 @@ func (c *Client) login(ctx context.Context) error {
 	return nil
 }
 
-// postJSON отправляет POST с JSON-телом и возвращает тело ответа (200 OK).
-func (c *Client) postJSON(ctx context.Context, path string, payload any) ([]byte, error) {
+// backoff — пауза перед повтором временно не удавшегося запроса.
+func backoff(attempt int) time.Duration {
+	return time.Duration(attempt*attempt) * 500 * time.Millisecond // 0.5s, 2s, 4.5s
+}
+
+func sleepCtx(ctx context.Context, d time.Duration) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(d):
+		return nil
+	}
+}
+
+// postJSON отправляет POST с JSON-телом (используется для ВХОДА — его повторять
+// безопасно) и возвращает тело ответа (200 OK). Временные сбои повторяет.
+func (c *Client) postJSON(ctx context.Context, op, path string, payload any) ([]byte, error) {
 	data, _ := json.Marshal(payload)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
-	if err != nil {
-		return nil, err
+	var lastErr error
+	for attempt := 0; attempt < readRetries; attempt++ {
+		if attempt > 0 {
+			if err := sleepCtx(ctx, backoff(attempt)); err != nil {
+				return nil, &APIError{Op: op, Err: err}
+			}
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(data))
+		if err != nil {
+			return nil, &APIError{Op: op, Err: err}
+		}
+		req.Header.Set("Content-Type", "application/json")
+		resp, err := c.http.Do(req)
+		if err != nil {
+			lastErr = &APIError{Op: op, Err: err}
+			continue
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			ae := &APIError{Op: op, Status: resp.StatusCode, Body: truncate(string(body), 200)}
+			if ae.Transient() {
+				lastErr = ae
+				continue
+			}
+			return nil, ae
+		}
+		return body, nil
 	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := c.http.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("cmf %s: %w", path, err)
-	}
-	defer resp.Body.Close()
-	body, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("cmf %s вернул %d: %s", path, resp.StatusCode, truncate(string(body), 200))
-	}
-	return body, nil
+	return nil, lastErr
 }
 
 func firstNonEmpty(vals ...string) string {
@@ -141,21 +194,45 @@ func firstNonEmpty(vals ...string) string {
 	return ""
 }
 
-// get выполняет GET с токеном, при 401 перелогинивается и повторяет один раз.
-// branchID (если не пустой) уходит в заголовок X-Branch-ID — его требуют
-// роуты с RequireBranch (например, /contract-payments).
-func (c *Client) get(ctx context.Context, path string, query url.Values, branchID string) ([]byte, error) {
-	for attempt := 0; attempt < 2; attempt++ {
-		c.tokenMu.Lock()
-		token := c.token
-		c.tokenMu.Unlock()
-		if token == "" {
-			if err := c.login(ctx); err != nil {
-				return nil, err
+// ensureToken возвращает действующий токен, при необходимости входя заново.
+func (c *Client) ensureToken(ctx context.Context) (string, error) {
+	c.tokenMu.Lock()
+	t := c.token
+	c.tokenMu.Unlock()
+	if t != "" {
+		return t, nil
+	}
+	if err := c.login(ctx); err != nil {
+		return "", err
+	}
+	c.tokenMu.Lock()
+	t = c.token
+	c.tokenMu.Unlock()
+	return t, nil
+}
+
+func (c *Client) clearToken() {
+	c.tokenMu.Lock()
+	c.token = ""
+	c.tokenMu.Unlock()
+}
+
+// get выполняет ЧИТАЮЩИЙ GET с токеном: при 401 один раз перелогинивается, при
+// временных сбоях (сеть, 429, 5xx) повторяет с паузой. op — что делаем (для
+// понятной причины ошибки). branchID (если не пустой) уходит в X-Branch-ID —
+// его требуют роуты с RequireBranch (например, /contract-payments).
+func (c *Client) get(ctx context.Context, op, path string, query url.Values, branchID string) ([]byte, error) {
+	var lastErr error
+	relogged := false
+	for attempt := 0; attempt <= readRetries; attempt++ {
+		if attempt > 0 && lastErr != nil {
+			if err := sleepCtx(ctx, backoff(attempt)); err != nil {
+				return nil, &APIError{Op: op, Err: err}
 			}
-			c.tokenMu.Lock()
-			token = c.token
-			c.tokenMu.Unlock()
+		}
+		token, err := c.ensureToken(ctx)
+		if err != nil {
+			return nil, err
 		}
 
 		u := c.baseURL + path
@@ -164,7 +241,7 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, branchI
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 		if err != nil {
-			return nil, err
+			return nil, &APIError{Op: op, Err: err}
 		}
 		req.Header.Set("Authorization", "Bearer "+token)
 		if branchID != "" {
@@ -173,23 +250,54 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, branchI
 
 		resp, err := c.http.Do(req)
 		if err != nil {
-			return nil, fmt.Errorf("cmf: %w", err)
+			lastErr = &APIError{Op: op, Err: err}
+			continue
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
 		if resp.StatusCode == http.StatusUnauthorized {
-			c.tokenMu.Lock()
-			c.token = ""
-			c.tokenMu.Unlock()
+			c.clearToken()
+			if relogged {
+				return nil, &APIError{Op: op, Status: resp.StatusCode, Body: truncate(string(body), 200)}
+			}
+			relogged = true
+			lastErr = nil // повтор сразу, с новым входом
 			continue
 		}
 		if resp.StatusCode != http.StatusOK {
-			return nil, fmt.Errorf("cmf %s вернул %d: %s", path, resp.StatusCode, truncate(string(body), 200))
+			ae := &APIError{Op: op, Status: resp.StatusCode, Body: truncate(string(body), 200)}
+			if ae.Transient() {
+				lastErr = ae
+				continue
+			}
+			return nil, ae
 		}
 		return body, nil
 	}
-	return nil, fmt.Errorf("cmf: не удалось авторизоваться")
+	if lastErr == nil {
+		lastErr = &APIError{Op: op, Status: http.StatusUnauthorized}
+	}
+	return nil, lastErr
+}
+
+// Ping проверяет связь с программой ПО-НАСТОЯЩЕМУ: свежий вход + пробный поиск.
+// nil — программа отвечает, логин верный, путь поиска существует. Используется
+// при старте (в лог) и когда владелец спрашивает «есть доступ к программе?».
+func (c *Client) Ping(ctx context.Context) error {
+	c.clearToken()
+	if err := c.login(ctx); err != nil {
+		return err
+	}
+	q := url.Values{}
+	q.Set("full_name", "ива")
+	q.Set("limit", "1")
+	_, err := c.get(ctx, "поиск клиента", "/api/clients/lookup", q, "")
+	var ae *APIError
+	if errors.As(err, &ae) && (ae.Status == http.StatusBadRequest || ae.Status == http.StatusUnprocessableEntity) {
+		return nil // сервер ответил (формат пробного запроса не понравился) — связь есть
+	}
+	return err
 }
 
 // looseItems достаёт массив объектов из ответа, который может быть голым
@@ -313,10 +421,18 @@ func (ci *ClientInfo) UnmarshalJSON(data []byte) error {
 
 // LookupClients ищет клиентов по подстроке имени (регистронезависимо).
 func (c *Client) LookupClients(ctx context.Context, fullName string) ([]ClientInfo, error) {
+	key := strings.ToLower(strings.TrimSpace(fullName))
+	c.cacheMu.Lock()
+	if e, ok := c.lookupCache[key]; ok && time.Since(e.at) < lookupCacheTTL {
+		c.cacheMu.Unlock()
+		return append([]ClientInfo(nil), e.res...), nil
+	}
+	c.cacheMu.Unlock()
+
 	q := url.Values{}
 	q.Set("full_name", fullName)
 	q.Set("limit", "10")
-	body, err := c.get(ctx, "/api/clients/lookup", q, "")
+	body, err := c.get(ctx, "поиск клиента", "/api/clients/lookup", q, "")
 	if err != nil {
 		return nil, err
 	}
@@ -327,6 +443,12 @@ func (c *Client) LookupClients(ctx context.Context, fullName string) ([]ClientIn
 			out = append(out, ci)
 		}
 	}
+	c.cacheMu.Lock()
+	if c.lookupCache == nil || len(c.lookupCache) > 2000 {
+		c.lookupCache = map[string]lookupEntry{} // ленивая инициализация + предохранитель от роста
+	}
+	c.lookupCache[key] = lookupEntry{at: time.Now(), res: append([]ClientInfo(nil), out...)}
+	c.cacheMu.Unlock()
 	return out, nil
 }
 
@@ -354,7 +476,7 @@ func (cr *ContractRef) UnmarshalJSON(data []byte) error {
 
 // ClientContracts возвращает договоры клиента.
 func (c *Client) ClientContracts(ctx context.Context, clientID string) ([]ContractRef, error) {
-	body, err := c.get(ctx, "/api/contracts/client/"+url.PathEscape(clientID)+"/contracts-summary", nil, "")
+	body, err := c.get(ctx, "договоры", "/api/contracts/client/"+url.PathEscape(clientID)+"/contracts-summary", nil, "")
 	if err != nil {
 		return nil, err
 	}
@@ -392,7 +514,7 @@ func (c *Client) ContractPayments(ctx context.Context, contractID, branchID stri
 	q.Set("date_from", from.Format("2006-01-02"))
 	q.Set("date_to", to.Format("2006-01-02"))
 	q.Set("limit", "200")
-	body, err := c.get(ctx, "/api/contract-payments/", q, branchID)
+	body, err := c.get(ctx, "платежи", "/api/contract-payments/", q, branchID)
 	if err != nil {
 		return nil, err
 	}
@@ -463,24 +585,17 @@ func (c *Client) AddPayment(ctx context.Context, contractID, branchID string, am
 		"comment":     "Внесено ботом по чеку из WhatsApp",
 	}
 	data, _ := json.Marshal(payload)
+	// ЗАПИСЬ: при сетевом сбое/таймауте НЕ повторяем — платёж мог уже записаться,
+	// и повтор задвоил бы его. Повтор только после 401 (протухший вход), когда
+	// программа точно ничего не записала.
 	for attempt := 0; attempt < 2; attempt++ {
-		c.tokenMu.Lock()
-		token := c.token
-		c.tokenMu.Unlock()
-		if token == "" {
-			// Логинимся и СРАЗУ шлём в этой же итерации (не тратя попытку на
-			// continue) — иначе протухший токен получал бы всего один POST без
-			// повтора, и платёж мог не записаться при истёкшей сессии.
-			if err := c.login(ctx); err != nil {
-				return err
-			}
-			c.tokenMu.Lock()
-			token = c.token
-			c.tokenMu.Unlock()
+		token, err := c.ensureToken(ctx)
+		if err != nil {
+			return err
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/contract-payments/", bytes.NewReader(data))
 		if err != nil {
-			return err
+			return &APIError{Op: "внесение", Err: err}
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Authorization", "Bearer "+token)
@@ -489,22 +604,20 @@ func (c *Client) AddPayment(ctx context.Context, contractID, branchID string, am
 		}
 		resp, err := c.http.Do(req)
 		if err != nil {
-			return fmt.Errorf("cmf add payment: %w", err)
+			return fmt.Errorf("связь с программой оборвалась при внесении — ПРОВЕРЬ в программе, записался ли платёж, прежде чем вносить снова: %w", &APIError{Op: "внесение", Err: err})
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if resp.StatusCode == http.StatusUnauthorized {
-			c.tokenMu.Lock()
-			c.token = ""
-			c.tokenMu.Unlock()
+			c.clearToken()
 			continue
 		}
 		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
-			return fmt.Errorf("программа отклонила платёж (%d): %s", resp.StatusCode, truncate(string(body), 200))
+			return fmt.Errorf("программа отклонила платёж: %w", &APIError{Op: "внесение", Status: resp.StatusCode, Body: truncate(string(body), 200)})
 		}
 		return nil
 	}
-	return fmt.Errorf("cmf add payment: не удалось авторизоваться")
+	return &APIError{Op: "внесение", Status: http.StatusUnauthorized}
 }
 
 func truncate(s string, n int) string {

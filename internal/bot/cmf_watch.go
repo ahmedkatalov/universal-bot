@@ -515,6 +515,31 @@ func (b *Bot) cmfExtractClientName(ctx context.Context, caption string) string {
 
 // ---- Инструменты ассистента ----
 
+// cmfConnectionTool — «есть доступ к программе?»: проверяет связь ПО ФАКТУ
+// (вход + пробный поиск), а не по наличию настроек. Раньше бот отвечал «да,
+// подключён», ничего не проверив, — а каждый запрос падал.
+func (b *Bot) cmfConnectionTool() ai.Tool {
+	return ai.Tool{
+		Name: "cmf_connection_check",
+		Description: "Проверяет ПО ФАКТУ, работает ли связь с программой рассрочек (вход + пробный поиск клиента). " +
+			"Вызывай на «есть доступ к программе?», «программа работает?», «почему сверка не идёт», и если сверка " +
+			"вернула ошибку. Отвечай по результату, не по догадке.",
+		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			if b.cmf == nil {
+				return "Программа НЕ подключена: в настройках бота не заданы CMF_API_URL / CMF_EMAIL / CMF_PASSWORD.", nil
+			}
+			pctx, cancel := context.WithTimeout(ctx, 40*time.Second)
+			defer cancel()
+			if err := b.cmf.Ping(pctx); err != nil {
+				fmt.Println("cmf ping:", err)
+				return "Связи с программой НЕТ: " + cmf.Human(err) + ".", nil
+			}
+			return "Связь с программой есть: вход и поиск клиентов работают.", nil
+		},
+	}
+}
+
 // cmfStatusTool — ЖИВАЯ сверка распознанных чеков из учёта с программой:
 // какие внесены, какие нет, по каким клиент не найден. Работает по всему
 // учёту (в т.ч. по чекам, сохранённым через "запомни"), а не по отдельной
@@ -604,12 +629,29 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	var attention []string
 	cidOrder := []string{}
 	cidGroups := map[string]*clientChecks{}
+	pinged := false
 	for _, key := range order {
 		bk := buckets[key]
 		clients, kind, err := b.cmfLookupWithTypos(ctx, bk.display)
 		switch {
 		case err != nil:
-			attention = append(attention, fmt.Sprintf("%s — ошибка поиска в программе (%s)", bk.display, checksBrief(bk.checks)))
+			fmt.Printf("cmf: ошибка поиска клиента %q: %v\n", bk.display, err)
+			// Первая же ошибка — проверим, жива ли программа ВООБЩЕ. Если нет —
+			// бессмысленно дёргать её по каждому чеку и вываливать владельцу
+			// двадцать одинаковых строк «ошибка поиска»: одна строка с причиной.
+			if !pinged {
+				pinged = true
+				if perr := b.cmf.Ping(ctx); perr != nil {
+					fmt.Printf("cmf: программа недоступна: %v\n", perr)
+					var sum float64
+					for _, r := range receipts {
+						sum += r.Amount
+					}
+					return fmt.Sprintf("⚠️ Сверку не сделал — %s. В учёте за %s чеков: %d на %.0f ₽; сверю, как только программа ответит.",
+						cmf.Human(perr), periodLabel, len(receipts), sum), nil
+				}
+			}
+			attention = append(attention, fmt.Sprintf("%s — %s (%s)", bk.display, cmf.Human(err), checksBrief(bk.checks)))
 			continue
 		case kind == cmfNoMatch:
 			attention = append(attention, fmt.Sprintf("%s — в программе не найден (%s)", bk.display, checksBrief(bk.checks)))
@@ -643,15 +685,15 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	fetchFrom := from.AddDate(0, 0, -cmfGapBackwardDays)
 	fetchTo := to.AddDate(0, 0, cmfGapForwardDays)
 
-	var problems []string // клиенты, где есть НЕ внесённые чеки — подробно
-	var okLines []string  // клиенты, где всё внесено — компактно
+	var problems []string // строки НЕ внесённых чеков (+ подсказки), компактно
 	entered, notEntered := 0, 0
 
 	for _, cid := range cidOrder {
 		g := cidGroups[cid]
 		pays, perr := b.cmf.PaymentsBetween(ctx, cid, fetchFrom, fetchTo)
 		if perr != nil {
-			attention = append(attention, fmt.Sprintf("%s — ошибка проверки платежей (%s)", g.display, checksBrief(g.checks)))
+			fmt.Printf("cmf: ошибка платежей клиента %q: %v\n", g.display, perr)
+			attention = append(attention, fmt.Sprintf("%s — не смог получить его оплаты: %s (%s)", g.display, cmf.Human(perr), checksBrief(g.checks)))
 			continue
 		}
 		matches, unmatched, leftover, kopecks := matchChecksToPayments(g.checks, pays)
@@ -659,61 +701,47 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		notEntered += len(unmatched)
 
 		if len(unmatched) == 0 {
-			okLines = append(okLines, fmt.Sprintf("%s — все %d внесены", g.display, len(g.checks)))
 			continue
 		}
-		// Есть невнесённые — подробный блок с логикой сопоставления.
-		var blk strings.Builder
-		fmt.Fprintf(&blk, "%s:", g.display)
-		for _, m := range matches {
-			pd := ""
-			if !m.pay.PaidAt.IsZero() {
-				pd = " (оплата " + m.pay.PaidAt.Format("02.01") + ")"
-			}
-			fmt.Fprintf(&blk, "\n  ✅ чек %s · %.0f ₽ — внесён%s", m.check.date.Format("02.01"), m.check.amount, pd)
-		}
+		// КОМПАКТНО: только то, что НЕ внесено (это и спрашивает владелец).
 		for _, uc := range unmatched {
-			fmt.Fprintf(&blk, "\n  ❌ чек %s · %.0f ₽ — НЕ внесён", uc.date.Format("02.01"), uc.amount)
+			problems = append(problems, fmt.Sprintf("• %s — %.0f ₽ (чек %s)", g.display, uc.amount, uc.date.Format("02.01")))
 		}
-		// Оставшиеся оплаты (без чека) показываем как подсказку — только если знаем
-		// единицу суммы (были совпадения); иначе только число, чтобы не путать.
+		// Подсказка, если у клиента в программе есть оплаты без пары-чека (часто
+		// внесли другой суммой/датой) — одной строкой, без простыни.
 		if len(leftover) > 0 {
 			if len(matches) > 0 {
-				for _, lp := range leftover {
-					amt := float64(lp.Amount)
+				var lp []string
+				for _, p := range leftover {
+					amt := float64(p.Amount)
 					if kopecks {
 						amt /= 100
 					}
-					when := ""
-					if !lp.PaidAt.IsZero() {
-						when = lp.PaidAt.Format("02.01") + " · "
+					if p.PaidAt.IsZero() {
+						lp = append(lp, fmt.Sprintf("%.0f ₽", amt))
+					} else {
+						lp = append(lp, fmt.Sprintf("%.0f ₽ от %s", amt, p.PaidAt.Format("02.01")))
 					}
-					fmt.Fprintf(&blk, "\n  ⚠️ в программе есть оплата %s%.0f ₽ без чека", when, amt)
 				}
+				problems = append(problems, "   ↳ в программе у него есть оплата без чека: "+strings.Join(lp, ", ")+" — может, внесли другой суммой")
 			} else {
-				fmt.Fprintf(&blk, "\n  ⚠️ в программе есть %d внесённых оплат(ы), не совпавших с чеками — проверь вручную", len(leftover))
+				problems = append(problems, fmt.Sprintf("   ↳ в программе у него %d оплат(ы), не совпавших с чеками — глянь вручную", len(leftover)))
 			}
 		}
-		problems = append(problems, blk.String())
 	}
 
 	var sb strings.Builder
-	fmt.Fprintf(&sb, "Сверка с программой за %s (чеков: %d):\n\n", periodLabel, len(receipts))
-	if len(problems) > 0 {
-		sb.WriteString(strings.Join(problems, "\n\n"))
-		sb.WriteString("\n\n")
+	fmt.Fprintf(&sb, "Сверка за %s (чеков: %d).\n", periodLabel, len(receipts))
+	if notEntered > 0 {
+		fmt.Fprintf(&sb, "\n❌ НЕ внесены (%d):\n%s\n", notEntered, strings.Join(problems, "\n"))
 	}
 	if len(attention) > 0 {
-		fmt.Fprintf(&sb, "⚠️ Требуют внимания:\n- %s\n\n", strings.Join(attention, "\n- "))
+		fmt.Fprintf(&sb, "\n⚠️ Уточнить (%d):\n• %s\n", len(attention), strings.Join(attention, "\n• "))
 	}
-	if len(okLines) > 0 {
-		fmt.Fprintf(&sb, "✅ Полностью внесены:\n- %s\n\n", strings.Join(okLines, "\n- "))
+	fmt.Fprintf(&sb, "\n✅ Внесены: %d чек(ов).", entered)
+	if notEntered == 0 && len(attention) == 0 {
+		sb.WriteString(" Всё сходится.")
 	}
-	fmt.Fprintf(&sb, "Итого: внесено чеков %d, НЕ внесено %d", entered, notEntered)
-	if len(attention) > 0 {
-		fmt.Fprintf(&sb, ", клиентов на ручную проверку %d", len(attention))
-	}
-	sb.WriteString(".")
 	return sb.String(), nil
 }
 

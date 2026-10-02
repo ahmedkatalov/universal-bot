@@ -165,7 +165,19 @@ func main() {
 	// платежами. Выключена, если CMF_API_URL/CMF_EMAIL/CMF_PASSWORD не заданы.
 	cmfClient := cmf.NewFromEnv()
 	if cmfClient != nil {
-		log.Println("Сверка с программой рассрочек (cmf) включена")
+		log.Println("Сверка с программой рассрочек (cmf) включена — проверяю связь...")
+		// Реальная проверка: вход + пробный поиск. Раньше «включена» значило лишь
+		// «переменные заданы», а на деле каждый запрос мог падать (неверный адрес/
+		// пароль) — и это всплывало только как «ошибка поиска» по каждому чеку.
+		go func(c *cmf.Client) {
+			pctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+			defer cancel()
+			if err := c.Ping(pctx); err != nil {
+				log.Printf("⚠️ ПРОВЕРКА CMF: программа НЕ отвечает как надо — %s. Детали: %v", cmf.Human(err), err)
+			} else {
+				log.Println("Проверка CMF: вход и поиск клиентов работают ✔")
+			}
+		}(cmfClient)
 	} else {
 		log.Println("CMF_API_URL/CMF_EMAIL/CMF_PASSWORD не заданы — сверка с программой выключена")
 	}
