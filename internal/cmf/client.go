@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -361,14 +362,14 @@ func jsonInt(m map[string]json.RawMessage, keys ...string) int64 {
 		}
 		var f float64
 		if json.Unmarshal(raw, &f) == nil {
-			return int64(f + 0.5)
+			return int64(math.Round(f))
 		}
 		var s string
 		if json.Unmarshal(raw, &s) == nil {
 			s = strings.TrimSpace(strings.ReplaceAll(s, " ", ""))
 			s = strings.ReplaceAll(s, ",", ".") // запятая — десятичный разделитель
 			if v, err := strconv.ParseFloat(s, 64); err == nil {
-				return int64(v + 0.5)
+				return int64(math.Round(v))
 			}
 		}
 	}

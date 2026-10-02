@@ -1,19 +1,22 @@
-// «Человеческая» сверка оплат клиента с программой рассрочек. Смотрим на ВСЮ
-// картину клиента (чеки и наличку вокруг периода, все его рассрочки) и
-// объясняем каждый чек так, как объяснил бы бухгалтер:
+// «Человеческая» сверка оплат клиента с программой рассрочек.
 //
-//  1. та же сумма в обычном окне дат (оплату вносят в день чека или позже) —
-//     «внесён оплатой 14.08»; при равных суммах — ближайшая оплата ПОСЛЕ чека;
-//  2. одна оплата закрывает несколько чеков («внесли одной суммой») или один чек
-//     внесён частями;
-//  3. та же сумма, но внесли сильно позже/раньше — «внесён поздно»;
-//  4. рядом есть оплата, похожая на ошибку в сумме (лишний/потерянный ноль,
-//     одна цифра, разница в пару процентов) — «проверь, похоже ошиблись»;
-//  5. иначе — «НЕ внесён».
+// Как рассуждает бухгалтер: у клиента есть чеки/наличка (по нашему учёту) и
+// оплаты в программе (по всем его рассрочкам). Надо найти САМОЕ ПРАВДОПОДОБНОЕ
+// объяснение всей картины сразу, а не хватать по одному «ближайшее»:
 //
-// Контекстные позиции (чеки/наличка соседних дней и других групп) участвуют в
-// сопоставлении, но в ответ не выводятся: они «забирают» свои оплаты, и оплата
-// сентябрьского чека, внесённая 2 октября, не засчитает октябрьский чек.
+//   - та же сумма, внесли в день чека или после — естественно;
+//   - внесли на пару дней РАНЬШЕ чека — бывает (опечатка в дате), но реже;
+//   - внесли сильно позже (3–6 недель) — «внесён поздно»;
+//   - та же сумма, но дата на 4–10 дней раньше чека — «проверь дату»;
+//   - похоже на ошибку ввода суммы (потеряли/лишний ноль, цифра) — «проверь»;
+//   - несколько чеков одной оплатой / один чек частями — реже, но бывает;
+//   - чек без оплаты — «НЕ внесён»; оплата без чека — тоже странно.
+//
+// Каждому варианту — «цена неправдоподобия»; выбираем набор объяснений с
+// минимальной суммарной ценой (1:1 — точно, венгерским алгоритмом; редкие
+// «одной оплатой/частями» — перебором). Даты сравниваем по КАЛЕНДАРНЫМ дням по
+// Москве: в программе дата без времени, а у чека есть часы. Результат не зависит
+// от порядка входных данных.
 package bot
 
 import (
@@ -25,25 +28,20 @@ import (
 	"whatsapp-bot/internal/cmf"
 )
 
-const day = 24 * time.Hour
-
-const (
-	reconWinBack  = 3 * day  // оплата раньше чека — допуск на перекос дат
-	reconWinFwd   = 20 * day // обычно вносят в течение пары недель после чека
-	reconLateBack = 10 * day // «внесли с датой раньше чека» — уже странно
-	reconLateFwd  = 45 * day // «внесли поздно» — но это всё ещё он
-)
+// reconLoc — календарь бизнеса (Москва, без перехода на летнее время).
+var reconLoc = time.FixedZone("MSK", 3*3600)
 
 // reconStatus — вердикт по позиции.
 type reconStatus int
 
 const (
 	stNotEntered reconStatus = iota
-	stEntered                // та же сумма в обычном окне
+	stEntered                // та же сумма, внесли в обычный срок
 	stCombined               // внесён вместе с другими одной оплатой
-	stSplit                  // внесён частями (несколько оплат)
-	stLate                   // та же сумма, но сильно позже/раньше
-	stSuspicious             // похоже, внесли с ошибкой в сумме — проверить
+	stSplit                  // внесён частями
+	stLate                   // внесён, но поздно / с ошибкой в дате оплаты
+	stSuspicious             // похоже, ошиблись в сумме — проверить
+	stDateCheck              // та же сумма, но дата заметно РАНЬШЕ чека — проверить
 )
 
 // reconItem — то, что клиент заплатил по нашему учёту (чек или наличка).
@@ -57,338 +55,636 @@ type reconItem struct {
 
 // reconVerdict — объяснение по одной позиции.
 type reconVerdict struct {
-	Status reconStatus
-	Pays   []int // индексы оплат, закрывших позицию (или похожей оплаты для stSuspicious)
-	With   []int // для stCombined — другие позиции в той же оплате
-	// SameAmountAs — для «НЕ внесён»: индекс внесённой позиции с той же суммой,
-	// чья оплата подходит и сюда (суммы одинаковые — внесена одна из двух).
-	SameAmountAs int
-	Note         string // «лишний ноль», «внесли меньше на 2%» и т.п.
+	Status       reconStatus
+	Pays         []int  // индексы оплат (в исходном срезе), закрывших позицию
+	With         []int  // для stCombined — другие позиции той же оплаты
+	SameAmountAs int    // для «НЕ внесён»: позиция с той же суммой, чья оплата подходит и сюда
+	Note         string // пояснение («потеряли ноль», «в программе без даты»…)
 }
 
 func (v reconVerdict) entered() bool {
 	return v.Status == stEntered || v.Status == stCombined || v.Status == stSplit || v.Status == stLate
 }
 
-// reconPaymentsInKopecks — в каких единицах программа хранит суммы (по всему
-// набору): иначе одна оплата совпала бы с двумя позициями, отличающимися в 100 раз.
-func reconPaymentsInKopecks(items []reconItem, pays []cmf.Payment) bool {
-	rub, kop := 0, 0
+func (v reconVerdict) needsCheck() bool {
+	return v.Status == stSuspicious || v.Status == stDateCheck
+}
+
+// unitMode — в каких единицах программа хранит суммы.
+type unitMode int
+
+const (
+	unitsAuto unitMode = iota
+	unitsRubles
+	unitsKopecks
+)
+
+// --- даты и деньги ---
+
+func dayNum(t time.Time) int {
+	y, m, d := t.In(reconLoc).Date()
+	return int(time.Date(y, m, d, 0, 0, 0, 0, time.UTC).Unix() / 86400)
+}
+
+// dayDelta — сколько календарных дней оплата позже позиции (отрицательно — раньше).
+func dayDelta(pay, item time.Time) int { return dayNum(pay) - dayNum(item) }
+
+func itemKop(a float64) int64 { return int64(math.Round(a * 100)) }
+
+func payKop(p cmf.Payment, kopecks bool) int64 {
+	if kopecks {
+		return p.Amount
+	}
+	return p.Amount * 100
+}
+
+// sameMoney — суммы совпадают с точностью до рубля (копейки часто отбрасывают).
+func sameMoney(a, b int64) bool {
+	d := a - b
+	if d < 0 {
+		d = -d
+	}
+	return d < 100
+}
+
+// --- цены неправдоподобия ---
+
+const (
+	costUnexplainedItem = 150 // чек/наличка без оплаты — «НЕ внесён»
+	costUnusedPayment   = 120 // оплата в программе без чека — тоже требует объяснения
+	costUnusedUndated   = 60
+	costCombo           = 150 // «одной оплатой» / «частями» — реже, чем 1:1
+	costUndatedExact    = 70  // та же сумма, но у оплаты нет даты
+)
+
+// normalCost — цена «та же сумма в обычный срок» (−3…+20 дней).
+func normalCost(d int) (int, bool) {
+	switch {
+	case d >= 0 && d <= 7:
+		return d, true
+	case d >= 8 && d <= 20:
+		return 7 + 2*(d-7), true
+	case d >= -3 && d < 0:
+		return 40 + 5*(-d), true // до чека — только если «после» ничего нет
+	}
+	return 0, false
+}
+
+// exactCost — цена совпадения ТОЙ ЖЕ суммы при сдвиге d дней.
+func exactCost(d int) (int, reconStatus, bool) {
+	if c, ok := normalCost(d); ok {
+		return c, stEntered, true
+	}
+	switch {
+	case d > 20 && d <= 45:
+		return 60 + (d - 20), stLate, true
+	case d < -3 && d >= -10:
+		return 95 + 3*(-d), stDateCheck, true
+	}
+	return 0, 0, false
+}
+
+type edgeInfo struct {
+	cost   int
+	status reconStatus
+	note   string
+}
+
+// pairEdge — можно ли объяснить позицию одной оплатой и во что это обойдётся.
+func pairEdge(it reconItem, p cmf.Payment, kopecks bool) (edgeInfo, bool) {
+	want, got := itemKop(it.Amount), payKop(p, kopecks)
+	exact := sameMoney(want, got)
+	paid, created := p.PaidAt, p.CreatedAt
+	if paid.IsZero() {
+		paid, created = created, time.Time{}
+	}
+	if paid.IsZero() {
+		if exact {
+			return edgeInfo{costUndatedExact, stEntered, "в программе без даты"}, true
+		}
+		return edgeInfo{}, false
+	}
+	best, found := edgeInfo{}, false
+	try := func(e edgeInfo) {
+		if !found || e.cost < best.cost {
+			best, found = e, true
+		}
+	}
+	if exact {
+		if c, st, ok := exactCost(dayDelta(paid, it.Date)); ok {
+			try(edgeInfo{c, st, ""})
+		}
+		// Дата ОПЛАТЫ в программе явно не та, но ВНЕСЛИ вовремя — это он, дату поправить.
+		if !created.IsZero() && dayNum(created) != dayNum(paid) {
+			if c, ok := normalCost(dayDelta(created, it.Date)); ok {
+				try(edgeInfo{c + 25, stLate, "в программе дата оплаты " + p.PaidAt.In(reconLoc).Format("02.01") + ", а внесли " + created.In(reconLoc).Format("02.01") + " — поправь дату"})
+			}
+		}
+	} else if d := dayDelta(paid, it.Date); d >= -3 && d <= 20 {
+		if note := amountSlip(want, got); note != "" {
+			ad := d
+			if ad < 0 {
+				ad = -ad
+			}
+			try(edgeInfo{100 + ad, stSuspicious, note})
+		}
+	}
+	return best, found
+}
+
+// reconUnitTally — сколько позиций находят оплату той же суммы в обычный срок при
+// трактовке «рубли» и «копейки». Суммируется по ВСЕМ клиентам сверки: единица у
+// программы одна, и одна случайная оплата одного клиента не должна её переворачивать.
+func reconUnitTally(items []reconItem, pays []cmf.Payment) (rub, kop int) {
 	for _, it := range items {
-		wr, wk := int64(it.Amount+0.5), int64(it.Amount*100+0.5)
-		for _, p := range pays {
-			if p.Amount == wr {
-				rub++
-				break
-			}
-		}
-		for _, p := range pays {
-			if p.Amount == wk {
-				kop++
-				break
-			}
-		}
-	}
-	return kop > rub
-}
-
-// prefKey — чем меньше, тем вероятнее, что оплата именно за эту позицию.
-// Оплата ПОСЛЕ позиции естественна; ДО — бывает (перекос дат), но реже.
-func prefKey(delta time.Duration) time.Duration {
-	if delta >= 0 {
-		return delta
-	}
-	return -3*delta + 12*time.Hour
-}
-
-// humanMatch сопоставляет позиции клиента с его оплатами в программе.
-// Возвращает вердикт по каждой позиции (по индексу), неиспользованные оплаты и
-// единицу сумм программы.
-func humanMatch(items []reconItem, pays []cmf.Payment) (verdicts []reconVerdict, leftover []int, kopecks bool) {
-	kopecks = reconPaymentsInKopecks(items, pays)
-	units := func(a float64) int64 {
-		if kopecks {
-			return int64(math.Round(a * 100))
-		}
-		return int64(math.Round(a))
-	}
-	verdicts = make([]reconVerdict, len(items))
-	for i := range verdicts {
-		verdicts[i].SameAmountAs = -1
-	}
-	payUsed := make([]bool, len(pays))
-	itemDone := func(i int) bool { return verdicts[i].Status != stNotEntered }
-
-	// --- Этап 1: та же сумма в обычном окне, максимум совпадений (Кун). ---
-	const noDate = time.Duration(1) << 62
-	adj := make([][]int, len(items))
-	type edge struct {
-		i, j int
-		key  time.Duration
-	}
-	var edges []edge
-	for i, it := range items {
-		w := units(it.Amount)
-		type cand struct {
-			j   int
-			key time.Duration
-		}
-		var cs []cand
-		for j, p := range pays {
-			if p.Amount != w {
-				continue
-			}
-			key := noDate
-			if !p.PaidAt.IsZero() {
-				delta := p.PaidAt.Sub(it.Date)
-				if delta > reconWinFwd || delta < -reconWinBack {
+		w := itemKop(it.Amount)
+		hit := func(kopecks bool) bool {
+			for _, p := range pays {
+				if p.Amount <= 0 || !sameMoney(w, payKop(p, kopecks)) {
 					continue
 				}
-				key = prefKey(delta)
+				if p.PaidAt.IsZero() {
+					return true
+				}
+				if _, ok := normalCost(dayDelta(p.PaidAt, it.Date)); ok {
+					return true
+				}
 			}
-			cs = append(cs, cand{j, key})
-		}
-		sort.SliceStable(cs, func(a, b int) bool { return cs[a].key < cs[b].key })
-		for _, c := range cs {
-			adj[i] = append(adj[i], c.j)
-			edges = append(edges, edge{i, c.j, c.key})
-		}
-	}
-	matchPay := make([]int, len(pays))
-	for j := range matchPay {
-		matchPay[j] = -1
-	}
-	matchItem := make([]int, len(items))
-	for i := range matchItem {
-		matchItem[i] = -1
-	}
-	sort.SliceStable(edges, func(a, b int) bool { return edges[a].key < edges[b].key })
-	for _, e := range edges {
-		if matchItem[e.i] == -1 && matchPay[e.j] == -1 {
-			matchItem[e.i], matchPay[e.j] = e.j, e.i
-		}
-	}
-	var augment func(i int, seen []bool) bool
-	augment = func(i int, seen []bool) bool {
-		for _, j := range adj[i] {
-			if seen[j] {
-				continue
-			}
-			seen[j] = true
-			if matchPay[j] == -1 || augment(matchPay[j], seen) {
-				matchPay[j], matchItem[i] = i, j
-				return true
-			}
-		}
-		return false
-	}
-	for i := range items {
-		if matchItem[i] == -1 {
-			augment(i, make([]bool, len(pays)))
-		}
-	}
-	for i := range items {
-		if j := matchItem[i]; j >= 0 {
-			verdicts[i] = reconVerdict{Status: stEntered, Pays: []int{j}, SameAmountAs: -1}
-			payUsed[j] = true
-		}
-	}
-
-	inWindow := func(it reconItem, p cmf.Payment) bool {
-		if p.PaidAt.IsZero() {
 			return false
 		}
-		delta := p.PaidAt.Sub(it.Date)
-		return delta <= reconWinFwd && delta >= -reconWinBack
+		if hit(false) {
+			rub++
+		}
+		if hit(true) {
+			kop++
+		}
 	}
+	return rub, kop
+}
 
-	// --- Этап 2а: одна оплата = сумма 2–3 позиций («внесли одной суммой»). ---
-	payOrder := make([]int, 0, len(pays))
-	for j := range pays {
-		payOrder = append(payOrder, j)
+// dropReversals убирает сторно: отрицательную оплату вместе с положительной той же
+// суммы (того же договора, ближайшей по дате). Отменённая запись — не оплата.
+func dropReversals(pays []cmf.Payment) []bool {
+	valid := make([]bool, len(pays))
+	for j, p := range pays {
+		valid[j] = p.Amount > 0
 	}
-	sort.SliceStable(payOrder, func(a, b int) bool { return pays[payOrder[a]].PaidAt.Before(pays[payOrder[b]].PaidAt) })
-	for _, j := range payOrder {
-		if payUsed[j] {
+	for _, p := range pays {
+		if p.Amount >= 0 {
 			continue
 		}
-		p := pays[j]
-		var cand []int
-		for i, it := range items {
-			if !itemDone(i) && inWindow(it, p) {
-				cand = append(cand, i)
+		best, bestDist := -1, math.MaxInt32
+		for k, q := range pays {
+			if !valid[k] || q.Amount != -p.Amount || (p.ContractID != "" && q.ContractID != "" && p.ContractID != q.ContractID) {
+				continue
+			}
+			dist := 0
+			if !p.PaidAt.IsZero() && !q.PaidAt.IsZero() {
+				dist = dayDelta(p.PaidAt, q.PaidAt)
+				if dist < 0 {
+					dist = -dist
+				}
+			}
+			if dist <= 60 && dist < bestDist {
+				best, bestDist = k, dist
 			}
 		}
-		if best := bestSubset(cand, 2, 3, p.Amount, func(i int) int64 { return units(items[i].Amount) },
-			func(i int) time.Duration { return prefKey(p.PaidAt.Sub(items[i].Date)) }); best != nil {
-			payUsed[j] = true
-			for _, i := range best {
-				var others []int
-				for _, k := range best {
-					if k != i {
-						others = append(others, k)
+		if best >= 0 {
+			valid[best] = false
+		}
+	}
+	return valid
+}
+
+// hyper — объяснение «одной оплатой несколько позиций» или «одна позиция частями».
+type hyper struct {
+	items  []int // канонические индексы позиций
+	pays   []int // канонические индексы оплат
+	cost   int
+	status reconStatus
+}
+
+const maxHypers = 12
+
+// humanMatch объясняет позиции клиента его оплатами в программе.
+// Возвращает вердикт по каждой позиции (по исходному индексу), неиспользованные
+// оплаты (исходные индексы) и единицу сумм программы.
+func humanMatch(items []reconItem, pays []cmf.Payment, mode unitMode) (verdicts []reconVerdict, leftover []int, kopecks bool) {
+	valid := dropReversals(pays)
+	switch mode {
+	case unitsKopecks:
+		kopecks = true
+	case unitsAuto:
+		rub, kop := reconUnitTally(items, pays)
+		kopecks = kop > rub
+	}
+
+	// Канонический порядок — чтобы ответ не зависел от порядка входа.
+	iord := make([]int, len(items))
+	for i := range iord {
+		iord[i] = i
+	}
+	sort.SliceStable(iord, func(a, b int) bool {
+		x, y := items[iord[a]], items[iord[b]]
+		if !x.Date.Equal(y.Date) {
+			return x.Date.Before(y.Date)
+		}
+		if x.Amount != y.Amount {
+			return x.Amount < y.Amount
+		}
+		if x.Kind != y.Kind {
+			return x.Kind < y.Kind
+		}
+		return x.ID < y.ID
+	})
+	var pord []int
+	for j := range pays {
+		if valid[j] {
+			pord = append(pord, j)
+		}
+	}
+	sort.SliceStable(pord, func(a, b int) bool {
+		x, y := pays[pord[a]], pays[pord[b]]
+		if !x.PaidAt.Equal(y.PaidAt) {
+			return x.PaidAt.Before(y.PaidAt)
+		}
+		if x.Amount != y.Amount {
+			return x.Amount < y.Amount
+		}
+		return x.ContractID < y.ContractID
+	})
+	ci := make([]reconItem, len(iord))
+	for k, i := range iord {
+		ci[k] = items[i]
+	}
+	cp := make([]cmf.Payment, len(pord))
+	for k, j := range pord {
+		cp[k] = pays[j]
+	}
+	n, m := len(ci), len(cp)
+
+	// Рёбра 1:1.
+	edge := make([][]edgeInfo, n)
+	has := make([][]bool, n)
+	for i := 0; i < n; i++ {
+		edge[i] = make([]edgeInfo, m)
+		has[i] = make([]bool, m)
+		for j := 0; j < m; j++ {
+			edge[i][j], has[i][j] = pairEdge(ci[i], cp[j], kopecks)
+		}
+	}
+
+	// Кандидаты «одной оплатой» и «частями».
+	hypers := buildHypers(ci, cp, kopecks)
+
+	unusedCost := func(j int) int {
+		if cp[j].PaidAt.IsZero() && cp[j].CreatedAt.IsZero() {
+			return costUnusedUndated
+		}
+		return costUnusedPayment
+	}
+
+	type solution struct {
+		total  int
+		chosen []int
+		assign []int // позиция -> оплата (или -1)
+	}
+	best := solution{total: math.MaxInt32}
+	usedI := make([]bool, n)
+	usedP := make([]bool, m)
+
+	solveLeaf := func(chosen []int, hcost int) {
+		var rows, cols []int
+		for i := 0; i < n; i++ {
+			if !usedI[i] {
+				rows = append(rows, i)
+			}
+		}
+		for j := 0; j < m; j++ {
+			if !usedP[j] {
+				cols = append(cols, j)
+			}
+		}
+		assign := make([]int, n)
+		for i := range assign {
+			assign[i] = -1
+		}
+		total := hcost
+		if len(rows) > 0 {
+			const big = 1 << 30
+			w := len(cols) + len(rows)
+			a := make([][]int, len(rows))
+			for r, i := range rows {
+				a[r] = make([]int, w)
+				for c, j := range cols {
+					if has[i][j] {
+						a[r][c] = edge[i][j].cost - unusedCost(j)
+					} else {
+						a[r][c] = big
 					}
 				}
-				verdicts[i] = reconVerdict{Status: stCombined, Pays: []int{j}, With: others, SameAmountAs: -1}
+				for c := len(cols); c < w; c++ {
+					a[r][c] = costUnexplainedItem
+				}
 			}
+			res := hungarian(a)
+			for r, c := range res {
+				total += a[r][c]
+				if c < len(cols) {
+					assign[rows[r]] = cols[c]
+				}
+			}
+		}
+		for _, j := range cols {
+			total += unusedCost(j)
+		}
+		if total < best.total {
+			best = solution{total, append([]int(nil), chosen...), assign}
 		}
 	}
 
-	// --- Этап 2б: одна позиция = сумма 2–3 оплат («внесли частями»). ---
-	for i, it := range items {
-		if itemDone(i) {
+	var dfs func(k int, chosen []int, hcost int)
+	dfs = func(k int, chosen []int, hcost int) {
+		if hcost >= best.total {
+			return
+		}
+		if k == len(hypers) {
+			solveLeaf(chosen, hcost)
+			return
+		}
+		dfs(k+1, chosen, hcost)
+		h := hypers[k]
+		for _, i := range h.items {
+			if usedI[i] {
+				return
+			}
+		}
+		for _, j := range h.pays {
+			if usedP[j] {
+				return
+			}
+		}
+		for _, i := range h.items {
+			usedI[i] = true
+		}
+		for _, j := range h.pays {
+			usedP[j] = true
+		}
+		dfs(k+1, append(chosen, k), hcost+h.cost)
+		for _, i := range h.items {
+			usedI[i] = false
+		}
+		for _, j := range h.pays {
+			usedP[j] = false
+		}
+	}
+	dfs(0, nil, 0)
+
+	// Переводим решение в вердикты (канонические индексы -> исходные).
+	cv := make([]reconVerdict, n)
+	for i := range cv {
+		cv[i].SameAmountAs = -1
+	}
+	payUsed := make([]bool, m)
+	for _, k := range best.chosen {
+		h := hypers[k]
+		for _, j := range h.pays {
+			payUsed[j] = true
+		}
+		for _, i := range h.items {
+			v := reconVerdict{Status: h.status, SameAmountAs: -1}
+			for _, j := range h.pays {
+				v.Pays = append(v.Pays, pord[j])
+			}
+			if h.status == stCombined {
+				for _, o := range h.items {
+					if o != i {
+						v.With = append(v.With, iord[o])
+					}
+				}
+			}
+			cv[i] = v
+		}
+	}
+	for i, j := range best.assign {
+		if j < 0 {
 			continue
 		}
-		var cand []int
-		for j, p := range pays {
-			if !payUsed[j] && inWindow(it, p) {
-				cand = append(cand, j)
-			}
-		}
-		if best := bestSubset(cand, 2, 3, units(it.Amount), func(j int) int64 { return pays[j].Amount },
-			func(j int) time.Duration { return prefKey(pays[j].PaidAt.Sub(it.Date)) }); best != nil {
-			for _, j := range best {
-				payUsed[j] = true
-			}
-			sort.Slice(best, func(a, b int) bool { return pays[best[a]].PaidAt.Before(pays[best[b]].PaidAt) })
-			verdicts[i] = reconVerdict{Status: stSplit, Pays: best, SameAmountAs: -1}
-		}
+		payUsed[j] = true
+		e := edge[i][j]
+		cv[i] = reconVerdict{Status: e.status, Pays: []int{pord[j]}, Note: e.note, SameAmountAs: -1}
 	}
 
-	// --- Этап 3: та же сумма, но внесли сильно позже/раньше обычного. ---
-	type lateEdge struct {
-		i, j int
-		key  time.Duration
-	}
-	var late []lateEdge
-	for i, it := range items {
-		if itemDone(i) {
+	// Равные суммы: «НЕ внесён», но рядом внесённая позиция ТОЙ ЖЕ суммы, чья
+	// оплата подошла бы и сюда — честно: внесена одна из двух.
+	for i := range ci {
+		if cv[i].Status != stNotEntered {
 			continue
 		}
-		w := units(it.Amount)
-		for j, p := range pays {
-			if payUsed[j] || p.Amount != w || p.PaidAt.IsZero() {
+		for k := range ci {
+			if k == i || !cv[k].entered() || !sameMoney(itemKop(ci[k].Amount), itemKop(ci[i].Amount)) {
 				continue
 			}
-			delta := p.PaidAt.Sub(it.Date)
-			if (delta > reconWinFwd && delta <= reconLateFwd) || (delta < -reconWinBack && delta >= -reconLateBack) {
-				late = append(late, lateEdge{i, j, prefKey(delta)})
+			for _, oj := range cv[k].Pays {
+				p := pays[oj]
+				if p.PaidAt.IsZero() {
+					continue
+				}
+				if _, ok := normalCost(dayDelta(p.PaidAt, ci[i].Date)); ok {
+					cv[i].SameAmountAs = iord[k]
+					break
+				}
 			}
-		}
-	}
-	sort.SliceStable(late, func(a, b int) bool { return late[a].key < late[b].key })
-	for _, e := range late {
-		if itemDone(e.i) || payUsed[e.j] {
-			continue
-		}
-		payUsed[e.j] = true
-		verdicts[e.i] = reconVerdict{Status: stLate, Pays: []int{e.j}, SameAmountAs: -1}
-	}
-
-	// --- Этап 4: похоже на ошибку в сумме при вводе в программу. ---
-	type susEdge struct {
-		i, j int
-		key  time.Duration
-		note string
-	}
-	var sus []susEdge
-	for i, it := range items {
-		if itemDone(i) {
-			continue
-		}
-		w := units(it.Amount)
-		for j, p := range pays {
-			if payUsed[j] || !inWindow(it, p) {
-				continue
-			}
-			if note := amountSlip(w, p.Amount); note != "" {
-				sus = append(sus, susEdge{i, j, prefKey(p.PaidAt.Sub(it.Date)), note})
-			}
-		}
-	}
-	sort.SliceStable(sus, func(a, b int) bool { return sus[a].key < sus[b].key })
-	for _, e := range sus {
-		if itemDone(e.i) || payUsed[e.j] {
-			continue
-		}
-		payUsed[e.j] = true
-		verdicts[e.i] = reconVerdict{Status: stSuspicious, Pays: []int{e.j}, Note: e.note, SameAmountAs: -1}
-	}
-
-	// Равные суммы: «НЕ внесён», но рядом внесённая позиция с ТОЙ ЖЕ суммой, чья
-	// оплата подошла бы и сюда — честно говорим, что внесена одна из двух.
-	for i, it := range items {
-		if verdicts[i].Status != stNotEntered {
-			continue
-		}
-		for k, other := range items {
-			if k == i || verdicts[k].Status != stEntered || units(other.Amount) != units(it.Amount) {
-				continue
-			}
-			if p := pays[verdicts[k].Pays[0]]; !p.PaidAt.IsZero() && inWindow(it, p) {
-				verdicts[i].SameAmountAs = k
+			if cv[i].SameAmountAs >= 0 {
 				break
 			}
 		}
 	}
 
-	for j := range pays {
+	verdicts = make([]reconVerdict, len(items))
+	for k, i := range iord {
+		verdicts[i] = cv[k]
+	}
+	for j := 0; j < m; j++ {
 		if !payUsed[j] {
-			leftover = append(leftover, j)
+			leftover = append(leftover, pord[j])
 		}
 	}
+	sort.Ints(leftover)
 	return verdicts, leftover, kopecks
 }
 
-// bestSubset ищет среди cand подмножество размера minK..maxK с суммой target,
-// предпочитая МЕНЬШИЙ размер и меньшую суммарную «дальность» по датам. nil — нет.
-func bestSubset(cand []int, minK, maxK int, target int64, val func(int) int64, cost func(int) time.Duration) []int {
-	if len(cand) < minK || target <= 0 {
-		return nil
-	}
-	if len(cand) > 12 {
-		cand = cand[:12] // предохранитель от перебора; у клиента столько не бывает
-	}
-	for k := minK; k <= maxK; k++ {
-		var best []int
-		bestCost := time.Duration(math.MaxInt64)
-		var rec func(start int, chosen []int, sum int64, c time.Duration)
-		rec = func(start int, chosen []int, sum int64, c time.Duration) {
-			if len(chosen) == k {
-				if sum == target && c < bestCost {
-					bestCost, best = c, append([]int(nil), chosen...)
-				}
-				return
-			}
-			for x := start; x < len(cand); x++ {
-				v := val(cand[x])
-				if v <= 0 || sum+v > target {
-					continue
-				}
-				rec(x+1, append(chosen, cand[x]), sum+v, c+cost(cand[x]))
+// buildHypers — кандидаты «несколько позиций одной оплатой» (2–3 позиции в пределах
+// двух недель, оплата в обычный срок к каждой) и «одна позиция частями» (2–3 оплаты).
+// Оставляем самые правдоподобные maxHypers штук.
+func buildHypers(ci []reconItem, cp []cmf.Payment, kopecks bool) []hyper {
+	var hs []hyper
+	for j, p := range cp {
+		if p.PaidAt.IsZero() {
+			continue
+		}
+		total := payKop(p, kopecks)
+		var cand []int
+		for i, it := range ci {
+			if _, ok := normalCost(dayDelta(p.PaidAt, it.Date)); ok && itemKop(it.Amount) < total {
+				cand = append(cand, i)
 			}
 		}
-		rec(0, nil, 0, 0)
-		if best != nil {
-			return best
-		}
+		forSubsets(cand, 2, 3, func(sub []int) {
+			var sum int64
+			cost := costCombo
+			first, last := ci[sub[0]].Date, ci[sub[0]].Date
+			for _, i := range sub {
+				sum += itemKop(ci[i].Amount)
+				c, _ := normalCost(dayDelta(p.PaidAt, ci[i].Date))
+				cost += c
+				if ci[i].Date.Before(first) {
+					first = ci[i].Date
+				}
+				if ci[i].Date.After(last) {
+					last = ci[i].Date
+				}
+			}
+			if sameMoney(sum, total) && dayNum(last)-dayNum(first) <= 14 {
+				hs = append(hs, hyper{items: append([]int(nil), sub...), pays: []int{j}, cost: cost, status: stCombined})
+			}
+		})
 	}
-	return nil
+	for i, it := range ci {
+		want := itemKop(it.Amount)
+		var cand []int
+		for j, p := range cp {
+			if p.PaidAt.IsZero() {
+				continue
+			}
+			if _, ok := normalCost(dayDelta(p.PaidAt, it.Date)); ok && payKop(p, kopecks) < want {
+				cand = append(cand, j)
+			}
+		}
+		forSubsets(cand, 2, 3, func(sub []int) {
+			var sum int64
+			cost := costCombo
+			for _, j := range sub {
+				sum += payKop(cp[j], kopecks)
+				c, _ := normalCost(dayDelta(cp[j].PaidAt, it.Date))
+				cost += c
+			}
+			if sameMoney(sum, want) {
+				hs = append(hs, hyper{items: []int{i}, pays: append([]int(nil), sub...), cost: cost, status: stSplit})
+			}
+		})
+	}
+	sort.SliceStable(hs, func(a, b int) bool { return hs[a].cost < hs[b].cost })
+	if len(hs) > maxHypers {
+		hs = hs[:maxHypers]
+	}
+	return hs
 }
 
-// amountSlip — похожа ли сумма оплаты на ОШИБКУ ввода суммы позиции. Возвращает
-// пояснение или "" (не похоже — тогда это просто другая оплата).
+// forSubsets вызывает f для каждого подмножества cand размера minK..maxK.
+func forSubsets(cand []int, minK, maxK int, f func([]int)) {
+	if len(cand) > 14 {
+		cand = cand[:14] // предохранитель от перебора; у клиента столько не бывает
+	}
+	var rec func(start int, chosen []int)
+	rec = func(start int, chosen []int) {
+		if len(chosen) >= minK {
+			f(chosen)
+		}
+		if len(chosen) == maxK {
+			return
+		}
+		for x := start; x < len(cand); x++ {
+			rec(x+1, append(chosen, cand[x]))
+		}
+	}
+	rec(0, nil)
+}
+
+// hungarian — назначение минимальной стоимости для прямоугольной матрицы n×m
+// (n ≤ m): каждой строке — свой столбец. Возвращает столбец для каждой строки.
+func hungarian(a [][]int) []int {
+	n := len(a)
+	if n == 0 {
+		return nil
+	}
+	m := len(a[0])
+	const inf = math.MaxInt64 / 4
+	u := make([]int, n+1)
+	v := make([]int, m+1)
+	p := make([]int, m+1)
+	way := make([]int, m+1)
+	for i := 1; i <= n; i++ {
+		p[0] = i
+		j0 := 0
+		minv := make([]int, m+1)
+		for j := range minv {
+			minv[j] = inf
+		}
+		used := make([]bool, m+1)
+		for {
+			used[j0] = true
+			i0, delta, j1 := p[j0], inf, 0
+			for j := 1; j <= m; j++ {
+				if used[j] {
+					continue
+				}
+				cur := a[i0-1][j-1] - u[i0] - v[j]
+				if cur < minv[j] {
+					minv[j], way[j] = cur, j0
+				}
+				if minv[j] < delta {
+					delta, j1 = minv[j], j
+				}
+			}
+			for j := 0; j <= m; j++ {
+				if used[j] {
+					u[p[j]] += delta
+					v[j] -= delta
+				} else {
+					minv[j] -= delta
+				}
+			}
+			j0 = j1
+			if p[j0] == 0 {
+				break
+			}
+		}
+		for {
+			j1 := way[j0]
+			p[j0] = p[j1]
+			j0 = j1
+			if j0 == 0 {
+				break
+			}
+		}
+	}
+	ans := make([]int, n)
+	for j := 1; j <= m; j++ {
+		if p[j] != 0 {
+			ans[p[j]-1] = j - 1
+		}
+	}
+	return ans
+}
+
+// amountSlip — похожа ли сумма оплаты на ОШИБКУ ввода суммы позиции (обе — в
+// копейках). Пояснение или "" (не похоже — значит, просто другая оплата).
 func amountSlip(want, got int64) string {
-	if want <= 0 || got <= 0 || want == got {
+	if want <= 0 || got <= 0 || sameMoney(want, got) {
 		return ""
 	}
 	switch {
-	case got*10 == want:
-		return "потеряли ноль"
-	case got == want*10:
-		return "лишний ноль"
+	case sameMoney(got*10, want):
+		return "похоже, потеряли ноль"
+	case sameMoney(got, want*10):
+		return "похоже, лишний ноль"
 	}
-	ws, gs := strconv.FormatInt(want, 10), strconv.FormatInt(got, 10)
+	rel := math.Abs(float64(got-want)) / float64(want)
+	if rel > 0.25 {
+		return "" // разница слишком большая — это другая оплата, а не опечатка
+	}
+	ws, gs := strconv.FormatInt(want/100, 10), strconv.FormatInt(got/100, 10)
 	if len(ws) == len(gs) && len(ws) >= 3 {
 		diff, first := 0, -1
 		for k := range ws {
@@ -400,13 +696,12 @@ func amountSlip(want, got int64) string {
 			}
 		}
 		if diff == 1 {
-			return "одна цифра не та"
+			return "похоже, ошиблись в одной цифре"
 		}
 		if diff == 2 && first+1 < len(ws) && ws[first] == gs[first+1] && ws[first+1] == gs[first] {
-			return "переставили цифры"
+			return "похоже, переставили цифры"
 		}
 	}
-	rel := math.Abs(float64(got-want)) / float64(want)
 	if rel <= 0.05 {
 		if got < want {
 			return "внесли чуть меньше"

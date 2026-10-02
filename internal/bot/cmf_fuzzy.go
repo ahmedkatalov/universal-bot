@@ -20,9 +20,9 @@ type cmfMatchKind int
 
 const (
 	cmfNoMatch cmfMatchKind = iota // в программе не нашли
-	cmfExact                   // прямое совпадение в программе
-	cmfStrong                  // уверенное нечёткое (одна явная кандидатура) — считаем совпадением
-	cmfWeak                    // слабое/неоднозначное — лучше переспросить/проверить вручную
+	cmfExact                       // прямое совпадение в программе
+	cmfStrong                      // уверенное нечёткое (одна явная кандидатура) — считаем совпадением
+	cmfWeak                        // слабое/неоднозначное — лучше переспросить/проверить вручную
 )
 
 // latinToCyr — похожие латинские буквы → кириллица (OCR и раскладка их путают,
@@ -33,11 +33,21 @@ var latinToCyr = map[rune]rune{
 }
 
 // normCyr нормализует имя для сравнения: нижний регистр, ё→е, латинские
-// двойники→кириллица, только буквы, пробелы схлопнуты.
+// двойники→кириллица, составные «и+˘»→й и «е+¨»→е (текст в разложенной форме
+// Unicode), только буквы, пробелы схлопнуты.
 func normCyr(s string) string {
-	var b strings.Builder
+	out := make([]rune, 0, len(s))
 	prevSpace := true
 	for _, r := range strings.ToLower(s) {
+		switch r {
+		case '\u0306': // комбинирующая краткая: и+˘ = й
+			if n := len(out); n > 0 && out[n-1] == 'и' {
+				out[n-1] = 'й'
+			}
+			continue
+		case '\u0308': // комбинирующее двоеточие: е+¨ = ё → е
+			continue
+		}
 		if r == 'ё' {
 			r = 'е'
 		}
@@ -45,14 +55,14 @@ func normCyr(s string) string {
 			r = c
 		}
 		if unicode.IsLetter(r) {
-			b.WriteRune(r)
+			out = append(out, r)
 			prevSpace = false
 		} else if !prevSpace {
-			b.WriteRune(' ')
+			out = append(out, ' ')
 			prevSpace = true
 		}
 	}
-	return strings.TrimSpace(b.String())
+	return strings.TrimSpace(string(out))
 }
 
 // normWords — значимые нормализованные слова имени (от 3 букв: инициалы и «оглы»
@@ -106,28 +116,37 @@ func min3(a, b, c int) int {
 	return a
 }
 
-// wordSimilar — похожи ли два НОРМАЛИЗОВАННЫХ слова (опечатка в букве или
-// склонение). Общий корень (одно слово — начало другого, минимум 3 общих буквы и
-// разница в длине ≤3) ловит склонения («каталов»/«каталова», основа «катал»);
-// небольшое расстояние редактирования ловит опечатки в буквах («котолов»).
+// caseEndings — окончания падежей/рода, которыми одно и то же имя отличается в
+// тексте («чек Ахмеда», «Каталова», «Нажудовичу»). Только они делают слово-«хвост»
+// тем же именем: «Ахмед»+«ов» = «Ахмедов» — это уже ДРУГАЯ фамилия, а
+// «Магомед»+«али» — другое имя.
+var caseEndings = map[string]bool{
+	"а": true, "я": true, "у": true, "ю": true, "е": true, "ы": true, "и": true,
+	"ом": true, "ем": true, "ым": true, "им": true, "ой": true, "ей": true, "ою": true, "ею": true,
+	"ого": true, "его": true, "ому": true, "ему": true, "ую": true,
+}
+
+// wordSimilar — похожи ли два НОРМАЛИЗОВАННЫХ слова: склонение («каталов»/
+// «каталова») или опечатка в букве («котолов»). Если одно слово — начало другого,
+// решает ТОЛЬКО окончание (падеж — да, «ов/ев/али/бек» — нет), без допуска на
+// опечатку: иначе «Ахмед» совпал бы с «Ахмедов».
 func wordSimilar(a, b string) bool {
 	if a == b {
 		return true
 	}
 	ra, rb := []rune(a), []rune(b)
-	la, lb := len(ra), len(rb)
-	if la < 3 || lb < 3 {
+	if len(ra) < 3 || len(rb) < 3 {
 		return false
 	}
-	mn, mx := la, lb
-	if lb < mn {
-		mn, mx = lb, la
+	short, long := ra, rb
+	if len(rb) < len(ra) {
+		short, long = rb, ra
 	}
-	if mn >= 3 && mx-mn <= 3 && string(ra[:mn]) == string(rb[:mn]) {
-		return true // общий корень / склонение
+	if string(long[:len(short)]) == string(short) {
+		return caseEndings[string(long[len(short):])]
 	}
 	tol := 1
-	if mx >= 6 {
+	if len(long) >= 6 {
 		tol = 2
 	}
 	return levenshtein(a, b) <= tol

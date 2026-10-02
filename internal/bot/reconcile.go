@@ -6,9 +6,7 @@ package bot
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -26,21 +24,48 @@ type reconRec struct {
 	groups map[string]bool
 }
 
-// dedupeReconReceipts склеивает копии ОДНОГО чека: пересылку «<id>-fwd-<группа>»
-// с оригиналом, и одинаковые чеки (тот же номер документа и сумма; без номера —
-// то же имя, сумма и минута операции). Иначе при сверке по всем группам один
-// пересланный чек давал две позиции, и одна из них всегда была бы «НЕ внесён».
+// normDoc — номер документа без пробелов/знаков (на копиях его печатают по-разному).
+func normDoc(s string) string {
+	var out []rune
+	for _, r := range strings.ToUpper(s) {
+		if (r >= '0' && r <= '9') || (r >= 'A' && r <= 'Z') || (r >= 'А' && r <= 'Я') {
+			out = append(out, r)
+		}
+	}
+	return string(out)
+}
+
+// sameCheckCopy — это копия того же чека из ДРУГОЙ группы? Та же сумма и либо
+// тот же номер документа (и та же дата операции ±1 день — номера у разных банков
+// повторяются), либо (номер есть не на обеих копиях) та же минута операции и то
+// же лицо (разное написание или неподтверждённая копия).
+func sameCheckCopy(a, b db.ReconReceipt) bool {
+	if !sameMoney(itemKop(a.Amount), itemKop(b.Amount)) {
+		return false
+	}
+	da, dbn := normDoc(a.DocNumber), normDoc(b.DocNumber)
+	if da != "" && dbn != "" {
+		dd := dayNum(a.TxDate) - dayNum(b.TxDate)
+		return da == dbn && dd >= -1 && dd <= 1
+	}
+	gap := a.TxDate.Sub(b.TxDate)
+	if gap < 0 {
+		gap = -gap
+	}
+	if gap > 2*time.Minute {
+		return false
+	}
+	return a.NeedsReview || b.NeedsReview || sameClientName(a.Name, b.Name)
+}
+
+// dedupeReconReceipts склеивает копии ОДНОГО чека, разосланного по группам:
+// пересылку «<id>-fwd-<группа>» — с оригиналом (и между собой, если оригинала нет
+// в выборке), остальное — по sameCheckCopy, но ТОЛЬКО между разными группами
+// (внутри одной группы повторы уже помечены дублями, а два одинаковых чека в
+// одной группе — это два разных платежа).
 func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 	var out []reconRec
 	byWa := map[string]int{}
-	byKey := map[string]int{}
-	keyOf := func(r db.ReconReceipt) string {
-		cents := strconv.FormatInt(int64(math.Round(r.Amount*100)), 10)
-		if r.DocNumber != "" {
-			return "doc|" + r.DocNumber + "|" + cents
-		}
-		return "t|" + normCyr(r.Name) + "|" + cents + "|" + r.TxDate.UTC().Truncate(time.Minute).Format(time.RFC3339)
-	}
 	merge := func(k int, r db.ReconReceipt) {
 		out[k].groups[r.GroupJID] = true
 		if out[k].NeedsReview && !r.NeedsReview { // предпочитаем копию с подтверждённым клиентом
@@ -49,21 +74,21 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 			out[k].groups = g
 		}
 	}
-	add := func(r db.ReconReceipt) {
-		key := keyOf(r)
-		if k, ok := byKey[key]; ok {
-			merge(k, r)
-			if r.WaMessageID != "" {
-				byWa[r.WaMessageID] = k
+	findCopy := func(r db.ReconReceipt) int {
+		for k := range out {
+			if !out[k].groups[r.GroupJID] && sameCheckCopy(out[k].ReconReceipt, r) {
+				return k
 			}
-			return
+		}
+		return -1
+	}
+	add := func(r db.ReconReceipt) int {
+		if k := findCopy(r); k >= 0 {
+			merge(k, r)
+			return k
 		}
 		out = append(out, reconRec{ReconReceipt: r, groups: map[string]bool{r.GroupJID: true}})
-		k := len(out) - 1
-		byKey[key] = k
-		if r.WaMessageID != "" {
-			byWa[r.WaMessageID] = k
-		}
+		return len(out) - 1
 	}
 	var fwd []db.ReconReceipt
 	for _, r := range rs {
@@ -71,7 +96,10 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 			fwd = append(fwd, r)
 			continue
 		}
-		add(r)
+		k := add(r)
+		if r.WaMessageID != "" {
+			byWa[r.WaMessageID] = k
+		}
 	}
 	for _, r := range fwd {
 		orig := r.WaMessageID[:strings.Index(r.WaMessageID, "-fwd-")]
@@ -79,14 +107,14 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 			merge(k, r)
 			continue
 		}
-		add(r)
+		byWa[orig] = add(r) // оригинала нет — следующие пересылки того же оригинала склеятся сюда
 	}
 	return out
 }
 
 // sameClientName — одно ли это имя клиента (разное написание/порядок слов/
-// склонение/отчество). Однословные имена — только точное совпадение, чтобы
-// «Ахмед» не прилип ко всем Ахмедам.
+// склонение/отчество, «Каталов А.» = «Каталов Ахмед»). Однословные имена — только
+// точное совпадение, чтобы «Ахмед» не прилип ко всем Ахмедам.
 func sameClientName(a, b string) bool {
 	na, nb := normCyr(a), normCyr(b)
 	if na == "" || nb == "" {
@@ -95,15 +123,62 @@ func sameClientName(a, b string) bool {
 	if na == nb {
 		return true
 	}
-	wa, wb := normWords(a), normWords(b)
-	mn := len(wa)
-	if len(wb) < mn {
-		mn = len(wb)
+	fa, ia := nameTokens(na)
+	fb, ib := nameTokens(nb)
+	mn := len(fa)
+	if len(fb) < mn {
+		mn = len(fb)
 	}
-	if mn < 2 {
+	if mn >= 2 && scoreCandidate(fa, fb) >= mn {
+		return true
+	}
+	// Фамилия + инициалы.
+	short, shortI, long := fa, ia, fb
+	if !(len(fa) == 1 && len(ia) > 0) {
+		short, shortI, long = fb, ib, fa
+	}
+	if len(short) != 1 || len(shortI) == 0 || len(long) < 2 {
 		return false
 	}
-	return scoreCandidate(wa, wb) >= mn
+	rest := append([]string(nil), long...)
+	hit := -1
+	for k, w := range rest {
+		if wordSimilar(short[0], w) {
+			hit = k
+			break
+		}
+	}
+	if hit < 0 {
+		return false
+	}
+	rest = append(rest[:hit], rest[hit+1:]...)
+	for _, ch := range shortI {
+		found := -1
+		for k, w := range rest {
+			if []rune(w)[0] == ch {
+				found = k
+				break
+			}
+		}
+		if found < 0 {
+			return false
+		}
+		rest = append(rest[:found], rest[found+1:]...)
+	}
+	return true
+}
+
+// nameTokens — полные слова (от 3 букв) и инициалы (1–2 буквы) нормализованного имени.
+func nameTokens(norm string) (full []string, initials []rune) {
+	for _, w := range strings.Fields(norm) {
+		r := []rune(w)
+		if len(r) >= 3 {
+			full = append(full, w)
+		} else if len(r) >= 1 {
+			initials = append(initials, r[0])
+		}
+	}
+	return full, initials
 }
 
 type reconBucket struct {
@@ -176,9 +251,9 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 
 	// Имя → клиент программы; один клиент под разными написаниями сводится по ID.
 	type clientGroup struct {
-		client  cmf.ClientInfo
-		names   []string
-		items   []reconItem
+		client cmf.ClientInfo
+		names  []string
+		items  []reconItem
 	}
 	var attention []string
 	cidOrder := []string{}
@@ -232,11 +307,16 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		g.items = append(g.items, bk.items...)
 	}
 
-	var blocks []string
-	okClients, entered, notEntered, suspicious := 0, 0, 0, 0
+	// Проход 1: по каждому клиенту — его позиции (период + контекст) и оплаты из
+	// программы по ВСЕМ его рассрочкам.
+	type clientCase struct {
+		g     *clientGroup
+		items []reconItem
+		pays  []cmf.Payment
+	}
+	var cases []clientCase
 	for _, cid := range cidOrder {
 		g := groupsByCID[cid]
-
 		// Контекст: остальные чеки/наличка ЭТОГО клиента вокруг периода и из других
 		// групп — они «забирают» свои оплаты, в ответ не выводятся.
 		isHis := func(name string) bool {
@@ -267,54 +347,80 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 			}
 			items = append(items, reconItem{ID: -c.ID, Kind: "cash", Amount: c.Amount, Date: c.TxDate})
 		}
-
-		pays, perr := b.cmf.PaymentsBetween(ctx, cid, ctxFrom.Add(-reconLateBack), ctxTo.Add(reconWinFwd))
+		pays, perr := b.cmf.PaymentsBetween(ctx, cid, ctxFrom.AddDate(0, 0, -10), ctxTo.AddDate(0, 0, 20))
 		if perr != nil {
 			fmt.Printf("cmf: ошибка платежей клиента %q: %v\n", g.client.FullName, perr)
 			attention = append(attention, fmt.Sprintf("%s — не смог получить его оплаты: %s (%s)", g.client.FullName, cmf.Human(perr), itemsBrief(g.items)))
 			continue
 		}
-		verdicts, leftover, kopecks := humanMatch(items, pays)
+		cases = append(cases, clientCase{g, items, pays})
+	}
 
-		// Показываем только позиции периода, по дате.
+	// Единица сумм у программы одна — решаем её по ВСЕМ клиентам сразу.
+	rubN, kopN := 0, 0
+	for _, c := range cases {
+		r, k := reconUnitTally(c.items, c.pays)
+		rubN += r
+		kopN += k
+	}
+	mode := unitsRubles
+	if kopN > rubN {
+		mode = unitsKopecks
+	}
+
+	// Проход 2: объясняем.
+	var blocks []string
+	okClients, entered, notEntered, toCheck := 0, 0, 0, 0
+	lastDay := dayNum(to) - 1
+	for _, c := range cases {
+		verdicts, leftover, kopecks := humanMatch(c.items, c.pays, mode)
+
 		var idx []int
-		for i, it := range items {
+		for i, it := range c.items {
 			if it.Report {
 				idx = append(idx, i)
 			}
 		}
-		sort.SliceStable(idx, func(a, b int) bool { return items[idx[a]].Date.Before(items[idx[b]].Date) })
+		sort.SliceStable(idx, func(a, b int) bool { return c.items[idx[a]].Date.Before(c.items[idx[b]].Date) })
 
-		allOK := true
+		plain := true // всё внесено обычно, без оговорок — клиента достаточно посчитать
 		var lines []string
 		for _, i := range idx {
 			v := verdicts[i]
 			switch {
 			case v.entered():
 				entered++
-			case v.Status == stSuspicious:
-				suspicious++
-				allOK = false
+			case v.needsCheck():
+				toCheck++
 			default:
 				notEntered++
-				allOK = false
 			}
-			lines = append(lines, "  "+describeVerdict(items, pays, verdicts, i, kopecks))
+			if !(v.Status == stEntered || v.Status == stCombined || v.Status == stSplit) || v.Note != "" {
+				plain = false
+			}
+			lines = append(lines, "  "+describeVerdict(c.items, c.pays, verdicts, i, kopecks))
 		}
-		// Оплаты в программе без пары в учёте — только относящиеся к периоду.
+		// Оплаты в программе без пары в учёте — относящиеся к периоду (в т.ч. «внесли
+		// дважды»). Показываем ВСЕГДА: это тоже то, что бухгалтер должен увидеть.
 		var extra []string
 		for _, j := range leftover {
-			p := pays[j]
-			if p.PaidAt.IsZero() || p.PaidAt.Before(from.Add(-reconWinBack)) || !p.PaidAt.Before(to.Add(reconWinFwd)) {
+			p := c.pays[j]
+			if p.PaidAt.IsZero() {
 				continue
 			}
-			extra = append(extra, fmt.Sprintf("%s ₽ от %s%s", formatRub(payRub(p, kopecks)), p.PaidAt.Format("02.01"), contractLabel(p)))
+			if d := dayNum(p.PaidAt); d < dayNum(from)-3 || d > lastDay+20 {
+				continue
+			}
+			extra = append(extra, fmt.Sprintf("%s ₽ от %s%s", formatRub(payRub(p, kopecks)), p.PaidAt.In(reconLoc).Format("02.01"), contractLabel(p)))
 		}
-		if allOK {
+		if len(extra) > 0 {
+			plain = false
+		}
+		if plain {
 			okClients++
 			continue
 		}
-		blk := g.client.FullName + ":\n" + strings.Join(lines, "\n")
+		blk := c.g.client.FullName + ":\n" + strings.Join(lines, "\n")
 		if len(extra) > 0 {
 			blk += "\n  ↳ в программе есть оплата без чека в учёте: " + strings.Join(extra, "; ")
 		}
@@ -340,8 +446,8 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		fmt.Fprintf(&sb, "\n✅ У остальных %d клиент(ов) всё внесено.", okClients)
 	}
 	fmt.Fprintf(&sb, "\nИтого: внесено %d, НЕ внесено %d", entered, notEntered)
-	if suspicious > 0 {
-		fmt.Fprintf(&sb, ", проверить сумму %d", suspicious)
+	if toCheck > 0 {
+		fmt.Fprintf(&sb, ", проверить %d", toCheck)
 	}
 	sb.WriteString(".")
 	return sb.String(), nil
@@ -382,52 +488,57 @@ func itemsBrief(items []reconItem) string {
 // describeVerdict — строка-объяснение по позиции, как сказал бы бухгалтер.
 func describeVerdict(items []reconItem, pays []cmf.Payment, vs []reconVerdict, i int, kopecks bool) string {
 	it, v := items[i], vs[i]
-	head := fmt.Sprintf("%s · %s ₽", it.Date.Format("02.01"), formatRub(it.Amount))
+	head := fmt.Sprintf("%s · %s ₽", it.Date.In(reconLoc).Format("02.01"), formatRub(it.Amount))
 	if it.Kind == "cash" {
 		head += " наличка"
+	}
+	note := ""
+	if v.Note != "" {
+		note = " (" + v.Note + ")"
 	}
 	payAt := func(j int) string {
 		p := pays[j]
 		if p.PaidAt.IsZero() {
-			return "оплатой (без даты)" + contractLabel(p)
+			return "оплатой без даты" + contractLabel(p)
 		}
-		return "оплатой " + p.PaidAt.Format("02.01") + contractLabel(p)
+		return "оплатой " + p.PaidAt.In(reconLoc).Format("02.01") + contractLabel(p)
 	}
+	days := func(j int) int { return dayDelta(pays[j].PaidAt, it.Date) }
 	switch v.Status {
 	case stEntered:
-		return "✅ " + head + " — внесён " + payAt(v.Pays[0])
+		return "✅ " + head + " — внесён " + payAt(v.Pays[0]) + note
 	case stCombined:
 		var others []string
 		for _, k := range v.With {
-			others = append(others, itemWord(items[k])+" "+items[k].Date.Format("02.01"))
+			others = append(others, itemWord(items[k])+" "+items[k].Date.In(reconLoc).Format("02.01"))
 		}
 		p := pays[v.Pays[0]]
 		return fmt.Sprintf("✅ %s — внесён одной оплатой %s ₽ от %s%s вместе с: %s", head,
-			formatRub(payRub(p, kopecks)), p.PaidAt.Format("02.01"), contractLabel(p), strings.Join(others, ", "))
+			formatRub(payRub(p, kopecks)), p.PaidAt.In(reconLoc).Format("02.01"), contractLabel(p), strings.Join(others, ", "))
 	case stSplit:
 		var parts []string
 		for _, j := range v.Pays {
-			parts = append(parts, fmt.Sprintf("%s ₽ (%s)", formatRub(payRub(pays[j], kopecks)), pays[j].PaidAt.Format("02.01")))
+			parts = append(parts, fmt.Sprintf("%s ₽ (%s)", formatRub(payRub(pays[j], kopecks)), pays[j].PaidAt.In(reconLoc).Format("02.01")))
 		}
 		return "✅ " + head + " — внесён частями: " + strings.Join(parts, " + ") + contractLabel(pays[v.Pays[0]])
 	case stLate:
-		p := pays[v.Pays[0]]
-		days := int(math.Round(p.PaidAt.Sub(it.Date).Hours() / 24))
-		if days >= 0 {
-			return fmt.Sprintf("✅ %s — внесён поздно: %s (через %d дн.)", head, payAt(v.Pays[0]), days)
+		if v.Note != "" { // дата оплаты в программе неверная, но внесли вовремя
+			return "✅ " + head + " — внесён " + payAt(v.Pays[0]) + note
 		}
-		return fmt.Sprintf("✅ %s — внесён, но с датой раньше чека: %s (на %d дн.) — проверь дату", head, payAt(v.Pays[0]), -days)
+		return fmt.Sprintf("✅ %s — внесён поздно: %s (через %d дн.)", head, payAt(v.Pays[0]), days(v.Pays[0]))
+	case stDateCheck:
+		return fmt.Sprintf("⚠️ %s — в программе оплата той же суммы %s, на %d дн. РАНЬШЕ чека — проверь, за этот ли чек", head, payAt(v.Pays[0]), -days(v.Pays[0]))
 	case stSuspicious:
 		p := pays[v.Pays[0]]
 		return fmt.Sprintf("⚠️ %s — в программе оплата %s ₽ от %s%s: %s — проверь сумму", head,
-			formatRub(payRub(p, kopecks)), p.PaidAt.Format("02.01"), contractLabel(p), v.Note)
+			formatRub(payRub(p, kopecks)), p.PaidAt.In(reconLoc).Format("02.01"), contractLabel(p), v.Note)
 	default:
 		s := "❌ " + head + " — НЕ внесён"
 		if it.Kind == "cash" {
 			s = "❌ " + head + " — НЕ внесена"
 		}
 		if k := v.SameAmountAs; k >= 0 {
-			s += fmt.Sprintf(" (сумма как у %s %s — внесена одна из двух оплат)", itemWord(items[k]), items[k].Date.Format("02.01"))
+			s += fmt.Sprintf(" (сумма как у %s %s — внесена одна из двух оплат)", itemWord(items[k]), items[k].Date.In(reconLoc).Format("02.01"))
 		}
 		return s
 	}
