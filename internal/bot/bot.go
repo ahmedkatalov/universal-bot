@@ -546,8 +546,15 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// Если владелец обращается к боту по имени («Джарвис, …») — это диалог с
 		// ассистентом, даже если сообщение — ответ на вопрос бота. Иначе фраза
 		// вроде «Джарвис, покажи этот чек» ушла бы в клариф как «имя клиента».
-		if _, addressed := b.stripBotName(text); !addressed && b.handleClarifyReply(ctx, msg, text) {
-			return
+		if _, addressed := b.stripBotName(text); !addressed {
+			if b.handleClarifyReply(ctx, msg, text) {
+				return
+			}
+			// Ответ БЕЗ свайпа на последний вопрос бота в этой группе («10000р»
+			// под вопросом «какая сумма?») — понимаем по контексту.
+			if b.tryContextAnswer(ctx, msg.Info.Chat, text) {
+				return
+			}
 		}
 	}
 
@@ -3155,6 +3162,8 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			if botMsgID != "" {
 				_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
 				b.registerClarifyAsk(botMsgID, waMsgID)
+				// Если в ответ пришлют ФИО (без свайпа) — засчитаем по дате сообщения.
+				b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needName: true})
 			}
 		}
 		return
@@ -3206,20 +3215,27 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// сумма свайпом на этот чек) через fix. Чек при этом уже лежит как
 		// «непонятый» — придёт в список по запросу «скинь нераспознанные».
 		if askReceiptsEnabled() && waMsgID != "" {
-			what := "не прочитал ни сумму, ни получателя"
-			if rd.Amount == 0 && rd.Recipient != "" {
-				what = "не прочитал сумму"
-			} else if rd.Amount > 0 && rd.Recipient == "" {
-				what = "не прочитал, чей это чек (получателя)"
+			// Спрашиваем ИМЕННО то, что не разобрали: только сумму, только ФИО, или
+			// оба. Отвечать можно и свайпом, и просто следующим сообщением.
+			needAmount := rd.Amount == 0
+			needName := rd.Recipient == ""
+			var q string
+			switch {
+			case needAmount && needName:
+				q = "🤔 Не смог разобрать этот чек. Напишите, пожалуйста, ФИО клиента и сумму — например «Ахмед Каталов 15000». " +
+					"Или пришлите чек чётче и полностью (не обрезанный)."
+			case needAmount:
+				q = fmt.Sprintf("🤔 По чеку %s не разобрал СУММУ. Напишите, пожалуйста, сумму — например «15000» (можно просто следующим сообщением).", rd.Recipient)
+			default: // needName
+				q = fmt.Sprintf("🤔 Чек на %.0f ₽ есть, но не понял, ЧЕЙ он. Напишите ФИО клиента (можно просто следующим сообщением).", rd.Amount)
 			}
-			q := fmt.Sprintf("🤔 Не смог разобрать этот чек (%s). Помогите: ответьте на это сообщение "+
-				"ФИО клиента и суммой — например «Ахмед Каталов 15000». Или пришлите чек чётче и полным (не обрезанным).", what)
 			botMsgID := b.sendReply(chat, q, waMsgID, senderJID)
 			// Помечаем «спросили» ТОЛЬКО если вопрос реально ушёл: при сбое
 			// отправки клариф-цикл спросит позже, иначе чек молча завис бы.
 			if botMsgID != "" {
 				_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
 				b.registerClarifyAsk(botMsgID, waMsgID)
+				b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needAmount: needAmount, needName: needName})
 			}
 		}
 		return
