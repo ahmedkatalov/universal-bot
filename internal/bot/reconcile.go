@@ -542,6 +542,12 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	for _, key := range order {
 		bk := buckets[key]
 		clients, kind, err := b.cmfLookupWithTypos(ctx, bk.display)
+		if err == nil && kind != cmfExact && kind != cmfStrong {
+			// Плательщик, за которого в группе уже ответили «это оплата за X».
+			if pc, ok := b.payerClient(ctx, bk.display); ok {
+				clients, kind = []cmf.ClientInfo{pc}, cmfStrong
+			}
+		}
 		switch {
 		case err != nil:
 			fmt.Printf("cmf: ошибка поиска клиента %q: %v\n", bk.display, err)
@@ -573,7 +579,12 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 			for _, c := range clients {
 				names = append(names, c.FullName)
 			}
-			attention = append(attention, fmt.Sprintf("%s — в программе несколько клиентов (%s), уточни (%s)", bk.display, strings.Join(names, ", "), itemsBrief(bk.items)))
+			_, opts := cmfAskText(bk.display, 0, clients)
+			names = names[:0]
+			for _, c := range opts {
+				names = append(names, c.FullName)
+			}
+			attention = append(attention, fmt.Sprintf("%s — точно такого клиента нет, похожие: %s — уточни (%s)", bk.display, strings.Join(names, ", "), itemsBrief(bk.items)))
 			continue
 		}
 		c := clients[0]

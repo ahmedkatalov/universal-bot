@@ -367,7 +367,8 @@ func extractQuotedText(msg *events.Message) string {
 // cmfResolveWatch ищет клиента в программе по имени. Точное совпадение всей
 // строки -> привязываем и следим за платежом. Нечёткое (по словам, при опечатке)
 // НЕ привязываем вслепую — иначе напоминание/«внесён» уйдёт на, возможно, не
-// того клиента (тёзку/однофамильца): спрашиваем подтверждение в группе.
+// того клиента (тёзку/однофамильца): спрашиваем в группе ответом на сам чек
+// («за кого этот платёж?»), ответ понимает applyCmfWatchAnswer.
 func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, clientText string, amount float64) {
 	clients, kind, err := b.cmfLookupWithTypos(ctx, clientText)
 	if err != nil {
@@ -375,40 +376,37 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "noname")
 		return
 	}
-
-	switch {
-	case kind == cmfNoMatch:
-		branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch)
-		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "unmatched")
-		note := ""
-		if branch != "" {
-			note = " Отнесла к точке «" + branch + "» (как договаривались для чеков, которых нет в программе)."
-		}
-		b.sendText(chat, fmt.Sprintf("🔎 Клиента %q в программе не нашла (чек на %.0f ₽).%s", clientText, amount, note))
-	case kind == cmfExact || kind == cmfStrong:
+	if kind == cmfExact || kind == cmfStrong {
 		// Точное ИЛИ уверенное нечёткое (опечатка/склонение, но кандидат явно один)
 		// — привязываем к клиенту и ждём его платёж в программе. Это и есть «как
 		// человек предположить»: «Каталова»/«Котолов» → «Ахмед Каталов».
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", clients[0].ID, clients[0].FullName, "", "watch")
 		fmt.Printf("cmf: чек на %.0f ₽ привязан к клиенту %s (совпадение: %v), ждём платёж\n", amount, clients[0].FullName, kind)
-	case len(clients) == 1:
-		// Слабое совпадение — возможен тёзка. Не привязываем вслепую, спрашиваем.
-		candJSON, _ := json.Marshal(clients)
-		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", string(candJSON), "ambiguous")
-		b.sendText(chat, fmt.Sprintf(
-			"🔎 По чеку на %.0f ₽ (%s) точного совпадения в программе нет. Похоже на «%s» — если это он, ответьте на это сообщение его полным именем; если нет, напишите верное имя.",
-			amount, clientText, clients[0].FullName))
-	default:
-		names := make([]string, 0, len(clients))
-		for _, c := range clients {
-			names = append(names, c.FullName)
-		}
-		candJSON, _ := json.Marshal(clients)
-		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", string(candJSON), "ambiguous")
-		b.sendText(chat, fmt.Sprintf(
-			"🔎 По чеку на %.0f ₽ (%s) в программе нашлось несколько клиентов:\n- %s\nКому относится платёж? Ответьте на это сообщение полным именем.",
-			amount, clientText, strings.Join(names, "\n- ")))
+		return
 	}
+	// Плательщик с чека раньше уже платил за конкретного клиента (ответили в
+	// группе) — человек бы это помнил и не переспрашивал.
+	if c, ok := b.payerClient(ctx, clientText); ok {
+		_ = b.db.UpdateCmfWatch(ctx, watchID, "", c.ID, c.FullName, "", "watch")
+		fmt.Printf("cmf: чек на %.0f ₽ от «%s» привязан к клиенту %s (запомненный плательщик)\n", amount, clientText, c.FullName)
+		return
+	}
+	waMsgID, senderJID := "", ""
+	if w, ok, err := b.db.CmfWatchByID(ctx, watchID); err == nil && ok {
+		waMsgID, senderJID = w.WaMessageID, w.SenderJID
+	}
+	if kind == cmfNoMatch {
+		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "unmatched")
+	} else {
+		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "ambiguous")
+	}
+	text, opts := cmfAskText(clientText, amount, clients)
+	if kind == cmfNoMatch {
+		if branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch); branch != "" {
+			text += " Пока отнесла к точке «" + branch + "»."
+		}
+	}
+	b.askCmfWatch(ctx, chat, watchID, waMsgID, senderJID, text, opts)
 }
 
 // cmfWatcherLoop — фоновая сверка: раз в полчаса проверяет наблюдения старше

@@ -212,6 +212,14 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_status ON cmf_watch(status)`); err != nil {
 		return fmt.Errorf("индекс cmf_watch: %w", err)
 	}
+	// id вопроса бота «за кого этот платёж?» — чтобы ответ свайпом на вопрос нашёл
+	// своё наблюдение даже после перезапуска бота.
+	if _, err := pool.Exec(ctx, `ALTER TABLE cmf_watch ADD COLUMN IF NOT EXISTS ask_msg_id TEXT`); err != nil {
+		return fmt.Errorf("колонка cmf_watch.ask_msg_id: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_ask ON cmf_watch(ask_msg_id)`); err != nil {
+		return fmt.Errorf("индекс cmf_watch.ask_msg_id: %w", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS bot_settings (
 			key   TEXT PRIMARY KEY,
@@ -2950,6 +2958,75 @@ func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+// SetCmfWatchAsk запоминает id вопроса бота по наблюдению.
+func (d *DB) SetCmfWatchAsk(ctx context.Context, id int, askMsgID string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE cmf_watch SET ask_msg_id = $2 WHERE id = $1`, id, askMsgID)
+	return err
+}
+
+// CmfWatchByAsk — наблюдение, по которому бот задал вопрос askMsgID.
+func (d *DB) CmfWatchByAsk(ctx context.Context, askMsgID string) (int, bool, error) {
+	if askMsgID == "" {
+		return 0, false, nil
+	}
+	var id int
+	err := d.pool.QueryRow(ctx, `SELECT id FROM cmf_watch WHERE ask_msg_id = $1 ORDER BY id DESC LIMIT 1`, askMsgID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// CmfWatchFull — наблюдение вместе с id сообщения-чека в WhatsApp.
+type CmfWatchFull struct {
+	CmfWatch
+	WaMessageID string
+}
+
+// CmfWatchByID возвращает наблюдение по id (и id сообщения с чеком).
+func (d *DB) CmfWatchByID(ctx context.Context, id int) (CmfWatchFull, bool, error) {
+	var w CmfWatchFull
+	err := d.pool.QueryRow(ctx, `
+		SELECT cw.id, cw.group_jid, COALESCE(cw.sender_jid,''), COALESCE(cw.client_text,''), COALESCE(cw.client_id,''),
+		       COALESCE(cw.client_name,''), COALESCE(cw.candidates,''), cw.amount::float8, cw.tx_date, cw.status, cw.created_at,
+		       COALESCE(rm.wa_message_id,'')
+		FROM cmf_watch cw
+		LEFT JOIN raw_messages rm ON rm.id = cw.raw_message_id
+		WHERE cw.id = $1
+	`, id).Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.ClientID, &w.ClientName,
+		&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt, &w.WaMessageID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return w, false, nil
+	}
+	if err != nil {
+		return w, false, err
+	}
+	return w, true, nil
+}
+
+// SetReceiptClientByMessage — по ответу в группе «это оплата за клиента X»
+// записывает клиента чеку (по id сообщения с чеком). В отличие от
+// ReattributeReceiptByMessage НЕ трогает владельца карты: прежнее имя здесь —
+// плательщик из подписи, а не получатель на чеке.
+func (d *DB) SetReceiptClientByMessage(ctx context.Context, waMessageID, name string, contactID *int) (bool, error) {
+	tag, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true
+		WHERE id = (
+			SELECT br.id FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false
+			ORDER BY br.id DESC LIMIT 1
+		)
+	`, waMessageID, name, contactID)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // LatestNonameWatch — последнее наблюдение без имени от этого отправителя в

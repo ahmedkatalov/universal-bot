@@ -48,9 +48,10 @@ type clarifyState struct {
 
 // openAsk — открытый вопрос бота в группе (для ответа без свайпа).
 type openAsk struct {
-	kind        string // "receipt" | "cash_collector" | "cash_dup"
+	kind        string // "receipt" | "cash_collector" | "cash_dup" | "cmf_watch"
 	receiptWaID string // для receipt — id сообщения-чека
 	txID        int    // для cash_* — id транзакции
+	watchID     int    // для cmf_watch — наблюдение сверки («за кого платёж?»)
 	needAmount  bool   // по чеку не прочиталась сумма
 	needName    bool   // по чеку не прочитан клиент
 	at          time.Time
@@ -623,6 +624,11 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		return false
 	}
 
+	// Ответ на вопрос сверки «за кого этот платёж?» (кто угодно из группы).
+	if b.cmfReplyAnswer(ctx, msg, text) {
+		return true
+	}
+
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».
 	b.clarify.mu.Lock()
 	dupTxID, isDupAsk := b.clarify.dupAskMap[quotedID]
@@ -707,6 +713,9 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 // sendTextReturnID отправляет текст и возвращает id отправленного сообщения
 // (нужно, чтобы привязать ответ владельца к конкретному вопросу).
 func (b *Bot) sendTextReturnID(chat types.JID, text string) string {
+	if b.sendHook != nil {
+		return b.sendHook(chat, text, "")
+	}
 	resp, err := b.client.SendMessage(context.Background(), chat, &waProto.Message{
 		Conversation: proto.String(text),
 	})

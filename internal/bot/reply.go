@@ -19,6 +19,9 @@ func (b *Bot) sendReply(chat types.JID, text, quotedID, quotedSender string) str
 	if quotedID == "" {
 		return b.sendTextReturnID(chat, text)
 	}
+	if b.sendHook != nil {
+		return b.sendHook(chat, text, quotedID)
+	}
 	ctxInfo := &waProto.ContextInfo{
 		StanzaID:      proto.String(quotedID),
 		QuotedMessage: &waProto.Message{Conversation: proto.String("")},

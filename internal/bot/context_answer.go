@@ -77,6 +77,9 @@ func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string)
 		}
 		return true
 
+	case "cmf_watch":
+		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, false)
+
 	case "cash_collector":
 		if b.applyCashCollectorReply(ctx, chat, a.txID, text) {
 			b.clearOpenAsk(groupJID)
