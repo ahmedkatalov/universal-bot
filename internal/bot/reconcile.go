@@ -161,7 +161,11 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 				if md := normDoc(m.DocNumber); rd != "" && md != "" && md != rd {
 					continue next // у копий одного чека номер документа один
 				}
-				copyOf = copyOf || sameCheckCopy(m, r)
+				same := sameCheckCopy(m, r)
+				if !same && !m.NeedsReview && !r.NeedsReview {
+					continue next // два подтверждённых клиента не склеиваются через неподтверждённую копию
+				}
+				copyOf = copyOf || same
 			}
 			if copyOf {
 				return k
@@ -206,17 +210,49 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 
 // sameClientName — одно ли это имя клиента (разное написание/порядок слов/
 // склонение/отчество/опечатка, «Каталов А.» = «Каталов Ахмед», «Хаджи-Мурат» =
-// «Хаджимурат»). Однословные имена — только точное совпадение, чтобы «Ахмед» не
-// прилип ко всем Ахмедам; разные имена (Рустам/Руслан, Мадина/Марина) — разные.
+// «Хаджи Мурат» = «Хаджимурат»). Однословные имена — только точное совпадение,
+// чтобы «Ахмед» не прилип ко всем Ахмедам; разные имена (Рустам/Руслан,
+// Мадина/Марина, Магомед/Магомед-Расул) — разные.
 func sameClientName(a, b string) bool {
-	if sameClientNameOnce(a, b) {
-		return true
+	ha, hb := hasHyphen(a), hasHyphen(b)
+	if ha == hb && sameClientNameOnce(a, b) {
+		return true // дефис у обоих (или ни у кого) — можно сравнивать по частям
 	}
 	da, db := dehyphen(a), dehyphen(b)
-	if da == a && db == b {
-		return false
+	if (ha || hb) && sameClientNameOnce(da, db) {
+		return true // составное имя с дефисом — одно слово
 	}
-	return sameClientNameOnce(da, b) || sameClientNameOnce(a, db) || sameClientNameOnce(da, db)
+	return joinedSame(da, db) || joinedSame(db, da)
+}
+
+func hasHyphen(s string) bool { return strings.ContainsAny(s, "-‐–—") }
+
+// joinedSame — «Хаджи Мурат» (через пробел) против «Хаджимурат»: склеиваем
+// соседние слова x, только если склейка есть среди слов y.
+func joinedSame(x, y string) bool {
+	fy, _ := nameParts(y)
+	ws := strings.Fields(x)
+	for k := 0; k+1 < len(ws); k++ {
+		a, b := normCyr(ws[k]), normCyr(ws[k+1])
+		if len([]rune(a)) < 3 || len([]rune(b)) < 3 {
+			continue
+		}
+		hit := false
+		for _, w := range fy {
+			if nameWordSame(a+b, w) {
+				hit = true
+				break
+			}
+		}
+		if !hit {
+			continue
+		}
+		v := append(append(append([]string(nil), ws[:k]...), ws[k]+ws[k+1]), ws[k+2:]...)
+		if sameClientNameOnce(strings.Join(v, " "), y) {
+			return true
+		}
+	}
+	return false
 }
 
 func dehyphen(s string) string {
@@ -336,12 +372,37 @@ func nameParts(raw string) (full []string, initials []rune) {
 
 func isVowelRu(r rune) bool { return strings.ContainsRune("аеёиоуыэюя", r) }
 
+// softEndings — падежные окончания имён на «ь»: Шамиль → Шамиля/Шамилю/Шамилем.
+var softEndings = map[string]bool{"я": true, "ю": true, "е": true, "ем": true, "и": true}
+
+// foldYi — «й» внутри слова → «и» (Хусейн/Хусеин, Айшат/Аишат); в конце слова
+// «й» не трогаем — это окончание.
+func foldYi(w string) string {
+	r := []rune(w)
+	for k := 0; k < len(r)-1; k++ {
+		if r[k] == 'й' {
+			r[k] = 'и'
+		}
+	}
+	return string(r)
+}
+
 // nameWordSame — одно ли это слово имени (нормализованные). Строже, чем поиск
 // клиента в программе: склонение, пропущенная/лишняя буква, перепутанная гласная
 // («Ахмед/Ахмад», «Каталов/Котолов») — да; другая согласная в коротком слове
 // («Рустам/Руслан», «Мадина/Марина», «Ахмедов/Ахматов») — нет; короткие слова
 // (Иса/Ира) — только точно или склонение.
 func nameWordSame(a, b string) bool {
+	if nameWordSame0(a, b) {
+		return true
+	}
+	if fa, fb := foldYi(a), foldYi(b); fa != a || fb != b {
+		return nameWordSame0(fa, fb)
+	}
+	return false
+}
+
+func nameWordSame0(a, b string) bool {
 	if a == b {
 		return true
 	}
@@ -360,8 +421,9 @@ func nameWordSame(a, b string) bool {
 		tail := string(rb[p:])
 		return caseEndings[tail] || tail == "ь"
 	}
-	if p >= 3 && caseEndings[string(ra[p:])] && caseEndings[string(rb[p:])] {
-		return true // два падежа одной основы: «Каталова» / «Каталову»
+	if ta, tb := string(ra[p:]), string(rb[p:]); p >= 3 &&
+		((caseEndings[ta] && caseEndings[tb]) || (ta == "ь" && softEndings[tb]) || (tb == "ь" && softEndings[ta])) {
+		return true // два падежа одной основы: «Каталова» / «Каталову», «Шамиль» / «Шамиля»
 	}
 	if len(ra) < 5 {
 		return false
@@ -591,13 +653,17 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	okClients, entered, notEntered, toCheck := 0, 0, 0, 0
 	lastDay := dayNum(to) - 1
 	for _, c := range cases {
-		verdicts, leftover, kopecks, net := humanMatchNet(c.items, c.pays, mode)
+		mr := humanMatchFull(c.items, c.pays, mode)
+		verdicts, leftover, kopecks := mr.Verdicts, mr.Leftover, mr.Kopecks
 		pays := c.pays
-		if len(net) > 0 { // частичные корректировки — показываем суммы после них
+		if len(mr.Net) > 0 { // частичные корректировки — показываем суммы после них
 			pays = append([]cmf.Payment(nil), c.pays...)
-			for j, a := range net {
+			for j, a := range mr.Net {
 				pays[j].Amount = a
 			}
+		}
+		if mr.Partial {
+			fmt.Printf("сверка: у клиента %q очень длинная история — перебор ограничен\n", c.g.client.FullName)
 		}
 
 		var idx []int
@@ -639,7 +705,19 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 			}
 			extra = append(extra, fmt.Sprintf("%s ₽ от %s%s", formatMoney(payRub(p, kopecks)), pd.In(reconLoc).Format("02.01"), contractLabel(p)))
 		}
-		if len(extra) > 0 {
+		// Списания/сторно, которые не удалось отнести ни к одной записи.
+		var stray []string
+		for _, j := range mr.Stray {
+			p := c.pays[j]
+			pd := effDate(p)
+			if !pd.IsZero() {
+				if d := dayNum(pd); d < dayNum(from)-3 || d > lastDay+20 {
+					continue
+				}
+			}
+			stray = append(stray, fmt.Sprintf("%s ₽ от %s%s", formatMoney(payRub(p, kopecks)), dayOrDash(pd), contractLabel(p)))
+		}
+		if len(extra) > 0 || len(stray) > 0 {
 			plain = false
 		}
 		if plain {
@@ -649,6 +727,9 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		blk := c.g.client.FullName + ":\n" + strings.Join(lines, "\n")
 		if len(extra) > 0 {
 			blk += "\n  ↳ в программе есть оплата без чека в учёте: " + strings.Join(extra, "; ")
+		}
+		if len(stray) > 0 {
+			blk += "\n  ↳ в программе есть списание, не понял к какой оплате — проверь: " + strings.Join(stray, "; ")
 		}
 		blocks = append(blocks, blk)
 	}
@@ -727,11 +808,19 @@ func itemWordGen(it reconItem) string {
 	return "чека"
 }
 
+// itemWordInstr — «чеком» / «наличкой» (после «вместе с»).
+func itemWordInstr(it reconItem) string {
+	if it.Kind == "cash" {
+		return "наличкой"
+	}
+	return "чеком"
+}
+
 // itemsBrief — коротко позиции клиента для строки «уточнить».
 func itemsBrief(items []reconItem) string {
 	parts := make([]string, 0, len(items))
 	for _, it := range items {
-		parts = append(parts, fmt.Sprintf("%s %s · %s ₽", itemWord(it), it.Date.Format("02.01"), formatRub(it.Amount)))
+		parts = append(parts, fmt.Sprintf("%s %s · %s ₽", itemWord(it), fmtDay(it.Date), formatMoney(it.Amount)))
 	}
 	return strings.Join(parts, ", ")
 }
@@ -750,29 +839,32 @@ func describeVerdict(items []reconItem, pays []cmf.Payment, vs []reconVerdict, i
 	if v.Note != "" {
 		note = " (" + v.Note + ")"
 	}
-	day := func(j int) string {
-		if d := effDate(pays[j]); !d.IsZero() {
-			return d.In(reconLoc).Format("02.01")
+	// Дата, по которой сошлось: для одной оплаты — из вердикта (дата оплаты или
+	// дата внесения), иначе — дата оплаты, а если её нет — дата внесения.
+	date := func(j int) time.Time {
+		if !v.At.IsZero() && len(v.Pays) == 1 {
+			return v.At
 		}
-		return "без даты"
+		return effDate(pays[j])
 	}
+	day := func(j int) string { return dayOrDash(date(j)) }
 	payAt := func(j int) string {
-		if effDate(pays[j]).IsZero() {
+		if date(j).IsZero() {
 			return "оплатой без даты" + contractLabel(pays[j])
 		}
 		return "оплатой " + day(j) + contractLabel(pays[j])
 	}
-	days := func(j int) int { return dayDelta(effDate(pays[j]), it.Date) }
+	days := func(j int) int { return dayDelta(date(j), it.Date) }
 	switch v.Status {
 	case stEntered:
 		return "✅ " + head + " — " + entered + " " + payAt(v.Pays[0]) + note
 	case stCombined:
 		var others []string
 		for _, k := range v.With {
-			others = append(others, itemWord(items[k])+" "+items[k].Date.In(reconLoc).Format("02.01"))
+			others = append(others, itemWordInstr(items[k])+" "+fmtDay(items[k].Date))
 		}
 		p := pays[v.Pays[0]]
-		return fmt.Sprintf("✅ %s — %s одной оплатой %s ₽ от %s%s вместе с: %s%s", head, entered,
+		return fmt.Sprintf("✅ %s — %s одной оплатой %s ₽ от %s%s вместе с %s%s", head, entered,
 			formatMoney(payRub(p, kopecks)), day(v.Pays[0]), contractLabel(p), strings.Join(others, ", "), note)
 	case stSplit:
 		var parts []string
@@ -805,7 +897,7 @@ func describeVerdict(items []reconItem, pays []cmf.Payment, vs []reconVerdict, i
 	default:
 		s := "❌ " + head + " — " + notEntered
 		if k := v.SameAmountAs; k >= 0 {
-			s += fmt.Sprintf(" (сумма как у %s %s — внесена одна из двух оплат)", itemWordGen(items[k]), items[k].Date.In(reconLoc).Format("02.01"))
+			s += fmt.Sprintf(" (сумма как у %s %s — оплат такой суммы в программе меньше, чем чеков)", itemWordGen(items[k]), fmtDay(items[k].Date))
 		}
 		return s
 	}
