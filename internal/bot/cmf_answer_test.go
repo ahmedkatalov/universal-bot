@@ -155,7 +155,7 @@ func TestAssistantOutgoing(t *testing.T) {
 		"Молчу.":        "",
 		"":              "",
 		"Привет!":       "Привет!",
-		"Ок [молчу]":    "Ок",
+		"Ок [молчу]":    "",
 		"Напишите ФИО.": "Напишите ФИО.",
 	} {
 		if got := assistantOutgoing(in); got != want {

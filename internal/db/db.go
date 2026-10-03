@@ -1448,6 +1448,10 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 	`, rawID); e != nil {
 		fmt.Println("Промоут дубля после удаления оригинала не удался:", e)
 	}
+	// Сверка по удалённому чеку больше не нужна — ни вопросов, ни напоминаний.
+	if _, e := d.pool.Exec(ctx, `UPDATE cmf_watch SET status = 'deleted' WHERE raw_message_id = $1 AND status <> 'found'`, rawID); e != nil {
+		fmt.Println("Закрытие сверки удалённого чека не удалось:", e)
+	}
 	if err = d.pool.QueryRow(ctx, `SELECT COUNT(*) FROM transactions WHERE raw_message_id = $1 AND ignored = false`, rawID).Scan(&txCount); err != nil {
 		return 0, 0, err
 	}
@@ -2949,8 +2953,9 @@ func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, group_jid, COALESCE(sender_jid,''), COALESCE(client_text,''), COALESCE(client_id,''),
 		       COALESCE(client_name,''), COALESCE(candidates,''), amount::float8, tx_date, status, created_at
-		FROM cmf_watch
+		FROM cmf_watch cw
 		WHERE status = 'watch' AND created_at < $1
+		  AND NOT EXISTS (SELECT 1 FROM raw_messages rm WHERE rm.id = cw.raw_message_id AND COALESCE(rm.deleted, false))
 		ORDER BY created_at
 		LIMIT $2
 	`, cutoff, limit)
@@ -3002,6 +3007,13 @@ func (d *DB) CmfWatchByAsk(ctx context.Context, askMsgID string) (int, bool, err
 	return id, true, nil
 }
 
+// ClearCmfWatchClient снимает привязку наблюдения к клиенту (клиента назвали
+// неверно) и ставит статус.
+func (d *DB) ClearCmfWatchClient(ctx context.Context, id int, status string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE cmf_watch SET client_id = NULL, client_name = NULL, status = $2, checked_at = now() WHERE id = $1`, id, status)
+	return err
+}
+
 // CmfWatchByCheckMessage — наблюдение по id сообщения с самим чеком.
 func (d *DB) CmfWatchByCheckMessage(ctx context.Context, waMessageID string) (int, bool, error) {
 	if waMessageID == "" {
@@ -3026,6 +3038,7 @@ func (d *DB) CmfWatchByCheckMessage(ctx context.Context, waMessageID string) (in
 type CmfWatchFull struct {
 	CmfWatch
 	WaMessageID string
+	Deleted     bool // сообщение с чеком удалили в WhatsApp
 }
 
 // CmfWatchByID возвращает наблюдение по id (и id сообщения с чеком).
@@ -3034,12 +3047,12 @@ func (d *DB) CmfWatchByID(ctx context.Context, id int) (CmfWatchFull, bool, erro
 	err := d.pool.QueryRow(ctx, `
 		SELECT cw.id, cw.group_jid, COALESCE(cw.sender_jid,''), COALESCE(cw.client_text,''), COALESCE(cw.client_id,''),
 		       COALESCE(cw.client_name,''), COALESCE(cw.candidates,''), cw.amount::float8, cw.tx_date, cw.status, cw.created_at,
-		       COALESCE(rm.wa_message_id,'')
+		       COALESCE(rm.wa_message_id,''), COALESCE(rm.deleted, false)
 		FROM cmf_watch cw
 		LEFT JOIN raw_messages rm ON rm.id = cw.raw_message_id
 		WHERE cw.id = $1
 	`, id).Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.ClientID, &w.ClientName,
-		&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt, &w.WaMessageID)
+		&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt, &w.WaMessageID, &w.Deleted)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return w, false, nil
 	}

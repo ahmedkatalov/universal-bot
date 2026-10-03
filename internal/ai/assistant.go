@@ -284,6 +284,9 @@ func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem strin
 	messages := make([]chatMessage, 0, len(history)+2)
 	messages = append(messages, systemWithCache(staticSystem, dynamicSystem))
 	for _, t := range history {
+		if strings.TrimSpace(t.Text) == "" {
+			continue // пустой ход (модель промолчала) — провайдер отвергает пустые сообщения
+		}
 		role := "assistant"
 		if t.FromUser {
 			role = "user"

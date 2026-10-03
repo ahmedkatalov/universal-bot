@@ -12,11 +12,13 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"go.mau.fi/whatsmeow"
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -566,6 +568,9 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			if b.cmfReplyAnswer(ctx, msg, stripped, modeAddressed) {
 				return
 			}
+			if extractQuotedStanzaID(msg) == "" && b.cmfAddressedContext(ctx, msg, stripped) {
+				return
+			}
 		} else {
 			if b.handleClarifyReply(ctx, msg, text) {
 				return
@@ -1009,6 +1014,9 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	// Дописываем пару к ТЕКУЩЕЙ истории под одним локом (а не к снимку history,
 	// снятому до многосекундного вызова ИИ) — иначе два быстрых сообщения от
 	// одного отправителя затирают ход друг друга.
+	if strings.TrimSpace(reply) == "" {
+		reply = "[молчу]"
+	}
 	b.historyMu.Lock()
 	updated := append(b.history[sender], ai.Turn{FromUser: true, Text: text}, ai.Turn{FromUser: false, Text: reply})
 	if len(updated) > maxPrivateHistory {
@@ -1346,6 +1354,9 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	// Дописываем пару к ТЕКУЩЕЙ истории под одним локом (не к снимку, снятому до
 	// вызова ИИ) — иначе два одновременных обращения к боту в группе затирают
 	// ход друг друга.
+	if strings.TrimSpace(reply) == "" {
+		reply = "[молчу]" // пустой ход в истории ломает следующие запросы к модели
+	}
 	b.historyMu.Lock()
 	updated := append(b.history[key], ai.Turn{FromUser: true, Text: userText}, ai.Turn{FromUser: false, Text: reply})
 	if len(updated) > maxPrivateHistory {
@@ -1361,23 +1372,21 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 }
 
 // assistantOutgoing — что реально отправить: ассистент может решить промолчать
-// («[молчу]» — на отмашку или непонятную реплику ответ не нужен).
+// («[молчу]» — на отмашку или непонятную реплику ответ не нужен). Если метка
+// молчания есть где угодно в ответе (в скобках, кавычках, с пояснением) —
+// не отправляем ничего.
 func assistantOutgoing(reply string) string {
 	r := strings.TrimSpace(reply)
-	if bare := strings.ToLower(strings.Trim(r, ".!…[]() ")); bare == "" || bare == "молчу" {
+	if silenceMark.MatchString(r) {
 		return ""
 	}
-	low := strings.ToLower(r)
-	for {
-		i := strings.Index(low, "[молчу]")
-		if i < 0 {
-			break
-		}
-		r = r[:i] + r[i+len("[молчу]"):]
-		low = low[:i] + low[i+len("[молчу]"):]
+	if strings.IndexFunc(r, func(c rune) bool { return unicode.IsLetter(c) || unicode.IsDigit(c) }) < 0 {
+		return ""
 	}
-	return strings.TrimSpace(r)
+	return r
 }
+
+var silenceMark = regexp.MustCompile(`(?i)\[\s*молчу\s*\]|^[\s\p{P}\p{S}]*молчу[\s\p{P}\p{S}]*$`)
 
 // joinedGroups возвращает список групп бота (JID -> название) с кэшем на
 // 5 минут, чтобы не дёргать WhatsApp на каждое сообщение.

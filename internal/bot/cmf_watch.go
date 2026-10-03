@@ -386,15 +386,19 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 		// — привязываем к клиенту и ждём его платёж в программе. Это и есть «как
 		// человек предположить»: «Каталова»/«Котолов» → «Ахмед Каталов».
 		_ = b.db.UpdateCmfWatch(ctx, watchID, "", clients[0].ID, clients[0].FullName, "", "watch")
+		b.clearOpenAskFor(chat.String(), watchID)
 		fmt.Printf("cmf: чек на %.0f ₽ привязан к клиенту %s (совпадение: %v), ждём платёж\n", amount, clients[0].FullName, kind)
 		return
 	}
 	w, wok, _ := b.db.CmfWatchByID(ctx, watchID)
+	if wok && (w.Deleted || w.Status == "deleted") {
+		return
+	}
 	// Плательщик с чека раньше уже платил за конкретного клиента (ответили в
 	// группе) — как человек, помним, но коротко говорим, чтобы можно было
 	// поправить. Только если среди найденных нет его самого.
-	if wok && len(matchCandidates(clientText, clients)) == 0 {
-		if c, ok := b.payerClient(ctx, clientText); ok {
+	if wok {
+		if c, ok := b.payerFor(ctx, clientText, clients); ok {
 			b.bindCmfWatch(ctx, chat, w, c, false)
 			b.cmfSay(ctx, chat, w, fmt.Sprintf("✅ Чек на %s — за «%s», как в прошлый раз. Если не так — ответьте на это сообщение ФИО клиента.", rub0(amount), c.FullName))
 			return

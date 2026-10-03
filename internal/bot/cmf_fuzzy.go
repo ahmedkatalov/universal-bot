@@ -134,6 +134,9 @@ func wordSimilar(a, b string) bool {
 	if a == b {
 		return true
 	}
+	if isPatronymic(a) != isPatronymic(b) {
+		return false // фамилия «Ахмедова» — не отчество «Ахмедовна»
+	}
 	ra, rb := []rune(a), []rune(b)
 	if len(ra) < 3 || len(rb) < 3 {
 		return false
@@ -250,19 +253,54 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 	if best == 0 {
 		return nil, false
 	}
-	// Все похожие (лучшие — первыми): родственник с той же фамилией не должен
-	// теряться за тёзкой, совпавшим по имени и отчеству.
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].s != all[j].s {
-			return all[i].s > all[j].s
+	// Все похожие, правдоподобные — первыми: покрывающие имя, затем с той же
+	// фамилией (родственник не должен теряться за десятком тёзок), затем по
+	// числу совпавших слов.
+	rank := func(c cmf.ClientInfo) (cover, surname bool) {
+		cover = nameCovers(name, c.FullName)
+		fq, _ := nameParts(name)
+		fc, _ := nameParts(c.FullName)
+		if len(fc) > 0 {
+			for _, w := range fq {
+				if nameWordSame(w, fc[0]) {
+					surname = true
+					break
+				}
+			}
 		}
-		if all[i].c.FullName != all[j].c.FullName {
-			return all[i].c.FullName < all[j].c.FullName
+		return cover, surname
+	}
+	type ranked struct {
+		scored
+		cover, surname bool
+	}
+	rs := make([]ranked, 0, len(all))
+	for _, sc := range all {
+		cv, sn := rank(sc.c)
+		rs = append(rs, ranked{sc, cv, sn})
+	}
+	sort.Slice(rs, func(i, j int) bool {
+		a, b := rs[i], rs[j]
+		if a.cover != b.cover {
+			return a.cover
 		}
-		return all[i].c.ID < all[j].c.ID
+		if a.surname != b.surname {
+			return a.surname
+		}
+		if a.s != b.s {
+			return a.s > b.s
+		}
+		if a.c.FullName != b.c.FullName {
+			return a.c.FullName < b.c.FullName
+		}
+		return a.c.ID < b.c.ID
 	})
-	if len(all) > 10 {
-		all = all[:10]
+	if len(rs) > 30 {
+		rs = rs[:30]
+	}
+	all = all[:0]
+	for _, r := range rs {
+		all = append(all, r.scored)
 	}
 	for _, sc := range all {
 		clients = append(clients, sc.c)
@@ -276,20 +314,38 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 // coveringUnique — индекс единственного кандидата, покрывающего имя (−1 — нет
 // такого или их несколько). Одно слово без инициалов не считается уверенным.
 func coveringUnique(name string, cands []cmf.ClientInfo) int {
-	full, initials := nameParts(name)
-	if len(full) == 0 || (len(full) < 2 && len(initials) == 0) {
+	_, initials := nameParts(name)
+	nFull := fullWordCount(name)
+	if nFull == 0 || (nFull < 2 && len(initials) == 0) {
 		return -1
 	}
+	full, _ := nameParts(dehyphen(name))
 	hit := -1
 	for k, c := range cands {
-		if nameCovers(name, c.FullName) {
-			if hit >= 0 {
-				return -1
-			}
-			hit = k
+		if !nameCovers(name, c.FullName) {
+			continue
 		}
+		// Одно слово + инициалы («Каталов А.», «Марха А.») — слово должно быть
+		// ФАМИЛИЕЙ клиента (первое слово в программе): по имени и букве не угадываем.
+		if nFull < 2 {
+			fc, _ := nameParts(dehyphen(c.FullName))
+			if len(fc) == 0 || !nameWordSame(full[0], fc[0]) {
+				continue
+			}
+		}
+		if hit >= 0 {
+			return -1
+		}
+		hit = k
 	}
 	return hit
+}
+
+// fullWordCount — сколько полных слов в имени; составное через дефис
+// («Хаджи-Мурат», «Магомед-Расул») — одно слово.
+func fullWordCount(name string) int {
+	full, _ := nameParts(dehyphen(name))
+	return len(full)
 }
 
 // cmfLookupWithTypos ищет клиента с допуском на опечатки/склонения и сообщает

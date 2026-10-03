@@ -591,7 +591,7 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		clients, kind, err := b.cmfLookupWithTypos(ctx, bk.display)
 		if err == nil && kind != cmfExact && kind != cmfStrong {
 			// Плательщик, за которого в группе уже ответили «это оплата за X».
-			if pc, ok := b.payerClient(ctx, bk.display); ok {
+			if pc, ok := b.payerFor(ctx, bk.display, clients); ok {
 				clients, kind = []cmf.ClientInfo{pc}, cmfStrong
 			}
 		}
