@@ -376,6 +376,9 @@ func jsonInt(m map[string]json.RawMessage, keys ...string) int64 {
 	return 0
 }
 
+// cmfLoc — часовой пояс программы (Москва) для дат без пояса.
+var cmfLoc = time.FixedZone("MSK", 3*3600)
+
 // jsonTime читает дату/время в нескольких форматах (RFC3339, «2006-01-02»,
 // unix-секунды). Пустое/непонятное -> нулевое время (для сопоставления не
 // критично: период фильтруется на стороне программы, сверяем по сумме).
@@ -387,7 +390,17 @@ func jsonTime(m map[string]json.RawMessage, keys ...string) time.Time {
 		}
 		var s string
 		if json.Unmarshal(raw, &s) == nil && s != "" {
-			for _, layout := range []string{time.RFC3339, "2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02"} {
+			if t, err := time.Parse(time.RFC3339, s); err == nil {
+				return t
+			}
+			// Время без пояса программа пишет по Москве: «2026-08-21 22:00» — это
+			// 21-е, а не 22-е число.
+			for _, layout := range []string{"2006-01-02T15:04:05", "2006-01-02 15:04:05", "2006-01-02T15:04", "2006-01-02 15:04"} {
+				if t, err := time.ParseInLocation(layout, s, cmfLoc); err == nil {
+					return t
+				}
+			}
+			for _, layout := range []string{"2006-01-02", "02.01.2006"} {
 				if t, err := time.Parse(layout, s); err == nil {
 					return t
 				}

@@ -1983,7 +1983,7 @@ func (d *DB) ReceiptsForReconcile(ctx context.Context, from, to time.Time) ([]Re
 		  AND br.is_duplicate = false AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
 		  AND br.amount > 0
-		ORDER BY br.tx_date
+		ORDER BY br.tx_date, br.id
 	`, from, to)
 	if err != nil {
 		return nil, err
