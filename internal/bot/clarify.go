@@ -52,6 +52,7 @@ type openAsk struct {
 	receiptWaID string // для receipt — id сообщения-чека
 	txID        int    // для cash_* — id транзакции
 	watchID     int    // для cmf_watch — наблюдение сверки («за кого платёж?»)
+	wantName    bool   // для cmf_watch — бот прямо попросил написать ФИО
 	needAmount  bool   // по чеку не прочиталась сумма
 	needName    bool   // по чеку не прочитан клиент
 	at          time.Time
@@ -625,7 +626,7 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	}
 
 	// Ответ на вопрос сверки «за кого этот платёж?» (кто угодно из группы).
-	if b.cmfReplyAnswer(ctx, msg, text) {
+	if b.cmfReplyAnswer(ctx, msg, text, modeSwipe) {
 		return true
 	}
 

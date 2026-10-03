@@ -370,6 +370,50 @@ func nameParts(raw string) (full []string, initials []rune) {
 	return full, initials
 }
 
+// patronymicTails — окончания отчеств (в т.ч. в косвенных падежах).
+var patronymicTails = []string{"вич", "вича", "вичу", "вичем", "виче", "вна", "вны", "вне", "вну", "вной",
+	"ична", "ичны", "ичне", "ичну", "ичной", "оглы", "кызы", "улы"}
+
+// isPatronymic — слово похоже на отчество («Ахмедовна», «Нажудовича»).
+func isPatronymic(w string) bool {
+	if len([]rune(w)) < 6 {
+		return false
+	}
+	for _, t := range patronymicTails {
+		if strings.HasSuffix(w, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// nameCovers — всё, что есть в имени query, есть и в полном имени cand: каждое
+// полное слово совпало (nameWordSame) и инициалы не противоречат. «Каталов А.»
+// покрывается «Каталов Ахмед Нажудович»; «Магомед» — НЕ «Магомедова Патимат»;
+// «Альмурзаева М.» — НЕ «Альмурзаева Разет».
+func nameCovers(query, cand string) bool {
+	if nameCoversOnce(query, cand) {
+		return true
+	}
+	if hasHyphen(query) || hasHyphen(cand) {
+		return nameCoversOnce(dehyphen(query), dehyphen(cand))
+	}
+	return false
+}
+
+func nameCoversOnce(query, cand string) bool {
+	fq, iq := nameParts(query)
+	fc, ic := nameParts(cand)
+	if len(fq) == 0 {
+		return false
+	}
+	score, _, uc := matchNameWords(fq, fc)
+	if score < len(fq) {
+		return false
+	}
+	return initialsAgree(iq, leftovers(fc, uc, ic))
+}
+
 func isVowelRu(r rune) bool { return strings.ContainsRune("аеёиоуыэюя", r) }
 
 // softEndings — падежные окончания имён на «ь»: Шамиль → Шамиля/Шамилю/Шамилем.
@@ -393,6 +437,9 @@ func foldYi(w string) string {
 // («Рустам/Руслан», «Мадина/Марина», «Ахмедов/Ахматов») — нет; короткие слова
 // (Иса/Ира) — только точно или склонение.
 func nameWordSame(a, b string) bool {
+	if isPatronymic(a) != isPatronymic(b) {
+		return false // «Магомедова» (фамилия) — не «Магомедовна» (отчество)
+	}
 	if nameWordSame0(a, b) {
 		return true
 	}

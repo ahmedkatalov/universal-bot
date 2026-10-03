@@ -165,7 +165,11 @@ func (b *Bot) quotedSenderPhoneNote(ctx context.Context, msg *events.Message) st
 		if len(r) > 200 {
 			qt = string(r[:200]) + "…"
 		}
-		parts = append(parts, "отвечает на сообщение: «"+qt+"»")
+		if b.client != nil && b.isReplyToBot(msg) {
+			parts = append(parts, "отвечает на твоё сообщение: «"+qt+"»")
+		} else {
+			parts = append(parts, "отвечает на сообщение: «"+qt+"»")
+		}
 	}
 	if len(parts) == 0 {
 		return ""

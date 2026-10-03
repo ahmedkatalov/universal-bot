@@ -220,6 +220,16 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_ask ON cmf_watch(ask_msg_id)`); err != nil {
 		return fmt.Errorf("индекс cmf_watch.ask_msg_id: %w", err)
 	}
+	// Все сообщения бота по наблюдению (вопрос, переспросы, «как в прошлый раз»):
+	// свайп на ЛЮБОЕ из них — ответ по этому чеку.
+	if _, err := pool.Exec(ctx, `
+		CREATE TABLE IF NOT EXISTS cmf_watch_asks (
+			ask_msg_id TEXT PRIMARY KEY,
+			watch_id   INT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		)`); err != nil {
+		return fmt.Errorf("таблица cmf_watch_asks: %w", err)
+	}
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS bot_settings (
 			key   TEXT PRIMARY KEY,
@@ -2960,19 +2970,49 @@ func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]
 	return out, rows.Err()
 }
 
-// SetCmfWatchAsk запоминает id вопроса бота по наблюдению.
+// SetCmfWatchAsk запоминает id сообщения бота по наблюдению (вопрос или
+// переспрос). Прежние id не забываются — свайп на любой из них работает.
 func (d *DB) SetCmfWatchAsk(ctx context.Context, id int, askMsgID string) error {
+	if _, err := d.pool.Exec(ctx, `
+		INSERT INTO cmf_watch_asks (ask_msg_id, watch_id) VALUES ($1, $2)
+		ON CONFLICT (ask_msg_id) DO UPDATE SET watch_id = EXCLUDED.watch_id`, askMsgID, id); err != nil {
+		return err
+	}
 	_, err := d.pool.Exec(ctx, `UPDATE cmf_watch SET ask_msg_id = $2 WHERE id = $1`, id, askMsgID)
 	return err
 }
 
-// CmfWatchByAsk — наблюдение, по которому бот задал вопрос askMsgID.
+// CmfWatchByAsk — наблюдение, по которому бот написал сообщение askMsgID.
 func (d *DB) CmfWatchByAsk(ctx context.Context, askMsgID string) (int, bool, error) {
 	if askMsgID == "" {
 		return 0, false, nil
 	}
 	var id int
-	err := d.pool.QueryRow(ctx, `SELECT id FROM cmf_watch WHERE ask_msg_id = $1 ORDER BY id DESC LIMIT 1`, askMsgID).Scan(&id)
+	err := d.pool.QueryRow(ctx, `
+		SELECT watch_id FROM cmf_watch_asks WHERE ask_msg_id = $1
+		UNION ALL
+		SELECT id FROM cmf_watch WHERE ask_msg_id = $1
+		LIMIT 1`, askMsgID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// CmfWatchByCheckMessage — наблюдение по id сообщения с самим чеком.
+func (d *DB) CmfWatchByCheckMessage(ctx context.Context, waMessageID string) (int, bool, error) {
+	if waMessageID == "" {
+		return 0, false, nil
+	}
+	var id int
+	err := d.pool.QueryRow(ctx, `
+		SELECT cw.id FROM cmf_watch cw
+		JOIN raw_messages rm ON rm.id = cw.raw_message_id
+		WHERE rm.wa_message_id = $1
+		ORDER BY cw.id DESC LIMIT 1`, waMessageID).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return 0, false, nil
 	}

@@ -267,6 +267,11 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	if quotedID != "" {
 		if found, _, err := b.db.ReattributeReceiptByMessage(ctx, quotedID, canonical, contactIDPtr); err == nil && found {
 			updated = true
+			// Сверка по этому чеку тоже переключается на нового клиента.
+			if b.reresolveWatchByCheck(ctx, chat, quotedID, canonical) {
+				fmt.Printf("Чек переатрибутирован на клиента %q (свайп с ФИО на чек), сверка обновлена\n", canonical)
+				return true
+			}
 		} else {
 			// Свайп пришёлся НЕ на чек (например, на вопрос бота, чья привязка уже
 			// вытеснена из askMap) — не привязываем вслепую к самому старому чеку
@@ -372,8 +377,8 @@ func extractQuotedText(msg *events.Message) string {
 func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, clientText string, amount float64) {
 	clients, kind, err := b.cmfLookupWithTypos(ctx, clientText)
 	if err != nil {
+		// Программа не ответила — оставляем «lookup»: фоновая проверка повторит.
 		fmt.Println("cmf lookup:", err)
-		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "noname")
 		return
 	}
 	if kind == cmfExact || kind == cmfStrong {
@@ -384,15 +389,19 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 		fmt.Printf("cmf: чек на %.0f ₽ привязан к клиенту %s (совпадение: %v), ждём платёж\n", amount, clients[0].FullName, kind)
 		return
 	}
+	w, wok, _ := b.db.CmfWatchByID(ctx, watchID)
 	// Плательщик с чека раньше уже платил за конкретного клиента (ответили в
-	// группе) — человек бы это помнил и не переспрашивал.
-	if c, ok := b.payerClient(ctx, clientText); ok {
-		_ = b.db.UpdateCmfWatch(ctx, watchID, "", c.ID, c.FullName, "", "watch")
-		fmt.Printf("cmf: чек на %.0f ₽ от «%s» привязан к клиенту %s (запомненный плательщик)\n", amount, clientText, c.FullName)
-		return
+	// группе) — как человек, помним, но коротко говорим, чтобы можно было
+	// поправить. Только если среди найденных нет его самого.
+	if wok && len(matchCandidates(clientText, clients)) == 0 {
+		if c, ok := b.payerClient(ctx, clientText); ok {
+			b.bindCmfWatch(ctx, chat, w, c, false)
+			b.cmfSay(ctx, chat, w, fmt.Sprintf("✅ Чек на %s — за «%s», как в прошлый раз. Если не так — ответьте на это сообщение ФИО клиента.", rub0(amount), c.FullName))
+			return
+		}
 	}
 	waMsgID, senderJID := "", ""
-	if w, ok, err := b.db.CmfWatchByID(ctx, watchID); err == nil && ok {
+	if wok {
 		waMsgID, senderJID = w.WaMessageID, w.SenderJID
 	}
 	if kind == cmfNoMatch {
@@ -403,7 +412,7 @@ func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, 
 	text, opts := cmfAskText(clientText, amount, clients)
 	if kind == cmfNoMatch {
 		if branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch); branch != "" {
-			text += " Пока отнесла к точке «" + branch + "»."
+			text += " Пока отнёс к точке «" + branch + "»."
 		}
 	}
 	b.askCmfWatch(ctx, chat, watchID, waMsgID, senderJID, text, opts)
@@ -424,7 +433,27 @@ func (b *Bot) cmfWatcherLoop() {
 	}
 }
 
+// cmfRetryLookups — чеки, по которым программа не ответила при поиске клиента
+// (статус lookup, старше 10 минут), ищем ещё раз.
+func (b *Bot) cmfRetryLookups(ctx context.Context) {
+	ws, err := b.db.ListCmfWatches(ctx, []string{"lookup"}, 20)
+	if err != nil {
+		return
+	}
+	for _, w := range ws {
+		if w.ClientText == "" || time.Since(w.CreatedAt) < 10*time.Minute || time.Since(w.CreatedAt) > 72*time.Hour {
+			continue
+		}
+		jid, err := types.ParseJID(w.GroupJID)
+		if err != nil {
+			continue
+		}
+		b.cmfResolveWatch(ctx, w.ID, jid, w.ClientText, w.Amount)
+	}
+}
+
 func (b *Bot) cmfCheckDue(ctx context.Context) {
+	b.cmfRetryLookups(ctx)
 	due, err := b.db.DueCmfWatches(ctx, time.Now().Add(-cmfRemindAfter()), 30)
 	if err != nil {
 		fmt.Println("cmf: ошибка выборки наблюдений:", err)
@@ -649,7 +678,7 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 				return "", err
 			}
 			if len(clients) == 0 {
-				return fmt.Sprintf("Клиента %q в программе не нашла.", args.ClientName), nil
+				return fmt.Sprintf("Клиента %q в программе не нашёл.", args.ClientName), nil
 			}
 			if len(clients) > 1 && contractID == "" {
 				var names []string
@@ -702,24 +731,27 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 }
 
 // cmfResolveTool — вручную указать, чей чек (ответ на вопрос бота или команда).
-func (b *Bot) cmfResolveTool() ai.Tool {
+func (b *Bot) cmfResolveTool(chat types.JID) ai.Tool {
 	return ai.Tool{
 		Name: "cmf_resolve",
 		Description: "Указывает, какому клиенту программы относится чек из сверки. Вызывай, когда владелец отвечает " +
-			"на вопрос 'кому относится платёж' или говорит 'чек #5 — это Ахмед Каталов Нажудович'. " +
-			"watch_id — номер из cmf_status или из вопроса бота (если не указан — последний неоднозначный). " +
-			"client_name — полное имя клиента как в программе.",
+			"на вопрос бота «за кого этот платёж» или говорит «этот чек — Ахмед Каталов Нажудович». " +
+			"Если владелец ответил свайпом — передай message_id из [Контекст ответа: … id сообщения …] (это вопрос бота или сам чек). " +
+			"watch_id — номер наблюдения из cmf_status (если ни его, ни message_id нет — последний неясный чек в ЭТОЙ группе). " +
+			"client_name — ФИО клиента как в программе.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"watch_id":    map[string]any{"type": "integer", "description": "Номер наблюдения (0 = последний неоднозначный)"},
-				"client_name": map[string]any{"type": "string", "description": "Полное имя клиента в программе"},
+				"watch_id":    map[string]any{"type": "integer", "description": "Номер наблюдения (0 = по message_id или последний неясный в этой группе)"},
+				"message_id":  map[string]any{"type": "string", "description": "id сообщения, на которое ответили свайпом (вопрос бота или чек)"},
+				"client_name": map[string]any{"type": "string", "description": "ФИО клиента в программе"},
 			},
 			"required": []string{"client_name"},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
 				WatchID    int    `json:"watch_id"`
+				MessageID  string `json:"message_id"`
 				ClientName string `json:"client_name"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
@@ -729,31 +761,52 @@ func (b *Bot) cmfResolveTool() ai.Tool {
 				return "", fmt.Errorf("интеграция с программой не настроена (CMF_API_URL/CMF_EMAIL/CMF_PASSWORD)")
 			}
 			watchID := args.WatchID
-			if watchID == 0 {
-				ws, err := b.db.ListCmfWatches(ctx, []string{"ambiguous", "noname", "unmatched"}, 1)
-				if err != nil || len(ws) == 0 {
-					return "", fmt.Errorf("нет наблюдений, ожидающих уточнения — укажи watch_id из cmf_status")
+			if watchID == 0 && strings.TrimSpace(args.MessageID) != "" {
+				mid := strings.TrimSpace(args.MessageID)
+				if id, ok, _ := b.db.CmfWatchByAsk(ctx, mid); ok {
+					watchID = id
+				} else if id, ok, _ := b.db.CmfWatchByCheckMessage(ctx, mid); ok {
+					watchID = id
 				}
-				watchID = ws[0].ID
 			}
-			clients, err := b.cmf.LookupClients(ctx, strings.TrimSpace(args.ClientName))
-			if err != nil {
-				return "", err
-			}
-			switch len(clients) {
-			case 0:
-				return fmt.Sprintf("Клиента %q в программе не нашла — проверь написание.", args.ClientName), nil
-			case 1:
-				if err := b.db.UpdateCmfWatch(ctx, watchID, "", clients[0].ID, clients[0].FullName, "", "watch"); err != nil {
+			if watchID == 0 {
+				ws, err := b.db.ListCmfWatches(ctx, []string{"ambiguous", "noname", "unmatched"}, 50)
+				if err != nil {
 					return "", err
 				}
-				return fmt.Sprintf("Чек #%d привязан к клиенту %s — слежу, чтобы платёж внесли в программу.", watchID, clients[0].FullName), nil
-			default:
+				for _, w := range ws {
+					if w.GroupJID == chat.String() {
+						watchID = w.ID
+						break
+					}
+				}
+			}
+			if watchID == 0 {
+				return "", fmt.Errorf("не понял, о каком чеке речь — ответь свайпом на чек или вопрос бота, или укажи watch_id из cmf_status")
+			}
+			w, ok, err := b.db.CmfWatchByID(ctx, watchID)
+			if err != nil || !ok {
+				return "", fmt.Errorf("наблюдение #%d не найдено", watchID)
+			}
+			plan := planCmfAnswer(cmfAnswer{Kind: ansClient, Name: strings.TrimSpace(args.ClientName)}, nil, b.cmfLookupFunc(ctx))
+			switch plan.Action {
+			case actBind:
+				gj := chat
+				if j, err := types.ParseJID(w.GroupJID); err == nil {
+					gj = j
+				}
+				b.bindCmfWatch(ctx, gj, w, plan.Client, false)
+				return fmt.Sprintf("Чек #%d на %.0f ₽ привязан к клиенту %s — слежу, чтобы платёж внесли в программу.", w.ID, w.Amount, plan.Client.FullName), nil
+			case actAskAgain:
 				var names []string
-				for _, c := range clients {
+				for _, c := range plan.Options {
 					names = append(names, c.FullName)
 				}
-				return "Под это имя подходит несколько клиентов: " + strings.Join(names, "; ") + " — уточни полное имя.", nil
+				return "Под это имя подходит не один клиент или имя неполное: " + strings.Join(names, "; ") + " — уточни полное ФИО.", nil
+			case actLookupError:
+				return "", plan.Err
+			default:
+				return fmt.Sprintf("Клиента %q в программе не нашёл — проверь написание.", args.ClientName), nil
 			}
 		},
 	}
@@ -791,7 +844,7 @@ func (b *Bot) cmfBranchTool() ai.Tool {
 			if err := b.db.SettingSet(ctx, settingUnmatchedBranch, strings.TrimSpace(args.Branch)); err != nil {
 				return "", err
 			}
-			return "Запомнила: чеки, которых нет в программе, относятся к точке «" + strings.TrimSpace(args.Branch) + "».", nil
+			return "Запомнил: чеки, которых нет в программе, относятся к точке «" + strings.TrimSpace(args.Branch) + "».", nil
 		},
 	}
 }

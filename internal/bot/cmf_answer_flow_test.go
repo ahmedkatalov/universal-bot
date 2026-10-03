@@ -128,7 +128,7 @@ func TestCmfAnswerFlow(t *testing.T) {
 	if !ok {
 		t.Fatal("вопрос не запомнен")
 	}
-	if !f.applyCmfWatchAnswer(ctx, grp, watchID, "Альмурзаева Разет", true) {
+	if !f.applyCmfWatchAnswer(ctx, grp, watchID, "Альмурзаева Разет", modeSwipe, false) {
 		t.Fatal("ответ не обработан")
 	}
 	reply := f.last()
@@ -143,13 +143,13 @@ func TestCmfAnswerFlow(t *testing.T) {
 		t.Errorf("клиент чека в учёте: %+v %v", rs, err)
 	}
 
-	// Второй чек того же плательщика — без вопроса.
+	// Второй чек того же плательщика — без вопроса, коротко «как в прошлый раз».
 	before := len(f.out)
 	waID2 := waID + "-2"
 	rawID2, _, _ := f.db.SaveRawMessage(ctx, waID2, grp.String(), "emp@s.whatsapp.net", "79990000000", "Сафаи", "чек", true, "", time.Now())
 	f.cmfWatchReceipt(ctx, grp, "emp@s.whatsapp.net", "Альмурзаева Марха А", 19000, time.Now(), rawID2)
-	if len(f.out) != before {
-		t.Errorf("по запомненному плательщику бот снова спросил: %q", f.last().text)
+	if len(f.out) != before+1 || !strings.Contains(f.last().text, "как в прошлый раз") || f.last().quoted != waID2 {
+		t.Errorf("по запомненному плательщику: %+v", f.last())
 	}
 
 	// Ответ без свайпа номером варианта на новый вопрос.

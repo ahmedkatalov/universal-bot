@@ -27,7 +27,7 @@ func TestCmfAnswerScreenshot(t *testing.T) {
 	if len(opts) != 2 {
 		t.Fatalf("вариантов %d", len(opts))
 	}
-	ans, ok := parseCmfAnswer("Альмурзаева Разет", opts)
+	ans, ok := parseCmfAnswer("Альмурзаева Разет", "Альмурзаева Марха А", opts)
 	if !ok || ans.Kind != ansClient || ans.Name != "Альмурзаева Разет" {
 		t.Fatalf("разбор ответа: %+v ok=%v", ans, ok)
 	}
@@ -70,19 +70,19 @@ func TestParseCmfAnswer(t *testing.T) {
 		{"Альмурзаева Разет 19000", ansOther, 0, false},
 	}
 	for _, c := range cases {
-		a, ok := parseCmfAnswer(c.in, screenshotCands)
+		a, ok := parseCmfAnswer(c.in, "Альмурзаева Марха А", screenshotCands)
 		if a.Kind != c.kind || ok != c.confident || (c.kind == ansPick && a.Pick != c.pick) {
 			t.Errorf("parseCmfAnswer(%q) = %+v ok=%v, ожидали kind=%v pick=%d ok=%v", c.in, a, ok, c.kind, c.pick, c.confident)
 		}
 	}
 	one := screenshotCands[:1]
 	for in, want := range map[string]cmfAnswerKind{"да": ansPick, "Да, она": ansPick, "нет": ansReject, "не она": ansReject} {
-		if a, _ := parseCmfAnswer(in, one); a.Kind != want {
+		if a, _ := parseCmfAnswer(in, "Альмурзаева Марха А", one); a.Kind != want {
 			t.Errorf("один вариант, %q: %+v", in, a)
 		}
 	}
 	// «да» при нескольких вариантах — не выбор.
-	if a, _ := parseCmfAnswer("да", screenshotCands); a.Kind == ansPick {
+	if a, _ := parseCmfAnswer("да", "Альмурзаева Марха А", screenshotCands); a.Kind == ansPick {
 		t.Errorf("«да» при двух вариантах: %+v", a)
 	}
 }
@@ -100,7 +100,13 @@ func TestPlanCmfAnswer(t *testing.T) {
 		t.Errorf("двое: %+v", p)
 	}
 	if p := planCmfAnswer(a, nil, look(two[:1], cmfWeak, nil)); p.Action != actBind {
-		t.Errorf("один нечёткий, все слова совпали: %+v", p)
+		t.Errorf("один, все слова совпали: %+v", p)
+	}
+	if p := planCmfAnswer(cmfAnswer{Kind: ansClient, Name: "Разет"}, nil, look([]cmf.ClientInfo{{ID: "90", FullName: "Хасанова Разет Мусаевна"}}, cmfStrong, nil)); p.Action != actAskAgain {
+		t.Errorf("одно имя — только с подтверждением: %+v", p)
+	}
+	if p := planCmfAnswer(cmfAnswer{Kind: ansClient, Name: "Магомед"}, nil, look([]cmf.ClientInfo{{ID: "88", FullName: "Магомедова Патимат Ибрагимовна"}}, cmfExact, nil)); p.Action != actNotFound {
+		t.Errorf("Магомед ≠ Магомедова: %+v", p)
 	}
 	if p := planCmfAnswer(a, nil, look([]cmf.ClientInfo{{ID: "3", FullName: "Петров Иван"}}, cmfWeak, nil)); p.Action != actAskAgain {
 		t.Errorf("один нечёткий, фамилия другая: %+v", p)
@@ -121,7 +127,7 @@ func TestPlanCmfAnswer(t *testing.T) {
 
 func TestCmfAskTextVariants(t *testing.T) {
 	q, _ := cmfAskText("Каталов Ахмед", 5000, nil)
-	if !strings.Contains(q, "не нашла") || !strings.Contains(q, "ФИО клиента") {
+	if !strings.Contains(q, "не нашёл") || !strings.Contains(q, "ФИО клиента") {
 		t.Errorf("не найден: %q", q)
 	}
 	q, _ = cmfAskText("Каталов Ахмед", 5000, []cmf.ClientInfo{{ID: "1", FullName: "Каталов Ахмед Нажудович"}, {ID: "2", FullName: "Каталов Ахмед Русланович"}})
@@ -137,7 +143,7 @@ func TestCmfAskTextVariants(t *testing.T) {
 		t.Errorf("одна однофамилица: %q", q)
 	}
 	q, _ = cmfAskText("Альмурзаева Марха А", 19000, screenshotCands[:1])
-	if !strings.Contains(q, "тёзка") {
+	if !strings.Contains(q, "только похожее имя") {
 		t.Errorf("один тёзка: %q", q)
 	}
 }

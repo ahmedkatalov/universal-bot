@@ -24,6 +24,7 @@ import (
 
 	"whatsapp-bot/internal/cmf"
 	"whatsapp-bot/internal/db"
+	"whatsapp-bot/internal/parser"
 )
 
 const settingPayerMap = "cmf_payer_map"
@@ -56,28 +57,80 @@ var ordinalWords = map[string]int{
 	"пятый": 5, "пятая": 5, "5й": 5, "5-й": 5, "5-я": 5,
 }
 
-var notInProgramMarks = []string{
+// Явные «нет в программе» — понимаем, даже если вокруг пара слов («его нет в
+// программе», «её нет в базе»), но только в коротком ответе без цифр и без ФИО.
+var notInProgramStrong = []string{
 	"нет в программе", "нету в программе", "не в программе", "нет в базе", "нету в базе",
-	"не внесен в программу", "не внесён в программу", "новый клиент", "нет такого клиента",
-	"нету такого клиента", "нет такого", "нету такого", "не наш клиент", "не клиент",
-	"его нет", "её нет", "ее нет", "нету его", "нету её", "нету ее",
+	"не внесен в программу", "не внесён в программу", "нет такого клиента", "нету такого клиента",
+	"не наш клиент", "нет в списке", "нету в списке",
+}
+
+// Короткие «нет такого» — только если это ВЕСЬ ответ (иначе «его нет на месте»,
+// «Новый клиент Хасанов Ислам 5000» приняли бы за ответ).
+var notInProgramWhole = map[string]bool{
+	"нет такого": true, "нету такого": true, "нет такой": true, "нету такой": true,
+	"его нет": true, "её нет": true, "ее нет": true, "нету его": true, "нету её": true, "нету ее": true,
+	"новый клиент": true, "новая клиентка": true, "не клиент": true, "нету": true, "нет его": true, "нет её": true,
+	"никто из них": true, "ни один из них": true, "ни одна из них": true, "никто": true,
+	"нет его в программе": true, "нет её в программе": true,
+}
+
+// fillerWords — слова, которые в ответе не делают его ФИО («это», «за», «её»…).
+var fillerWords = map[string]bool{
+	"это": true, "его": true, "её": true, "ее": true, "в": true, "у": true, "нас": true, "тут": true,
+	"такой": true, "такого": true, "клиент": true, "клиента": true, "клиентка": true, "программе": true,
+	"базе": true, "списке": true, "нет": true, "нету": true, "не": true, "наш": true, "внесен": true,
+	"внесён": true, "программу": true, "он": true, "она": true, "там": true,
+}
+
+// unclearWords — если они есть в ответе, правила не берутся решать: приветствие,
+// «уточню у …», «ни … ни …», «вариант» без номера — пусть решает ИИ.
+var unclearWords = map[string]bool{
+	"никто": true, "никого": true, "ни": true, "них": true, "из": true, "одна": true, "один": true,
+	"вариант": true, "варианта": true, "новая": true, "новый": true, "клиентка": true,
+	"салам": true, "салям": true, "ассаламу": true, "ассалам": true, "алейкум": true, "алейкуму": true,
+	"привет": true, "здравствуйте": true, "уточню": true, "спрошу": true, "узнаю": true, "щас": true,
+	"сейчас": true, "потом": true, "позже": true, "ок": true, "окей": true, "спасибо": true,
 }
 
 var yesWords = map[string]bool{
 	"да": true, "ага": true, "угу": true, "он": true, "она": true, "верно": true, "точно": true,
 	"это он": true, "это она": true, "да он": true, "да она": true, "да это он": true, "да это она": true,
-	"да, он": true, "да, она": true, "правильно": true, "так": true, "именно": true,
+	"да, он": true, "да, она": true, "правильно": true, "так": true, "именно": true, "да, это он": true, "да, это она": true,
 }
 
+var rejectWords = map[string]bool{
+	"нет": true, "не он": true, "не она": true, "нет, не он": true, "нет, не она": true, "неа": true, "нет не он": true, "нет не она": true,
+}
+
+// keycapDigits — «2️⃣» → «2».
+var keycapRepl = strings.NewReplacer("\uFE0F", "", "\u20E3", "")
+
 func cleanAnswer(text string) string {
-	low := strings.ToLower(strings.TrimSpace(text))
+	low := strings.ToLower(strings.TrimSpace(keycapRepl.Replace(text)))
 	low = strings.Trim(low, ".,!)👍✅ \t")
 	return strings.Join(strings.Fields(low), " ")
 }
 
+func answerTokens(low string) []string {
+	return strings.FieldsFunc(low, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' })
+}
+
+func hasNegation(tokens []string) bool {
+	for _, t := range tokens {
+		switch t {
+		case "не", "нет", "неа", "ни", "нету":
+			return true
+		}
+	}
+	return false
+}
+
 // parseCmfAnswer — разбор ответа правилами. confident=false — правила не
-// уверены (длинная фраза, вопрос, незнакомое слово): пусть решит ИИ.
-func parseCmfAnswer(text string, cands []cmf.ClientInfo) (ans cmfAnswer, confident bool) {
+// уверены (фраза, вопрос, отрицание, незнакомое слово): пусть решит ИИ, а без
+// ИИ — переспросим, но НИЧЕГО не привяжем. caption — имя плательщика с чека:
+// повторить его — не значит выбрать вариант.
+func parseCmfAnswer(text, caption string, cands []cmf.ClientInfo) (ans cmfAnswer, confident bool) {
 	low := cleanAnswer(text)
 	if low == "" {
 		return cmfAnswer{Kind: ansOther}, true
@@ -85,87 +138,125 @@ func parseCmfAnswer(text string, cands []cmf.ClientInfo) (ans cmfAnswer, confide
 	if strings.Contains(text, "?") {
 		return cmfAnswer{Kind: ansOther}, false
 	}
-	for _, m := range notInProgramMarks {
-		if strings.Contains(low, m) {
-			return cmfAnswer{Kind: ansNotInProgram}, true
+	toks := answerTokens(low)
+	hasDigit := strings.IndexFunc(low, unicode.IsDigit) >= 0
+	// «нет в программе».
+	if notInProgramWhole[low] {
+		return cmfAnswer{Kind: ansNotInProgram}, true
+	}
+	for _, m := range notInProgramStrong {
+		if !strings.Contains(low, m) {
+			continue
 		}
+		if hasDigit || len(toks) > 6 {
+			return cmfAnswer{Kind: ansOther}, false
+		}
+		for _, t := range toks {
+			if !fillerWords[t] && len([]rune(t)) >= 3 && !strings.Contains(m, t) {
+				return cmfAnswer{Kind: ansOther}, false // рядом названо что-то ещё (ФИО?) — пусть решит ИИ
+			}
+		}
+		return cmfAnswer{Kind: ansNotInProgram}, true
 	}
 	if isUnknownReply(low) {
 		return cmfAnswer{Kind: ansUnknown}, true
-	}
-	// Номер варианта: «2», «№2», «второй», «2-й».
-	if len(cands) > 0 {
-		w := strings.TrimPrefix(strings.TrimPrefix(low, "№"), "номер ")
-		w = strings.TrimSpace(w)
-		if n, err := strconv.Atoi(w); err == nil && n >= 1 && n <= len(cands) {
-			return cmfAnswer{Kind: ansPick, Pick: n - 1}, true
-		}
-		if n, ok := ordinalWords[w]; ok && n <= len(cands) {
-			return cmfAnswer{Kind: ansPick, Pick: n - 1}, true
-		}
 	}
 	if len(cands) == 1 {
 		if yesWords[low] {
 			return cmfAnswer{Kind: ansPick, Pick: 0}, true
 		}
-		if low == "нет" || low == "не он" || low == "не она" || low == "нет, не он" || low == "нет, не она" {
+		if rejectWords[low] {
 			return cmfAnswer{Kind: ansReject}, true
 		}
 	}
-	// Голые цифры/сумма — это не ФИО (а номер вне списка — тоже не ответ).
+	// Номер варианта: «2», «№2», «второй», «2-й», «второй вариант», «вторая марха».
+	if len(cands) > 0 {
+		w := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(low, "№"), "номер "))
+		if n, err := strconv.Atoi(w); err == nil {
+			if n >= 1 && n <= len(cands) {
+				return cmfAnswer{Kind: ansPick, Pick: n - 1}, true
+			}
+			return cmfAnswer{Kind: ansOther}, true
+		}
+		if len(toks) > 0 {
+			if n, ok := ordinalWords[toks[0]]; ok && n <= len(cands) {
+				rest := toks[1:]
+				okRest := true
+				var named []string
+				for _, t := range rest {
+					switch t {
+					case "вариант", "номер", "это", "он", "она":
+					default:
+						named = append(named, t)
+					}
+				}
+				if len(named) > 0 {
+					idx := matchCandidates(strings.Join(named, " "), cands)
+					okRest = false
+					for _, k := range idx {
+						if k == n-1 {
+							okRest = true
+						}
+					}
+				}
+				if okRest {
+					return cmfAnswer{Kind: ansPick, Pick: n - 1}, true
+				}
+				return cmfAnswer{Kind: ansOther}, false
+			}
+		}
+	}
+	// Голые цифры/сумма — это не ФИО.
 	if strings.IndexFunc(low, unicode.IsLetter) < 0 {
 		return cmfAnswer{Kind: ansOther}, true
 	}
-	// Короткий ответ словами одного из вариантов, как угодно написанный
-	// («сайдаевой», «мусиева марха») — выбор этого варианта.
-	if ws := strings.Fields(low); len(ws) <= 3 && strings.IndexFunc(low, unicode.IsDigit) < 0 {
+	// Отрицание («не Мусиева», «нет, это Альмурзаева») и фразы — решает ИИ.
+	if hasNegation(toks) {
+		return cmfAnswer{Kind: ansOther}, false
+	}
+	for _, t := range toks {
+		if unclearWords[t] {
+			return cmfAnswer{Kind: ansOther}, false
+		}
+	}
+	if hasDigit {
+		return cmfAnswer{Kind: ansOther}, false
+	}
+	// Повторили имя плательщика с чека («Марха») — это не выбор.
+	if caption != "" && nameCovers(low, caption) {
+		return cmfAnswer{Kind: ansOther}, false
+	}
+	// Короткий ответ словами одного из вариантов («сайдаевой», «мусиева марха»).
+	if len(toks) <= 3 {
 		if idx := matchCandidates(low, cands); len(idx) == 1 {
 			return cmfAnswer{Kind: ansPick, Pick: idx[0]}, true
+		} else if len(idx) > 1 {
+			return cmfAnswer{Kind: ansClient, Name: strings.TrimSpace(text), Among: idx}, true
 		}
 	}
 	name, amount, deferToAI := clarifyNameFromReply(text)
-	if deferToAI || amount > 0 {
+	if deferToAI || amount > 0 || name == "" {
 		return cmfAnswer{Kind: ansOther}, false
 	}
-	if name == "" {
-		// Одно незнакомое слово («давай», «Д1авала») — не уверены, что это имя.
-		return cmfAnswer{Kind: ansOther}, false
-	}
-	// Названо ФИО — сначала среди вариантов.
 	if idx := matchCandidates(name, cands); len(idx) == 1 {
 		return cmfAnswer{Kind: ansPick, Pick: idx[0]}, true
 	} else if len(idx) > 1 {
 		return cmfAnswer{Kind: ansClient, Name: name, Among: idx}, true
 	}
-	// Одно слово, которого нет среди вариантов (обычное имя/реплика) — не уверены.
-	if len(normWords(name)) < 2 {
+	// Одно слово (имя без фамилии, реплика) — не уверены.
+	if full, _ := nameParts(name); len(full) < 2 {
 		return cmfAnswer{Kind: ansClient, Name: name}, false
 	}
 	return cmfAnswer{Kind: ansClient, Name: name}, true
 }
 
-// matchCandidates — варианты, к которым подходит названное имя: все значимые
-// слова ответа нашлись в имени варианта («Сайдаева» → «Сайдаева Марха …»).
+// matchCandidates — варианты, которые покрывают названное имя (все слова
+// ответа есть в имени варианта, инициалы не спорят): «Сайдаева» → «Сайдаева
+// Марха …», «Альмурзаева Р.» → «Альмурзаева Разет …».
 func matchCandidates(name string, cands []cmf.ClientInfo) []int {
-	q := normWords(name)
-	if len(q) == 0 {
-		return nil
-	}
 	var out []int
 	for k, c := range cands {
-		cw := normWords(c.FullName)
-		hit := 0
-		used := make([]bool, len(cw))
-		for _, w := range q {
-			for x, v := range cw {
-				if !used[x] && nameWordSame(w, v) {
-					used[x] = true
-					hit++
-					break
-				}
-			}
-		}
-		if hit == len(q) {
+		if nameCovers(name, c.FullName) {
 			out = append(out, k)
 		}
 	}
@@ -178,8 +269,8 @@ func (b *Bot) cmfAnswerByAI(ctx context.Context, question, text string, cands []
 		return cmfAnswer{}, false
 	}
 	var list []string
-	for k, c := range cands {
-		list = append(list, fmt.Sprintf("%d. %s", k+1, c.FullName))
+	for k, l := range optionLabels(cands) {
+		list = append(list, fmt.Sprintf("%d. %s", k+1, l))
 	}
 	system := "Бот спросил в рабочей группе, за какого клиента программы рассрочек этот платёж по чеку. " +
 		"Сотрудник ответил. Пойми ответ по смыслу (бывают опечатки, сленг, чеченские слова, падежи). " +
@@ -187,8 +278,9 @@ func (b *Bot) cmfAnswerByAI(ctx context.Context, question, text string, cands []
 		"pick — выбрал вариант из списка (номером, именем, фамилией, «да/он» при одном варианте); " +
 		"client — назвал ФИО клиента (в т.ч. не из списка, например родственника, за которого платят); " +
 		"not_in_program — клиента нет в программе/новый клиент; unknown — не знает; " +
-		"other — это не ответ на вопрос (приветствие, отмашка, вопрос боту, болтовня). " +
-		"ФИО в ответе — это КЛИЕНТ, а не имя сотрудника."
+		"other — это не ответ на вопрос (приветствие, отмашка, вопрос боту, болтовня, «сейчас уточню»). " +
+		"ФИО в ответе — это КЛИЕНТ, а не имя сотрудника. Отрицание важно: «не Мусиева» — НЕ выбор Мусиевой; " +
+		"«нет такого, это Дудаева Разет» — client «Дудаева Разет». «никто из них» без ФИО — not_in_program."
 	user := "Вопрос бота: " + question + "\nВарианты:\n" + strings.Join(list, "\n") + "\nОтвет сотрудника: " + text
 	out, err := b.assistant.Complete(ctx, system, user)
 	if err != nil {
@@ -228,50 +320,25 @@ func (b *Bot) cmfAnswerByAI(ctx context.Context, question, text string, cands []
 
 // --- текст вопроса ---
 
-var surnameEndings = []string{"ова", "ева", "ёва", "ина", "ына", "ская", "цкая", "ов", "ев", "ёв", "ин", "ын", "ский", "цкий", "ая", "ий", "ой", "ко", "ук", "юк", "ян", "янц", "дзе", "швили"}
-
-// looksLikeSurname — слово похоже на фамилию (по окончанию).
-func looksLikeSurname(w string) bool {
-	r := []rune(w)
-	if len(r) < 5 {
-		return false
-	}
-	for _, e := range surnameEndings {
-		if strings.HasSuffix(w, e) {
-			return true
-		}
-	}
-	return false
-}
-
 // candInfo — вариант и то, чем он похож на имя с чека.
 type candInfo struct {
 	c         cmf.ClientInfo
-	matched   []string // слова имени с чека, найденные у варианта
-	surname   bool     // совпала фамилия (родственник/он сам)
-	fullMatch bool     // совпали все значимые слова
+	matched   int  // сколько слов имени с чека нашлось у варианта
+	surname   bool // совпала ФАМИЛИЯ варианта (первое слово в программе) — он сам или родственник
+	fullMatch bool // вариант покрывает всё имя с чека (и инициалы не спорят)
+	initialOK bool // инициалы с чека не противоречат варианту
 }
 
 func analyzeCands(query string, cands []cmf.ClientInfo) []candInfo {
-	q := normWords(query)
+	fq, iq := nameParts(query)
 	out := make([]candInfo, 0, len(cands))
 	for _, c := range cands {
-		cw := normWords(c.FullName)
-		used := make([]bool, len(cw))
-		ci := candInfo{c: c}
-		for _, w := range q {
-			for x, v := range cw {
-				if !used[x] && wordSimilar(w, v) {
-					used[x] = true
-					ci.matched = append(ci.matched, w)
-					if looksLikeSurname(w) {
-						ci.surname = true
-					}
-					break
-				}
-			}
-		}
-		ci.fullMatch = len(q) > 0 && len(ci.matched) == len(q)
+		fc, ic := nameParts(c.FullName)
+		score, _, uc := matchNameWords(fq, fc)
+		ci := candInfo{c: c, matched: score}
+		ci.surname = len(uc) > 0 && uc[0]
+		ci.initialOK = initialsAgree(iq, leftovers(fc, uc, ic))
+		ci.fullMatch = len(fq) > 0 && score == len(fq) && ci.initialOK
 		out = append(out, ci)
 	}
 	sort.SliceStable(out, func(a, b int) bool {
@@ -279,13 +346,19 @@ func analyzeCands(query string, cands []cmf.ClientInfo) []candInfo {
 		if x.fullMatch != y.fullMatch {
 			return x.fullMatch
 		}
-		if len(x.matched) != len(y.matched) {
-			return len(x.matched) > len(y.matched)
-		}
 		if x.surname != y.surname {
 			return x.surname
 		}
-		return x.c.FullName < y.c.FullName
+		if x.initialOK != y.initialOK {
+			return x.initialOK
+		}
+		if x.matched != y.matched {
+			return x.matched > y.matched
+		}
+		if x.c.FullName != y.c.FullName {
+			return x.c.FullName < y.c.FullName
+		}
+		return x.c.ID < y.c.ID
 	})
 	return out
 }
@@ -294,12 +367,42 @@ func rub0(v float64) string { return formatMoney(v) + " ₽" }
 
 const cmfAskMaxOptions = 5
 
+// optionLabels — как показать варианты: ФИО, а у одинаковых ФИО — хвост
+// телефона (или номер карточки), чтобы их можно было различить.
+func optionLabels(opts []cmf.ClientInfo) []string {
+	count := map[string]int{}
+	for _, c := range opts {
+		count[normCyr(c.FullName)]++
+	}
+	out := make([]string, len(opts))
+	for k, c := range opts {
+		out[k] = c.FullName
+		if count[normCyr(c.FullName)] > 1 {
+			digits := strings.Map(func(r rune) rune {
+				if r >= '0' && r <= '9' {
+					return r
+				}
+				return -1
+			}, c.Phone)
+			if len(digits) >= 4 {
+				out[k] += " (тел. …" + digits[len(digits)-4:] + ")"
+			} else {
+				out[k] += " (карточка " + c.ID + ")"
+			}
+		}
+	}
+	return out
+}
+
 // cmfAskText — вопрос в группу, когда клиента по чеку нельзя уверенно найти.
 // Возвращает текст и варианты в том порядке, в каком они перечислены.
 func cmfAskText(clientText string, amount float64, cands []cmf.ClientInfo) (string, []cmf.ClientInfo) {
 	head := fmt.Sprintf("🔎 Чек на %s («%s»)", rub0(amount), clientText)
+	if amount <= 0 {
+		head = fmt.Sprintf("🔎 «%s»", clientText)
+	}
 	if len(cands) == 0 {
-		return head + ": такого клиента в программе не нашла. За кого этот платёж? Ответьте на это сообщение ФИО клиента (или «нет в программе»).", nil
+		return head + ": такого клиента в программе не нашёл. За кого этот платёж? Ответьте на это сообщение ФИО клиента (или «нет в программе»).", nil
 	}
 	info := analyzeCands(clientText, cands)
 	if len(info) > cmfAskMaxOptions {
@@ -309,26 +412,29 @@ func cmfAskText(clientText string, amount float64, cands []cmf.ClientInfo) (stri
 	for k, ci := range info {
 		opts[k] = ci.c
 	}
-	allFull := true
-	anySurname := false
+	labels := optionLabels(opts)
+	allFull, anySurname, sameName := true, false, true
 	for _, ci := range info {
 		allFull = allFull && ci.fullMatch
 		anySurname = anySurname || ci.surname
+		sameName = sameName && normCyr(ci.c.FullName) == normCyr(info[0].c.FullName)
 	}
 	if len(info) == 1 {
 		ci := info[0]
 		switch {
 		case ci.fullMatch:
-			return head + fmt.Sprintf(": в программе похоже на «%s». Если это он(а) — ответьте «да»; если нет — напишите ФИО клиента.", ci.c.FullName), opts
+			return head + fmt.Sprintf(": в программе похоже на «%s». Если это он(а) — ответьте «да»; если нет — напишите ФИО клиента.", labels[0]), opts
 		case ci.surname:
-			return head + fmt.Sprintf(": такого клиента в программе нет, есть с той же фамилией — «%s». Платёж за него(неё)? Ответьте «да» или ФИО клиента.", ci.c.FullName), opts
+			return head + fmt.Sprintf(": такого клиента в программе нет, есть с той же фамилией — «%s». Платёж за него(неё)? Ответьте «да» или ФИО клиента.", labels[0]), opts
 		default:
-			return head + fmt.Sprintf(": такого клиента в программе нет (есть только тёзка — «%s»). За кого этот платёж? Ответьте ФИО клиента (или «да», если за неё/него).", ci.c.FullName), opts
+			return head + fmt.Sprintf(": такого клиента в программе нет (только похожее имя — «%s»). За кого этот платёж? Ответьте ФИО клиента (или «да», если за него/неё).", labels[0]), opts
 		}
 	}
 	var sb strings.Builder
 	sb.WriteString(head)
 	switch {
+	case allFull && sameName:
+		fmt.Fprintf(&sb, ": в программе %d карточки с таким ФИО:", len(info))
 	case allFull:
 		sb.WriteString(": в программе несколько подходящих клиентов:")
 	case anySurname:
@@ -337,7 +443,7 @@ func cmfAskText(clientText string, amount float64, cands []cmf.ClientInfo) (stri
 		sb.WriteString(": такого клиента в программе нет — совпадает только имя:")
 	}
 	for k, ci := range info {
-		fmt.Fprintf(&sb, "\n%d. %s", k+1, ci.c.FullName)
+		fmt.Fprintf(&sb, "\n%d. %s", k+1, labels[k])
 		if !allFull && ci.surname && !ci.fullMatch {
 			sb.WriteString(" (та же фамилия)")
 		}
@@ -370,6 +476,9 @@ type cmfAnswerPlan struct {
 }
 
 // planCmfAnswer — что делать с разобранным ответом (без побочных эффектов).
+// Привязываем, только если названное имя ДЕЙСТВИТЕЛЬНО покрывает ровно одного
+// клиента программы (все слова, инициалы); одно слово («Разет», «Магомед») —
+// только с подтверждением.
 func planCmfAnswer(ans cmfAnswer, cands []cmf.ClientInfo, lookup func(string) ([]cmf.ClientInfo, cmfMatchKind, error)) cmfAnswerPlan {
 	switch ans.Kind {
 	case ansPick:
@@ -396,24 +505,25 @@ func planCmfAnswer(ans cmfAnswer, cands []cmf.ClientInfo, lookup func(string) ([
 		if lookup == nil {
 			return cmfAnswerPlan{Action: actNone}
 		}
-		found, kind, err := lookup(ans.Name)
+		found, _, err := lookup(ans.Name)
 		if err != nil {
 			return cmfAnswerPlan{Action: actLookupError, Name: ans.Name, Err: err}
 		}
+		var covering []cmf.ClientInfo
+		for _, k := range matchCandidates(ans.Name, found) {
+			covering = append(covering, found[k])
+		}
+		full, initials := nameParts(ans.Name)
+		single := len(full) < 2 && len(initials) == 0
 		switch {
-		case (kind == cmfExact || kind == cmfStrong) && len(found) > 0:
-			return cmfAnswerPlan{Action: actBind, Client: found[0], Name: ans.Name}
-		case len(found) == 0:
-			return cmfAnswerPlan{Action: actNotFound, Name: ans.Name}
-		default:
-			if len(found) == 1 {
-				// Одно нечёткое совпадение на ФИО, которое человек сам назвал в ответ на
-				// вопрос — это он (опечатка/склонение), если совпали все слова.
-				if idx := matchCandidates(ans.Name, found); len(idx) == 1 {
-					return cmfAnswerPlan{Action: actBind, Client: found[0], Name: ans.Name}
-				}
-			}
+		case len(covering) == 1 && !single:
+			return cmfAnswerPlan{Action: actBind, Client: covering[0], Name: ans.Name}
+		case len(covering) >= 1:
+			return cmfAnswerPlan{Action: actAskAgain, Options: covering, Name: ans.Name}
+		case len(found) > 0 && !single:
 			return cmfAnswerPlan{Action: actAskAgain, Options: found, Name: ans.Name}
+		default:
+			return cmfAnswerPlan{Action: actNotFound, Name: ans.Name}
 		}
 	}
 	return cmfAnswerPlan{Action: actNone}
@@ -421,7 +531,16 @@ func planCmfAnswer(ans cmfAnswer, cands []cmf.ClientInfo, lookup func(string) ([
 
 // --- применение ---
 
-// cmfWatchByAsk — наблюдение, на вопрос по которому ответили свайпом.
+// answerMode — как пришёл ответ.
+type answerMode int
+
+const (
+	modeSwipe     answerMode = iota // свайп на сообщение бота по этому чеку
+	modeAddressed                   // свайп + обращение по имени («Джарвис, это …»)
+	modeContext                     // без свайпа, следом за вопросом
+)
+
+// cmfWatchByAsk — наблюдение, на сообщение бота по которому ответили свайпом.
 func (b *Bot) cmfWatchByAsk(ctx context.Context, quotedID string) (int, bool) {
 	if b.db == nil || quotedID == "" {
 		return 0, false
@@ -434,37 +553,90 @@ func (b *Bot) cmfWatchByAsk(ctx context.Context, quotedID string) (int, bool) {
 	return id, ok
 }
 
-// askCmfWatch задаёт вопрос «за кого платёж» ответом на сам чек и запоминает
-// его — и для ответа свайпом, и для ответа следом без свайпа.
-func (b *Bot) askCmfWatch(ctx context.Context, chat types.JID, watchID int, waMsgID, senderJID, text string, opts []cmf.ClientInfo) {
+// cmfSay — сообщение по чеку: ответом на сам чек, и свайп на него тоже
+// считается ответом по этому чеку.
+func (b *Bot) cmfSay(ctx context.Context, chat types.JID, w db.CmfWatchFull, text string) {
 	if b.groupSilent(chat) {
 		return
 	}
-	candJSON := ""
+	id := b.sendReply(chat, text, w.WaMessageID, w.SenderJID)
+	if id == "" {
+		return
+	}
+	if err := b.db.SetCmfWatchAsk(ctx, w.ID, id); err != nil {
+		fmt.Println("cmf: не сохранил сообщение по чеку:", err)
+	}
+}
+
+// cmfFollowUp — переспрос по чеку: ответить можно свайпом, а если просили
+// ФИО — и просто следом (недолго).
+func (b *Bot) cmfFollowUp(ctx context.Context, chat types.JID, w db.CmfWatchFull, text string, wantName bool) {
+	if b.groupSilent(chat) {
+		return
+	}
+	b.cmfSay(ctx, chat, w, text)
+	b.setOpenAskIfLatest(chat.String(), openAsk{kind: "cmf_watch", watchID: w.ID, wantName: wantName})
+}
+
+// askCmfWatch задаёт вопрос «за кого платёж» ответом на сам чек и запоминает
+// его — и для ответа свайпом, и для ответа следом без свайпа.
+func (b *Bot) askCmfWatch(ctx context.Context, chat types.JID, watchID int, waMsgID, senderJID, text string, opts []cmf.ClientInfo) {
 	if len(opts) > 0 {
 		if j, err := json.Marshal(opts); err == nil {
-			candJSON = string(j)
+			_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", string(j), "")
 		}
 	}
-	if candJSON != "" {
-		_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", candJSON, "")
+	if b.groupSilent(chat) {
+		return
 	}
 	askID := b.sendReply(chat, text, waMsgID, senderJID)
 	if askID == "" {
 		return
 	}
 	if err := b.db.SetCmfWatchAsk(ctx, watchID, askID); err != nil {
-		fmt.Println("cmf: не сохранила вопрос:", err)
+		fmt.Println("cmf: не сохранил вопрос:", err)
 	}
 	b.setOpenAsk(chat.String(), openAsk{kind: "cmf_watch", watchID: watchID})
 }
 
-// applyCmfWatchAnswer применяет ответ на вопрос «за кого платёж». swipe —
-// ответили свайпом на вопрос (тогда понимаем любой ответ, в т.ч. ИИ); без
-// свайпа принимаем только бесспорное (номер/вариант/«нет в программе»), чтобы
-// не перехватить обычное сообщение-имя перед новым чеком. Возвращает true,
-// если сообщение — ответ и обработано.
-func (b *Bot) applyCmfWatchAnswer(ctx context.Context, chat types.JID, watchID int, text string, swipe bool) bool {
+func sameOptionIDs(a, b []cmf.ClientInfo) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ids := map[string]int{}
+	for _, c := range a {
+		ids[c.ID]++
+	}
+	for _, c := range b {
+		ids[c.ID]--
+	}
+	for _, v := range ids {
+		if v != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func (b *Bot) cmfLookupFunc(ctx context.Context) func(string) ([]cmf.ClientInfo, cmfMatchKind, error) {
+	if b.cmf == nil {
+		return nil
+	}
+	return func(name string) ([]cmf.ClientInfo, cmfMatchKind, error) {
+		return b.cmfLookupWithTypos(ctx, name)
+	}
+}
+
+// applyCmfWatchAnswer применяет ответ на вопрос «за кого платёж». Возвращает
+// true, если сообщение обработано как ответ.
+//   - свайп: понимаем любой ответ (неясное — ИИ); если ИИ решил, что это не
+//     ответ, а разговор, — отдаём ассистенту; без ИИ переспрашиваем, НИЧЕГО не
+//     привязывая;
+//   - свайп с обращением по имени: только понятный ответ, остальное — ассистенту;
+//   - без свайпа: только бесспорное (номер, вариант целиком, «нет в программе»,
+//     а сразу после просьбы «напишите ФИО» — ФИО), чтобы не перехватить имя
+//     перед новым чеком или новый платёж.
+func (b *Bot) applyCmfWatchAnswer(ctx context.Context, chat types.JID, watchID int, text string, mode answerMode, wantName bool) bool {
 	w, ok, err := b.db.CmfWatchByID(ctx, watchID)
 	if err != nil || !ok {
 		return false
@@ -473,55 +645,89 @@ func (b *Bot) applyCmfWatchAnswer(ctx context.Context, chat types.JID, watchID i
 	if w.Candidates != "" {
 		_ = json.Unmarshal([]byte(w.Candidates), &cands)
 	}
-	ans, confident := parseCmfAnswer(text, cands)
-	if !swipe {
-		// Без свайпа — только бесспорное.
-		if !confident || !(ans.Kind == ansPick || ans.Kind == ansNotInProgram) {
-			return false
-		}
-		if ans.Kind == ansPick && len(cands) > 1 && !isPickToken(text) && len(matchCandidates(text, cands)) != 1 {
-			return false
-		}
-	} else if !confident {
+	ans, confident := parseCmfAnswer(text, w.ClientText, cands)
+	aiUsed := false
+	if !confident && mode != modeContext {
 		question, _ := cmfAskText(w.ClientText, w.Amount, cands)
 		if a, ok := b.cmfAnswerByAI(ctx, question, text, cands); ok {
-			ans = a
+			ans, confident, aiUsed = a, true, true
 		}
 	}
-	var lookup func(string) ([]cmf.ClientInfo, cmfMatchKind, error)
-	if b.cmf != nil {
-		lookup = func(name string) ([]cmf.ClientInfo, cmfMatchKind, error) {
-			return b.cmfLookupWithTypos(ctx, name)
+	switch mode {
+	case modeContext:
+		if !confident {
+			return false
+		}
+		switch ans.Kind {
+		case ansPick:
+			low := cleanAnswer(text)
+			if yesWords[low] || !(isPickToken(text) || len(matchCandidates(text, cands)) == 1) {
+				return false
+			}
+		case ansNotInProgram:
+		case ansClient:
+			full, _ := nameParts(text)
+			if !wantName || len(ans.Among) > 0 || len(full) < 2 || parser.ExtractAmount(text) > 0 {
+				return false
+			}
+		default:
+			return false
+		}
+	case modeAddressed:
+		if !confident || ans.Kind == ansOther {
+			return false
+		}
+	default: // modeSwipe
+		if !confident {
+			b.cmfFollowUp(ctx, chat, w, "Не понял ответ — напишите номер варианта или ФИО клиента (или «нет в программе»).", true)
+			return true
+		}
+		if ans.Kind == ansOther {
+			if aiUsed {
+				return false // это не ответ, а разговор — пусть ответит ассистент
+			}
+			hint := "Напишите ФИО клиента, за кого этот платёж (или «нет в программе»)."
+			if len(cands) > 1 {
+				hint = fmt.Sprintf("Нет такого варианта — ответьте номером от 1 до %d или ФИО клиента.", len(cands))
+			}
+			b.cmfFollowUp(ctx, chat, w, hint, true)
+			return true
 		}
 	}
-	plan := planCmfAnswer(ans, cands, lookup)
+	if w.Status == "found" {
+		b.cmfSay(ctx, chat, w, "Этот платёж уже найден в программе — менять не стал.")
+		return true
+	}
+	plan := planCmfAnswer(ans, cands, b.cmfLookupFunc(ctx))
 	switch plan.Action {
 	case actNone:
 		return false
 	case actBind:
-		b.bindCmfWatch(ctx, chat, w, plan.Client)
+		b.bindCmfWatch(ctx, chat, w, plan.Client, true)
 	case actAskAgain:
+		if sameOptionIDs(plan.Options, cands) {
+			b.cmfFollowUp(ctx, chat, w, "Под это ФИО подходит не один вариант — ответьте номером из списка.", false)
+			break
+		}
 		q, opts := cmfAskText(plan.Name, w.Amount, plan.Options)
 		b.askCmfWatch(ctx, chat, w.ID, w.WaMessageID, w.SenderJID, q, opts)
 	case actNotFound:
-		b.sendText(chat, fmt.Sprintf("Клиента «%s» в программе не нашла — проверьте, как он записан там, и ответьте ещё раз (или «нет в программе»).", plan.Name))
-		b.setOpenAsk(chat.String(), openAsk{kind: "cmf_watch", watchID: w.ID})
+		b.cmfFollowUp(ctx, chat, w, fmt.Sprintf("Клиента «%s» в программе не нашёл — проверьте, как он записан там, и ответьте ещё раз (или «нет в программе»).", plan.Name), true)
 	case actNotInProgram:
-		_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "unmatched")
-		b.clearOpenAsk(chat.String())
+		b.unbindToUnmatched(ctx, w)
+		b.clearOpenAskFor(chat.String(), w.ID)
 		msg := "Понял, клиента нет в программе — по этому чеку напоминать не буду."
 		if branch, _ := b.db.SettingGet(ctx, settingUnmatchedBranch); branch != "" {
-			msg += " Отнесла к точке «" + branch + "»."
+			msg += " Отнёс к точке «" + branch + "»."
 		}
-		b.sendText(chat, msg)
+		b.cmfSay(ctx, chat, w, msg)
 	case actUnknown:
-		b.clearOpenAsk(chat.String())
-		b.sendText(chat, "Хорошо, оставлю пока без клиента.")
+		b.clearOpenAskFor(chat.String(), w.ID)
+		b.cmfSay(ctx, chat, w, "Хорошо, оставлю пока без клиента.")
 	case actReject:
-		b.sendText(chat, "Тогда напишите ФИО клиента, за кого этот платёж.")
-		b.setOpenAsk(chat.String(), openAsk{kind: "cmf_watch", watchID: w.ID})
+		b.cmfFollowUp(ctx, chat, w, "Тогда напишите ФИО клиента, за кого этот платёж.", true)
 	case actLookupError:
-		b.sendText(chat, "Не смогла проверить в программе: "+cmf.Human(plan.Err)+". Ответьте ещё раз чуть позже.")
+		b.cmfFollowUp(ctx, chat, w, "Не смог проверить в программе: "+cmf.Human(plan.Err)+". Ответьте ещё раз чуть позже.", false)
 	}
 	return true
 }
@@ -532,16 +738,42 @@ func isPickToken(text string) bool {
 	if _, err := strconv.Atoi(low); err == nil {
 		return true
 	}
-	_, ok := ordinalWords[low]
-	return ok
+	toks := answerTokens(low)
+	if len(toks) == 0 {
+		return false
+	}
+	_, ok := ordinalWords[toks[0]]
+	return ok && (len(toks) == 1 || (len(toks) == 2 && toks[1] == "вариант"))
+}
+
+// unbindToUnmatched — «клиента нет в программе»: если чек уже был привязан,
+// откатываем привязку (клиент чека — снова плательщик с подписи, связь
+// «плательщик → клиент» забываем).
+func (b *Bot) unbindToUnmatched(ctx context.Context, w db.CmfWatchFull) {
+	_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "unmatched")
+	if w.ClientID == "" {
+		return
+	}
+	if pc, ok := b.payerClient(ctx, w.ClientText); ok && pc.ID == w.ClientID {
+		b.forgetPayer(ctx, w.ClientText)
+	}
+	if w.WaMessageID != "" && w.ClientText != "" {
+		canonical, _ := b.aliases.ResolveName(w.ClientText)
+		var cidPtr *int
+		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			cidPtr = &cid
+		}
+		_, _ = b.db.SetReceiptClientByMessage(ctx, w.WaMessageID, canonical, cidPtr)
+	}
 }
 
 // bindCmfWatch привязывает чек к клиенту программы: сверка ждёт его платёж,
 // в учёте чек записывается на этого клиента, а связь «плательщик с чека →
-// клиент» запоминается на будущее.
-func (b *Bot) bindCmfWatch(ctx context.Context, chat types.JID, w db.CmfWatchFull, c cmf.ClientInfo) {
+// клиент» запоминается — только для настоящего плательщика (ФИО из 2+ слов,
+// не сам клиент) и только если она не спорит с прежней.
+func (b *Bot) bindCmfWatch(ctx context.Context, chat types.JID, w db.CmfWatchFull, c cmf.ClientInfo, announce bool) {
 	_ = b.db.UpdateCmfWatch(ctx, w.ID, "", c.ID, c.FullName, "", "watch")
-	b.clearOpenAsk(chat.String())
+	b.clearOpenAskFor(chat.String(), w.ID)
 	if w.WaMessageID != "" {
 		canonical, _ := b.aliases.ResolveName(c.FullName)
 		var cidPtr *int
@@ -549,19 +781,34 @@ func (b *Bot) bindCmfWatch(ctx context.Context, chat types.JID, w db.CmfWatchFul
 			cidPtr = &cid
 		}
 		if _, err := b.db.SetReceiptClientByMessage(ctx, w.WaMessageID, canonical, cidPtr); err != nil {
-			fmt.Println("cmf: не записала клиента чеку:", err)
+			fmt.Println("cmf: не записал клиента чеку:", err)
 		}
 	}
-	remembered := false
-	if w.ClientText != "" && !sameClientName(w.ClientText, c.FullName) {
-		remembered = b.rememberPayer(ctx, w.ClientText, c)
+	note := ""
+	if w.ClientText != "" {
+		prev, had := b.payerClient(ctx, w.ClientText)
+		switch {
+		case nameCovers(w.ClientText, c.FullName):
+			// Подпись — это сам клиент: никакой связи «плательщик → клиент».
+			if had {
+				b.forgetPayer(ctx, w.ClientText)
+			}
+		case !payerEligible(w.ClientText):
+			// «Марха» / «Альмурзаева» — это сокращённое имя, а не плательщик.
+		case had && prev.ID != c.ID:
+			// Платит за разных людей — больше не угадываем, будем спрашивать.
+			b.forgetPayer(ctx, w.ClientText)
+		case had:
+		default:
+			if b.rememberPayer(ctx, w.ClientText, c) {
+				note = fmt.Sprintf(" Запомнил: «%s» платит за этого клиента.", w.ClientText)
+			}
+		}
 	}
-	msg := fmt.Sprintf("✅ Понял: чек на %s — оплата за «%s». Слежу, чтобы внесли в программу.", rub0(w.Amount), c.FullName)
-	if remembered {
-		msg += fmt.Sprintf(" Запомнила: «%s» платит за этого клиента.", w.ClientText)
+	if announce {
+		b.cmfSay(ctx, chat, w, fmt.Sprintf("✅ Понял: чек на %s — оплата за «%s». Слежу, чтобы внесли в программу.%s", rub0(w.Amount), c.FullName, note))
 	}
-	b.sendText(chat, msg)
-	fmt.Printf("cmf: чек %d на %.0f ₽ привязан к клиенту %s по ответу в группе\n", w.ID, w.Amount, c.FullName)
+	fmt.Printf("cmf: чек %d на %.0f ₽ привязан к клиенту %s\n", w.ID, w.Amount, c.FullName)
 }
 
 // --- «плательщик → клиент» ---
@@ -569,9 +816,16 @@ func (b *Bot) bindCmfWatch(ctx context.Context, chat types.JID, w db.CmfWatchFul
 type payerRec struct {
 	ID   string `json:"id"`
 	Name string `json:"name"`
+	Raw  string `json:"raw,omitempty"` // подпись плательщика как есть (с дефисами)
 }
 
 func payerKey(name string) string { return normCyr(name) }
+
+// payerEligible — запоминать можно только плательщика с ФИО из 2+ слов.
+func payerEligible(payer string) bool {
+	full, _ := nameParts(payer)
+	return len(full) >= 2
+}
 
 func (b *Bot) loadPayerMap(ctx context.Context) map[string]payerRec {
 	m := map[string]payerRec{}
@@ -584,17 +838,7 @@ func (b *Bot) loadPayerMap(ctx context.Context) map[string]payerRec {
 	return m
 }
 
-// rememberPayer — запоминает, что плательщик с чека платит за клиента c.
-func (b *Bot) rememberPayer(ctx context.Context, payer string, c cmf.ClientInfo) bool {
-	k := payerKey(payer)
-	if k == "" || c.ID == "" {
-		return false
-	}
-	m := b.loadPayerMap(ctx)
-	m[k] = payerRec{ID: c.ID, Name: c.FullName}
-	if len(m) > 1000 {
-		return false // разрослось — не копим бесконечно
-	}
+func (b *Bot) savePayerMap(ctx context.Context, m map[string]payerRec) bool {
 	j, err := json.Marshal(m)
 	if err != nil {
 		return false
@@ -602,23 +846,78 @@ func (b *Bot) rememberPayer(ctx context.Context, payer string, c cmf.ClientInfo)
 	return b.db.SettingSet(ctx, settingPayerMap, string(j)) == nil
 }
 
-// payerClient — клиент, за которого обычно платит этот плательщик (если запомнен).
+// rememberPayer — запоминает, что плательщик с чека платит за клиента c.
+func (b *Bot) rememberPayer(ctx context.Context, payer string, c cmf.ClientInfo) bool {
+	k := payerKey(payer)
+	if k == "" || c.ID == "" || !payerEligible(payer) {
+		return false
+	}
+	b.payerMu.Lock()
+	defer b.payerMu.Unlock()
+	m := b.loadPayerMap(ctx)
+	if _, exists := m[k]; !exists && len(m) >= 1000 {
+		return false // разрослось — не копим бесконечно
+	}
+	m[k] = payerRec{ID: c.ID, Name: c.FullName, Raw: strings.TrimSpace(payer)}
+	return b.savePayerMap(ctx, m)
+}
+
+// forgetPayer — забыть плательщика (и записи, которые с ним совпадают).
+func (b *Bot) forgetPayer(ctx context.Context, payer string) {
+	b.payerMu.Lock()
+	defer b.payerMu.Unlock()
+	m := b.loadPayerMap(ctx)
+	changed := false
+	for k, r := range m {
+		raw := r.Raw
+		if raw == "" {
+			raw = k
+		}
+		if k == payerKey(payer) || sameClientName(raw, payer) {
+			delete(m, k)
+			changed = true
+		}
+	}
+	if changed {
+		b.savePayerMap(ctx, m)
+	}
+}
+
+// payerClient — клиент, за которого платит этот плательщик (если запомнен и
+// однозначен: две подходящие записи на разных клиентов — не угадываем).
 func (b *Bot) payerClient(ctx context.Context, payer string) (cmf.ClientInfo, bool) {
+	if !payerEligible(payer) {
+		return cmf.ClientInfo{}, false
+	}
 	m := b.loadPayerMap(ctx)
 	if r, ok := m[payerKey(payer)]; ok && r.ID != "" {
 		return cmf.ClientInfo{ID: r.ID, FullName: r.Name}, true
 	}
+	var hit *payerRec
 	for k, r := range m {
-		if r.ID != "" && sameClientName(k, payer) {
-			return cmf.ClientInfo{ID: r.ID, FullName: r.Name}, true
+		raw := r.Raw
+		if raw == "" {
+			raw = k
 		}
+		if r.ID == "" || !payerEligible(raw) || !sameClientName(raw, payer) {
+			continue
+		}
+		if hit != nil && hit.ID != r.ID {
+			return cmf.ClientInfo{}, false
+		}
+		rr := r
+		hit = &rr
 	}
-	return cmf.ClientInfo{}, false
+	if hit == nil {
+		return cmf.ClientInfo{}, false
+	}
+	return cmf.ClientInfo{ID: hit.ID, FullName: hit.Name}, true
 }
 
-// cmfReplyAnswer — ответ свайпом на сообщение бота: если это его вопрос «за кого
-// платёж», применяет ответ. Вызывается до маршрутизации реплая в ассистента.
-func (b *Bot) cmfReplyAnswer(ctx context.Context, msg *events.Message, text string) bool {
+// cmfReplyAnswer — свайп на сообщение бота по чеку («за кого платёж?», переспрос,
+// «как в прошлый раз»): применяет ответ. Вызывается до маршрутизации реплая в
+// ассистента.
+func (b *Bot) cmfReplyAnswer(ctx context.Context, msg *events.Message, text string, mode answerMode) bool {
 	quotedID := extractQuotedStanzaID(msg)
 	if quotedID == "" {
 		return false
@@ -627,5 +926,29 @@ func (b *Bot) cmfReplyAnswer(ctx context.Context, msg *events.Message, text stri
 	if !ok {
 		return false
 	}
-	return b.applyCmfWatchAnswer(ctx, msg.Info.Chat, watchID, text, true)
+	return b.applyCmfWatchAnswer(ctx, msg.Info.Chat, watchID, text, mode, false)
+}
+
+// reresolveWatchByCheck — свайп с ФИО на САМ чек: клиент чека поменялся —
+// сверка тоже должна следить за новым клиентом.
+func (b *Bot) reresolveWatchByCheck(ctx context.Context, chat types.JID, checkWaID, name string) bool {
+	if b.cmf == nil || b.db == nil {
+		return false
+	}
+	wid, ok, err := b.db.CmfWatchByCheckMessage(ctx, checkWaID)
+	if err != nil || !ok {
+		return false
+	}
+	w, ok, err := b.db.CmfWatchByID(ctx, wid)
+	if err != nil || !ok || w.Status == "found" {
+		return ok
+	}
+	if w.ClientID != "" {
+		if pc, had := b.payerClient(ctx, w.ClientText); had && pc.ID == w.ClientID && !nameCovers(name, pc.FullName) {
+			b.forgetPayer(ctx, w.ClientText) // «как в прошлый раз» оказалось не так
+		}
+	}
+	_ = b.db.UpdateCmfWatch(ctx, wid, name, "", "", "", "lookup")
+	go b.cmfResolveWatch(context.Background(), wid, chat, name, w.Amount)
+	return true
 }

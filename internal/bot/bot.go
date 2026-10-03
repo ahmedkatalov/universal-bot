@@ -56,6 +56,7 @@ type Bot struct {
 	reportAdmins  map[string]bool                                    // номера, которым доступны отчёты/суммы; остальным — вежливый отказ
 	botName       string                                             // обращение в группах: "Джарвис скинь отчет"
 	sendHook      func(chat types.JID, text, quotedID string) string // только для тестов: перехват отправки
+	payerMu       sync.Mutex                                         // запись карты «плательщик → клиент»
 	fontDir       string
 	reportDir     string
 
@@ -559,13 +560,20 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// Если владелец обращается к боту по имени («Джарвис, …») — это диалог с
 		// ассистентом, даже если сообщение — ответ на вопрос бота. Иначе фраза
 		// вроде «Джарвис, покажи этот чек» ушла бы в клариф как «имя клиента».
-		if _, addressed := b.stripBotName(text); !addressed {
+		// Исключение — свайп на вопрос сверки «за кого платёж» с понятным ответом
+		// («Джарвис, это Альмурзаева Разет»): его понимает код, по ЭТОМУ чеку.
+		if stripped, addressed := b.stripBotName(text); addressed {
+			if b.cmfReplyAnswer(ctx, msg, stripped, modeAddressed) {
+				return
+			}
+		} else {
 			if b.handleClarifyReply(ctx, msg, text) {
 				return
 			}
 			// Ответ БЕЗ свайпа на последний вопрос бота в этой группе («10000р»
-			// под вопросом «какая сумма?») — понимаем по контексту.
-			if b.tryContextAnswer(ctx, msg.Info.Chat, text) {
+			// под вопросом «какая сумма?») — понимаем по контексту. Свайп на
+			// другое сообщение — это ответ НА НЕГО, а не на последний вопрос.
+			if extractQuotedStanzaID(msg) == "" && b.tryContextAnswer(ctx, msg.Info.Chat, text) {
 				return
 			}
 		}
@@ -713,7 +721,8 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Проактивное участие в разговоре: бот сам решает, когда вставить полезную
 	// реплику (в фоне). Пропускаем сообщения-платежи (это записи, не беседа) —
 	// по ним отвечать незачем.
-	if !hasMedia && b.assistant != nil && !routedToAI && len(result.Transactions) == 0 &&
+	_, openAskNow := b.recentOpenAsk(msg.Info.Chat.String())
+	if !hasMedia && b.assistant != nil && !routedToAI && len(result.Transactions) == 0 && !openAskNow &&
 		proactiveChatEnabled() && worthChimingIn(text) {
 		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
 	}
@@ -1182,7 +1191,7 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 	}
 	tools = append(tools, b.cmfConnectionTool()) // проверка связи — всегда (и «не подключена» честно)
 	if b.cmf != nil {
-		tools = append(tools, b.cmfStatusTool(), b.cmfAddPaymentTool(), b.cmfResolveTool(), b.cmfBranchTool())
+		tools = append(tools, b.cmfStatusTool(), b.cmfAddPaymentTool(), b.cmfResolveTool(chat), b.cmfBranchTool())
 	}
 	if !inGroup {
 		tools = append(tools, b.savePendingTool(chat))
@@ -1328,7 +1337,9 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
 	if err != nil {
 		fmt.Println("Ошибка ответа ассистента в группе:", err) // детали — в лог
-		b.sendText(chat, ai.UserMessage(err))                  // в чат — чистое сообщение
+		if isAdmin {
+			b.sendText(chat, ai.UserMessage(err)) // владельцу — чистое сообщение; сотрудникам группу не засоряем
+		}
 		return
 	}
 
@@ -1353,11 +1364,19 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 // («[молчу]» — на отмашку или непонятную реплику ответ не нужен).
 func assistantOutgoing(reply string) string {
 	r := strings.TrimSpace(reply)
-	if bare := strings.ToLower(strings.Trim(r, ".!…[] ")); bare == "" || bare == "молчу" {
+	if bare := strings.ToLower(strings.Trim(r, ".!…[]() ")); bare == "" || bare == "молчу" {
 		return ""
 	}
-	r = strings.TrimSpace(strings.ReplaceAll(r, "[молчу]", ""))
-	return r
+	low := strings.ToLower(r)
+	for {
+		i := strings.Index(low, "[молчу]")
+		if i < 0 {
+			break
+		}
+		r = r[:i] + r[i+len("[молчу]"):]
+		low = low[:i] + low[i+len("[молчу]"):]
+	}
+	return strings.TrimSpace(r)
 }
 
 // joinedGroups возвращает список групп бота (JID -> название) с кэшем на
@@ -1606,9 +1625,10 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 const talkRules = "\n\nКАК ОБРАЩАТЬСЯ К ЛЮДЯМ. Имя собеседника — ТОЛЬКО то, что стоит перед двоеточием в его сообщении (имя в WhatsApp). " +
 	"ФИО внутри текста сообщения — это почти всегда КЛИЕНТ, о котором речь (чей чек, за кого платёж), а НЕ имя собеседника: " +
 	"никогда не обращайся к человеку по имени из текста и не принимай голое ФИО за знакомство. " +
-	"Если человек отвечает на ТВОЁ сообщение (в контексте есть «отвечает на сообщение: «…»») — это ответ по делу на твой вопрос, а не новая беседа: " +
-	"не здоровайся и не представляйся. Короткая реплика-отмашка («ок», «давай», «ладно», слово на чеченском или другом языке, которое ты не понял) " +
-	"не требует ответа — тогда ответь ровно [молчу], и ничего не отправится."
+	"Если человек отвечает на ТВОЁ сообщение (в контексте есть «отвечает на твоё сообщение: «…»») — это ответ по делу, а не новая беседа: " +
+	"не здоровайся и не представляйся. «Да/давай/ок» в ответ на ТВОЁ предложение — это согласие: сделай то, что предлагал. " +
+	"А реплика сотрудника, которая не обращена к тебе по делу (отмашка, слово на чеченском или другом языке без вопроса, которое ты не понял), " +
+	"ответа не требует — тогда ответь ровно [молчу], и ничего не отправится. Владельцу на прямой вопрос или просьбу так не отвечай никогда."
 
 func accessNote(isAdmin bool) string {
 	if isAdmin {

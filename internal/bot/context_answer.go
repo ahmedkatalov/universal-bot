@@ -39,6 +39,32 @@ func (b *Bot) recentOpenAsk(groupJID string) (openAsk, bool) {
 	return a, true
 }
 
+// cmfNameWindow — сколько после просьбы бота «напишите ФИО» голое ФИО без
+// свайпа считается ответом (дольше — это уже, скорее, имя перед новым чеком).
+const cmfNameWindow = 5 * time.Minute
+
+// setOpenAskIfLatest — запомнить вопрос, только если в группе нет более нового
+// (переспрос по старому чеку не должен перебивать свежий вопрос по другому).
+func (b *Bot) setOpenAskIfLatest(groupJID string, a openAsk) {
+	a.at = time.Now()
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	cur, ok := b.clarify.lastAsk[groupJID]
+	if ok && time.Since(cur.at) <= contextAnswerWindow && !(cur.kind == a.kind && cur.watchID == a.watchID) {
+		return
+	}
+	b.clarify.lastAsk[groupJID] = a
+}
+
+// clearOpenAskFor — снять открытый вопрос, только если он про это наблюдение.
+func (b *Bot) clearOpenAskFor(groupJID string, watchID int) {
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if cur, ok := b.clarify.lastAsk[groupJID]; ok && cur.kind == "cmf_watch" && cur.watchID == watchID {
+		delete(b.clarify.lastAsk, groupJID)
+	}
+}
+
 func (b *Bot) clearOpenAsk(groupJID string) {
 	b.clarify.mu.Lock()
 	delete(b.clarify.lastAsk, groupJID)
@@ -78,7 +104,8 @@ func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string)
 		return true
 
 	case "cmf_watch":
-		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, false)
+		wantName := a.wantName && time.Since(a.at) < cmfNameWindow
+		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, modeContext, wantName)
 
 	case "cash_collector":
 		if b.applyCashCollectorReply(ctx, chat, a.txID, text) {

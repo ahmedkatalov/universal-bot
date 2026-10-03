@@ -250,21 +250,46 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 	if best == 0 {
 		return nil, false
 	}
-	var top []cmf.ClientInfo
+	// Все похожие (лучшие — первыми): родственник с той же фамилией не должен
+	// теряться за тёзкой, совпавшим по имени и отчеству.
+	sort.Slice(all, func(i, j int) bool {
+		if all[i].s != all[j].s {
+			return all[i].s > all[j].s
+		}
+		if all[i].c.FullName != all[j].c.FullName {
+			return all[i].c.FullName < all[j].c.FullName
+		}
+		return all[i].c.ID < all[j].c.ID
+	})
+	if len(all) > 10 {
+		all = all[:10]
+	}
 	for _, sc := range all {
-		if sc.s == best {
-			top = append(top, sc.c)
+		clients = append(clients, sc.c)
+	}
+	// Уверенно — когда ровно ОДИН кандидат действительно покрывает имя: каждое
+	// слово совпало строго (склонение, гласная, пропущенная буква — да; другое
+	// имя/фамилия — нет), отчество не принято за фамилию, инициалы не спорят.
+	return clients, coveringUnique(name, clients) >= 0
+}
+
+// coveringUnique — индекс единственного кандидата, покрывающего имя (−1 — нет
+// такого или их несколько). Одно слово без инициалов не считается уверенным.
+func coveringUnique(name string, cands []cmf.ClientInfo) int {
+	full, initials := nameParts(name)
+	if len(full) == 0 || (len(full) < 2 && len(initials) == 0) {
+		return -1
+	}
+	hit := -1
+	for k, c := range cands {
+		if nameCovers(name, c.FullName) {
+			if hit >= 0 {
+				return -1
+			}
+			hit = k
 		}
 	}
-	sort.Slice(top, func(i, j int) bool {
-		if top[i].FullName != top[j].FullName {
-			return top[i].FullName < top[j].FullName
-		}
-		return top[i].ID < top[j].ID
-	})
-	// Уверенно — когда совпали ВСЕ значимые слова запроса и кандидат ровно один.
-	strong = len(top) == 1 && best == len(qWords)
-	return top, strong
+	return hit
 }
 
 // cmfLookupWithTypos ищет клиента с допуском на опечатки/склонения и сообщает
@@ -275,18 +300,33 @@ func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) ([]cmf.Client
 	if err != nil {
 		return nil, cmfNoMatch, err
 	}
-	if len(direct) == 1 {
-		return direct, cmfExact, nil
-	}
-	if len(direct) > 1 {
-		return direct, cmfWeak, nil // несколько прямых — неоднозначно, спросим
+	// Прямой поиск программы — по подстроке: «Магомед» находит и «Магомедова
+	// Патимат». Совпадением считаем, только если имя действительно покрывает
+	// клиента, и он такой один.
+	if k := coveringUnique(name, direct); k >= 0 {
+		return []cmf.ClientInfo{direct[k]}, cmfExact, nil
 	}
 	cands, strong := b.cmfFuzzyByWords(ctx, name)
+	for _, d := range direct { // прямые находки — тоже кандидаты
+		dup := false
+		for _, c := range cands {
+			if c.ID == d.ID {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			cands = append(cands, d)
+		}
+	}
 	switch {
 	case len(cands) == 0:
 		return nil, cmfNoMatch, nil
 	case strong:
-		return cands, cmfStrong, nil
+		if k := coveringUnique(name, cands); k >= 0 {
+			return []cmf.ClientInfo{cands[k]}, cmfStrong, nil
+		}
+		return cands, cmfWeak, nil
 	default:
 		return cands, cmfWeak, nil
 	}
