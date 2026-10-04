@@ -650,7 +650,11 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 			}
 		}
 		if !resolved {
-			b.sendText(msg.Info.Chat, "Ответьте, пожалуйста, «новый» (засчитать отдельно) или «тот же» (повтор, не считать).")
+			// Переспрос тоже связываем с этой наличкой: ответ свайпом на него сработает.
+			if id := b.sendTextReturnID(msg.Info.Chat, "Ответьте, пожалуйста, «новый» (засчитать отдельно) или «тот же» (повтор, не считать)."); id != "" {
+				b.registerDupAsk(id, dupTxID)
+				_ = b.db.MarkCashDupAsked(ctx, dupTxID, id)
+			}
 			return true // оставляем связь — можно ответить ещё раз на тот же вопрос
 		}
 		b.clarify.mu.Lock()

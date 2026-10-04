@@ -78,6 +78,10 @@ func newFlowBot(t *testing.T, clients []cmf.ClientInfo) *flowBot {
 	if err := d.SettingSet(context.Background(), settingPayerMap, ""); err != nil {
 		t.Fatal(err)
 	}
+	// История решений по плательщикам от прошлых прогонов — тоже не в счёт.
+	if err := d.TestResetCmfWatches(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	f := &flowBot{}
 	f.Bot = &Bot{db: d, aliases: parser.NewAliasMap(), cmf: fakeCMF(t, clients), botName: "Джарвис",
 		clarify: newClarifyState(), muted: map[string]bool{}}

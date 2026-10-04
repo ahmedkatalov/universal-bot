@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 
 	"whatsapp-bot/internal/ai"
 	"whatsapp-bot/internal/cmf"
+	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/parser"
 )
 
@@ -466,6 +468,7 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 	// Собираем неотмеченные по ГРУППЕ, чтобы послать ОДНО напоминание со списком
 	// клиентов, а не по сообщению на каждый чек (меньше шума, как просил владелец).
 	type rem struct {
+		id     int
 		client string
 		amount float64
 		date   time.Time
@@ -487,7 +490,7 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		if _, ok := byGroup[w.GroupJID]; !ok {
 			order = append(order, w.GroupJID)
 		}
-		byGroup[w.GroupJID] = append(byGroup[w.GroupJID], rem{w.ClientName, w.Amount, w.TxDate})
+		byGroup[w.GroupJID] = append(byGroup[w.GroupJID], rem{w.ID, w.ClientName, w.Amount, w.TxDate})
 	}
 
 	for _, gj := range order {
@@ -504,13 +507,23 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 			it := items[0]
 			fmt.Fprintf(&sb, "⏰ Занесите, пожалуйста, оплату в программу: чек от %s на %.0f ₽ — клиент %s (в рассрочке пока НЕ отмечен).",
 				it.date.Format("02.01"), it.amount, it.client)
+			// Ответом на сам чек и со связью: поправку («это не он») поймём по этому чеку.
+			if w, ok, err := b.db.CmfWatchByID(ctx, it.id); err == nil && ok {
+				b.cmfSay(ctx, jid, w, sb.String())
+				continue
+			}
 		} else {
 			sb.WriteString("⏰ Занесите, пожалуйста, оплаты этих клиентов в программу (чеки пришли, но в рассрочке пока НЕ отмечены):")
 			for _, it := range items {
 				fmt.Fprintf(&sb, "\n• %s — %.0f ₽ (чек %s)", it.client, it.amount, it.date.Format("02.01"))
 			}
 		}
-		b.sendText(jid, sb.String())
+		id := b.sendTextReturnID(jid, sb.String())
+		if id != "" && len(items) > 1 {
+			for _, it := range items {
+				_ = b.db.SetCmfWatchAsk(ctx, it.id, id, "")
+			}
+		}
 	}
 }
 
@@ -741,22 +754,26 @@ func (b *Bot) cmfResolveTool(chat types.JID) ai.Tool {
 		Description: "Указывает, какому клиенту программы относится чек из сверки. Вызывай, когда владелец отвечает " +
 			"на вопрос бота «за кого этот платёж» или говорит «этот чек — Ахмед Каталов Нажудович». " +
 			"Если владелец ответил свайпом — передай message_id из [Контекст ответа: … id сообщения …] (это вопрос бота или сам чек). " +
-			"watch_id — номер наблюдения из cmf_status (если ни его, ни message_id нет — последний неясный чек в ЭТОЙ группе). " +
+			"Без свайпа передай amount (сумму чека) и/или payer (подпись), если владелец их назвал: привяжу, только если такой неясный чек один. " +
 			"client_name — ФИО клиента как в программе.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"watch_id":    map[string]any{"type": "integer", "description": "Номер наблюдения (0 = по message_id или последний неясный в этой группе)"},
-				"message_id":  map[string]any{"type": "string", "description": "id сообщения, на которое ответили свайпом (вопрос бота или чек)"},
+				"watch_id":    map[string]any{"type": "integer", "description": "Номер наблюдения (0 = по message_id или по сумме/плательщику)"},
+				"message_id":  map[string]any{"type": "string", "description": "id сообщения, на которое ответили свайпом (вопрос бота, его подтверждение/напоминание или сам чек)"},
 				"client_name": map[string]any{"type": "string", "description": "ФИО клиента в программе"},
+				"amount":      map[string]any{"type": "number", "description": "Сумма чека, если владелец её назвал (чтобы найти нужный чек)"},
+				"payer":       map[string]any{"type": "string", "description": "Подпись/плательщик чека, если владелец его назвал"},
 			},
 			"required": []string{"client_name"},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
-				WatchID    int    `json:"watch_id"`
-				MessageID  string `json:"message_id"`
-				ClientName string `json:"client_name"`
+				WatchID    int     `json:"watch_id"`
+				MessageID  string  `json:"message_id"`
+				ClientName string  `json:"client_name"`
+				Amount     float64 `json:"amount"`
+				Payer      string  `json:"payer"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", err
@@ -765,28 +782,47 @@ func (b *Bot) cmfResolveTool(chat types.JID) ai.Tool {
 				return "", fmt.Errorf("интеграция с программой не настроена (CMF_API_URL/CMF_EMAIL/CMF_PASSWORD)")
 			}
 			watchID := args.WatchID
-			if watchID == 0 && strings.TrimSpace(args.MessageID) != "" {
-				mid := strings.TrimSpace(args.MessageID)
-				if id, ok, _ := b.db.CmfWatchByAsk(ctx, mid); ok {
-					watchID = id
+			if mid := strings.TrimSpace(args.MessageID); watchID == 0 && mid != "" {
+				if refs, _ := b.db.CmfWatchesByAsk(ctx, mid); len(refs) == 1 {
+					watchID = refs[0].WatchID
 				} else if id, ok, _ := b.db.CmfWatchByCheckMessage(ctx, mid); ok {
 					watchID = id
 				}
+				if watchID == 0 {
+					// Свайп на сообщение, которое не относится к одному чеку — НЕ угадываем.
+					return "", fmt.Errorf("не понял, к какому чеку относится это сообщение — ответь свайпом на сам чек или вопрос бота по нему, или укажи watch_id")
+				}
 			}
 			if watchID == 0 {
-				ws, err := b.db.ListCmfWatches(ctx, []string{"ambiguous", "noname", "unmatched"}, 50)
+				ws, err := b.db.ListCmfWatches(ctx, []string{"ambiguous", "noname"}, 100)
 				if err != nil {
 					return "", err
 				}
+				var match []db.CmfWatch
 				for _, w := range ws {
-					if w.GroupJID == chat.String() {
-						watchID = w.ID
-						break
+					if w.GroupJID != chat.String() {
+						continue
 					}
+					if args.Amount > 0 && math.Abs(args.Amount-w.Amount) >= 1 {
+						continue
+					}
+					if p := strings.TrimSpace(args.Payer); p != "" && !sameClientName(p, w.ClientText) && !nameCovers(p, w.ClientText) {
+						continue
+					}
+					match = append(match, w)
 				}
-			}
-			if watchID == 0 {
-				return "", fmt.Errorf("не понял, о каком чеке речь — ответь свайпом на чек или вопрос бота, или укажи watch_id из cmf_status")
+				switch len(match) {
+				case 1:
+					watchID = match[0].ID
+				case 0:
+					return "", fmt.Errorf("неясных чеков с такими данными в этой группе нет — уточни сумму или ответь свайпом на чек")
+				default:
+					var lines []string
+					for _, w := range match {
+						lines = append(lines, fmt.Sprintf("#%d — %.0f ₽ — «%s» — %s", w.ID, w.Amount, w.ClientText, w.TxDate.In(reconLoc).Format("02.01")))
+					}
+					return "Неясных чеков несколько — спроси владельца, какой, и вызови снова с watch_id:\n" + strings.Join(lines, "\n"), nil
+				}
 			}
 			w, ok, err := b.db.CmfWatchByID(ctx, watchID)
 			if err != nil || !ok {
@@ -800,7 +836,7 @@ func (b *Bot) cmfResolveTool(chat types.JID) ai.Tool {
 					gj = j
 				}
 				b.bindCmfWatch(ctx, gj, w, plan.Client, false)
-				return fmt.Sprintf("Чек #%d на %.0f ₽ привязан к клиенту %s — слежу, чтобы платёж внесли в программу.", w.ID, w.Amount, plan.Client.FullName), nil
+				return fmt.Sprintf("Чек #%d на %.0f ₽ (подпись «%s») привязан к клиенту %s — слежу, чтобы платёж внесли в программу.", w.ID, w.Amount, w.ClientText, plan.Client.FullName), nil
 			case actAskAgain:
 				var names []string
 				for _, c := range plan.Options {

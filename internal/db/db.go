@@ -224,11 +224,22 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// свайп на ЛЮБОЕ из них — ответ по этому чеку.
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS cmf_watch_asks (
-			ask_msg_id TEXT PRIMARY KEY,
+			ask_msg_id TEXT NOT NULL,
 			watch_id   INT NOT NULL,
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`); err != nil {
 		return fmt.Errorf("таблица cmf_watch_asks: %w", err)
+	}
+	// Одно сообщение бота может касаться нескольких чеков (общее напоминание), а
+	// у вопроса — свой список вариантов (номер в ответе — из ЭТОГО списка).
+	for _, q := range []string{
+		`ALTER TABLE cmf_watch_asks DROP CONSTRAINT IF EXISTS cmf_watch_asks_pkey`,
+		`ALTER TABLE cmf_watch_asks ADD COLUMN IF NOT EXISTS options TEXT`,
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_cmf_watch_asks_pair ON cmf_watch_asks(ask_msg_id, watch_id)`,
+	} {
+		if _, err := pool.Exec(ctx, q); err != nil {
+			return fmt.Errorf("cmf_watch_asks: %w", err)
+		}
 	}
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS bot_settings (
@@ -2975,15 +2986,104 @@ func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]
 	return out, rows.Err()
 }
 
-// SetCmfWatchAsk запоминает id сообщения бота по наблюдению (вопрос или
-// переспрос). Прежние id не забываются — свайп на любой из них работает.
-func (d *DB) SetCmfWatchAsk(ctx context.Context, id int, askMsgID string) error {
+// SetCmfWatchAsk запоминает id сообщения бота по наблюдению (вопрос, переспрос,
+// подтверждение, напоминание) и варианты, которые были в этом сообщении (JSON;
+// пусто — вариантов не было). Прежние id не забываются — свайп на любой работает.
+func (d *DB) SetCmfWatchAsk(ctx context.Context, id int, askMsgID, options string) error {
 	if _, err := d.pool.Exec(ctx, `
-		INSERT INTO cmf_watch_asks (ask_msg_id, watch_id) VALUES ($1, $2)
-		ON CONFLICT (ask_msg_id) DO UPDATE SET watch_id = EXCLUDED.watch_id`, askMsgID, id); err != nil {
+		INSERT INTO cmf_watch_asks (ask_msg_id, watch_id, options) VALUES ($1, $2, NULLIF($3, ''))
+		ON CONFLICT (ask_msg_id, watch_id) DO UPDATE SET options = EXCLUDED.options`, askMsgID, id, options); err != nil {
 		return err
 	}
 	_, err := d.pool.Exec(ctx, `UPDATE cmf_watch SET ask_msg_id = $2 WHERE id = $1`, id, askMsgID)
+	return err
+}
+
+// CmfAskRef — чек, которого касается сообщение бота, и варианты в этом сообщении.
+type CmfAskRef struct {
+	WatchID int
+	Options string // JSON вариантов, показанных в этом сообщении ("" — не сохранены)
+}
+
+// CmfWatchesByAsk — все чеки, которых касается сообщение бота askMsgID.
+func (d *DB) CmfWatchesByAsk(ctx context.Context, askMsgID string) ([]CmfAskRef, error) {
+	if askMsgID == "" {
+		return nil, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT watch_id, COALESCE(options, '') FROM cmf_watch_asks WHERE ask_msg_id = $1
+		UNION
+		SELECT id, '' FROM cmf_watch WHERE ask_msg_id = $1 AND id NOT IN (SELECT watch_id FROM cmf_watch_asks WHERE ask_msg_id = $1)
+		ORDER BY 1`, askMsgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CmfAskRef
+	for rows.Next() {
+		var r CmfAskRef
+		if err := rows.Scan(&r.WatchID, &r.Options); err != nil {
+			return nil, err
+		}
+		out = append(out, r)
+	}
+	return out, rows.Err()
+}
+
+// CmfWatchStatusByMessages — статус сверки по id сообщений с чеками.
+func (d *DB) CmfWatchStatusByMessages(ctx context.Context, waIDs []string) (map[string]string, error) {
+	out := map[string]string{}
+	if len(waIDs) == 0 {
+		return out, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT DISTINCT ON (rm.wa_message_id) rm.wa_message_id, cw.status
+		FROM cmf_watch cw JOIN raw_messages rm ON rm.id = cw.raw_message_id
+		WHERE rm.wa_message_id = ANY($1)
+		ORDER BY rm.wa_message_id, cw.id DESC`, waIDs)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var wa, st string
+		if err := rows.Scan(&wa, &st); err != nil {
+			return nil, err
+		}
+		out[wa] = st
+	}
+	return out, rows.Err()
+}
+
+// CmfPayerHistory — прежние решения по чекам с похожей подписью-плательщиком
+// (для «платит за разных»): подписи, клиенты и статусы.
+func (d *DB) CmfPayerHistory(ctx context.Context, firstWord string, excludeID int) ([]CmfWatch, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, group_jid, COALESCE(sender_jid,''), COALESCE(client_text,''), COALESCE(client_id,''),
+		       COALESCE(client_name,''), COALESCE(candidates,''), amount::float8, tx_date, status, created_at
+		FROM cmf_watch
+		WHERE id <> $2 AND client_text ILIKE $1 || '%'
+		  AND status IN ('watch', 'reminded', 'found', 'not_in_program')
+		ORDER BY id DESC LIMIT 200`, firstWord, excludeID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CmfWatch
+	for rows.Next() {
+		var w CmfWatch
+		if err := rows.Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.ClientID, &w.ClientName,
+			&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
+// TestResetCmfWatches — очистка наблюдений сверки (только для тестовой БД).
+func (d *DB) TestResetCmfWatches(ctx context.Context) error {
+	_, err := d.pool.Exec(ctx, `DELETE FROM cmf_watch_asks; DELETE FROM cmf_watch`)
 	return err
 }
 

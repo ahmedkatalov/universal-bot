@@ -240,9 +240,17 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 	}
 	var all []scored
 	best := 0
+	// Слова запроса без отчества: совпадение ОДНОГО отчества («…Ахмедовна») —
+	// не похожесть (у половины клиентов такое отчество).
+	var qCore []string
+	for _, w := range qWords {
+		if !isPatronymic(w) {
+			qCore = append(qCore, w)
+		}
+	}
 	for _, c := range byID {
 		s := scoreCandidate(qWords, normWords(c.FullName))
-		if s == 0 {
+		if s == 0 || (len(qCore) > 0 && scoreCandidate(qCore, normWords(c.FullName)) == 0) {
 			continue
 		}
 		all = append(all, scored{c, s})

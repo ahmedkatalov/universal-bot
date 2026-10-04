@@ -392,26 +392,97 @@ func isPatronymic(w string) bool {
 // покрывается «Каталов Ахмед Нажудович»; «Магомед» — НЕ «Магомедова Патимат»;
 // «Альмурзаева М.» — НЕ «Альмурзаева Разет».
 func nameCovers(query, cand string) bool {
-	if nameCoversOnce(query, cand) {
+	return nameCoversWith(query, cand, nameWordSame)
+}
+
+// nameCoversStrict — то же, но слова совпадают только точно или как падежные
+// формы (й/и не в счёт): без допуска на «опечатку» — Мусаева ≠ Мусиева,
+// Дудаева ≠ Дадаева (это разные фамилии). Для выбора варианта по ответу.
+func nameCoversStrict(query, cand string) bool {
+	return nameCoversWith(query, cand, nameWordStrict)
+}
+
+// nameCoversWith — составное имя через дефис сравниваем по частям, только если
+// дефис есть у обоих (или ни у кого): «Магомед» ≠ «Магомед-Расул». Написание
+// через пробел («Хаджи Мурат») сравниваем и со слитным («Хаджимурат»).
+func nameCoversWith(query, cand string, same func(a, b string) bool) bool {
+	hq, hc := hasHyphen(query), hasHyphen(cand)
+	if hq == hc && nameCoversOnce(query, cand, same) {
 		return true
 	}
-	if hasHyphen(query) || hasHyphen(cand) {
-		return nameCoversOnce(dehyphen(query), dehyphen(cand))
+	dq, dc := dehyphen(query), dehyphen(cand)
+	if (hq || hc) && nameCoversOnce(dq, dc, same) {
+		return true
+	}
+	// «Хаджи Мурат Магомедов» ↔ «Магомедов Хаджимурат»: склеиваем соседние слова
+	// запроса, если склейка есть среди слов клиента.
+	fc, _ := nameParts(dc)
+	ws := strings.Fields(dq)
+	for k := 0; k+1 < len(ws); k++ {
+		a, b := normCyr(ws[k]), normCyr(ws[k+1])
+		if len([]rune(a)) < 3 || len([]rune(b)) < 3 {
+			continue
+		}
+		for _, w := range fc {
+			if same(a+b, w) {
+				v := append(append(append([]string(nil), ws[:k]...), ws[k]+ws[k+1]), ws[k+2:]...)
+				if nameCoversOnce(strings.Join(v, " "), dc, same) {
+					return true
+				}
+			}
+		}
 	}
 	return false
 }
 
-func nameCoversOnce(query, cand string) bool {
+func nameCoversOnce(query, cand string, same func(a, b string) bool) bool {
 	fq, iq := nameParts(query)
 	fc, ic := nameParts(cand)
 	if len(fq) == 0 {
 		return false
 	}
-	score, _, uc := matchNameWords(fq, fc)
-	if score < len(fq) {
+	used := make([]bool, len(fc))
+	for _, w := range fq {
+		hit := false
+		for k, v := range fc {
+			if !used[k] && same(w, v) {
+				used[k], hit = true, true
+				break
+			}
+		}
+		if !hit {
+			return false
+		}
+	}
+	return initialsAgree(iq, leftovers(fc, used, ic))
+}
+
+// nameWordStrict — слова совпадают точно или как падежные формы одной основы.
+func nameWordStrict(a, b string) bool {
+	if isPatronymic(a) != isPatronymic(b) {
 		return false
 	}
-	return initialsAgree(iq, leftovers(fc, uc, ic))
+	a, b = foldYi(a), foldYi(b)
+	if a == b {
+		return true
+	}
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) > len(rb) {
+		ra, rb = rb, ra
+	}
+	if len(ra) < 3 {
+		return false
+	}
+	p := 0
+	for p < len(ra) && ra[p] == rb[p] {
+		p++
+	}
+	if p == len(ra) {
+		tail := string(rb[p:])
+		return caseEndings[tail] || tail == "ь"
+	}
+	ta, tb := string(ra[p:]), string(rb[p:])
+	return p >= 3 && ((caseEndings[ta] && caseEndings[tb]) || (ta == "ь" && softEndings[tb]) || (tb == "ь" && softEndings[ta]))
 }
 
 func isVowelRu(r rune) bool { return strings.ContainsRune("аеёиоуыэюя", r) }
@@ -553,6 +624,16 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	}
 	unconfirmed, unconfirmedSum := 0, 0.0
 	nChecks, nCash := 0, 0
+	// Чеки, про которые в группе ответили «нет в программе», никому не относим
+	// (даже по памяти о плательщике) — показываем отдельно.
+	var waIDs []string
+	for _, r := range recs {
+		if r.WaMessageID != "" {
+			waIDs = append(waIDs, r.WaMessageID)
+		}
+	}
+	watchStatus, _ := b.db.CmfWatchStatusByMessages(ctx, waIDs)
+	var notInProgram []string
 	for _, r := range recs {
 		if !inPeriod(r.TxDate) || !inGroup(r.groups) {
 			continue
@@ -560,6 +641,11 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		if r.NeedsReview || strings.TrimSpace(r.Name) == "" {
 			unconfirmed++
 			unconfirmedSum += r.Amount
+			continue
+		}
+		if watchStatus[r.WaMessageID] == "not_in_program" {
+			nChecks++
+			notInProgram = append(notInProgram, fmt.Sprintf("%s — чек %s · %s ₽", strings.TrimSpace(r.Name), fmtDay(r.TxDate), formatMoney(r.Amount)))
 			continue
 		}
 		nChecks++
@@ -572,7 +658,7 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		nCash++
 		addReported(c.Name, reconItem{ID: -c.ID, Kind: "cash", Amount: c.Amount, Date: c.TxDate, Report: true})
 	}
-	if len(order) == 0 && unconfirmed == 0 {
+	if len(order) == 0 && unconfirmed == 0 && len(notInProgram) == 0 {
 		return "За " + periodLabel + " чеков и налички в учёте нет.", nil
 	}
 
@@ -583,6 +669,9 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		items  []reconItem
 	}
 	var attention []string
+	for _, l := range notInProgram {
+		attention = append(attention, l+" — в группе ответили «нет в программе»")
+	}
 	cidOrder := []string{}
 	groupsByCID := map[string]*clientGroup{}
 	pinged := false

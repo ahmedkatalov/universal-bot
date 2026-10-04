@@ -577,8 +577,9 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			}
 			// Ответ БЕЗ свайпа на последний вопрос бота в этой группе («10000р»
 			// под вопросом «какая сумма?») — понимаем по контексту. Свайп на
-			// другое сообщение — это ответ НА НЕГО, а не на последний вопрос.
-			if extractQuotedStanzaID(msg) == "" && b.tryContextAnswer(ctx, msg.Info.Chat, text) {
+			// вопрос сверки по чеку — это ответ НА НЕГО (уже разобран выше), а не
+			// на последний вопрос.
+			if !b.quotesCmfAsk(ctx, msg) && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswer(ctx, msg.Info.Chat, text) {
 				return
 			}
 		}

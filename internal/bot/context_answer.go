@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-bot/internal/parser"
 )
@@ -37,6 +38,28 @@ func (b *Bot) recentOpenAsk(groupJID string) (openAsk, bool) {
 		return openAsk{}, false
 	}
 	return a, true
+}
+
+// quotesCmfAsk — сообщение отвечает свайпом на сообщение бота по сверке чека.
+func (b *Bot) quotesCmfAsk(ctx context.Context, msg *events.Message) bool {
+	q := extractQuotedStanzaID(msg)
+	if q == "" || b.db == nil {
+		return false
+	}
+	refs, err := b.db.CmfWatchesByAsk(ctx, q)
+	return err == nil && len(refs) > 0
+}
+
+// contextAnswerBlocked — открыт вопрос сверки «за кого платёж», но этот же
+// человек ПОСЛЕ вопроса прислал новый чек без клиента: его имя — для нового
+// чека, а не ответ на старый вопрос.
+func (b *Bot) contextAnswerBlocked(ctx context.Context, msg *events.Message) bool {
+	a, ok := b.recentOpenAsk(msg.Info.Chat.String())
+	if !ok || a.kind != "cmf_watch" || b.db == nil {
+		return false
+	}
+	has, err := b.db.HasUnconfirmedReceiptFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), a.at)
+	return err == nil && has
 }
 
 // cmfNameWindow — сколько после просьбы бота «напишите ФИО» голое ФИО без
@@ -148,6 +171,18 @@ func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string)
 	return false
 }
 
+// askAboutReceipt — переспрос по чеку (чего ещё не хватает): связываем его с
+// чеком, чтобы ответ свайпом на ЭТОТ переспрос тоже применился к чеку.
+func (b *Bot) askAboutReceipt(ctx context.Context, chat types.JID, receiptWaID, text string, needAmount, needName bool) {
+	id := b.sendTextReturnID(chat, text)
+	if id == "" {
+		return
+	}
+	b.registerClarifyAsk(id, receiptWaID)
+	_ = b.db.MarkReceiptAskedByMessage(ctx, receiptWaID, id)
+	b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: receiptWaID, needAmount: needAmount, needName: needName})
+}
+
 // applyReceiptAnswer применяет ответ владельца (ФИО и/или сумма) к чеку
 // receiptWaID. handled — ответ распознан и что-то записано/поправлено; done —
 // вопрос закрыт (всё заполнено). handled && !done — чего-то ещё не хватает
@@ -185,11 +220,11 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 		return false, false
 	}
 	if amount <= 0 {
-		b.sendText(chat, "Записал клиента "+canonical+", но сумму по этому чеку так и не знаю — напишите сумму (например «15000»), и чек войдёт в сбор.")
+		b.askAboutReceipt(ctx, chat, receiptWaID, "Записал клиента "+canonical+", но сумму по этому чеку так и не знаю — напишите сумму (например «15000»), и чек войдёт в сбор.", true, false)
 		return true, false
 	}
 	if stillReview {
-		b.sendText(chat, "Поправил сумму. А чей это чек? Напишите ФИО клиента — тогда засчитаю.")
+		b.askAboutReceipt(ctx, chat, receiptWaID, "Поправил сумму. А чей это чек? Напишите ФИО клиента — тогда засчитаю.", false, true)
 		return true, false
 	}
 	if canonical != "" {
