@@ -907,6 +907,11 @@ func mergeAIReceipt(rd *parser.ReceiptData, rec aiReceipt) {
 // parseAIDatetime разбирает дату/время из ответа модели.
 func parseAIDatetime(s string) (time.Time, bool) {
 	s = strings.TrimSpace(s)
+	for _, suf := range []string{"(МСК)", "МСК", "(мск)", "мск", "MSK"} {
+		s = strings.TrimSpace(strings.TrimSuffix(s, suf))
+	}
+	s = strings.ReplaceAll(s, ", ", " ")
+	s = strings.ReplaceAll(s, " в ", " ")
 	if s == "" {
 		return time.Time{}, false
 	}

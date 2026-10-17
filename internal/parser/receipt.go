@@ -220,7 +220,17 @@ var moneyRe = regexp.MustCompile(`\d[\d\s.,]*\d|\d`)
 //	с секундами или без.
 var (
 	namedDateTimeRe   = regexp.MustCompile(`(?i)(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?`)
-	numericDateTimeRe = regexp.MustCompile(`(\d{2})\.(\d{2})\.(\d{4}),?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?`)
+	numericDateTimeRe = regexp.MustCompile(`(\d{2})\.(\d{2})\.(\d{4}|\d{2})(?:,|\s+в)?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?`)
+	isoDateTimeRe     = regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?`)
+	shortMonthRe      = regexp.MustCompile(`(?i)(\d{1,2})\s+(янв|фев|мар|апр|мая|май|июн|июл|авг|сен|окт|ноя|дек)[а-я]*\.?,?\s*(\d{4})?,?\s*(?:в\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?`)
+	numericDateOnlyRe = regexp.MustCompile(`(\d{2})\.(\d{2})\.(\d{4})`)
+	timeOnlyRe        = regexp.MustCompile(`(?:^|\s)(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s|$)`)
+
+	shortMonths = map[string]time.Month{
+		"янв": time.January, "фев": time.February, "мар": time.March, "апр": time.April, "мая": time.May, "май": time.May,
+		"июн": time.June, "июл": time.July, "авг": time.August, "сен": time.September, "окт": time.October,
+		"ноя": time.November, "дек": time.December,
+	}
 
 	monthGenitive = map[string]time.Month{
 		"января": time.January, "февраля": time.February, "марта": time.March,
@@ -246,6 +256,44 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			return t, true
 		}
 	}
+	// «Дата операции: 30.09.2026» и время отдельной строкой («Время операции:
+	// 23:40») — или вовсе без времени: дата с чека важнее даты присылки.
+	for i, l := range lines {
+		low := strings.ToLower(l)
+		if !strings.Contains(low, "дата") || strings.Contains(low, "рожд") || strings.Contains(low, "формир") {
+			continue
+		}
+		m := numericDateOnlyRe.FindStringSubmatch(l)
+		if m == nil {
+			if v := strings.TrimSpace(nextNonEmptyLine(lines, i+1)); v != "" {
+				m = numericDateOnlyRe.FindStringSubmatch(v)
+			}
+		}
+		if m == nil {
+			continue
+		}
+		day, _ := strconv.Atoi(m[1])
+		mon, _ := strconv.Atoi(m[2])
+		year, _ := strconv.Atoi(m[3])
+		if mon < 1 || mon > 12 || day < 1 || day > 31 {
+			continue
+		}
+		hour, min, sec := 12, 0, 0
+		for k := i; k < len(lines) && k <= i+3; k++ {
+			if tm := timeOnlyRe.FindStringSubmatch(lines[k]); tm != nil {
+				hour, _ = strconv.Atoi(tm[1])
+				min, _ = strconv.Atoi(tm[2])
+				if tm[3] != "" {
+					sec, _ = strconv.Atoi(tm[3])
+				}
+				break
+			}
+		}
+		if hour > 23 || min > 59 {
+			hour, min, sec = 12, 0, 0
+		}
+		return time.Date(year, time.Month(mon), day, hour, min, sec, 0, time.Local), true
+	}
 	return time.Time{}, false
 }
 
@@ -267,6 +315,40 @@ func parseDateTimeFromLine(line string) (time.Time, bool) {
 		}
 		return time.Date(year, month, day, hour, min, sec, 0, time.Local), true
 	}
+	if m := isoDateTimeRe.FindStringSubmatch(line); m != nil {
+		year, _ := strconv.Atoi(m[1])
+		mon, _ := strconv.Atoi(m[2])
+		day, _ := strconv.Atoi(m[3])
+		hour, _ := strconv.Atoi(m[4])
+		min, _ := strconv.Atoi(m[5])
+		sec := 0
+		if m[6] != "" {
+			sec, _ = strconv.Atoi(m[6])
+		}
+		if mon >= 1 && mon <= 12 {
+			return time.Date(year, time.Month(mon), day, hour, min, sec, 0, time.Local), true
+		}
+	}
+	if m := shortMonthRe.FindStringSubmatch(line); m != nil {
+		day, _ := strconv.Atoi(m[1])
+		month := shortMonths[strings.ToLower(m[2])]
+		hour, _ := strconv.Atoi(m[4])
+		min, _ := strconv.Atoi(m[5])
+		sec := 0
+		if m[6] != "" {
+			sec, _ = strconv.Atoi(m[6])
+		}
+		now := time.Now()
+		year := now.Year()
+		if m[3] != "" {
+			year, _ = strconv.Atoi(m[3])
+		}
+		t := time.Date(year, month, day, hour, min, sec, 0, time.Local)
+		if m[3] == "" && t.After(now.Add(24*time.Hour)) {
+			t = t.AddDate(-1, 0, 0) // «28 декабря» в январе — прошлого года
+		}
+		return t, true
+	}
 	if m := numericDateTimeRe.FindStringSubmatch(line); m != nil {
 		day, _ := strconv.Atoi(m[1])
 		monthNum, _ := strconv.Atoi(m[2])
@@ -274,6 +356,9 @@ func parseDateTimeFromLine(line string) (time.Time, bool) {
 			return time.Time{}, false
 		}
 		year, _ := strconv.Atoi(m[3])
+		if year < 100 {
+			year += 2000 // «16.10.26»
+		}
 		hour, _ := strconv.Atoi(m[4])
 		min, _ := strconv.Atoi(m[5])
 		sec := 0
@@ -343,6 +428,11 @@ func ParseReceipt(text string) ReceiptData {
 			}
 			// Значение не должно само быть очередным лейблом (бывает при
 			// нестандартной вёрстке скриншота, когда OCR склеивает строки).
+			// Номер документа — не дата и не время («Квитанция» в шапке, а под
+			// ней дата: дата номером документа не становится).
+			if rule.field == "doc" && !plausibleDocNumber(value) {
+				break
+			}
 			if value != "" && !isFieldLabel(value) {
 				applyField(&rd, rule.field, value)
 				filled[rule.field] = true
@@ -358,6 +448,14 @@ func ParseReceipt(text string) ReceiptData {
 	// итоговую (комиссию НЕ вычитаем — банк берёт её сверх).
 	if net, ok := netTransferAmount(lines); ok {
 		rd.Amount = net
+	} else if rd.Commission > 0 {
+		// «Итого 15 150 / Сумма 15 000 / Комиссия 150» (Т-Банк, Озон): в сбор идёт
+		// сумма ПЕРЕВОДА, без комиссии банка.
+		if bare, ok := bareSumAmount(lines); ok && bare < rd.Amount {
+			rd.Amount = bare
+		} else if itogo, ok := labeledAmount(lines, itogoRe); ok && rd.Amount == itogo && itogo > rd.Commission {
+			rd.Amount = itogo - rd.Commission
+		}
 	}
 
 	// Формат СБП-перевода (ВТБ и другие банки часто пишут это фразой, а не текстом
@@ -393,6 +491,55 @@ func ParseReceipt(text string) ReceiptData {
 	}
 
 	return rd
+}
+
+var (
+	bareSumRe = regexp.MustCompile(`(?i)^сумма\s*:?\s*(.*)$`)
+	itogoRe   = regexp.MustCompile(`(?i)^итого\s*:?\s*(.*)$`)
+	docDateRe = regexp.MustCompile(`^\d{1,2}[./-]\d{1,2}[./-]\d{2,4}`)
+)
+
+// plausibleDocNumber — похоже на номер документа/операции: есть цифры (4+), и
+// это не дата/время.
+func plausibleDocNumber(v string) bool {
+	v = strings.TrimSpace(v)
+	if v == "" || docDateRe.MatchString(v) || strings.Count(v, ":") >= 1 && strings.ContainsAny(v, ".-") {
+		return false
+	}
+	digits := 0
+	for _, r := range v {
+		if r >= '0' && r <= '9' {
+			digits++
+		}
+	}
+	return digits >= 4
+}
+
+// bareSumAmount — значение строки «Сумма» (без уточнения «перевода/комиссии/
+// списания/прописью»).
+func bareSumAmount(lines []string) (float64, bool) {
+	return labeledAmount(lines, bareSumRe)
+}
+
+func labeledAmount(lines []string, re *regexp.Regexp) (float64, bool) {
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		m := re.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		value := strings.TrimSpace(m[1])
+		if value == "" {
+			value = nextNonEmptyLine(lines, i+1)
+		}
+		if value == "" || isFieldLabel(value) {
+			continue
+		}
+		if v := ParseMoneyValue(value); v > 0 {
+			return v, true
+		}
+	}
+	return 0, false
 }
 
 // netAmountRules — лейблы ЧИСТОЙ суммы перевода (без комиссии), в порядке

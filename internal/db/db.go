@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -19,6 +20,15 @@ import (
 // али» попадали в две строки отчёта, и суммы по человеку были неверные.
 func nameKey(s string) string {
 	return strings.ToLower(strings.Join(strings.Fields(s), " "))
+}
+
+// contactKey — ключ человека для склейки контактов: без регистра, ё=е, без
+// знаков, слова по алфавиту («магомедов ахмед» = «Ахмед Магомедов»).
+func contactKey(s string) string {
+	s = strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(s, "ё", "е"), "Ё", "Е"))
+	f := strings.FieldsFunc(s, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	sort.Strings(f)
+	return strings.Join(f, " ")
 }
 
 type DB struct {
@@ -211,6 +221,31 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	}
 	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_status ON cmf_watch(status)`); err != nil {
 		return fmt.Errorf("индекс cmf_watch: %w", err)
+	}
+	// Ключ человека у контакта (без регистра/порядка слов) — для склейки.
+	if _, err := pool.Exec(ctx, `ALTER TABLE contacts ADD COLUMN IF NOT EXISTS name_key TEXT`); err != nil {
+		return fmt.Errorf("колонка contacts.name_key: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_contacts_name_key ON contacts(name_key)`); err != nil {
+		return fmt.Errorf("индекс contacts.name_key: %w", err)
+	}
+	if rows, err := pool.Query(ctx, `SELECT id, canonical_name FROM contacts WHERE name_key IS NULL`); err == nil {
+		type kv struct {
+			id  int
+			key string
+		}
+		var todo []kv
+		for rows.Next() {
+			var id int
+			var name string
+			if rows.Scan(&id, &name) == nil {
+				todo = append(todo, kv{id, contactKey(name)})
+			}
+		}
+		rows.Close()
+		for _, x := range todo {
+			_, _ = pool.Exec(ctx, `UPDATE contacts SET name_key = $2 WHERE id = $1`, x.id, x.key)
+		}
 	}
 	// Какое сообщение назвало клиента чека (имя после чека): удалят его —
 	// привязку откатываем, чек снова ждёт клиента.
@@ -508,11 +543,24 @@ func (d *DB) MarkMessageParsed(ctx context.Context, rawMessageID int) error {
 // GetOrCreateContact возвращает id контакта по каноничному имени, создавая при отсутствии.
 func (d *DB) GetOrCreateContact(ctx context.Context, canonicalName string) (int, error) {
 	var id int
+	// Тот же человек, написанный иначе («магомедов ахмед», «Ахмед Магомедов»),
+	// — тот же контакт: иначе текст и чек одного платежа не сводились в один и
+	// сбор задваивался.
+	key := contactKey(canonicalName)
+	if key != "" {
+		err := d.pool.QueryRow(ctx, `SELECT id FROM contacts WHERE name_key = $1 ORDER BY id LIMIT 1`, key).Scan(&id)
+		if err == nil {
+			return id, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return 0, err
+		}
+	}
 	err := d.pool.QueryRow(ctx, `
-		INSERT INTO contacts (canonical_name) VALUES ($1)
+		INSERT INTO contacts (canonical_name, name_key) VALUES ($1, $2)
 		ON CONFLICT (canonical_name) DO UPDATE SET canonical_name = EXCLUDED.canonical_name
 		RETURNING id
-	`, canonicalName).Scan(&id)
+	`, canonicalName, key).Scan(&id)
 	return id, err
 }
 
@@ -964,6 +1012,7 @@ type BankReceiptInput struct {
 	SubmittedBy     string    // кто прислал чек; пусто для чеков из групп (там отправитель в raw_messages)
 	TxDate          time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
 	Collapsed       bool      // свёрнутый экран банка (без даты/номера/получателя) — ждёт полного чека
+	Ignored         bool      // в сбор не идёт (например, перевод отклонён банком)
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
@@ -971,12 +1020,12 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 		INSERT INTO bank_receipts
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
 			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
-			 client_confirmed, group_jid, submitted_by, tx_date, collapsed)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22)
+			 client_confirmed, group_jid, submitted_by, tx_date, collapsed, ignored)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23)
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
 		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
 		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
-		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed)
+		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed, r.Ignored)
 	return err
 }
 
@@ -1351,41 +1400,66 @@ const DuplicateWindow = 5 * time.Minute
 // НЕ дубль. Пустой groupJID = поиск по всем группам (для информационной
 // проверки чеков из лички).
 func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
-	var existing time.Time
+	dup, err := d.FindDuplicateReceiptEx(ctx, groupJID, docNumber, authCode, contactID, recipientRaw, "", amount, txDate)
+	return dup.Found, dup.TxDate, err
+}
+
+// DuplicateMatch — найденный ранее тот же чек.
+type DuplicateMatch struct {
+	Found    bool
+	TxDate   time.Time
+	Client   string // на кого записан найденный чек
+	StrongID bool   // совпал номер операции/документа или код авторизации
+}
+
+// FindDuplicateReceiptEx ищет тот же чек, присланный раньше. Совпадение
+// номера операции (документа) или кода авторизации — это тот же чек, КАК БЫ
+// его ни подписали. Без номеров — тот же клиент/получатель, та же сумма,
+// время операции в пределах окна и тот же ПЛАТЕЛЬЩИК на чеке: два разных
+// клиента, перечислившие одинаковую сумму на одну карту, — не дубль.
+func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw, senderRaw string, amount float64, txDate time.Time) (DuplicateMatch, error) {
+	var m DuplicateMatch
 	err := d.pool.QueryRow(ctx, `
-		SELECT br.tx_date FROM bank_receipts br
+		SELECT br.tx_date, COALESCE(c.canonical_name, br.recipient_raw, ''),
+		       (($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8))
+		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE br.amount = $1
-		  AND (
-		    ($4::int IS NOT NULL AND br.contact_id = $4) OR
-		    ($4::int IS NULL AND br.recipient_raw = $5)
-		  )
 		  AND ($6 = '' OR br.group_jid = $6)
 		  AND br.is_duplicate = false
 		  AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
 		  AND (
-		    -- Либо чеки близки по времени операции И номер/код не противоречат
-		    -- (эвристика для чеков без читаемого идентификатора).
-		    ( br.tx_date BETWEEN $2 AND $3
+		    -- Совпал сильный идентификатор — тот же чек, независимо от подписи и
+		    -- времени (дата могла не прочитаться на одной из копий). Код
+		    -- авторизации короткий — для него ограничиваем окно в несколько дней.
+		    ($7 <> '' AND br.doc_number = $7)
+		    OR ($8 <> '' AND br.auth_code = $8
+		        AND br.tx_date BETWEEN $2::timestamptz - interval '3 days' AND $3::timestamptz + interval '3 days')
+		    -- Эвристика для чеков без номеров: тот же клиент, окно по времени,
+		    -- номера не противоречат и плательщик на чеке тот же.
+		    OR (
+		      (($4::int IS NOT NULL AND br.contact_id = $4) OR ($4::int IS NULL AND br.recipient_raw = $5))
+		      AND br.tx_date BETWEEN $2::timestamptz AND $3::timestamptz
 		      AND (COALESCE(br.doc_number, '') = '' OR $7 = '' OR br.doc_number = $7)
-		      AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8) )
-		    -- ЛИБО точно совпал сильный идентификатор (номер документа/код) — тогда
-		    -- это тот же чек, даже если время НЕ совпало (дата операции прочиталась
-		    -- не на всех копиях и одна упала на время сообщения).
-		    OR ($7 <> '' AND br.doc_number = $7)
-		    OR ($8 <> '' AND br.auth_code = $8)
+		      AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8)
+		      AND (COALESCE(br.sender_raw, '') = '' OR $9 = ''
+		           OR lower(split_part(trim(br.sender_raw), ' ', 1)) = lower(split_part(trim($9), ' ', 1)))
+		    )
 		  )
-		ORDER BY br.tx_date
+		ORDER BY 3 DESC, br.tx_date
 		LIMIT 1
-	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode).Scan(&existing)
-	if err == nil {
-		return true, existing, nil
-	}
+	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode, senderRaw).
+		Scan(&m.TxDate, &m.Client, &m.StrongID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, time.Time{}, nil
+		return m, nil
 	}
-	return false, time.Time{}, err
+	if err != nil {
+		return m, err
+	}
+	m.Found = true
+	return m, nil
 }
 
 // UnresolvedReceipt — чек, получателя которого не удалось сопоставить
@@ -1961,7 +2035,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 			  -- Зеркало countableTextCondition: пара по времени ПРИСЫЛКИ (±2 дня).
 			  AND COALESCE(brm.received_at, brd.tx_date) >= COALESCE(rm.received_at, t.tx_date::timestamptz) - interval '2 days'
 			  AND COALESCE(brm.received_at, brd.tx_date) <  COALESCE(rm.received_at, t.tx_date::timestamptz) + interval '2 days'
-			  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+			  `+groupPairClause("$3")+`
 		  )
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.TextDupCount, &ex.TextDupSum)
 	return ex, err
@@ -2074,7 +2148,7 @@ func (d *DB) CashForReconcile(ctx context.Context, from, to time.Time) ([]ReconC
 		  AND t.ignored = false
 		  AND t.amount > 0
 		  AND COALESCE(rm.deleted, false) = false
-		  AND `+countableTextCondition+`
+		  AND `+textCountable("NULL")+`
 		ORDER BY t.tx_date
 	`, from, to)
 	if err != nil {
@@ -2678,7 +2752,7 @@ func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person stri
 		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE t.tx_date >= $1 AND t.tx_date < $2
 		  AND t.ignored = false AND COALESCE(rm.deleted, false) = false AND t.amount > 0
-		  AND `+countableTextCondition+`
+		  AND `+textCountable("$4")+`
 		  AND ($3 = '' OR COALESCE(c.canonical_name, t.raw_name, '') ILIKE '%' || $3 || '%')
 		  AND ($4::text[] IS NULL OR rm.wa_group_jid = ANY($4)))
 
@@ -3497,19 +3571,36 @@ func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *tim
 			LEAST(r.first_op, t.first_op), GREATEST(r.last_op, t.last_op)
 		FROM contacts c
 		LEFT JOIN LATERAL (
-			SELECT COUNT(*) AS cnt, SUM(br.amount) AS total,
-			       MIN(br.tx_date) AS first_op, MAX(br.tx_date) AS last_op
-			FROM bank_receipts br
-			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-			WHERE br.contact_id = c.id
-			  -- needs_review=false — как в сборе (SummaryForPeriod): неподтверждённые
-			  -- чеки в «всего» не считаем, иначе отчёт по человеку расходится со сбором.
-			  AND br.needs_review = false
-			  AND br.is_duplicate = false AND br.ignored = false
-			  AND COALESCE(rm.deleted, false) = false
-			  AND ($2::timestamptz IS NULL OR br.tx_date >= $2)
-			  AND ($3::timestamptz IS NULL OR br.tx_date < $3)
-			  AND ($4 = '' OR br.group_jid = $4)
+			SELECT COUNT(*) AS cnt, SUM(x.amount) AS total,
+			       MIN(x.tx_date) AS first_op, MAX(x.tx_date) AS last_op
+			FROM (
+				-- Один чек, присланный в несколько групп (или пересланный), — один
+				-- платёж, как в сборе (SummaryForPeriod).
+				SELECT DISTINCT ON (br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
+				       br.amount, br.tx_date
+				FROM bank_receipts br
+				LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+				WHERE br.contact_id = c.id
+				  -- needs_review=false — как в сборе (SummaryForPeriod): неподтверждённые
+				  -- чеки в «всего» не считаем, иначе отчёт по человеку расходится со сбором.
+				  AND br.needs_review = false
+				  AND br.is_duplicate = false AND br.ignored = false
+				  AND COALESCE(rm.deleted, false) = false
+				  AND ($2::timestamptz IS NULL OR br.tx_date >= $2)
+				  AND ($3::timestamptz IS NULL OR br.tx_date < $3)
+				  AND ($4 = '' OR br.group_jid = $4)
+				  AND NOT EXISTS (
+					SELECT 1 FROM bank_receipts o
+					JOIN raw_messages orm ON orm.id = o.raw_message_id
+					WHERE o.id <> br.id AND o.contact_id = c.id
+					  AND o.needs_review = false AND o.is_duplicate = false AND o.ignored = false
+					  AND COALESCE(orm.deleted, false) = false
+					  AND ($4 = '' OR o.group_jid = $4)
+					  AND COALESCE(rm.wa_message_id, '') <> '' AND COALESCE(orm.wa_message_id, '') <> ''
+					  AND starts_with(rm.wa_message_id, orm.wa_message_id || '-fwd-')
+				  )
+				ORDER BY br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text), br.created_at
+			) x
 		) r ON true
 		LEFT JOIN LATERAL (
 			SELECT COUNT(*) AS cnt, SUM(tx.amount) AS total,
@@ -3535,7 +3626,7 @@ func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *tim
 			        AND COALESCE(brm.deleted, false) = false
 			        AND COALESCE(brm.received_at, brd.tx_date) >= COALESCE(rm.received_at, tx.tx_date::timestamptz) - interval '2 days'
 			        AND COALESCE(brm.received_at, brd.tx_date) <  COALESCE(rm.received_at, tx.tx_date::timestamptz) + interval '2 days'
-			        AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+			        AND (COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '') OR $4 = '' OR brd.group_jid = $4)
 			    )
 			  )
 			  AND ($2::timestamptz IS NULL OR tx.tx_date >= $2)
@@ -3600,7 +3691,7 @@ func groupSliceArg(groupJIDs []string) any {
 // считается ОДИН раз: если работник и чек прислал, и переписал текстом — берём
 // чек, а текст-дубль отбрасываем; но если чек не распознался, платёж не
 // теряется — учитывается текст. Это чинит и задвоение, и недосчёт.
-const countableTextCondition = `(
+const countableTextConditionTmpl = `(
 		t.dup_pending = false
 		AND (
 			t.is_cash = true
@@ -3624,10 +3715,27 @@ const countableTextCondition = `(
 				  -- сообщения (импорт/ручные) запасной ориентир — дата операции.
 				  AND COALESCE(brm.received_at, brd.tx_date) >= COALESCE(rm.received_at, t.tx_date::timestamptz) - interval '2 days'
 				  AND COALESCE(brm.received_at, brd.tx_date) <  COALESCE(rm.received_at, t.tx_date::timestamptz) + interval '2 days'
-				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+				  {GROUPCLAUSE}
 			)
 		)
 	)`
+
+// groupPairClause — где искать чек-близнец текста: в той же группе ИЛИ в
+// любой из выбранных групп (в сборе «по всем группам» текст в основной и чек в
+// группе СБ — один платёж). gp — SQL-параметр со списком групп (NULL — все).
+func groupPairClause(gp string) string {
+	return "AND (COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '') OR " + gp + "::text[] IS NULL OR brd.group_jid = ANY(" + gp + "))"
+}
+
+// textCountable — countableTextCondition для запроса со списком групп в gp.
+func textCountable(gp string) string {
+	return strings.Replace(countableTextConditionTmpl, "{GROUPCLAUSE}", groupPairClause(gp), 1)
+}
+
+// textCountableByChat — то же для режима «по дате чата».
+func textCountableByChat(gp string) string {
+	return strings.Replace(countableTextConditionByChatTmpl, "{GROUPCLAUSE}", groupPairClause(gp), 1)
+}
 
 // countableTextConditionByChat — тот же дедуп «текст vs чек», но для режима ПО
 // ДАТЕ ЧАТА: парный чек ищем по ЕГО дате присылки (brm.received_at в [$1,$2)),
@@ -3636,7 +3744,7 @@ const countableTextCondition = `(
 // отбрасывается, если рядом в тот же период прислали парный чек — считается один
 // раз (сам чек — в основной сумме, если его дата операции в месяце периода, или
 // отдельной «⚠️ старые чеки» секцией, если нет). $1/$2 в обоих чат-режимах = from/to.
-const countableTextConditionByChat = `(
+const countableTextConditionByChatTmpl = `(
 		t.dup_pending = false
 		AND (
 			t.is_cash = true
@@ -3651,7 +3759,7 @@ const countableTextConditionByChat = `(
 				  AND COALESCE(brm.deleted, false) = false
 				  -- ±2 дня относительно присылки текста (см. countableTextCondition).
 				  AND brm.received_at >= rm.received_at - interval '2 days' AND brm.received_at < rm.received_at + interval '2 days'
-				  AND COALESCE(brd.group_jid, '') = COALESCE(rm.wa_group_jid, '')
+				  {GROUPCLAUSE}
 			)
 		)
 	)`
@@ -3688,7 +3796,7 @@ func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs
 		-- и ветка чеков (timestamptz) сравнивалась с полночью по TZ сервера.
 		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
 		  AND t.ignored = false
-		  AND `+countableTextCondition+`
+		  AND `+textCountable("$3")+`
 		  AND COALESCE(rm.deleted, false) = false
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
@@ -3765,7 +3873,7 @@ func (d *DB) SummaryForPeriodByChat(ctx context.Context, from, to, monthStart, m
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		WHERE rm.received_at >= $1 AND rm.received_at < $2
 		  AND t.ignored = false
-		  AND `+countableTextConditionByChat+`
+		  AND `+textCountableByChat("$3")+`
 		  AND COALESCE(rm.deleted, false) = false
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3)))
 
@@ -3969,7 +4077,7 @@ func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []st
 			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 			WHERE t.tx_date >= $1 AND t.tx_date < $2
 			  AND t.ignored = false
-			  AND `+countableTextCondition+`
+			  AND `+textCountable("$3")+`
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
@@ -4036,7 +4144,7 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 			WHERE rm.received_at >= $1 AND rm.received_at < $2
 			  AND t.ignored = false
-			  AND `+countableTextConditionByChat+`
+			  AND `+textCountableByChat("$3")+`
 			  AND COALESCE(rm.deleted, false) = false
 			  AND t.amount > 0
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))

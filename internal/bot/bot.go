@@ -244,6 +244,21 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	return b, nil
 }
 
+var declinedRe = regexp.MustCompile(`(?i)отклон|не\s*выполн|не\s*прош[её]л|неуспеш|отказ|ошибк|declin|reject|fail`)
+
+// receiptDeclined — статус на чеке говорит, что перевод не прошёл.
+func receiptDeclined(status string) bool {
+	st := strings.TrimSpace(status)
+	return st != "" && declinedRe.MatchString(st)
+}
+
+// nameKeyBot — имя без регистра и порядка слов (для сравнения подписей).
+func nameKeyBot(s string) string {
+	f := strings.Fields(strings.ToLower(strings.ReplaceAll(s, "ё", "е")))
+	sort.Strings(f)
+	return strings.Join(f, " ")
+}
+
 // receiptPairWindow — окно спаривания чек↔имя по времени сообщения WhatsApp.
 // RECEIPT_PAIR_WINDOW_MINUTES (по умолчанию 15). Явный свайп-ответ работает и вне окна.
 func receiptPairWindow() time.Duration {
@@ -3393,6 +3408,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// ФИО отправляем чек на ручную проверку («чей это чек?»), иначе платёж молча
 	// уйдёт в сбор под владельцем карты — не под настоящим клиентом.
 	needsReview := payerOverride == ""
+	// Перевод отклонён/не выполнен банком — денег нет: в сбор не идёт, сверку не
+	// заводим, в группе предупреждаем.
+	declined := receiptDeclined(rd.Status)
 
 	var contactIDPtr *int
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)
@@ -3411,9 +3429,14 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// документа, см. FindDuplicateReceipt) — до вставки, иначе новая запись
 	// найдёт сама себя. Тот же чек в другой группе дублем не считается: это
 	// рабочий процесс (чеки из группы СБ пересылают в основную группу).
-	isDuplicate, dupTxDate, err := b.db.FindDuplicateReceipt(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate)
+	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate)
 	if err != nil {
 		fmt.Println("Ошибка проверки дубля чека:", err)
+	}
+	isDuplicate, dupTxDate := dupMatch.Found, dupMatch.TxDate
+	if isDuplicate {
+		// Повтор того же чека — клиента не спрашиваем (он уже есть у оригинала).
+		needsReview = false
 	}
 
 	// Если до этого тот же человек прислал СВЁРНУТЫЙ экран на ту же сумму (мы
@@ -3460,6 +3483,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		ClientConfirmed: clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
 		GroupJID:        chat.String(),
 		TxDate:          txDate,
+		Ignored:         declined,
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)
@@ -3467,13 +3491,30 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if needsReview {
 		fmt.Printf("Чек (сообщение %d): получатель %q не найден в списке известных — нужна проверка\n", rawID, rd.Recipient)
 	}
+	if declined {
+		fmt.Printf("Чек (сообщение %d): статус «%s» — перевод не прошёл, в сбор не идёт\n", rawID, rd.Status)
+		if !b.groupSilent(chat) {
+			b.sendReply(chat, fmt.Sprintf("⚠️ На чеке статус «%s» — перевод не прошёл, в сбор не засчитываю.", rd.Status), waMsgID, senderJID)
+		}
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+		return
+	}
 	if isDuplicate {
 		fmt.Printf("Чек (сообщение %d): похоже на повтор чека от %s на %.0f ₽ (первый раз был %s) — не учитываю в сумме\n",
 			rawID, canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"))
+		shown := canonical
+		if dupMatch.Client != "" {
+			shown = dupMatch.Client
+		}
+		extra := ""
+		if payerOverride != "" && dupMatch.Client != "" && nameKeyBot(dupMatch.Client) != nameKeyBot(payerOverride) {
+			// Тот же чек, но подписан другим клиентом — скорее всего, поправка.
+			extra = fmt.Sprintf(" В первый раз он записан на «%s», сейчас подписан «%s» — если клиент «%s», напишите «%s, это чек %s», и я поправлю.",
+				dupMatch.Client, payerOverride, payerOverride, b.botName, payerOverride)
+		}
 		b.sendReply(chat, fmt.Sprintf(
-			"⚠️ Похоже, этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора. "+
-				"Если это ошибка — ответь на это сообщение или напиши «%s, это не дубль, засчитай чек %s на %.0f», и я его учту.",
-			canonical, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), b.botName, canonical, rd.Amount),
+			"⚠️ Этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.%s",
+			shown, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), extra),
 			waMsgID, senderJID)
 	}
 
