@@ -300,11 +300,11 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
 			}
-			from, err := time.Parse("2006-01-02", args.FromDate)
+			from, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
 			}
-			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			toDay, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
 			}

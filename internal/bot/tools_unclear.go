@@ -395,11 +395,11 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
 			}
-			from, err := time.Parse("2006-01-02", args.FromDate)
+			from, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
 			}
-			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			toDay, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
 			}
@@ -416,8 +416,12 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}
+			exNote := ""
+			if strings.TrimSpace(args.Person) == "" {
+				exNote = b.exclusionsNote(ctx, from, toDay.AddDate(0, 0, 1), groupJIDs, -1, false)
+			}
 			if len(rows) == 0 {
-				return fmt.Sprintf("Чеков за %s — %s (%s) не нашлось.", from.Format("02.01.2006"), toDay.Format("02.01.2006"), groupLabel), nil
+				return fmt.Sprintf("Чеков за %s — %s (%s) не нашлось.%s", from.Format("02.01.2006"), toDay.Format("02.01.2006"), groupLabel, exNote), nil
 			}
 			truncated := len(rows) > args.Limit
 			if truncated {
@@ -467,6 +471,7 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 			} else {
 				fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
 			}
+			sb.WriteString(exNote)
 			return sb.String(), nil
 		},
 	}
@@ -512,11 +517,11 @@ func (b *Bot) missingInGroupTool() ai.Tool {
 			if err != nil {
 				return "", err
 			}
-			from, err := time.Parse("2006-01-02", args.FromDate)
+			from, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата начала %q (нужен YYYY-MM-DD)", args.FromDate)
 			}
-			toDay, err := time.Parse("2006-01-02", args.ToDate)
+			toDay, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
 			if err != nil {
 				return "", fmt.Errorf("неверная дата конца %q (нужен YYYY-MM-DD)", args.ToDate)
 			}

@@ -647,6 +647,13 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 
 	// Команда отчёта (актуально только для текстовых сообщений)
 	if !hasMedia && isReportCommand(text) {
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+		// Отчёт по всем группам — только владельцу/админам отчётности, как и
+		// финансовые инструменты ассистента.
+		if !b.isReportAdmin(msg.Info) {
+			fmt.Println("/отчет от не-админа — игнорирую")
+			return
+		}
 		b.sendMonthlyReport(ctx, msg.Info.Chat)
 		return
 	}
@@ -1499,29 +1506,51 @@ func (b *Bot) joinedGroups(ctx context.Context) map[types.JID]string {
 // Возвращает JID и точное название. Если совпадений нет или их несколько —
 // ошибка с пояснением, чтобы ассистент мог переспросить владельца.
 func (b *Bot) resolveGroup(ctx context.Context, name string) (types.JID, string, error) {
-	name = strings.ToLower(strings.TrimSpace(name))
-	if name == "" {
+	q := normGroupName(name)
+	if q == "" {
 		return types.JID{}, "", fmt.Errorf("название группы пустое")
 	}
-	var (
-		foundJID  types.JID
-		foundName string
-		matches   []string
-	)
+	// Точное название важнее совпадения по части: «Оплата клиентов» — это она,
+	// а не «СБ оплата клиентов». Затем — по целым словам, и лишь потом по части.
+	type hit struct {
+		jid  types.JID
+		name string
+	}
+	tiers := make([][]hit, 3)
 	for jid, gname := range b.joinedGroups(ctx) {
-		if strings.Contains(strings.ToLower(gname), name) {
-			foundJID, foundName = jid, gname
-			matches = append(matches, gname)
+		g := normGroupName(gname)
+		switch {
+		case g == q:
+			tiers[0] = append(tiers[0], hit{jid, gname})
+		case strings.Contains(" "+g+" ", " "+q+" "):
+			tiers[1] = append(tiers[1], hit{jid, gname})
+		case strings.Contains(g, q):
+			tiers[2] = append(tiers[2], hit{jid, gname})
 		}
 	}
-	switch len(matches) {
-	case 0:
-		return types.JID{}, "", fmt.Errorf("группа %q не найдена среди групп бота", name)
-	case 1:
-		return foundJID, foundName, nil
-	default:
-		return types.JID{}, "", fmt.Errorf("под %q подходит несколько групп: %s — уточни название", name, strings.Join(matches, "; "))
+	for _, t := range tiers {
+		switch len(t) {
+		case 0:
+			continue
+		case 1:
+			return t[0].jid, t[0].name, nil
+		}
+		var names []string
+		for _, h := range t {
+			names = append(names, h.name)
+		}
+		sort.Strings(names)
+		return types.JID{}, "", fmt.Errorf("под %q подходит несколько групп: %s — уточни название", strings.TrimSpace(name), strings.Join(names, "; "))
 	}
+	return types.JID{}, "", fmt.Errorf("группа %q не найдена среди групп бота", strings.TrimSpace(name))
+}
+
+// normGroupName — название группы для сравнения: без регистра, кавычек, ё и
+// лишних пробелов.
+func normGroupName(s string) string {
+	s = strings.ToLower(s)
+	s = strings.NewReplacer("ё", "е", "«", " ", "»", " ", "\"", " ", "'", " ").Replace(s)
+	return strings.Join(strings.Fields(s), " ")
 }
 
 // resolveGroups разбирает описание из ОДНОЙ или НЕСКОЛЬКИХ групп (через
@@ -2083,6 +2112,33 @@ func (b *Bot) cardsTool(chat types.JID) ai.Tool {
 	}
 }
 
+// exclusionsNote — раздел «НЕ вошло в сбор»: непроверенные чеки и придержанная
+// наличка за период (вне суммы), плюс тексты, зачтённые как дубль чека. Его
+// добавляет каждый отчёт с суммами, чтобы итог был сверяем до рубля.
+func (b *Bot) exclusionsNote(ctx context.Context, from, to time.Time, groupJIDs []string, total float64, byChat bool) string {
+	ex, err := b.db.ReportExclusionsBasis(ctx, from, to, groupJIDs, byChat)
+	if err != nil {
+		return ""
+	}
+	var nb strings.Builder
+	if ex.NeedsReviewCount > 0 || ex.HeldCashCount > 0 {
+		nb.WriteString("\n\nℹ️ НЕ вошло в сбор (разберись — и засчитается):")
+		if ex.NeedsReviewCount > 0 {
+			fmt.Fprintf(&nb, "\n• Непроверенные чеки (не распознал клиента/сумму): %d шт на ~%.0f ₽ — ответь на вопросы бота «чей чек?» или суммой", ex.NeedsReviewCount, ex.NeedsReviewSum)
+		}
+		if ex.HeldCashCount > 0 {
+			fmt.Fprintf(&nb, "\n• Придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽ — ответь «новый» / «тот же»", ex.HeldCashCount, ex.HeldCashSum)
+		}
+		if total >= 0 {
+			fmt.Fprintf(&nb, "\nМаксимум за период, если всё это твоё: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
+		}
+	}
+	if ex.TextDupCount > 0 && total >= 0 {
+		fmt.Fprintf(&nb, "\n\nⓘ Текстовых платежей зачтено как дубль чека (уже в сумме, не дважды): %d шт на %.0f ₽. Если какой-то из них — ОТДЕЛЬНЫЙ платёж, скажи, зачту.", ex.TextDupCount, ex.TextDupSum)
+	}
+	return nb.String()
+}
+
 // sendersTool — статистика "кто сколько чеков прислал": для групп, где
 // работники кидают чеки (их сбор считается по отправленным чекам).
 func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
@@ -2168,8 +2224,14 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 			if byChat {
 				periodLabel += " · по дате в чате"
 			}
+			// Что не вошло в суммы (чеки без клиента, придержанная наличка) — для всей
+			// выборки; при фильтре по человеку не показываем (это не его цифры).
+			exNote := ""
+			if strings.TrimSpace(args.Sender) == "" {
+				exNote = b.exclusionsNote(ctx, from, to, groupJIDs, -1, byChat)
+			}
 			if len(stats) == 0 {
-				return fmt.Sprintf("За период %s (%s) чеков не найдено.", periodLabel, groupLabel), nil
+				return fmt.Sprintf("За период %s (%s) чеков не найдено.%s", periodLabel, groupLabel, exNote), nil
 			}
 
 			var totalCount int
@@ -2204,7 +2266,7 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				if err := b.sendDocument(chat, outPath, "Чеки_по_отправителям_"+from.Format("2006-01-02")+".pdf"); err != nil {
 					return "", fmt.Errorf("не удалось отправить PDF по отправителям: %w", err)
 				}
-				return fmt.Sprintf("PDF с разбивкой по отправителям за %s (%s) отправлен: %d чек(ов) на %.0f ₽.", periodLabel, groupLabel, totalCount, totalSum), nil
+				return fmt.Sprintf("PDF с разбивкой по отправителям за %s (%s) отправлен: %d чек(ов) на %.0f ₽.%s", periodLabel, groupLabel, totalCount, totalSum, exNote), nil
 			}
 
 			var sb strings.Builder
@@ -2247,6 +2309,7 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 					}
 				}
 			}
+			sb.WriteString(exNote)
 			return sb.String(), nil
 		},
 	}
@@ -2684,8 +2747,18 @@ func (b *Bot) personTool() ai.Tool {
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
 			}
+			pendNote := ""
+			if hn, hs, rn, rs, err := b.db.PersonPending(ctx, strings.TrimSpace(args.Person), fromPtr, toPtr, groupJID); err == nil && hn+rn > 0 {
+				pendNote = "\nℹ️ НЕ вошло в суммы выше:"
+				if hn > 0 {
+					pendNote += fmt.Sprintf("\n• придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽", hn, hs)
+				}
+				if rn > 0 {
+					pendNote += fmt.Sprintf("\n• чеки на проверке с этим именем: %d шт на %.0f ₽", rn, rs)
+				}
+			}
 			if len(stats) == 0 {
-				return fmt.Sprintf("По имени %q операций не нашёл. Проверь имя — известные люди перечислены в твоём контексте.", args.Person), nil
+				return fmt.Sprintf("По имени %q засчитанных операций не нашёл. Проверь имя — известные люди перечислены в твоём контексте.%s", args.Person, pendNote), nil
 			}
 			var sb strings.Builder
 			for _, p := range stats {
@@ -2697,6 +2770,7 @@ func (b *Bot) personTool() ai.Tool {
 					fmt.Fprintf(&sb, "- операции с %s по %s\n", p.FirstOp.Format("02.01.2006"), p.LastOp.Format("02.01.2006"))
 				}
 			}
+			sb.WriteString(pendNote)
 			return sb.String(), nil
 		},
 	}
@@ -3027,26 +3101,7 @@ func (b *Bot) buildReportForAssistant(ctx context.Context, chat types.JID, fromS
 	// то, в чём не уверен, пока владелец не разберётся. Показываем суммы явно.
 	// Только в операционном режиме: ReportExclusions считает по дате операции, а
 	// в режиме «по дате чата» это смешало бы базы (сумма — по дате присылки).
-	reconNote := ""
-	if !byChat {
-		if ex, err := b.db.ReportExclusions(ctx, from, to, groupJIDs); err == nil {
-			var nb strings.Builder
-			if ex.NeedsReviewCount > 0 || ex.HeldCashCount > 0 {
-				nb.WriteString("\n\nℹ️ НЕ вошло в сбор (разберись — и засчитается):")
-				if ex.NeedsReviewCount > 0 {
-					fmt.Fprintf(&nb, "\n• Непроверенные чеки (не распознал клиента/сумму): %d шт на ~%.0f ₽ — ответь на вопросы бота «чей чек?» или суммой", ex.NeedsReviewCount, ex.NeedsReviewSum)
-				}
-				if ex.HeldCashCount > 0 {
-					fmt.Fprintf(&nb, "\n• Придержанная наличка-повтор (жду «новый или тот же?»): %d шт на %.0f ₽ — ответь «новый» / «тот же»", ex.HeldCashCount, ex.HeldCashSum)
-				}
-				fmt.Fprintf(&nb, "\nМаксимум за период, если всё это твоё: %.0f ₽", total+ex.NeedsReviewSum+ex.HeldCashSum)
-			}
-			if ex.TextDupCount > 0 {
-				fmt.Fprintf(&nb, "\n\nⓘ Текстовых платежей зачтено как дубль чека (уже в сумме, не дважды): %d шт на %.0f ₽. Если какой-то из них — ОТДЕЛЬНЫЙ платёж, скажи, зачту.", ex.TextDupCount, ex.TextDupSum)
-			}
-			reconNote = nb.String()
-		}
-	}
+	reconNote := b.exclusionsNote(ctx, from, to, groupJIDs, total, byChat)
 	notes := excludedNote + reconNote
 
 	if len(summaries) == 0 {

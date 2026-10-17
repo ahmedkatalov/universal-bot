@@ -2232,7 +2232,17 @@ type ReportExclusions struct {
 //   - TextDup     — тексты, зачтённые как дубль чека (уже в сумме — информационно,
 //     чтобы владелец мог заметить, если какой-то из них ОТДЕЛЬНЫЙ платёж).
 func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs []string) (ReportExclusions, error) {
+	return d.ReportExclusionsBasis(ctx, from, to, groupJIDs, false)
+}
+
+// ReportExclusionsBasis — то же, но byChat=true считает период по дате, когда
+// сообщение прислали в чат (для отчёта «по дате в чате»).
+func (d *DB) ReportExclusionsBasis(ctx context.Context, from, to time.Time, groupJIDs []string, byChat bool) (ReportExclusions, error) {
 	var ex ReportExclusions
+	brDate, oDate, tDate := "br.tx_date", "o.tx_date", "t.tx_date::timestamptz"
+	if byChat {
+		brDate, oDate, tDate = "COALESCE(rm.received_at, br.tx_date)", "COALESCE(orm.received_at, o.tx_date)", "COALESCE(rm.received_at, t.tx_date::timestamptz)"
+	}
 	// 1) Непроверенные чеки: needs_review ИЛИ без contact_id (иначе выпал бы из
 	//    суммы молча). Дедуп кросс-групповых копий (как в SummaryForPeriod).
 	//    Клиент непроверенного чека НЕИЗВЕСТЕН (contact_id там, если есть, — это
@@ -2246,7 +2256,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 				br.amount
 			FROM bank_receipts br
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
-			WHERE br.tx_date >= $1::timestamptz AND br.tx_date < $2::timestamptz
+			WHERE `+brDate+` >= $1::timestamptz AND `+brDate+` < $2::timestamptz
 			  AND (br.needs_review = true OR br.contact_id IS NULL)
 			  AND br.is_duplicate = false AND br.ignored = false
 			  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
@@ -2261,7 +2271,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 				WHERE o.id <> br.id
 				  AND o.needs_review = false AND o.is_duplicate = false AND o.ignored = false
 				  AND COALESCE(orm.deleted, false) = false
-				  AND o.tx_date >= $1 AND o.tx_date < $2
+				  AND `+oDate+` >= $1 AND `+oDate+` < $2
 				  AND ($3::text[] IS NULL OR o.group_jid = ANY($3))
 				  AND (
 					(NULLIF(br.doc_number, '') IS NOT NULL AND o.doc_number = br.doc_number)
@@ -2280,7 +2290,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
-		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
+		WHERE `+tDate+` >= $1::timestamptz AND `+tDate+` < $2::timestamptz
 		  AND t.is_cash = true AND t.dup_pending = true AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
@@ -2295,7 +2305,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
 		FROM transactions t
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
-		WHERE t.tx_date >= $1::timestamptz AND t.tx_date < $2::timestamptz
+		WHERE `+tDate+` >= $1::timestamptz AND `+tDate+` < $2::timestamptz
 		  AND t.is_cash = false AND t.dup_pending = false AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false AND t.amount > 0
 		  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
@@ -2314,6 +2324,33 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 		  )
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.TextDupCount, &ex.TextDupSum)
 	return ex, err
+}
+
+// PersonPending — что по человеку НЕ вошло в сбор: придержанная наличка-повтор
+// и чеки на проверке, подписанные его именем.
+func (d *DB) PersonPending(ctx context.Context, person string, from, to *time.Time, groupJID string) (heldN int, heldSum float64, reviewN int, reviewSum float64, err error) {
+	err = d.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(t.amount), 0)::float8
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE t.dup_pending = true AND t.ignored = false AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(c.canonical_name, t.raw_name, '') ILIKE '%' || $1 || '%'
+		  AND ($2::timestamptz IS NULL OR t.tx_date >= $2) AND ($3::timestamptz IS NULL OR t.tx_date < $3)
+		  AND ($4 = '' OR rm.wa_group_jid = $4)`, person, from, to, groupJID).Scan(&heldN, &heldSum)
+	if err != nil {
+		return
+	}
+	err = d.pool.QueryRow(ctx, `
+		SELECT COUNT(*), COALESCE(SUM(br.amount), 0)::float8
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.needs_review = true AND br.ignored = false AND br.is_duplicate = false
+		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+		  AND COALESCE(br.recipient_raw, '') ILIKE '%' || $1 || '%'
+		  AND ($2::timestamptz IS NULL OR br.tx_date >= $2) AND ($3::timestamptz IS NULL OR br.tx_date < $3)
+		  AND ($4 = '' OR br.group_jid = $4)`, person, from, to, groupJID).Scan(&reviewN, &reviewSum)
+	return
 }
 
 // LedgerReceipt — распознанный чек из учёта для живой сверки с программой.
