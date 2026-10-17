@@ -778,12 +778,14 @@ func (d *DB) ResolveCashDup(ctx context.Context, txID int, isNew bool) (bool, fl
 	if isNew {
 		err = d.pool.QueryRow(ctx, `
 			UPDATE transactions SET dup_pending = false, dup_asked = true
-			WHERE id = $1 RETURNING amount::float8, COALESCE(raw_name, '')
+			WHERE id = $1 AND dup_pending = true RETURNING amount::float8, COALESCE(raw_name, '')
 		`, txID).Scan(&amount, &client)
 	} else {
+		// Только ещё не решённый повтор: случайное «нет» позже не снимет уже
+		// подтверждённую владельцем наличку.
 		err = d.pool.QueryRow(ctx, `
 			UPDATE transactions SET ignored = true, dup_pending = false, dup_asked = true
-			WHERE id = $1 RETURNING amount::float8, COALESCE(raw_name, '')
+			WHERE id = $1 AND dup_pending = true RETURNING amount::float8, COALESCE(raw_name, '')
 		`, txID).Scan(&amount, &client)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -874,13 +876,14 @@ func (d *DB) TxByCollectorAskMsg(ctx context.Context, askMsgID string) (int, boo
 }
 
 // SetTxCollector записывает ответственного (кто забрал наличку) по id транзакции.
-func (d *DB) SetTxCollector(ctx context.Context, txID int, collector string) (bool, float64, string, error) {
+func (d *DB) SetTxCollector(ctx context.Context, txID int, collector string, onlyIfEmpty bool) (bool, float64, string, error) {
 	var amount float64
 	var client string
 	err := d.pool.QueryRow(ctx, `
-		UPDATE transactions SET collector = $2, collector_asked = true WHERE id = $1
+		UPDATE transactions SET collector = $2, collector_asked = true
+		WHERE id = $1 AND (NOT $3 OR COALESCE(collector, '') = '')
 		RETURNING amount::float8, COALESCE(raw_name, '')
-	`, txID, collector).Scan(&amount, &client)
+	`, txID, collector, onlyIfEmpty).Scan(&amount, &client)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, 0, "", nil
 	}
@@ -3277,6 +3280,27 @@ func (d *DB) TestReceiptByMessage(ctx context.Context, waMessageID string) TestR
 		Scan(&r.Recipient, &r.Amount, &r.NeedsReview, &r.Confirmed, &r.Duplicate, &r.TxDate)
 	r.Found = err == nil
 	return r
+}
+
+// TestAgeGroup — «состарить» чеки и платежи группы на d (только для тестов:
+// чтобы клариф-цикл увидел их как ждущие вопроса).
+func (d *DB) TestAgeGroup(ctx context.Context, groupJID string, by time.Duration) error {
+	sec := int(by.Seconds())
+	if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET created_at = created_at - make_interval(secs => $2) WHERE group_jid = $1`, groupJID, sec); err != nil {
+		return err
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE transactions t SET created_at = t.created_at - make_interval(secs => $2)
+		FROM raw_messages rm WHERE rm.id = t.raw_message_id AND rm.wa_group_jid = $1`, groupJID, sec)
+	return err
+}
+
+// TestResetAll — очистить все данные (только для тестовой БД!): каждый
+// сквозной тест начинает с чистой базы.
+func (d *DB) TestResetAll(ctx context.Context) error {
+	_, err := d.pool.Exec(ctx, `TRUNCATE transactions, bank_receipts, raw_messages, pending_client_names,
+		cmf_watch, cmf_watch_asks, contacts, contact_aliases, expenses, forward_rules, phone_owners,
+		scheduled_jobs, assistant_history, bot_settings RESTART IDENTITY CASCADE`)
+	return err
 }
 
 // TestResetCmfWatches — очистка наблюдений сверки (только для тестовой БД).

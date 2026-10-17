@@ -87,8 +87,9 @@ func newE2E(t *testing.T, o e2eOpts) *e2eBot {
 		t.Fatalf("Connect: %v", err)
 	}
 	ctx := context.Background()
-	_ = d.SettingSet(ctx, settingPayerMap, "")
-	_ = d.TestResetCmfWatches(ctx)
+	if err := d.TestResetAll(ctx); err != nil {
+		t.Fatalf("очистка тестовой базы: %v", err)
+	}
 
 	e := &e2eBot{t: t}
 	b := &Bot{

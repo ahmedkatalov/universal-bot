@@ -44,6 +44,9 @@ type clarifyState struct {
 	// ПРОСТОЙ ответ, написанный следом БЕЗ свайпа («10000р» под вопросом «какая
 	// сумма?»). Ключ — JID группы.
 	lastAsk map[string]openAsk
+	// receiptAsks — открытые вопросы «чей чек?» группы по порядку (ответ без
+	// свайпа идёт к самому раннему или к чеку на названную сумму).
+	receiptAsks map[string][]openAsk
 }
 
 // openAsk — открытый вопрос бота в группе (для ответа без свайпа).
@@ -52,9 +55,11 @@ type openAsk struct {
 	receiptWaID string // для receipt — id сообщения-чека
 	txID        int    // для cash_* — id транзакции
 	watchID     int    // для cmf_watch — наблюдение сверки («за кого платёж?»)
-	wantName    bool   // для cmf_watch — бот прямо попросил написать ФИО
-	needAmount  bool   // по чеку не прочиталась сумма
-	needName    bool   // по чеку не прочитан клиент
+	senderJID   string // чей чек/наличка (ответ без свайпа принимаем от него или от владельца)
+	amount      float64
+	wantName    bool // для cmf_watch — бот прямо попросил написать ФИО
+	needAmount  bool // по чеку не прочиталась сумма
+	needName    bool // по чеку не прочитан клиент
 	at          time.Time
 }
 
@@ -64,6 +69,8 @@ func newClarifyState() *clarifyState {
 		cashAskMap: make(map[string]int),
 		dupAskMap:  make(map[string]int),
 		lastAsk:    make(map[string]openAsk),
+
+		receiptAsks: make(map[string][]openAsk),
 	}
 }
 
@@ -182,7 +189,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 					if b.askClarify(ctx, jid, text, it) {
 						asked++
 						// Имя клиента примем и без свайпа — следующим сообщением.
-						b.setOpenAsk(jid.String(), openAsk{kind: "receipt", receiptWaID: it.WaMessageID, needName: true})
+						b.setOpenAsk(jid.String(), openAsk{kind: "receipt", receiptWaID: it.WaMessageID, needName: true, senderJID: it.SenderJID, amount: it.Amount})
 					}
 				}
 			}
@@ -205,7 +212,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 						// ответственного.
 						_ = b.db.MarkTxCollectorAsked(ctx, it.TxID, botMsgID)
 						b.registerCashAsk(botMsgID, it.TxID)
-						b.setOpenAsk(jid.String(), openAsk{kind: "cash_collector", txID: it.TxID})
+						b.setOpenAsk(jid.String(), openAsk{kind: "cash_collector", txID: it.TxID, senderJID: it.SenderJID, amount: it.Amount})
 						asked++
 					}
 				}
@@ -235,7 +242,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 						if botMsgID != "" {
 							_ = b.db.MarkCashDupAsked(ctx, it.TxID, botMsgID)
 							b.registerDupAsk(botMsgID, it.TxID)
-							b.setOpenAsk(jid.String(), openAsk{kind: "cash_dup", txID: it.TxID})
+							b.setOpenAsk(jid.String(), openAsk{kind: "cash_dup", txID: it.TxID, senderJID: it.SenderJID, amount: it.Amount})
 							asked++
 						}
 					}
@@ -254,7 +261,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 						"и ФИО клиента — например: «Ахмед Каталов 15000» (можно просто следующим сообщением)."
 					if b.askClarify(ctx, jid, text, it) {
 						asked++
-						b.setOpenAsk(jid.String(), openAsk{kind: "receipt", receiptWaID: it.WaMessageID, needAmount: true, needName: true})
+						b.setOpenAsk(jid.String(), openAsk{kind: "receipt", receiptWaID: it.WaMessageID, needAmount: true, needName: true, senderJID: it.SenderJID})
 					}
 				}
 			}
@@ -282,6 +289,15 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		if !ok {
 			continue
 		}
+		// Уверены, что это ФИО, только если имя известно или его подтвердил ИИ
+		// («Ассаламу алейкум брат», «Доброе утро всем» — не клиенты).
+		if _, known := b.aliases.ResolveName(name); !known {
+			confirmed := b.cmfExtractClientName(ctx, t)
+			if confirmed == "" {
+				continue
+			}
+			name = confirmed
+		}
 		canonical, _ := b.aliases.ResolveName(name)
 		// Владелец карты (получатель на чеке) — это НЕ клиент, его не берём.
 		if it.CardOwner != "" && strings.EqualFold(strings.TrimSpace(canonical), strings.TrimSpace(it.CardOwner)) {
@@ -307,9 +323,9 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 
 // applyCashCollectorReply записывает ответственного (кто забрал наличку) из
 // ответа владельца на вопрос «у кого наличка?».
-func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID int, text string) bool {
+func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID int, text string, swipe bool) bool {
 	collector := extractCollectorName(text)
-	if collector == "" {
+	if collector == "" && swipe {
 		// Детерминированный разбор не справился с нестандартной формулировкой —
 		// спрашиваем ИИ (он поймёт «да Шамиль его забрал, он в офисе был» и т.п.).
 		collector = b.aiCashCollector(ctx, text)
@@ -320,7 +336,8 @@ func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID 
 	if canon, ok := b.aliases.ResolveName(collector); ok {
 		collector = canon
 	}
-	found, amount, client, err := b.db.SetTxCollector(ctx, txID, collector)
+	// Без свайпа ответственного только ДОПИСЫВАЕМ (не перезаписываем уже названного).
+	found, amount, client, err := b.db.SetTxCollector(ctx, txID, collector, !swipe)
 	if err != nil || !found {
 		return false
 	}
@@ -403,26 +420,42 @@ func extractCollectorName(text string) string {
 	return strings.TrimSpace(strings.Join(words, " "))
 }
 
-// parseCashDupAnswer разбирает ответ на вопрос про повтор налички.
-// Возвращает (resolved, isNew): resolved=false — ответ непонятен (переспросим).
+// parseCashDupAnswer разбирает ответ на вопрос про повтор налички (по целым
+// словам: «Усманов» — не «новый»). Возвращает (resolved, isNew): resolved=false —
+// ответ непонятен (переспросим).
 func parseCashDupAnswer(text string) (bool, bool) {
 	t := strings.ToLower(strings.TrimSpace(text))
-	// «тот же / повтор» проверяем первым: «не новый» содержит «нов».
-	sameMarkers := []string{"тот же", "та же", "то же", "тоже", "повтор", "дубл",
-		"один и тот", "не новый", "не считай", "старый", "ошиб"}
-	for _, m := range sameMarkers {
-		if strings.Contains(t, m) {
-			return true, false
+	toks := strings.FieldsFunc(t, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	has := func(ws ...string) bool {
+		for _, tk := range toks {
+			for _, w := range ws {
+				if tk == w {
+					return true
+				}
+			}
 		}
+		return false
 	}
-	if t == "нет" {
+	phrase := " " + strings.Join(toks, " ") + " "
+	hasPhrase := func(ps ...string) bool {
+		for _, p := range ps {
+			if strings.Contains(phrase, " "+p+" ") {
+				return true
+			}
+		}
+		return false
+	}
+	// «тот же / повтор» — первыми: «не новый» содержит «новый».
+	if hasPhrase("тот же", "та же", "то же", "тоже самое", "то же самое", "один и тот же", "не новый", "не новая",
+		"не считай", "не считать", "не засчитывай") || has("повтор", "дубль", "дубликат", "старый", "ошибка", "ошибся", "ошиблась", "тоже") {
 		return true, false
 	}
-	newMarkers := []string{"нов", "отдельн", "друг", "ещё", "еще"}
-	for _, m := range newMarkers {
-		if strings.Contains(t, m) {
-			return true, true
-		}
+	if t == "нет" || t == "неа" {
+		return true, false
+	}
+	if has("новый", "новая", "новое", "новые", "отдельный", "отдельно", "отдельная", "другой", "другая", "другое") ||
+		hasPhrase("ещё один", "еще один", "ещё одна", "еще одна", "ещё раз", "еще раз") {
+		return true, true
 	}
 	if t == "да" {
 		return true, true // «да» на «это новый?» — новый
@@ -613,7 +646,7 @@ func (b *Bot) checkSuspiciousAmount(ctx context.Context, chat types.JID, waMsgID
 		_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
 		b.registerClarifyAsk(botMsgID, waMsgID)
 		// Поправленную сумму примем и без свайпа (следующим сообщением «130000»).
-		b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needAmount: true})
+		b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needAmount: true, senderJID: senderJID})
 	}
 }
 
@@ -664,6 +697,7 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		if err != nil || !found {
 			return false
 		}
+		b.clearOpenAskTx(msg.Info.Chat.String(), "cash_dup", dupTxID)
 		if isNew {
 			b.sendText(msg.Info.Chat, fmt.Sprintf("Засчитал как новый платёж: наличка %s %.0f ₽.", client, amount))
 		} else {
@@ -687,7 +721,11 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		}
 	}
 	if isCashAsk {
-		return b.applyCashCollectorReply(ctx, msg.Info.Chat, txID, text)
+		if b.applyCashCollectorReply(ctx, msg.Info.Chat, txID, text, true) {
+			b.clearOpenAskTx(msg.Info.Chat.String(), "cash_collector", txID)
+			return true
+		}
+		return false
 	}
 
 	// Связь «вопрос -> чек» НЕ снимаем при поиске: снимем только после успешной

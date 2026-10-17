@@ -8,6 +8,7 @@ package bot
 
 import (
 	"context"
+	"math"
 	"strings"
 	"time"
 
@@ -26,6 +27,16 @@ func (b *Bot) setOpenAsk(groupJID string, a openAsk) {
 	a.at = time.Now()
 	b.clarify.mu.Lock()
 	b.clarify.lastAsk[groupJID] = a
+	if a.kind == "receipt" && a.receiptWaID != "" {
+		q := b.clarify.receiptAsks[groupJID]
+		var rest []openAsk
+		for _, x := range q {
+			if x.receiptWaID != a.receiptWaID {
+				rest = append(rest, x)
+			}
+		}
+		b.clarify.receiptAsks[groupJID] = append(rest, a)
+	}
 	b.clarify.mu.Unlock()
 }
 
@@ -55,7 +66,7 @@ func (b *Bot) quotesCmfAsk(ctx context.Context, msg *events.Message) bool {
 // чека, а не ответ на старый вопрос.
 func (b *Bot) contextAnswerBlocked(ctx context.Context, msg *events.Message) bool {
 	a, ok := b.recentOpenAsk(msg.Info.Chat.String())
-	if !ok || a.kind != "cmf_watch" || b.db == nil {
+	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt") || b.db == nil {
 		return false
 	}
 	has, err := b.db.HasUnconfirmedReceiptFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), a.at)
@@ -97,19 +108,41 @@ func (b *Bot) clearOpenAsk(groupJID string) {
 // tryContextAnswer пытается понять сообщение как ответ БЕЗ свайпа на последний
 // вопрос бота в группе. Возвращает true, если сообщение потреблено как ответ.
 func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string) bool {
+	return b.tryContextAnswerAs(ctx, chat, "", true, text)
+}
+
+// tryContextAnswerFrom — ответ без свайпа от конкретного участника: на вопрос о
+// ЧУЖОМ чеке/наличке принимаем только от того, кто его прислал, или от владельца.
+func (b *Bot) tryContextAnswerFrom(ctx context.Context, msg *events.Message, text string) bool {
+	return b.tryContextAnswerAs(ctx, msg.Info.Chat, msg.Info.Sender.String(), b.isReportAdmin(msg.Info), text)
+}
+
+// shortPlainReply — короткий ответ без сумм (не новый платёж и не фраза).
+func shortPlainReply(text string, maxWords int) bool {
+	if parser.ExtractAmount(text) > 0 || strings.ContainsAny(text, "0123456789") {
+		return false
+	}
+	n := len(strings.Fields(text))
+	return n > 0 && n <= maxWords
+}
+
+func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender string, admin bool, text string) bool {
 	groupJID := chat.String()
 	a, ok := b.recentOpenAsk(groupJID)
 	if !ok {
 		return false
 	}
+	if a.kind != "cmf_watch" && sender != "" && a.senderJID != "" && sender != a.senderJID && !admin {
+		return false // вопрос о чужом чеке/наличке — без свайпа отвечает его отправитель или владелец
+	}
 	switch a.kind {
 	case "cash_dup":
-		resolved, isNew := parseCashDupAnswer(text)
-		if !resolved && b.assistant != nil {
-			if r, n := b.aiCashDupDecision(ctx, text); r {
-				resolved, isNew = r, n
-			}
+		// Без свайпа — только короткий ответ без сумм («новый», «тот же»): иначе
+		// новый платёж «Усманов 5000» решил бы судьбу чужой налички.
+		if !shortPlainReply(text, 4) {
+			return false
 		}
+		resolved, isNew := parseCashDupAnswer(text)
 		if !resolved {
 			return false
 		}
@@ -131,16 +164,24 @@ func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string)
 		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, modeContext, wantName)
 
 	case "cash_collector":
-		if b.applyCashCollectorReply(ctx, chat, a.txID, text) {
+		// Без свайпа — только явный ответ «у Дени» / «Мансур взял» / «отдал Адаму»
+		// или известное имя; новый платёж и болтовня («Ок понял») — не ответ.
+		if !shortPlainReply(text, 3) || isConfirmReply(strings.ToLower(text)) || !collectorAnswerLike(text, b) {
+			return false
+		}
+		if b.applyCashCollectorReply(ctx, chat, a.txID, text, false) {
 			b.clearOpenAsk(groupJID)
 			return true
 		}
 		return false
 
 	case "receipt":
-		// Берём ТОЛЬКО бесспорный бэр-ответ ровно на недостающее поле, чтобы не
-		// перехватить обычный новый платёж («Магомед 5000») в переписке.
+		// Несколько открытых вопросов «чей чек?»: ответ — к самому раннему, а если
+		// в ответе сумма — к чеку на эту сумму.
 		amount := parser.ExtractAmount(text)
+		if q := b.pickReceiptAsk(groupJID, amount); q.receiptWaID != "" {
+			a = q
+		}
 		name, _, deferToAI := clarifyNameFromReply(text)
 		if deferToAI {
 			return false
@@ -152,8 +193,9 @@ func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string)
 				return false
 			}
 		case a.needName && !a.needAmount:
-			// Нужно только ФИО — принимаем голое имя без суммы.
-			if name == "" || amount > 0 {
+			// Нужно только ФИО — принимаем голое имя; с суммой — только если она
+			// равна сумме этого чека («Хасанов Ислам 15000» на вопрос о 15000).
+			if name == "" || (amount > 0 && (a.amount <= 0 || math.Abs(amount-a.amount) >= 1)) {
 				return false
 			}
 		default:
@@ -162,13 +204,85 @@ func (b *Bot) tryContextAnswer(ctx context.Context, chat types.JID, text string)
 				return false
 			}
 		}
-		handled, done := b.applyReceiptAnswer(ctx, chat, a.receiptWaID, text)
+		answer := text
+		if a.needName && !a.needAmount && amount > 0 {
+			answer = name // сумму уже знаем — берём только ФИО
+		}
+		handled, done := b.applyReceiptAnswer(ctx, chat, a.receiptWaID, answer)
 		if done {
-			b.clearOpenAsk(groupJID)
+			b.dropReceiptAsk(groupJID, a.receiptWaID)
 		}
 		return handled
 	}
 	return false
+}
+
+// collectorAnswerLike — похоже на ответ «кто забрал наличку»: есть слово-маркер
+// («у», «взял», «забрал», «отдал», «к») или это известное имя.
+func collectorAnswerLike(text string, b *Bot) bool {
+	for _, w := range strings.Fields(strings.ToLower(text)) {
+		switch strings.Trim(w, ".,!?()«»\"") {
+		case "у", "взял", "взяла", "забрал", "забрала", "отдал", "отдала", "к", "принял", "приняла", "в":
+			return true
+		}
+	}
+	_, known := b.aliases.ResolveName(strings.TrimSpace(text))
+	return known
+}
+
+// pickReceiptAsk — какой из открытых вопросов «чей чек?» группы имеется в виду.
+func (b *Bot) pickReceiptAsk(groupJID string, amount float64) openAsk {
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	var fresh []openAsk
+	for _, q := range b.clarify.receiptAsks[groupJID] {
+		if time.Since(q.at) <= contextAnswerWindow {
+			fresh = append(fresh, q)
+		}
+	}
+	b.clarify.receiptAsks[groupJID] = fresh
+	if amount > 0 {
+		for _, q := range fresh {
+			if q.amount > 0 && math.Abs(q.amount-amount) < 1 {
+				return q
+			}
+		}
+	}
+	if len(fresh) > 0 {
+		return fresh[0]
+	}
+	return openAsk{}
+}
+
+// dropReceiptAsk — вопрос по чеку закрыт; следующим открытым становится
+// следующий по очереди вопрос «чей чек?» (если есть).
+func (b *Bot) dropReceiptAsk(groupJID, receiptWaID string) {
+	b.clarify.mu.Lock()
+	var rest []openAsk
+	for _, q := range b.clarify.receiptAsks[groupJID] {
+		if q.receiptWaID != receiptWaID {
+			rest = append(rest, q)
+		}
+	}
+	b.clarify.receiptAsks[groupJID] = rest
+	cur, ok := b.clarify.lastAsk[groupJID]
+	if ok && cur.kind == "receipt" && cur.receiptWaID == receiptWaID {
+		if len(rest) > 0 {
+			b.clarify.lastAsk[groupJID] = rest[0]
+		} else {
+			delete(b.clarify.lastAsk, groupJID)
+		}
+	}
+	b.clarify.mu.Unlock()
+}
+
+// clearOpenAskTx — снять открытый вопрос о наличке txID (ответили свайпом).
+func (b *Bot) clearOpenAskTx(groupJID, kind string, txID int) {
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if cur, ok := b.clarify.lastAsk[groupJID]; ok && cur.kind == kind && cur.txID == txID {
+		delete(b.clarify.lastAsk, groupJID)
+	}
 }
 
 // askAboutReceipt — переспрос по чеку (чего ещё не хватает): связываем его с

@@ -58,6 +58,12 @@ func aiNamesAndPayments(names ...string) func(c aiCall) aiReply {
 			return aiReply{Text: `{"client":""}`}
 		}
 		if strings.Contains(c.System, "модуль разбора платежей") {
+			if i := strings.Index(u, "Строки:\n"); i >= 0 {
+				u = u[i+len("Строки:\n"):]
+			}
+			if i := strings.Index(u, "\n\nЧисла-суммы"); i >= 0 {
+				u = u[:i]
+			}
 			var ps []string
 			for _, ln := range strings.Split(u, "\n") {
 				for _, n := range names {
@@ -69,7 +75,9 @@ func aiNamesAndPayments(names ...string) func(c aiCall) aiReply {
 							}
 						}
 						if amt > 0 {
-							cash := strings.Contains(ln, "нал") || strings.Contains(ln, " у ")
+							// Как настоящая модель: «наличка» на соседней строке относится к платежу.
+							cash := strings.Contains(ln, "нал") || strings.Contains(ln, " у ") ||
+								(strings.Count(u, "\n") <= 6 && strings.Contains(u, "налич") && countAmountLines(u) <= 1)
 							ps = append(ps, fmt.Sprintf(`{"name":%q,"amount":%v,"cash":%v}`, n, amt, cash))
 						}
 					}

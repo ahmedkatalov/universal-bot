@@ -580,7 +580,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			// под вопросом «какая сумма?») — понимаем по контексту. Свайп на
 			// вопрос сверки по чеку — это ответ НА НЕГО (уже разобран выше), а не
 			// на последний вопрос.
-			if !b.quotesCmfAsk(ctx, msg) && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswer(ctx, msg.Info.Chat, text) {
+			if extractQuotedStanzaID(msg) == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, text) {
 				return
 			}
 		}
@@ -3305,7 +3305,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 				_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
 				b.registerClarifyAsk(botMsgID, waMsgID)
 				// Если в ответ пришлют ФИО (без свайпа) — засчитаем по дате сообщения.
-				b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needName: true})
+				b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needName: true, senderJID: senderJID, amount: rd.Amount})
 			}
 		}
 		return
@@ -3377,7 +3377,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			if botMsgID != "" {
 				_ = b.db.MarkReceiptAskedByMessage(ctx, waMsgID, botMsgID)
 				b.registerClarifyAsk(botMsgID, waMsgID)
-				b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needAmount: needAmount, needName: needName})
+				b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needAmount: needAmount, needName: needName, senderJID: senderJID, amount: rd.Amount})
 			}
 		}
 		return
