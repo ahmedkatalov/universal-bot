@@ -82,7 +82,10 @@ func (b *Bot) scheduleReminderTool(chat types.JID, ownerJID types.JID) ai.Tool {
 			"«отправь Мухаммаду в 18:00 …». kind: once (разово), daily (каждый день), weekly (раз в неделю). Время в " +
 			"формате ЧЧ:ММ (time) или через in_minutes (через сколько минут, для разового). Для weekly укажи weekday " +
 			"(пн/вт/…/вс). Кому: target = me (владельцу лично), here (в этот чат), group (укажи group=название), " +
-			"person (укажи number или name). message — точный текст, который отправлять.",
+			"person (укажи number или name). message — точный текст, который отправлять. Если просят присылать " +
+			"СБОР/ОТЧЁТ/ИТОГ за день («каждый день в 21:00 присылай сбор за день») — укажи report=day_collection " +
+			"(и group, если сбор нужен по одной группе): бот сам посчитает настоящие цифры за этот день. Простой " +
+			"message — это всегда неизменный текст, цифр в нём не будет.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -96,8 +99,11 @@ func (b *Bot) scheduleReminderTool(chat types.JID, ownerJID types.JID) ai.Tool {
 				"number":     map[string]any{"type": "string", "description": "Номер человека (если target=person)"},
 				"name":       map[string]any{"type": "string", "description": "Имя человека (если target=person)"},
 				"message":    map[string]any{"type": "string", "description": "Текст, который отправить"},
+				"report": map[string]any{"type": "string", "enum": []string{"day_collection"},
+					"description": "day_collection — вместо текста присылать сбор за день с цифрами"},
+				"report_group": map[string]any{"type": "string", "description": "Группа для сбора (пусто — все группы)"},
 			},
-			"required": []string{"kind", "message"},
+			"required": []string{"kind"},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var a struct {
@@ -111,11 +117,22 @@ func (b *Bot) scheduleReminderTool(chat types.JID, ownerJID types.JID) ai.Tool {
 				Number    string `json:"number"`
 				Name      string `json:"name"`
 				Message   string `json:"message"`
+				Report    string `json:"report"`
+				RepGroup  string `json:"report_group"`
 			}
 			if err := json.Unmarshal(input, &a); err != nil {
 				return "", err
 			}
 			msg := strings.TrimSpace(a.Message)
+			if a.Report == "day_collection" {
+				spec := strings.TrimSpace(a.RepGroup)
+				if spec != "" {
+					if _, _, err := b.resolveGroups(ctx, spec); err != nil {
+						return "", err
+					}
+				}
+				msg = reportJobPrefix + spec
+			}
 			if msg == "" {
 				return "Что именно отправлять по расписанию? Укажи текст.", nil
 			}
@@ -195,7 +212,7 @@ func (b *Bot) scheduleReminderTool(chat types.JID, ownerJID types.JID) ai.Tool {
 				return "", fmt.Errorf("не получилось создать напоминание: %w", err)
 			}
 			return fmt.Sprintf("Готово, напоминание #%d: %s, %s — «%s». Первый раз: %s.",
-				job.ID, describeSchedule(kind, job.NextRunAt, hour, minute, weekday), label, msg, job.NextRunAt.Format("02.01 15:04")), nil
+				job.ID, describeSchedule(kind, job.NextRunAt, hour, minute, weekday), label, jobLabel(msg), job.NextRunAt.Format("02.01 15:04")), nil
 		},
 	}
 }
@@ -252,7 +269,7 @@ func (b *Bot) listRemindersTool() ai.Tool {
 			for _, j := range jobs {
 				fmt.Fprintf(&sb, "#%d — %s, %s: «%s» (ближайшее %s)\n",
 					j.ID, describeSchedule(j.Kind, j.NextRunAt, j.AtHour, j.AtMinute, j.Weekday),
-					j.TargetLabel, j.Message, j.NextRunAt.Format("02.01 15:04"))
+					j.TargetLabel, jobLabel(j.Message), j.NextRunAt.Format("02.01 15:04"))
 			}
 			return sb.String(), nil
 		},

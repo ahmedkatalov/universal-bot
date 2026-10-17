@@ -50,6 +50,15 @@ type clarifyState struct {
 	receiptAsks map[string][]openAsk
 	// paymentAsks — «❓ Чья это наличка 27000?»: id вопроса → сообщение-платёж.
 	paymentAsks map[string]paymentAsk
+	// dupFixAsks — «этот чек уже присылали, в первый раз он на X, сейчас
+	// подписан Y»: id предупреждения → какой чек и на кого поправить.
+	dupFixAsks map[string]dupFixAsk
+}
+
+// dupFixAsk — повторно присланный чек подписан другим клиентом.
+type dupFixAsk struct {
+	checkWa string // первый (засчитанный) чек
+	name    string // клиент из новой подписи
 }
 
 // paymentAsk — платёж из текста, по которому бот спросил, чей он.
@@ -83,6 +92,7 @@ func newClarifyState() *clarifyState {
 
 		receiptAsks: make(map[string][]openAsk),
 		paymentAsks: make(map[string]paymentAsk),
+		dupFixAsks:  make(map[string]dupFixAsk),
 	}
 }
 
@@ -682,9 +692,14 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	// Ответ на «❓ Чья это наличка?» по текстовому платежу.
 	b.clarify.mu.Lock()
 	pa, isPayAsk := b.clarify.paymentAsks[quotedID]
+	fix, isFixAsk := b.clarify.dupFixAsks[quotedID]
 	b.clarify.mu.Unlock()
 	if isPayAsk {
 		return b.applyPaymentWhoAnswer(ctx, msg.Info.Chat, quotedID, pa, text)
+	}
+	// «Этот чек уже присылали… сейчас подписан Y» — «да» переносит чек на Y.
+	if isFixAsk {
+		return b.applyDupFixAnswer(ctx, msg.Info.Chat, quotedID, fix, text)
 	}
 
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».
@@ -862,5 +877,64 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 	}
 	b.sendText(chat, fmt.Sprintf("Записал: %s %s ₽ — %s.", kind, formatMoney(amount), canonical))
 	_ = askID
+	return true
+}
+
+// registerDupFixAsk — запомнить предупреждение о повторном чеке с другим клиентом.
+func (b *Bot) registerDupFixAsk(botMsgID string, a dupFixAsk) {
+	if botMsgID == "" || a.checkWa == "" {
+		return
+	}
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if len(b.clarify.dupFixAsks) >= clarifyMapCap {
+		for k := range b.clarify.dupFixAsks {
+			delete(b.clarify.dupFixAsks, k)
+			break
+		}
+	}
+	b.clarify.dupFixAsks[botMsgID] = a
+}
+
+// applyDupFixAnswer — ответ на предупреждение о повторном чеке: «да» — чек на
+// клиента из новой подписи, ФИО — на этого клиента, «нет» — оставить как есть.
+func (b *Bot) applyDupFixAnswer(ctx context.Context, chat types.JID, askID string, a dupFixAsk, text string) bool {
+	t := strings.ToLower(strings.Trim(strings.TrimSpace(text), ".!,"))
+	name := ""
+	switch {
+	case t == "нет" || strings.HasPrefix(t, "нет ") || strings.HasPrefix(t, "нет,") || strings.Contains(t, "оставь"):
+		b.clarify.mu.Lock()
+		delete(b.clarify.dupFixAsks, askID)
+		b.clarify.mu.Unlock()
+		b.sendText(chat, "Ок, оставил как было.")
+		return true
+	case t == "да" || t == "+" || t == "ага" || t == "верно" || strings.HasPrefix(t, "да,") || strings.HasPrefix(t, "да "):
+		name = a.name
+		if rest := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(text)[len("да"):], " ,.")); len([]rune(t)) > 3 && rest != "" {
+			if c, ok := b.confirmClientName(ctx, strings.TrimPrefix(strings.TrimPrefix(rest, "это "), "Это ")); ok {
+				name = c
+			}
+		}
+	default:
+		c, ok := b.confirmClientName(ctx, strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(text), "это "), "Это "))
+		if !ok {
+			return false
+		}
+		name = c
+	}
+	canonical, _ := b.aliases.ResolveName(name)
+	var cid *int
+	if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+		cid = &id
+	}
+	found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, a.checkWa, canonical, cid, 0)
+	if err != nil || !found {
+		return false
+	}
+	b.clarify.mu.Lock()
+	delete(b.clarify.dupFixAsks, askID)
+	b.clarify.mu.Unlock()
+	b.reresolveWatchByCheck(ctx, chat, a.checkWa, canonical)
+	b.sendText(chat, "Поправил: чек теперь на клиента "+canonical+".")
 	return true
 }

@@ -595,7 +595,18 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			if b.cmfReplyAnswer(ctx, msg, stripped, modeAddressed) {
 				return
 			}
-			if extractQuotedStanzaID(msg) == "" && b.cmfAddressedContext(ctx, msg, stripped) {
+			quoted := extractQuotedStanzaID(msg)
+			if quoted == "" && b.cmfAddressedContext(ctx, msg, stripped) {
+				return
+			}
+			// «Джарвис, это Каталов Ахмед» свайпом на «чей чек?» / «у кого
+			// наличка?» — это ответ на вопрос, а не команда ассистенту.
+			if quoted != "" && b.handleClarifyReply(ctx, msg, stripped) {
+				return
+			}
+			// Сотрудник отвечает на открытый вопрос бота, обращаясь по имени.
+			// (Владельцу оставляем ассистента — у него есть инструменты.)
+			if quoted == "" && !b.isReportAdmin(msg.Info) && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, stripped) {
 				return
 			}
 		} else {
@@ -616,11 +627,17 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// на его сообщение — отвечаем ассистентом прямо в группе, в учёт такое
 	// сообщение не идёт. В фоне, чтобы не блокировать разбор остальных.
 	if !hasMedia && b.assistant != nil {
+		// Платёж сотрудника, написанный боту («Джарвис, Каталов Ахмед 15000») или
+		// свайпом на сообщение бота, — это обычный платёж: записываем как всегда.
+		// Ассистент сотруднику его не запишет (у не-админов нет инструментов).
 		if query, ok := b.stripBotName(text); ok {
-			go b.handleGroupAssistant(context.Background(), msg, query)
-			return
-		}
-		if b.isReplyToBot(msg) {
+			if b.employeePayment(msg, query) {
+				text = query
+			} else {
+				go b.handleGroupAssistant(context.Background(), msg, query)
+				return
+			}
+		} else if b.isReplyToBot(msg) && !b.employeePayment(msg, text) {
 			go b.handleGroupAssistant(context.Background(), msg, text)
 			return
 		}
@@ -728,6 +745,16 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		proactiveChatEnabled() && worthChimingIn(text) {
 		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
 	}
+}
+
+// employeePayment — сообщение сотрудника (не админа отчётности) похоже на
+// платёж, а не на вопрос боту.
+func (b *Bot) employeePayment(msg *events.Message, text string) bool {
+	if b.isReportAdmin(msg.Info) {
+		return false
+	}
+	res := parser.ParseMessage(text)
+	return len(res.Transactions) > 0 || parser.LooksMessyPayment(text, res)
 }
 
 // processText — разбор текста из группы: имя для чека или платежи. aiSync —
@@ -1063,6 +1090,10 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
 	text += b.quotedSenderPhoneNote(ctx, msg)
+	// Пересланное из группы сообщение — скорее всего, платёж уже в учёте.
+	if ci := contextInfoOf(msg); ci != nil && ci.GetIsForwarded() {
+		text = "[Переслано из другого чата — проверь, нет ли этого платежа уже в учёте, прежде чем записывать]\n" + text
+	}
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
 	if err != nil {
@@ -2877,6 +2908,26 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 					candidates = append(candidates, op)
 				}
 			}
+			// Чек и его текстовая копия («Магомедов Ахмед 5000» рядом с чеком) —
+			// ОДИН платёж: показываем и исключаем вместе.
+			candidates = collapseTextTwins(candidates)
+			groups := b.joinedGroups(ctx)
+			opLabel := func(op db.OperationRef) string {
+				kind := "текст"
+				switch {
+				case op.Kind == "receipt":
+					kind = "чек"
+				case op.Cash:
+					kind = "наличка"
+				}
+				g := ""
+				if jid, err := types.ParseJID(op.GroupJID); err == nil {
+					if n, ok := groups[jid]; ok {
+						g = ", группа " + n
+					}
+				}
+				return fmt.Sprintf("[%s] %s, %.0f ₽, %s%s", kind, op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04"), g)
+			}
 
 			switch len(candidates) {
 			case 0:
@@ -2886,25 +2937,77 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				return fmt.Sprintf("Операций на %.0f ₽ в учёте не нашёл — возможно, она уже исключена или сумма другая.", args.Amount), nil
 			case 1:
 				op := candidates[0]
-				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, args.Action == "exclude"); err != nil {
+				exclude := args.Action == "exclude"
+				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, exclude); err != nil {
 					return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+				}
+				twins := 0
+				if exclude && op.Kind == "receipt" {
+					// Текстовая копия этого чека иначе сразу начала бы считаться.
+					if ids, err := b.db.ReceiptTextTwins(ctx, op.ID); err == nil {
+						for _, id := range ids {
+							if b.db.SetOperationIgnored(ctx, "transaction", id, true) == nil {
+								twins++
+							}
+						}
+					}
 				}
 				verb := "исключена из учёта"
 				if args.Action == "restore" {
 					verb = "возвращена в учёт"
 				}
-				return fmt.Sprintf("Операция %s: %s, %.0f ₽ от %s. Отчёты уже учитывают это изменение.",
-					verb, op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04")), nil
+				out := fmt.Sprintf("Операция %s: %s. Отчёты уже учитывают это изменение.", verb, opLabel(op))
+				if twins > 0 {
+					out += fmt.Sprintf(" Вместе с чеком исключил его текстовую запись (%d) — это был тот же платёж.", twins)
+				}
+				return out, nil
 			default:
 				var sb strings.Builder
-				sb.WriteString("Нашёл несколько подходящих операций, уточни дату или имя:\n")
+				sb.WriteString("Нашёл несколько подходящих операций, уточни дату, имя или группу:\n")
 				for _, op := range candidates {
-					fmt.Fprintf(&sb, "- %s, %.0f ₽, %s\n", op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04"))
+					fmt.Fprintf(&sb, "- %s\n", opLabel(op))
 				}
 				return sb.String(), nil
 			}
 		},
 	}
+}
+
+// collapseTextTwins убирает из списка текстовые записи, которые — копия чека из
+// того же списка (тот же клиент и сумма, та же группа, ±2 дня, перевод): чек
+// останется, а его копию инструмент исключит вместе с ним.
+func collapseTextTwins(ops []db.OperationRef) []db.OperationRef {
+	var receipts []db.OperationRef
+	for _, op := range ops {
+		if op.Kind == "receipt" {
+			receipts = append(receipts, op)
+		}
+	}
+	if len(receipts) == 0 {
+		return ops
+	}
+	out := ops[:0:0]
+	for _, op := range ops {
+		if op.Kind == "transaction" && !op.Cash {
+			twin := false
+			for _, r := range receipts {
+				d := op.Received.Sub(r.Received)
+				if d < 0 {
+					d = -d
+				}
+				if r.GroupJID == op.GroupJID && math.Abs(r.Amount-op.Amount) < 1 && d <= 48*time.Hour &&
+					nameKeyBot(r.Name) == nameKeyBot(op.Name) {
+					twin = true
+					break
+				}
+			}
+			if twin {
+				continue
+			}
+		}
+		out = append(out, op)
+	}
+	return out
 }
 
 // savePendingTool сохраняет в учёт чеки, присланные владельцем в личку —
@@ -3604,13 +3707,16 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		extra := ""
 		if payerOverride != "" && dupMatch.Client != "" && nameKeyBot(dupMatch.Client) != nameKeyBot(payerOverride) {
 			// Тот же чек, но подписан другим клиентом — скорее всего, поправка.
-			extra = fmt.Sprintf(" В первый раз он записан на «%s», сейчас подписан «%s» — если клиент «%s», напишите «%s, это чек %s», и я поправлю.",
-				dupMatch.Client, payerOverride, payerOverride, b.botName, payerOverride)
+			extra = fmt.Sprintf(" В первый раз он записан на «%s», сейчас подписан «%s» — если клиент «%s», ответьте на это сообщение «да», и я поправлю.",
+				dupMatch.Client, payerOverride, payerOverride)
 		}
-		b.sendReply(chat, fmt.Sprintf(
+		id := b.sendReply(chat, fmt.Sprintf(
 			"⚠️ Этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.%s",
 			shown, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), extra),
 			waMsgID, senderJID)
+		if extra != "" {
+			b.registerDupFixAsk(id, dupFixAsk{checkWa: dupMatch.WaMessage, name: payerOverride})
+		}
 	}
 
 	// Подозрительно большая сумма (вероятно, лишний ноль при распознавании) —

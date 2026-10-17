@@ -91,10 +91,11 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 			"поймал его из группы. Вызывай на сообщения-платежи владельца: 'Джабраилов Мовсар оплатил наличными 22400', " +
 			"'Асхабов Ибрагим наличка 35000 отдал Адаму', 'Умхадижиев Рахман 170т', 'запиши перевод Милана 25000'. " +
 			"Если владелец прислал СРАЗУ НЕСКОЛЬКО платежей — вызови инструмент по КАЖДОМУ. client и amount обязательны. " +
-			"kind: 'cash' если явно наличка/наличными/нал, иначе 'transfer'. collector — кто ЗАБРАЛ наличку (ответственный, " +
-			"'отдал Адаму'/'Мансур взял'). group — в какую группу; если не указана, берётся ЗАПОМНЕННАЯ рабочая группа. " +
-			"НЕ переспрашивай группу на каждый платёж — спроси один раз, запомни и применяй ко всем. date — YYYY-MM-DD, " +
-			"по умолчанию сегодня.",
+			"kind: 'cash' если наличка/наличными/нал ИЛИ сказано, у кого деньги («у Дени», «отдал Адаму», «Мансур взял»), " +
+			"иначе 'transfer'. collector — кто ЗАБРАЛ наличку (ответственный). group — в какую группу; если не указана, " +
+			"берётся ЗАПОМНЕННАЯ рабочая группа. НЕ переспрашивай группу на каждый платёж — спроси один раз, запомни и " +
+			"применяй ко всем. date — YYYY-MM-DD, по умолчанию сегодня. Если инструмент ответил «ПОХОЖЕ НА ПОВТОР» — " +
+			"спроси владельца и вызывай с confirm_duplicate=true, только если он подтвердил, что это ОТДЕЛЬНЫЙ платёж.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -104,6 +105,8 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				"group":     map[string]any{"type": "string", "description": "Группа учёта (пусто — рабочая группа из памяти)"},
 				"collector": map[string]any{"type": "string", "description": "Кто забрал наличку (ответственный), если указан"},
 				"date":      map[string]any{"type": "string", "description": "Дата платежа YYYY-MM-DD (по умолчанию сегодня)"},
+				"confirm_duplicate": map[string]any{"type": "boolean",
+					"description": "true — владелец подтвердил, что это ОТДЕЛЬНЫЙ платёж, хотя похожий уже есть"},
 			},
 			"required": []string{"client", "amount"},
 		},
@@ -115,6 +118,7 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				Group     string  `json:"group"`
 				Collector string  `json:"collector"`
 				Date      string  `json:"date"`
+				Confirm   bool    `json:"confirm_duplicate"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
@@ -157,11 +161,30 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				txDate = t
 			}
 
-			isCash := strings.EqualFold(args.Kind, "cash")
 			collector := strings.TrimSpace(args.Collector)
+			// «у Дени» / «отдал Адаму» — это наличка (правило владельца).
+			isCash := strings.EqualFold(args.Kind, "cash") || collector != ""
 			senderName := collector
 			if senderName == "" {
 				senderName = "владелец"
+			}
+
+			canonical := client
+			if resolved, ok := b.aliases.ResolveName(client); ok {
+				canonical = resolved
+			}
+			contactID, err := b.db.GetOrCreateContact(ctx, canonical)
+			if err != nil {
+				return "", fmt.Errorf("не удалось создать контакт: %w", err)
+			}
+			// Такой платёж уже есть (пересланный из группы, повтор налички за 30
+			// дней, перевод с чеком) — не записываем молча второй раз.
+			if !args.Confirm {
+				if prev, found, err := b.db.SimilarPayment(ctx, groupJID, contactID, args.Amount, txDate, isCash); err == nil && found {
+					return fmt.Sprintf("ПОХОЖЕ НА ПОВТОР: уже есть %s — %.0f ₽ (%s, %s). Не записал. Спроси владельца: "+
+						"это тот же платёж или отдельный? Если отдельный — вызови record_payment ещё раз с confirm_duplicate=true.",
+						prev.Name, prev.Amount, prev.Kind, prev.When.Format("02.01.2006")), nil
+				}
 			}
 
 			// Синтетическое сырое сообщение, чтобы платёж лёг в нужную группу и
@@ -179,14 +202,6 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				return "", fmt.Errorf("не удалось сохранить: %w", err)
 			}
 
-			canonical := client
-			if resolved, ok := b.aliases.ResolveName(client); ok {
-				canonical = resolved
-			}
-			contactID, err := b.db.GetOrCreateContact(ctx, canonical)
-			if err != nil {
-				return "", fmt.Errorf("не удалось создать контакт: %w", err)
-			}
 			cardTo := ""
 			if isCash {
 				cardTo = "наличные"

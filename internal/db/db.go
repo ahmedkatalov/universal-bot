@@ -1415,10 +1415,11 @@ func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, auth
 
 // DuplicateMatch — найденный ранее тот же чек.
 type DuplicateMatch struct {
-	Found    bool
-	TxDate   time.Time
-	Client   string // на кого записан найденный чек
-	StrongID bool   // совпал номер операции/документа или код авторизации
+	Found     bool
+	TxDate    time.Time
+	Client    string // на кого записан найденный чек
+	StrongID  bool   // совпал номер операции/документа или код авторизации
+	WaMessage string // id WhatsApp сообщения с найденным чеком
 }
 
 // FindDuplicateReceiptEx ищет тот же чек, присланный раньше. Совпадение
@@ -1430,7 +1431,8 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 	var m DuplicateMatch
 	err := d.pool.QueryRow(ctx, `
 		SELECT br.tx_date, COALESCE(c.canonical_name, br.recipient_raw, ''),
-		       (($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8))
+		       (($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8)),
+		       COALESCE(rm.wa_message_id, '')
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
@@ -1460,7 +1462,7 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 		ORDER BY 3 DESC, br.tx_date
 		LIMIT 1
 	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode, senderRaw).
-		Scan(&m.TxDate, &m.Client, &m.StrongID)
+		Scan(&m.TxDate, &m.Client, &m.StrongID, &m.WaMessage)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, nil
 	}
@@ -1603,12 +1605,15 @@ func (d *DB) releaseMessageLinks(ctx context.Context, rawID int) {
 // OperationRef — ссылка на операцию (текстовый платёж или чек) для ручных
 // корректировок через ассистента.
 type OperationRef struct {
-	Kind    string // "transaction" | "receipt"
-	ID      int
-	Name    string
-	Amount  float64
-	TxDate  time.Time
-	Ignored bool
+	Kind     string // "transaction" | "receipt"
+	ID       int
+	Name     string
+	Amount   float64
+	TxDate   time.Time
+	Ignored  bool
+	GroupJID string
+	Cash     bool
+	Received time.Time // когда прислали в чат
 }
 
 // FindOperations ищет операции по сумме с необязательными уточнениями:
@@ -1620,7 +1625,8 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 		SELECT * FROM (
 			SELECT 'transaction' AS kind, t.id, COALESCE(c.canonical_name, t.raw_name) AS name,
 			       t.amount::float8 AS amount, t.tx_date::timestamptz AS tx_date,
-			       COALESCE(rm.wa_group_jid, '') AS group_jid, t.ignored
+			       COALESCE(rm.wa_group_jid, '') AS group_jid, t.ignored,
+			       t.is_cash AS cash, COALESCE(rm.received_at, t.tx_date::timestamptz) AS received
 			FROM transactions t
 			LEFT JOIN contacts c ON c.id = t.contact_id
 			LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
@@ -1629,7 +1635,8 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 			UNION ALL
 
 			SELECT 'receipt', br.id, COALESCE(c.canonical_name, br.recipient_raw, ''),
-			       br.amount::float8, br.tx_date, COALESCE(br.group_jid, ''), br.ignored
+			       br.amount::float8, br.tx_date, COALESCE(br.group_jid, ''), br.ignored,
+			       false, COALESCE(rm.received_at, br.tx_date)
 			FROM bank_receipts br
 			LEFT JOIN contacts c ON c.id = br.contact_id
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -1651,9 +1658,10 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 	for rows.Next() {
 		var op OperationRef
 		var groupJID string
-		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &groupJID, &op.Ignored); err != nil {
+		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &groupJID, &op.Ignored, &op.Cash, &op.Received); err != nil {
 			return nil, err
 		}
+		op.GroupJID = groupJID
 		out = append(out, op)
 	}
 	return out, rows.Err()
@@ -1699,6 +1707,37 @@ func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignor
 	}
 	_, err := d.pool.Exec(ctx, `UPDATE `+table+` SET ignored = $2 WHERE id = $1`, id, ignored)
 	return err
+}
+
+// ReceiptTextTwins — живые текстовые платежи, засчитанные как дубль этого чека
+// (тот же клиент и сумма, перевод, присланы в той же группе в пределах ±2 дней).
+// Если чек исключить, они бы начали считаться — исключаем вместе с ним.
+func (d *DB) ReceiptTextTwins(ctx context.Context, receiptID int) ([]int, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT t.id FROM bank_receipts br
+		LEFT JOIN raw_messages brm ON brm.id = br.raw_message_id
+		JOIN transactions t ON t.contact_id = br.contact_id AND t.amount = br.amount
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE br.id = $1 AND br.contact_id IS NOT NULL
+		  AND t.is_cash = false AND t.ignored = false AND t.dup_pending = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(rm.wa_group_jid, '') = COALESCE(br.group_jid, '')
+		  AND COALESCE(rm.received_at, t.tx_date::timestamptz) >= COALESCE(brm.received_at, br.tx_date) - interval '2 days'
+		  AND COALESCE(rm.received_at, t.tx_date::timestamptz) <  COALESCE(brm.received_at, br.tx_date) + interval '2 days'
+		ORDER BY t.id`, receiptID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // ForwardRule — правило пересылки чеков: все чеки из source идут в target.
@@ -2324,6 +2363,52 @@ func (d *DB) ReportExclusionsBasis(ctx context.Context, from, to time.Time, grou
 		  )
 	`, from, to, groupSliceArg(groupJIDs)).Scan(&ex.TextDupCount, &ex.TextDupSum)
 	return ex, err
+}
+
+// SimilarRef — уже записанный похожий платёж.
+type SimilarRef struct {
+	Name   string
+	Amount float64
+	Kind   string // «чек» / «наличка» / «перевод»
+	When   time.Time
+}
+
+// SimilarPayment — есть ли в группе такой же платёж того же клиента: наличка —
+// в пределах 30 дней (правило повтора налички), перевод/чек — ±2 дня.
+func (d *DB) SimilarPayment(ctx context.Context, groupJID string, contactID int, amount float64, when time.Time, cash bool) (SimilarRef, bool, error) {
+	var r SimilarRef
+	days := 2
+	if cash {
+		days = 30
+	}
+	err := d.pool.QueryRow(ctx, `
+		SELECT name, amount, kind, at FROM (
+			SELECT COALESCE(c.canonical_name, t.raw_name, '') AS name, t.amount::float8 AS amount,
+			       CASE WHEN t.is_cash THEN 'наличка' ELSE 'перевод' END AS kind, t.tx_date::timestamptz AS at
+			FROM transactions t
+			JOIN raw_messages rm ON rm.id = t.raw_message_id
+			LEFT JOIN contacts c ON c.id = t.contact_id
+			WHERE t.contact_id = $2 AND abs(t.amount - $3) < 1 AND t.ignored = false
+			  AND COALESCE(rm.deleted, false) = false AND rm.wa_group_jid = $1
+			  AND t.is_cash = $5
+			  AND t.tx_date::timestamptz BETWEEN $4::timestamptz - make_interval(days => $6) AND $4::timestamptz + make_interval(days => $6)
+			UNION ALL
+			SELECT COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, 'чек', br.tx_date
+			FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			LEFT JOIN contacts c ON c.id = br.contact_id
+			WHERE NOT $5 AND br.contact_id = $2 AND abs(br.amount - $3) < 1
+			  AND br.ignored = false AND br.is_duplicate = false AND COALESCE(rm.deleted, false) = false
+			  AND br.group_jid = $1
+			  AND br.tx_date BETWEEN $4::timestamptz - interval '2 days' AND $4::timestamptz + interval '2 days'
+		) x ORDER BY at DESC LIMIT 1`, groupJID, contactID, amount, when, cash, days).Scan(&r.Name, &r.Amount, &r.Kind, &r.When)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, false, nil
+	}
+	if err != nil {
+		return r, false, err
+	}
+	return r, true, nil
 }
 
 // PersonPending — что по человеку НЕ вошло в сбор: придержанная наличка-повтор
