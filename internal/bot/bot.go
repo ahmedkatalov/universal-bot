@@ -576,12 +576,6 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 
-	// Пересылка чеков между чатами по активным правилам ("все чеки из группы
-	// оплата клиентов скидывай в оплата клнт") — в фоне, не мешая учёту.
-	if hasMedia && mediaBytes != nil {
-		go b.applyForwardRules(context.Background(), msg.Info.Chat.String(), senderName, msg.Info.ID, mediaBytes, mediaExt, text, msg.Info.Timestamp)
-	}
-
 	// Ответ (свайп) на ВОПРОС-УТОЧНЕНИЕ бота («чей это чек?», «у кого наличка?»,
 	// «новый платёж или тот же?») обрабатываем ПЕРВЫМ — ДО маршрутизации реплая
 	// в ассистента. Иначе ответ владельца («у Нура») уходил в ИИ, и тот отвечал
@@ -688,6 +682,9 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// вижн-фолбэк. СИНХРОННО (как путь с OCR ниже): иначе строка чека ещё не
 		// в БД, когда придёт следующее сообщение-имя, и имя привяжется не к тому
 		// чеку (перепутает клиентов). Вижн-запрос секунды — обработчик их терпит.
+		if mediaBytes != nil {
+			b.startForward(msg, senderName, mediaBytes, mediaExt, text)
+		}
 		if mediaBytes != nil && b.assistant != nil {
 			payer, payerAmount := b.resolveReceiptPayer(ctx, msg, caption)
 			b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), msg.Info.ID, "", rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer, payerAmount)
@@ -710,6 +707,11 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// чеке (там может быть владелец карты, а не клиент).
 		payer, payerAmount := b.resolveReceiptPayer(ctx, msg, caption)
 		b.handleBankReceipt(ctx, msg.Info.Chat, msg.Info.Sender.String(), msg.Info.ID, text, rawID, msg.Info.Timestamp, mediaBytes, mediaExt, payer, payerAmount)
+		// Пересылка по правилам — ПОСЛЕ записи чека (повторная доставка сюда не
+		// доходит), чтобы копия получила уже названного клиента.
+		if mediaBytes != nil {
+			b.startForward(msg, senderName, mediaBytes, mediaExt, text)
+		}
 		// Если в ПОДПИСИ к чеку есть обращение к боту («Джарвис, чей это чек?»,
 		// «Джарвис запиши на Ахмеда») — отвечаем ассистентом. Раньше команда в
 		// подписи к фото терялась: ветка ассистента работала только для текста без
@@ -3281,15 +3283,29 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 		// Записываем чек в учёт целевой группы. Синтетический ID сообщения,
 		// чтобы не конфликтовать с исходным по уникальности.
 		if parser.LooksLikeBankReceipt(text) {
-			rawID, _, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
+			rawID, existed, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
 				"bot-forward", "", senderName, text, true, "", ts)
 			if err != nil {
 				fmt.Println("Ошибка сохранения пересланного чека:", err)
 				continue
 			}
-			b.handleBankReceipt(ctx, targetJID, "", "", text, rawID, ts, media, ext, "", 0)
+			if existed {
+				continue // эту копию уже записывали
+			}
+			// Клиент, названный у исходного чека, — и у копии (иначе в целевой
+			// группе чек не считался и бот спрашивал «чей это чек?»).
+			payer := ""
+			if name, ok, err := b.db.ReceiptClientByMessage(ctx, origMsgID); err == nil && ok {
+				payer = name
+			}
+			b.handleBankReceipt(ctx, targetJID, "", "", text, rawID, ts, media, ext, payer, 0)
 		}
 	}
+}
+
+// startForward — переслать чек по правилам пересылки (в фоне).
+func (b *Bot) startForward(msg *events.Message, senderName string, media []byte, ext, text string) {
+	go b.applyForwardRules(context.Background(), msg.Info.Chat.String(), senderName, msg.Info.ID, media, ext, text, msg.Info.Timestamp)
 }
 
 // handleBankReceipt разбирает распознанный текст скриншота банковского перевода
@@ -3505,7 +3521,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			// Зрение было недоступно — поставим на автоповтор распознавания.
 			_ = b.db.MarkReceiptForRetry(ctx, rawID, "vision unavailable (collapsed)", time.Now().Add(retryBackoff(0)))
 		}
-		if askReceiptsEnabled() && waMsgID != "" {
+		if askReceiptsEnabled() && waMsgID != "" && !b.groupSilent(chat) {
 			botMsgID := b.sendReply(chat, fmt.Sprintf(
 				"🤔 Чек на %.0f ₽ пришёл НЕПОЛНЫМ (похоже на свёрнутый экран «Перевод выполнен»). Не видно главного: "+
 					"КОГДА (дата операции), НА КАКУЮ КАРТУ (получатель), ЧЬЁ ИМЯ (ФИО получателя). "+
@@ -3570,7 +3586,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// чтобы клариф-цикл не переспрашивал, и привязываем ответ владельца (ФИО+
 		// сумма свайпом на этот чек) через fix. Чек при этом уже лежит как
 		// «непонятый» — придёт в список по запросу «скинь нераспознанные».
-		if askReceiptsEnabled() && waMsgID != "" {
+		if askReceiptsEnabled() && waMsgID != "" && !b.groupSilent(chat) {
 			// Спрашиваем ИМЕННО то, что не разобрали: только сумму, только ФИО, или
 			// оба. Отвечать можно и свайпом, и просто следующим сообщением.
 			needAmount := rd.Amount == 0
@@ -3712,12 +3728,14 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			extra = fmt.Sprintf(" В первый раз он записан на «%s», сейчас подписан «%s» — если клиент «%s», ответьте на это сообщение «да», и я поправлю.",
 				dupMatch.Client, payerOverride, payerOverride)
 		}
-		id := b.sendReply(chat, fmt.Sprintf(
-			"⚠️ Этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.%s",
-			shown, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), extra),
-			waMsgID, senderJID)
-		if extra != "" {
-			b.registerDupFixAsk(id, dupFixAsk{checkWa: dupMatch.WaMessage, name: payerOverride})
+		if !b.groupSilent(chat) {
+			id := b.sendReply(chat, fmt.Sprintf(
+				"⚠️ Этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.%s",
+				shown, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), extra),
+				waMsgID, senderJID)
+			if extra != "" {
+				b.registerDupFixAsk(id, dupFixAsk{checkWa: dupMatch.WaMessage, name: payerOverride})
+			}
 		}
 	}
 
@@ -3735,7 +3753,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// НЕ сверяем по печатному получателю: в рассрочке это владелец карты-сборщика,
 	// а не плательщик — сверка и напоминания ушли бы не на того. Оставляем клиента
 	// пустым (noname): сверка подхватится после того, как клиента уточнят.
-	if b.cmf != nil && !isDuplicate {
+	// Копию пересланного чека (senderJID пуст) не сверяем — сверка и напоминание
+	// идут по исходному чеку, иначе напоминали бы дважды.
+	if b.cmf != nil && !isDuplicate && senderJID != "" {
 		clientText := ""
 		if clientConfirmed {
 			clientText = rd.Recipient

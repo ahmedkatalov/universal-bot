@@ -173,6 +173,10 @@ func askReceiptsEnabled() bool {
 }
 
 func (b *Bot) clarifyTick(ctx context.Context) {
+	// Клиента исходного чека назвали — копии в других группах получают его.
+	if n, err := b.db.SyncForwardCopies(ctx); err == nil && n > 0 {
+		fmt.Printf("Пересланные копии чеков: клиент подтянут из исходных (%d)\n", n)
+	}
 	if b.assistant == nil {
 		return // без ИИ имена не разбираем — вопросы бессмысленны
 	}

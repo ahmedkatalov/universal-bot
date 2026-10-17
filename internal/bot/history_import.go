@@ -16,6 +16,7 @@ import (
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/parser"
@@ -69,6 +70,7 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 	}
 	ctx := context.Background()
 	var seen, receipts, payments int
+	aiBudget := 60 // столько текстов за импорт читает ИИ (дальше — только явные платежи)
 	for _, conv := range data.GetConversations() {
 		msgs := conv.GetMessages()
 		// По времени сообщения (возрастание) — чтобы порядок совпадал с реальным.
@@ -138,12 +140,23 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 			if err != nil || existed {
 				continue // уже было (идемпотентно) или ошибка — не дублируем
 			}
+			// Обращения к боту («Джарвис запиши …») и ответы на его сообщения — это
+			// команды и ответы на вопросы, а не платежи: их уже выполнили вживую.
+			em := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsGroup: true}, ID: waID, Timestamp: ts}, Message: content}
+			if _, addressed := b.stripBotName(text); mediaBytes == nil && (addressed || b.isReplyToBot(em)) {
+				_ = b.db.MarkMessageParsed(ctx, rawID)
+				continue
+			}
 			if mediaBytes != nil {
 				if b.importReceiptSilent(ctx, chat, rawID, ts, mediaBytes, ext) {
 					receipts++
 				}
 			} else if text != "" {
-				payments += b.importTextSilent(ctx, chat, rawID, ts, text)
+				n, viaAI := b.importTextSilent(ctx, chat, sender.User, rawID, ts, text, &aiBudget)
+				payments += n
+				if viaAI {
+					continue // разбор ИИ сам отмечает сообщение (и вернёт его, если ИИ лежал)
+				}
 			}
 			_ = b.db.MarkMessageParsed(ctx, rawID)
 		}
@@ -202,18 +215,17 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 }
 
 // importTextSilent разбирает текстовый платёж(и) и пишет их в базу БЕЗ сообщений.
-func (b *Bot) importTextSilent(ctx context.Context, chat types.JID, rawID int, received time.Time, text string) int {
-	res := parser.ParseMessage(text)
-	saved := 0
-	for _, tr := range res.Transactions {
-		canonical, _ := b.aliases.ResolveName(tr.RawName)
-		cid, err := b.db.GetOrCreateContact(ctx, canonical)
-		if err != nil {
-			continue
-		}
-		if err := b.db.InsertTransaction(ctx, dbTransactionFromParsed(tr, cid, rawID, received)); err == nil {
-			saved++
-		}
+func (b *Bot) importTextSilent(ctx context.Context, chat types.JID, senderName string, rawID int, received time.Time, text string, aiBudget *int) (saved int, viaAI bool) {
+	// Как вживую: платёж понимает ИИ (наличка «у Дени», планы «завтра занесёт»
+	// не платёж), только молча — без вопросов в группу.
+	if b.assistant != nil && *aiBudget > 0 && mightBePayment(text) {
+		*aiBudget--
+		before, _ := b.db.TxIDsByRawID(ctx, rawID)
+		b.aiRescueUnparsed(ctx, chat, senderName, []string{text}, rawID, received, false, false)
+		after, _ := b.db.TxIDsByRawID(ctx, rawID)
+		return len(after) - len(before), true
 	}
-	return saved
+	// Без ИИ (или лимит исчерпан) — только явные платежи известным клиентам.
+	n, _ := b.recordDeterministicPayments(ctx, text, rawID, received, false, true)
+	return n, false
 }

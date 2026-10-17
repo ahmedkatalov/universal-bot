@@ -1127,6 +1127,7 @@ func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan
 		  AND br.client_confirmed = false AND br.clarify_asked = false
 		  AND br.is_duplicate = false AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward' -- копию пересланного чека спрашиваем в исходной группе
 		  AND br.amount > 0
 		  AND br.created_at < $2
 		ORDER BY br.created_at
@@ -1190,6 +1191,7 @@ func (d *DB) UnrecognizedReceipts(ctx context.Context, groupJID string, olderTha
 		  AND br.clarify_asked = false
 		  AND br.is_duplicate = false AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward' -- копию пересланного чека спрашиваем в исходной группе
 		  AND br.amount <= 0
 		  AND br.created_at < $2
 		ORDER BY br.created_at
@@ -1219,7 +1221,8 @@ func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan t
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 		  AND br.clarify_asked = false
 		  AND br.is_duplicate = false AND br.ignored = false
-		  AND COALESCE(rm.deleted, false) = false AND br.amount <= 0
+		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward' -- копию пересланного чека спрашиваем в исходной группе AND br.amount <= 0
 		  AND br.created_at < $2
 	`, groupJID, olderThan).Scan(&n)
 	return n, err
@@ -1286,7 +1289,8 @@ func (d *DB) CountUnconfirmed(ctx context.Context, groupJID string, olderThan ti
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 		  AND br.client_confirmed = false AND br.clarify_asked = false
 		  AND br.is_duplicate = false AND br.ignored = false
-		  AND COALESCE(rm.deleted, false) = false AND br.amount > 0
+		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward' -- копию пересланного чека спрашиваем в исходной группе AND br.amount > 0
 		  AND br.created_at < $2
 	`, groupJID, olderThan).Scan(&n)
 	return n, err
@@ -3681,6 +3685,42 @@ func (d *DB) OpenWatchForClientAmount(ctx context.Context, clientID string, amou
 		return 0, t, false, err
 	}
 	return id, t, true, nil
+}
+
+// ReceiptClientByMessage — клиент чека по id сообщения: имя и назван ли он
+// точно (ФИО рядом с чеком / ответ на «чей чек?»).
+func (d *DB) ReceiptClientByMessage(ctx context.Context, waID string) (name string, confirmed bool, err error) {
+	err = d.pool.QueryRow(ctx, `
+		SELECT COALESCE(c.canonical_name, br.recipient_raw, ''), br.client_confirmed AND NOT br.needs_review
+		FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1`, waID).Scan(&name, &confirmed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return
+}
+
+// SyncForwardCopies — клиента исходного чека назвали позже (ФИО после чека,
+// ответ на «чей чек?»): копии этого чека, пересланные в другие группы, получают
+// того же клиента. Возвращает, сколько копий обновили.
+func (d *DB) SyncForwardCopies(ctx context.Context) (int64, error) {
+	tag, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts cp SET contact_id = src.contact_id, recipient_raw = src.recipient_raw,
+			card_owner = COALESCE(NULLIF(cp.card_owner, ''), src.card_owner),
+			client_confirmed = true, needs_review = false, clarify_asked = true
+		FROM bank_receipts src
+		JOIN raw_messages srm ON srm.id = src.raw_message_id
+		JOIN raw_messages crm ON starts_with(crm.wa_message_id, srm.wa_message_id || '-fwd-')
+		WHERE cp.raw_message_id = crm.id AND crm.sender_jid = 'bot-forward'
+		  AND src.client_confirmed = true AND src.needs_review = false AND src.ignored = false AND src.is_duplicate = false
+		  AND src.contact_id IS NOT NULL AND cp.ignored = false AND cp.is_duplicate = false
+		  AND (cp.contact_id IS DISTINCT FROM src.contact_id OR cp.needs_review OR NOT cp.client_confirmed)
+		  AND COALESCE(srm.deleted, false) = false`)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
 }
 
 // ReceiptRef — сообщение и группа чека (по id чека).

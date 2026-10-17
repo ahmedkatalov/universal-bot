@@ -43,8 +43,14 @@ func (b *Bot) loadMutedGroups(ctx context.Context) {
 func (b *Bot) groupSilent(jid types.JID) bool {
 	b.mutedMu.Lock()
 	defer b.mutedMu.Unlock()
+	if b.muted[unmutedPrefix+jid.String()] {
+		return false // «молчи везде», но в этой группе снова разрешили писать
+	}
 	return b.muted[muteAllSentinel] || b.muted[jid.String()]
 }
+
+// unmutedPrefix — исключение из «молчи везде» для одной группы.
+const unmutedPrefix = "!"
 
 // setMuted включает/выключает молчание для группы (или для всех: key="*") и
 // сохраняет в настройки.
@@ -96,6 +102,7 @@ func (b *Bot) muteGroupTool(chat types.JID) ai.Tool {
 				if err := b.setMuted(ctx, muteAllSentinel, args.Silence); err != nil {
 					return "", err
 				}
+				b.clearUnmuteExceptions(ctx) // «везде» — значит везде, без прежних исключений
 				if args.Silence {
 					return "Молчу во ВСЕХ группах — сам писать не буду (учёт идёт, на обращение отвечу). Скажи «можешь снова писать», когда вернуть.", nil
 				}
@@ -118,6 +125,11 @@ func (b *Bot) muteGroupTool(chat types.JID) ai.Tool {
 			if err := b.setMuted(ctx, target.String(), args.Silence); err != nil {
 				return "", err
 			}
+			// При «молчи везде» разрешение для одной группы — исключение из общего
+			// молчания (иначе бот ответил бы «снова пишу», а молчал бы дальше).
+			if err := b.setMuted(ctx, unmutedPrefix+target.String(), !args.Silence && b.mutedAll()); err != nil {
+				return "", err
+			}
 			name := target.String()
 			if groups := b.joinedGroups(ctx); groups[target] != "" {
 				name = groups[target]
@@ -127,5 +139,25 @@ func (b *Bot) muteGroupTool(chat types.JID) ai.Tool {
 			}
 			return fmt.Sprintf("Снова могу писать в «%s».", name), nil
 		},
+	}
+}
+
+func (b *Bot) mutedAll() bool {
+	b.mutedMu.Lock()
+	defer b.mutedMu.Unlock()
+	return b.muted[muteAllSentinel]
+}
+
+func (b *Bot) clearUnmuteExceptions(ctx context.Context) {
+	b.mutedMu.Lock()
+	var keys []string
+	for k := range b.muted {
+		if strings.HasPrefix(k, unmutedPrefix) {
+			keys = append(keys, k)
+		}
+	}
+	b.mutedMu.Unlock()
+	for _, k := range keys {
+		_ = b.setMuted(ctx, k, false)
 	}
 }
