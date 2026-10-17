@@ -436,6 +436,14 @@ func (b *Bot) handleEvent(evt interface{}) {
 		return
 	}
 
+	// Сообщение изменили («изменить» в WhatsApp) — поправляем учёт по нему.
+	if prot := msg.Message.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+		if msg.Info.IsGroup && b.isAllowedGroup(msg.Info.Chat) {
+			go b.handleMessageEdit(context.Background(), msg, prot)
+		}
+		return
+	}
+
 	if !msg.Info.IsGroup {
 		// Выдача секретного файла (по коду, для белого списка номеров) —
 		// ДО логирования и до всего остального, чтобы код не попал в логи/БД.
@@ -643,6 +651,11 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 
+	// «не 5000 а 6000» — поправка суммы уже записанного платежа, а не новый.
+	if !hasMedia && b.applyAmountCorrection(ctx, msg, text, rawID) {
+		return
+	}
+
 	if text == "" {
 		// OCR не дал текста вообще. Последний шанс — Claude смотрит на само
 		// изображение: handleBankReceipt с пустым текстом сразу уйдёт в
@@ -695,8 +708,27 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Сообщение-имя (ФИО без чека): по порядку сообщений привязываем к чеку
 	// (до или после), либо ставим в очередь для будущего чека. Если это имя —
 	// в учёт как платёж оно не идёт.
-	if b.handleNameMessage(ctx, msg, text, rawID) {
+	routedToAI, hasPayment, isName := b.processText(ctx, msg, text, rawID, senderName, false)
+	if isName {
 		return
+	}
+
+	// Проактивное участие в разговоре: бот сам решает, когда вставить полезную
+	// реплику (в фоне). Пропускаем сообщения-платежи (это записи, не беседа) —
+	// по ним отвечать незачем.
+	_, openAskNow := b.recentOpenAsk(msg.Info.Chat.String())
+	if !hasMedia && b.assistant != nil && !routedToAI && !hasPayment && !openAskNow &&
+		proactiveChatEnabled() && worthChimingIn(text) {
+		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
+	}
+}
+
+// processText — разбор текста из группы: имя для чека или платежи. aiSync —
+// дождаться разбора ИИ (при правке сообщения нужен итог, чтобы ответить).
+// isName — сообщение оказалось именем клиента для чека (не платёж).
+func (b *Bot) processText(ctx context.Context, msg *events.Message, text string, rawID int, senderName string, aiSync bool) (routedToAI, hasPayment, isName bool) {
+	if b.handleNameMessage(ctx, msg, text, rawID) {
+		return false, false, true
 	}
 
 	result := parser.ParseMessage(text)
@@ -718,13 +750,17 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// платёж это или болтовня. Для НЕ-платёжеподобных по цифре сообщений публичный
 	// вопрос «❓» подавляется (paymentLikely=false), чтобы не допрашивать болтовню.
 	// Детерминированный парсер остаётся запасным путём (ассистента нет/вызов упал).
-	hasPayment := len(result.Transactions) > 0 || parser.LooksMessyPayment(text, result)
-	routedToAI := b.assistant != nil && (hasPayment || mightBePayment(text))
+	hasPayment = len(result.Transactions) > 0 || parser.LooksMessyPayment(text, result)
+	routedToAI = b.assistant != nil && (hasPayment || mightBePayment(text))
 	if routedToAI {
 		// Пометку «рядом было фото пачки денег» снимаем здесь: если она свежая —
 		// эти платежи и есть наличка (передаём подсказкой, но решает ассистент).
 		cashHint := b.consumePendingCash(msg.Info.Chat, msg.Info.Sender.String())
-		go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint, hasPayment)
+		if aiSync {
+			b.aiRescueUnparsed(ctx, msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint, hasPayment)
+		} else {
+			go b.aiRescueUnparsed(context.Background(), msg.Info.Chat, senderName, []string{text}, rawID, msg.Info.Timestamp, cashHint, hasPayment)
+		}
 	}
 	keepUnparsed := false
 	if !routedToAI && len(result.Transactions) > 0 {
@@ -742,15 +778,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	if !routedToAI && !keepUnparsed {
 		_ = b.db.MarkMessageParsed(ctx, rawID)
 	}
-
-	// Проактивное участие в разговоре: бот сам решает, когда вставить полезную
-	// реплику (в фоне). Пропускаем сообщения-платежи (это записи, не беседа) —
-	// по ним отвечать незачем.
-	_, openAskNow := b.recentOpenAsk(msg.Info.Chat.String())
-	if !hasMedia && b.assistant != nil && !routedToAI && len(result.Transactions) == 0 && !openAskNow &&
-		proactiveChatEnabled() && worthChimingIn(text) {
-		go b.maybeChimeIn(context.Background(), msg.Info.Chat, senderName, text)
-	}
+	return routedToAI, len(result.Transactions) > 0, false
 }
 
 // mightBePayment — грубый фильтр «возможно, это платёж»: есть цифра (возможная
@@ -3272,9 +3300,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// клиента): по нему решаем, похоже ли изображение на чек вообще.
 	// Имя, написанное ПЕРЕД чеком (очередь), — только если оно без суммы или с
 	// суммой этого чека.
+	payerSrc := 0 // сообщение с именем из очереди
 	if payerOverride == "" {
-		if name, ok := b.takeQueuedPayer(ctx, chat, senderJID, rd.Amount); ok {
-			payerOverride = name
+		if name, src, ok := b.takeQueuedPayer(ctx, chat, senderJID, rd.Amount); ok {
+			payerOverride, payerSrc = name, src
 		}
 	}
 	receiptRecipient := rd.Recipient
@@ -3305,7 +3334,8 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if rd.Amount > 0 && !rd.HasTxTime && media != nil && looksCollapsed {
 		fmt.Printf("Чек (сообщение %d): неполный (нет даты операции) — прошу развёрнутый\n", rawID)
 		if err := b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
-			RawMessageID: rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
+			ClientSourceRawID: payerSrc,
+			RawMessageID:      rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
 			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
 			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true,
 		}); err != nil {
@@ -3358,18 +3388,19 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		}
 		fmt.Printf("Чек (сообщение %d): не удалось распознать сумму/получателя, нужна ручная проверка\n", rawID)
 		_ = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
-			RawMessageID: rawID,
-			Bank:         rd.Bank,
-			RecipientRaw: rd.Recipient,
-			SenderRaw:    rd.Sender,
-			Amount:       rd.Amount,
-			Commission:   rd.Commission,
-			DocNumber:    rd.DocNumber,
-			AuthCode:     rd.AuthCode,
-			Status:       rd.Status,
-			NeedsReview:  true,
-			GroupJID:     chat.String(),
-			TxDate:       txDate,
+			ClientSourceRawID: payerSrc,
+			RawMessageID:      rawID,
+			Bank:              rd.Bank,
+			RecipientRaw:      rd.Recipient,
+			SenderRaw:         rd.Sender,
+			Amount:            rd.Amount,
+			Commission:        rd.Commission,
+			DocNumber:         rd.DocNumber,
+			AuthCode:          rd.AuthCode,
+			Status:            rd.Status,
+			NeedsReview:       true,
+			GroupJID:          chat.String(),
+			TxDate:            txDate,
 		})
 		if visionUnavailable {
 			// Зрение было недоступно — ставим на автоповтор распознавания.
@@ -3471,27 +3502,28 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	}
 
 	err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
-		RawMessageID:    rawID,
-		Bank:            rd.Bank,
-		RecipientRaw:    rd.Recipient,
-		RecipientBank:   rd.RecipientBank,
-		RecipientPhone:  rd.RecipientPhone,
-		SenderRaw:       rd.Sender,
-		SenderBank:      rd.SenderBank,
-		SenderAccount:   rd.SenderAccount,
-		CardOwner:       cardOwner,
-		ContactID:       contactIDPtr,
-		Amount:          rd.Amount,
-		Commission:      rd.Commission,
-		DocNumber:       rd.DocNumber,
-		AuthCode:        rd.AuthCode,
-		Status:          rd.Status,
-		NeedsReview:     needsReview,
-		IsDuplicate:     isDuplicate,
-		ClientConfirmed: clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
-		GroupJID:        chat.String(),
-		TxDate:          txDate,
-		Ignored:         declined,
+		ClientSourceRawID: payerSrc,
+		RawMessageID:      rawID,
+		Bank:              rd.Bank,
+		RecipientRaw:      rd.Recipient,
+		RecipientBank:     rd.RecipientBank,
+		RecipientPhone:    rd.RecipientPhone,
+		SenderRaw:         rd.Sender,
+		SenderBank:        rd.SenderBank,
+		SenderAccount:     rd.SenderAccount,
+		CardOwner:         cardOwner,
+		ContactID:         contactIDPtr,
+		Amount:            rd.Amount,
+		Commission:        rd.Commission,
+		DocNumber:         rd.DocNumber,
+		AuthCode:          rd.AuthCode,
+		Status:            rd.Status,
+		NeedsReview:       needsReview,
+		IsDuplicate:       isDuplicate,
+		ClientConfirmed:   clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
+		GroupJID:          chat.String(),
+		TxDate:            txDate,
+		Ignored:           declined,
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)

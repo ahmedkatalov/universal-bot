@@ -192,7 +192,7 @@ func TestSweepDeletedCashNotRepeat(t *testing.T) {
 	}
 	m1 := groupText(grp, snd, "Сафаи", "Магомедов Ахмед 20000 нал")
 	e.sendGroup(m1)
-	e.sendGroup(&events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: grp, Sender: snd, IsGroup: true}, ID: e2eID("R"), Timestamp: time.Now()},
+	e.event(&events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: grp, Sender: snd, IsGroup: true}, ID: e2eID("R"), Timestamp: time.Now()},
 		Message: &waProto.Message{ProtocolMessage: &waProto.ProtocolMessage{Type: waProto.ProtocolMessage_REVOKE.Enum(),
 			Key: &waProto.MessageKey{RemoteJID: proto.String(grp.String()), ID: proto.String(m1.Info.ID), Participant: proto.String(snd.String())}}}})
 	e.sendGroup(groupText(grp, snd, "Сафаи", "Магомедов Ахмед 20000 наличными"))

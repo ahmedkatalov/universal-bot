@@ -175,16 +175,18 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 }
 
 // takeQueuedPayer — имя из очереди «написали перед чеком» для чека на эту сумму.
-func (b *Bot) takeQueuedPayer(ctx context.Context, chat types.JID, senderJID string, amount float64) (string, bool) {
+// Возвращает и id сообщения с именем: если его потом удалят или изменят, чек
+// узнает об этом.
+func (b *Bot) takeQueuedPayer(ctx context.Context, chat types.JID, senderJID string, amount float64) (string, int, bool) {
 	if senderJID == "" || b.db == nil {
-		return "", false
+		return "", 0, false
 	}
 	p, ok, err := b.db.TakePendingNameFor(ctx, chat.String(), senderJID, time.Now().Add(-b.pairWindow), amount)
 	if err != nil {
 		fmt.Println("Очередь имён: ошибка выборки:", err)
-		return "", false
+		return "", 0, false
 	}
-	return p.Name, ok
+	return p.Name, p.RawID, ok
 }
 
 // consumeQueuedSameName — снять из очереди имя того же клиента (оно уже

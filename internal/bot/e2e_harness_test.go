@@ -374,6 +374,12 @@ func (e *e2eBot) sendGroup(msg *events.Message) {
 	e.waitIdle()
 }
 
+// event — подать событие целиком (удаление, правка) и дождаться обработки.
+func (e *e2eBot) event(msg *events.Message) {
+	e.handleEvent(msg)
+	e.waitIdle()
+}
+
 // sendReceipt — чек в группе: распознанный текст (как после OCR) и подпись.
 // Возвращает id сообщения с чеком.
 func (e *e2eBot) sendReceipt(grp, sender types.JID, pushName, ocrText, caption string) string {
