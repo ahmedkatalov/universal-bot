@@ -699,8 +699,14 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	pa, isPayAsk := b.clarify.paymentAsks[quotedID]
 	fix, isFixAsk := b.clarify.dupFixAsks[quotedID]
 	b.clarify.mu.Unlock()
+	if !isPayAsk {
+		// Связь могла потеряться из памяти (рестарт бота) — ищем в БД.
+		if p, ok, _ := b.db.WhoAskByMsg(ctx, quotedID); ok {
+			pa, isPayAsk = paymentAsk{rawID: p.RawID, amount: p.Amount, cash: p.Cash, txDate: p.TxDate}, true
+		}
+	}
 	if isPayAsk {
-		return b.applyPaymentWhoAnswer(ctx, msg.Info.Chat, quotedID, pa, text)
+		return b.applyPaymentWhoAnswer(ctx, msg.Info.Chat, quotedID, pa, text, true)
 	}
 	// «Этот чек уже присылали… сейчас подписан Y» — «да» переносит чек на Y.
 	if isFixAsk {
@@ -827,45 +833,93 @@ func (b *Bot) registerPaymentAsk(botMsgID string, a paymentAsk) {
 	b.clarify.mu.Unlock()
 }
 
-// applyPaymentWhoAnswer — ответ на «❓ чей это платёж?»: записываем платёж того
-// сообщения на названного клиента. Возвращает true, если ответ понят.
-func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID string, pa paymentAsk, text string) bool {
-	name, amount, deferToAI := clarifyNameFromReply(text)
+// whoPlaceholders — «клиенты»-заглушки налички без имени.
+var whoPlaceholders = map[string]bool{"Наличка": true, "(не указано)": true}
+
+// applyPaymentWhoAnswer — ответ на «❓ чей это платёж?»: платёж того сообщения
+// получает названного клиента (заглушка «Наличка» переименовывается, новый не
+// добавляется). swipe=false — ответ без свайпа: сумма в нём допустима только
+// та же, что в вопросе (иначе это новый платёж). Возвращает true, если ответ
+// понят (или бот переспросил по этому вопросу).
+func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID string, pa paymentAsk, text string, swipe bool) bool {
+	t := strings.TrimSpace(text)
+	low := strings.ToLower(t)
+	// «у Дени» — это кто забрал деньги, а не клиент.
+	if strings.HasPrefix(low, "у ") {
+		return false
+	}
+	name, amount, deferToAI := clarifyNameFromReply(t)
 	if deferToAI || name == "" {
 		return false
 	}
-	if pa.amount > 0 && amount > 0 && math.Abs(pa.amount-amount) >= 1 {
-		return false // названа другая сумма — это не ответ на этот вопрос
+	if amount > 0 && (pa.amount <= 0 && !swipe || pa.amount > 0 && math.Abs(pa.amount-amount) >= 1) {
+		return false // названа другая сумма — это новый платёж, а не ответ
 	}
-	if amount <= 0 {
-		amount = pa.amount
-	}
-	if amount <= 0 {
+	// Только настоящее ФИО («Мансур знает», «Позже скажу» — не клиент).
+	canonical, ok := b.confirmClientName(ctx, name)
+	if !ok {
 		return false
 	}
-	canonical, _ := b.aliases.ResolveName(name)
 	cid, err := b.db.GetOrCreateContact(ctx, canonical)
 	if err != nil {
 		return false
 	}
-	card := ""
-	if pa.cash {
-		card = "наличные"
-	}
-	// Платёж из того сообщения уже записан без имени («Наличка») — даём ему
-	// клиента; иначе записываем.
-	if txs, err := b.db.TxIDsByRawID(ctx, pa.rawID); err == nil && len(txs) == 1 {
-		if err := b.db.SetTxClient(ctx, txs[0], cid, canonical); err != nil {
+	cash := pa.cash
+	live, _ := b.db.TxRefsByRawID(ctx, pa.rawID)
+	switch {
+	case len(live) > 0:
+		// Платёж уже записан без имени — даём клиента ему (не добавляем второй).
+		var pick []db.TxRef
+		for _, tx := range live {
+			if amount > 0 && math.Abs(tx.Amount-amount) >= 1 {
+				continue
+			}
+			if whoPlaceholders[tx.Name] || len(live) == 1 {
+				pick = append(pick, tx)
+			}
+		}
+		if len(pick) != 1 {
+			var sums []string
+			for _, tx := range live {
+				sums = append(sums, formatMoney(tx.Amount))
+			}
+			b.sendText(chat, "Какой из платежей ("+strings.Join(sums, ", ")+" ₽)? Напишите «ФИО сумма».")
+			return true
+		}
+		if err := b.db.SetTxClient(ctx, pick[0].ID, cid, canonical); err != nil {
 			return false
 		}
-	} else if err := b.db.InsertTransaction(ctx, db.TransactionInput{
-		ContactID: cid, RawName: canonical, Amount: amount, CardTo: card, IsCash: pa.cash,
-		RawMessageID: pa.rawID, TxDate: pa.txDate, DupCheck: b.cashDupCheckOn(),
-	}); err != nil {
-		fmt.Println("Ответ «чей платёж»: ошибка записи:", err)
-		return false
+		if pick[0].Cash && b.cashDupCheckOn() {
+			_ = b.db.RecheckCashRepeat(ctx, pick[0].ID) // та же наличка этого клиента за 30 дней — «повтор?»
+		}
+		amount, cash = pick[0].Amount, pick[0].Cash
+	default:
+		if amount <= 0 {
+			amount = pa.amount
+		}
+		if amount <= 0 {
+			// В сообщении несколько сумм — перечитываем его с названным клиентом.
+			if b.rereadWithClient(ctx, chat, pa, canonical) == 0 {
+				b.sendText(chat, "Понял, клиент "+canonical+". А какая сумма? Напишите «ФИО сумма».")
+				return true
+			}
+			amount = 0
+		} else {
+			card := ""
+			if cash {
+				card = "наличные"
+			}
+			if err := b.db.InsertTransaction(ctx, db.TransactionInput{
+				ContactID: cid, RawName: canonical, Amount: amount, CardTo: card, IsCash: cash,
+				RawMessageID: pa.rawID, TxDate: pa.txDate, DupCheck: b.cashDupCheckOn(),
+			}); err != nil {
+				fmt.Println("Ответ «чей платёж»: ошибка записи:", err)
+				return false
+			}
+		}
 	}
 	_ = b.db.MarkMessageParsed(ctx, pa.rawID)
+	_ = b.db.ClearWhoAsk(ctx, pa.rawID)
 	b.clarify.mu.Lock()
 	for k, v := range b.clarify.paymentAsks {
 		if v.rawID == pa.rawID {
@@ -876,13 +930,37 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 		delete(b.clarify.lastAsk, chat.String())
 	}
 	b.clarify.mu.Unlock()
+	if amount <= 0 {
+		now, _ := b.db.TxRefsByRawID(ctx, pa.rawID)
+		var parts []string
+		for _, tx := range now {
+			parts = append(parts, formatMoney(tx.Amount)+" ₽")
+		}
+		b.sendText(chat, fmt.Sprintf("Записал: %s — %s.", strings.Join(parts, ", "), canonical))
+		return true
+	}
 	kind := "перевод"
-	if pa.cash {
+	if cash {
 		kind = "наличка"
 	}
 	b.sendText(chat, fmt.Sprintf("Записал: %s %s ₽ — %s.", kind, formatMoney(amount), canonical))
 	_ = askID
 	return true
+}
+
+// rereadWithClient — «❓ чей платёж?» по сообщению с несколькими суммами: ИИ
+// перечитывает его, зная клиента. Возвращает, сколько платежей записано.
+func (b *Bot) rereadWithClient(ctx context.Context, chat types.JID, pa paymentAsk, canonical string) int {
+	if b.assistant == nil {
+		return 0
+	}
+	body, sender, err := b.db.RawBodyByID(ctx, pa.rawID)
+	if err != nil || strings.TrimSpace(body) == "" {
+		return 0
+	}
+	b.aiRescueUnparsed(ctx, chat, sender, []string{canonical + "\n" + body}, pa.rawID, pa.txDate, pa.cash, false)
+	now, _ := b.db.TxRefsByRawID(ctx, pa.rawID)
+	return len(now)
 }
 
 // registerDupFixAsk — запомнить предупреждение о повторном чеке с другим клиентом.
@@ -904,24 +982,37 @@ func (b *Bot) registerDupFixAsk(botMsgID string, a dupFixAsk) {
 // applyDupFixAnswer — ответ на предупреждение о повторном чеке: «да» — чек на
 // клиента из новой подписи, ФИО — на этого клиента, «нет» — оставить как есть.
 func (b *Bot) applyDupFixAnswer(ctx context.Context, chat types.JID, askID string, a dupFixAsk, text string) bool {
-	t := strings.ToLower(strings.Trim(strings.TrimSpace(text), ".!,"))
-	name := ""
-	switch {
-	case t == "нет" || strings.HasPrefix(t, "нет ") || strings.HasPrefix(t, "нет,") || strings.Contains(t, "оставь"):
+	low := cleanAnswer(text)
+	toks := answerTokens(low)
+	keep := func() bool {
 		b.clarify.mu.Lock()
 		delete(b.clarify.dupFixAsks, askID)
 		b.clarify.mu.Unlock()
 		b.sendText(chat, "Ок, оставил как было.")
 		return true
-	case t == "да" || t == "+" || t == "ага" || t == "верно" || strings.HasPrefix(t, "да,") || strings.HasPrefix(t, "да "):
-		name = a.name
-		if rest := strings.TrimSpace(strings.TrimLeft(strings.TrimSpace(text)[len("да"):], " ,.")); len([]rune(t)) > 3 && rest != "" {
-			if c, ok := b.confirmClientName(ctx, strings.TrimPrefix(strings.TrimPrefix(rest, "это "), "Это ")); ok {
-				name = c
-			}
+	}
+	// «да нет», «да не, всё правильно», «да, это повтор», «оставь» — оставить как есть.
+	if hasNegation(toks) || strings.Contains(low, "повтор") || strings.Contains(low, "тот же") ||
+		strings.Contains(low, "оставь") || strings.Contains(low, "оставьте") || strings.Contains(low, "правильно") {
+		return keep()
+	}
+	name := ""
+	rest := toks
+	if len(rest) > 0 && (yesWords[rest[0]] || ackWords[rest[0]]) {
+		rest = rest[1:]
+		for len(rest) > 0 && (rest[0] == "это" || rest[0] == "он" || rest[0] == "она" || rest[0] == "верно") {
+			rest = rest[1:]
 		}
-	default:
-		c, ok := b.confirmClientName(ctx, strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(text), "это "), "Это "))
+		if len(rest) == 0 {
+			name = a.name // «да» — клиент из новой подписи
+		} else if c, ok := b.confirmClientName(ctx, strings.Join(rest, " ")); ok {
+			name = c // «да, это Исаев Харон»
+		} else {
+			return false // «да …» с чем-то ещё — не ответ на этот вопрос
+		}
+	} else {
+		// Свайп с ФИО — чек на этого клиента.
+		c, ok := b.confirmClientName(ctx, strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(text), "это "), "Это ")))
 		if !ok {
 			return false
 		}

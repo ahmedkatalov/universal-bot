@@ -160,8 +160,8 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		return true
 
 	case "payment_who":
-		// Без свайпа — только голое ФИО (с суммой — только той же).
-		if !shortPlainReply(text, 4) && parser.ExtractAmount(text) <= 0 {
+		// Без свайпа — только короткое ФИО (с суммой — только той же, что в вопросе).
+		if !shortPlainReply(text, 4) {
 			return false
 		}
 		b.clarify.mu.Lock()
@@ -176,7 +176,7 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		if askID == "" {
 			return false
 		}
-		return b.applyPaymentWhoAnswer(ctx, chat, askID, pa, text)
+		return b.applyPaymentWhoAnswer(ctx, chat, askID, pa, text, false)
 
 	case "cmf_watch":
 		wantName := a.wantName && time.Since(a.at) < cmfNameWindow
@@ -361,6 +361,7 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 		return true, false
 	}
 	if canonical != "" {
+		_ = b.db.SetReceiptSourceByMessage(ctx, receiptWaID, answerRawFrom(ctx))
 		b.sendText(chat, "Записал: чек — клиент "+canonical+".")
 		b.syncWatchByCheckWa(ctx, chat, receiptWaID, canonical)
 	} else {

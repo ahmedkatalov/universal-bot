@@ -56,9 +56,21 @@ type aiPayment struct {
 func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint, paymentLikely bool) {
 
 	keepUnparsed := false
+	// Сообщение могли изменить, пока ИИ читал старый текст: тогда итог этого
+	// чтения не пишем — новый текст разбирает правка.
+	edits0, _ := b.db.MessageEditCount(ctx, rawID)
+	stale := func() bool {
+		n, err := b.db.MessageEditCount(ctx, rawID)
+		return err == nil && n != edits0
+	}
+	staleResult := false
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("ИИ-доразбор: паника, оставляю сообщение на пересчёт:", r)
+			return
+		}
+		if staleResult {
+			fmt.Printf("ИИ-доразбор: сообщение %d изменили во время разбора — старый итог не пишу\n", rawID)
 			return
 		}
 		if keepUnparsed {
@@ -170,6 +182,10 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			clarifies = append(clarifies, r.clarify)
 		}
 	}
+	if stale() {
+		staleResult = true
+		return
+	}
 	if okRuns == 0 {
 		// Ни одно чтение не удалось (ИИ недоступен) — вердикта НЕТ. Откат к парсеру,
 		// но если он ничего не записал — оставляем сообщение на пересчёт (не помечаем
@@ -177,7 +193,13 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// Без ИИ записываем только явные платежи ИЗВЕСТНЫМ клиентам; остальное
 		// ждёт повторного разбора, когда ИИ снова доступен (textRetryLoop).
 		fmt.Println("ИИ-доразбор: ни одно чтение не удалось, откат к обычному парсеру")
-		saved, _ := b.recordDeterministicPayments(ctx, joined, rawID, txDate, cashHint, true)
+		// Если хоть одну строку без ИИ не понять (неизвестный клиент, «Нал» без
+		// имени) — не пишем ничего: ИИ потом прочтёт сообщение целиком (иначе
+		// записанная часть закрыла бы сообщение и остальное пропало бы).
+		saved := 0
+		if _, unknown := b.deterministicLines(joined, detKnown); unknown == 0 {
+			saved, _ = b.recordDeterministicPaymentsMode(ctx, joined, rawID, txDate, cashHint, detKnown)
+		}
 		keepUnparsed = saved == 0
 		if keepUnparsed {
 			b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
@@ -212,6 +234,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 					amt = tokens[0]
 				}
 				b.registerPaymentAsk(id, paymentAsk{rawID: rawID, amount: amt, cash: cashHint || parser.IsCash(joined), txDate: txDate})
+				_ = b.db.SetWhoAsk(ctx, rawID, id, amt, cashHint || parser.IsCash(joined))
 				b.setOpenAsk(chat.String(), openAsk{kind: "payment_who", txID: rawID, amount: amt, senderJID: senderJIDOfRaw(ctx, b, rawID)})
 			}
 		}
@@ -274,7 +297,14 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// (обсуждение/план: «сказал взять 5000»). Доверяем ему и НЕ пишем мусор.
 		// Подстраховка только для платежей ИЗВЕСТНЫМ клиентам (совпал алиас),
 		// которых ИИ мог ошибочно пропустить: болтовню это не заденет.
-		dsaved, dfailed := b.recordDeterministicPayments(ctx, joined, rawID, txDate, cashHint, true)
+		// «Нал 27000» без имени: ИИ спросил «чья наличка?» — заглушка «Наличка»
+		// держит деньги в сборе, пока не ответят (ответ даст ей клиента). Если ИИ
+		// не спрашивал (итог дня «Наличка 50000»), заглушку не пишем.
+		mode := detKnown
+		if paymentLikely && majorityString(clarifies, okRuns) != "" {
+			mode = detKnownOrPlaceholder
+		}
+		dsaved, dfailed := b.recordDeterministicPaymentsMode(ctx, joined, rawID, txDate, cashHint, mode)
 		keepUnparsed = dsaved == 0 && dfailed
 	}
 }

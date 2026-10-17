@@ -14,6 +14,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode"
 )
 
 // Transaction — одна извлечённая денежная операция.
@@ -358,25 +359,84 @@ func cleanNumber(s string) string {
 }
 
 // correctionRe — «не 5000 а 6000», «не 5 а 6 тысяч»: поправка суммы, а не платёж.
-var correctionRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}])не\s+(\d[\d\s.,]*\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)?)\s*,?\s*а\s+(\d[\d\s.,]*\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)?)`)
+var correctionRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}])не\s+(\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к)?)\s*,?\s*а\s+(\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к)?)`)
 
-// ParseAmountCorrection — поправка суммы «не X а Y» (или «исправь на Y»: old=0).
+// Correction — поправка суммы: «не 5000 а 6000», «Магомедов не 5000 а 6000»,
+// «правильно 6000». Name — ФИО/фамилия, если её назвали; Old=0 — старую сумму
+// не назвали (такую поправку применяем только свайпом на платёж).
+type Correction struct {
+	Name     string
+	Old, New float64
+}
+
+// correctionFillers — слова, допустимые в поправке рядом с «не X а Y».
+var correctionFillers = map[string]bool{
+	"исправь": true, "исправьте": true, "поправь": true, "поправьте": true, "сумма": true, "ошибся": true,
+	"ошиблась": true, "ошибка": true, "опечатка": true, "извините": true, "извиняюсь": true, "там": true,
+	"у": true, "по": true, "чек": true, "платёж": true, "платеж": true, "это": true, "для": true, "за": true,
+	"нет": true, "ой": true, "сорри": true, "пардон": true, "вот": true, "тут": true,
+}
+
+// thousandSuffixRe — у суммы есть «т/к/тыс/тыщ».
+var thousandSuffixRe = regexp.MustCompile(`(?i)\d\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)\s*$`)
+
+// correctionTailRe — «₽», «р.», «руб» после новой суммы.
+var correctionTailRe = regexp.MustCompile(`(?i)^[\s.,!)₽]*(?:р|руб[а-яё]*|рублей)?[\s.,!)]*$`)
+
+// correctionSetRe — «правильно 6000», «исправь на 6000», «правильная сумма 6000».
+var correctionSetRe = regexp.MustCompile(`(?i)^\s*(?:правильно|правильная сумма|исправь(?:те)? на|исправить на|поправь(?:те)? на|сумма должна быть)\s*[:\-–—]?\s*(\d[\d\s.,]*\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)?)\s*(?:₽|р\.?|руб[а-яё]*)?\s*[.!]?\s*$`)
+
+// ParseCorrection — сообщение целиком — поправка суммы (а не разговор, где
+// встретилось «не 5000 а 6000», и не платёж «принёс не 10000 а 15000»).
+func ParseCorrection(text string) (Correction, bool) {
+	t := strings.TrimSpace(text)
+	if t == "" || strings.Contains(t, "\n") || len([]rune(t)) > 70 || strings.Contains(t, "?") || planWordsRe.MatchString(t) {
+		return Correction{}, false
+	}
+	if m := correctionSetRe.FindStringSubmatch(t); m != nil {
+		if n := ExtractAmount(m[1]); n > 0 {
+			return Correction{New: n}, true
+		}
+		return Correction{}, false
+	}
+	loc := correctionRe.FindStringSubmatchIndex(t)
+	if loc == nil {
+		return Correction{}, false
+	}
+	oText, nText := t[loc[2]:loc[3]], t[loc[4]:loc[5]]
+	o, n := ExtractAmount(oText), ExtractAmount(nText)
+	// «не 5 а 6 тысяч» — «тысяч» относится к обеим суммам.
+	if n >= 1000 && !thousandSuffixRe.MatchString(oText) && thousandSuffixRe.MatchString(nText) {
+		if v, err := strconv.ParseFloat(strings.TrimSpace(cleanNumber(oText)), 64); err == nil && v > 0 && v < 1000 {
+			o = v * 1000
+		}
+	}
+	if o <= 0 || n <= 0 || o == n {
+		return Correction{}, false
+	}
+	if !correctionTailRe.MatchString(t[loc[1]:]) {
+		return Correction{}, false
+	}
+	var name []string
+	for _, w := range strings.FieldsFunc(t[:loc[0]+1], func(r rune) bool { return !unicode.IsLetter(r) && r != '-' }) {
+		lw := strings.ToLower(w)
+		switch {
+		case lw == "не":
+			// «не» — начало самой поправки (оно попало в префикс из-за границы).
+		case correctionFillers[lw]:
+		case len([]rune(w)) >= 3 && unicode.IsUpper([]rune(w)[0]):
+			name = append(name, w)
+		default:
+			return Correction{}, false // посторонние слова — это разговор, а не поправка
+		}
+	}
+	return Correction{Name: strings.Join(name, " "), Old: o, New: n}, true
+}
+
+// ParseAmountCorrection — поправка суммы (см. ParseCorrection): old=0 для «правильно 6000».
 func ParseAmountCorrection(text string) (oldAmount, newAmount float64, ok bool) {
-	if m := correctionRe.FindStringSubmatch(text); m != nil {
-		o, n := ExtractAmount(m[1]), ExtractAmount(m[2])
-		if o > 0 && n > 0 && o != n {
-			return o, n, true
-		}
-	}
-	low := strings.ToLower(text)
-	for _, p := range []string{"исправь на", "исправить на", "поправь на", "правильно", "сумма не та, правильная"} {
-		if i := strings.Index(low, p); i >= 0 {
-			if n := ExtractAmount(text[i+len(p):]); n > 0 {
-				return 0, n, true
-			}
-		}
-	}
-	return 0, 0, false
+	c, ok := ParseCorrection(text)
+	return c.Old, c.New, ok
 }
 
 // planOrQuestion — строка про план/вопрос/контакт, а не про совершённый платёж
@@ -389,7 +449,8 @@ func LooksLikeNonPayment(tr Transaction) bool {
 	if strings.Contains(line, "?") || planWordsRe.MatchString(line) {
 		return true
 	}
-	if _, _, ok := ParseAmountCorrection(line); ok {
+	// «не 5000 а 6000» в строке — сумма неоднозначна: без ИИ не записываем.
+	if correctionRe.MatchString(line) {
 		return true
 	}
 	// Телефон, номер договора/карты — не сумма: 9+ цифр подряд.

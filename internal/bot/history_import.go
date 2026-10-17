@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"go.mau.fi/whatsmeow"
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -103,6 +104,16 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 					sender = s
 				}
 			}
+			// Правка сообщения в истории — как вживую: исходное уже импортировано
+			// (сообщения идут по времени), применяем к нему новый текст молча.
+			if prot := content.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
+				em := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsGroup: true},
+					ID: key.GetID(), Timestamp: time.Unix(int64(wmi.GetMessageTimestamp()), 0)}, Message: content}
+				if b.applyEdit(ctx, em, prot, editQuiet{budget: &aiBudget}) {
+					seen++
+				}
+				continue
+			}
 			text := extractText(content)
 			img := content.GetImageMessage()
 			doc := content.GetDocumentMessage()
@@ -143,9 +154,17 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 			// Обращения к боту («Джарвис запиши …») и ответы на его сообщения — это
 			// команды и ответы на вопросы, а не платежи: их уже выполнили вживую.
 			em := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsGroup: true}, ID: waID, Timestamp: ts}, Message: content}
-			if _, addressed := b.stripBotName(text); mediaBytes == nil && (addressed || b.isReplyToBot(em)) {
-				_ = b.db.MarkMessageParsed(ctx, rawID)
-				continue
+			if stripped, addressed := b.stripBotName(text); mediaBytes == nil && (addressed || b.isReplyToBot(em)) {
+				// Платёж сотрудника, написанный боту, вживую записывается как обычный —
+				// и при импорте тоже. Остальное (команды, ответы) уже выполнено.
+				if !addressed {
+					stripped = text
+				}
+				if !b.employeePayment(em, stripped) {
+					_ = b.db.MarkMessageParsed(ctx, rawID)
+					continue
+				}
+				text = stripped
 			}
 			if mediaBytes != nil {
 				if b.importReceiptSilent(ctx, chat, rawID, ts, mediaBytes, ext) {
@@ -226,6 +245,6 @@ func (b *Bot) importTextSilent(ctx context.Context, chat types.JID, senderName s
 		return len(after) - len(before), true
 	}
 	// Без ИИ (или лимит исчерпан) — только явные платежи известным клиентам.
-	n, _ := b.recordDeterministicPayments(ctx, text, rawID, received, false, true)
+	n, _ := b.recordDeterministicPaymentsMode(ctx, text, rawID, received, false, detKnown)
 	return n, false
 }

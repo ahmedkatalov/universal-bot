@@ -103,6 +103,9 @@ func (b *Bot) muteGroupTool(chat types.JID) ai.Tool {
 					return "", err
 				}
 				b.clearUnmuteExceptions(ctx) // «везде» — значит везде, без прежних исключений
+				if !args.Silence {
+					b.clearGroupMutes(ctx) // «можешь снова писать везде» — и в заглушённых по одной
+				}
 				if args.Silence {
 					return "Молчу во ВСЕХ группах — сам писать не буду (учёт идёт, на обращение отвечу). Скажи «можешь снова писать», когда вернуть.", nil
 				}
@@ -153,6 +156,20 @@ func (b *Bot) clearUnmuteExceptions(ctx context.Context) {
 	var keys []string
 	for k := range b.muted {
 		if strings.HasPrefix(k, unmutedPrefix) {
+			keys = append(keys, k)
+		}
+	}
+	b.mutedMu.Unlock()
+	for _, k := range keys {
+		_ = b.setMuted(ctx, k, false)
+	}
+}
+
+func (b *Bot) clearGroupMutes(ctx context.Context) {
+	b.mutedMu.Lock()
+	var keys []string
+	for k := range b.muted {
+		if k != muteAllSentinel {
 			keys = append(keys, k)
 		}
 	}

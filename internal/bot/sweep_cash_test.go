@@ -5,6 +5,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"whatsapp-bot/internal/ai"
 
@@ -22,8 +23,36 @@ func aiClarifyOnly(q string) func(c aiCall) aiReply {
 		if strings.Contains(c.System, "модуль разбора платежей") {
 			return aiReply{Text: `{"payments":[],"clarify":"` + q + `"}`}
 		}
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
 		return aiReply{Text: ""}
 	}
+}
+
+// fakeNameExtract — как настоящая модель на «выдели имя КЛИЕНТА»: ФИО — это
+// 2–3 слова с заглавной буквы («Магомедов Ахмед»), а «Мансур знает» или
+// «Позже скажу» — не имя.
+func fakeNameExtract(c aiCall) (aiReply, bool) {
+	if !strings.Contains(c.System, "выдели имя КЛИЕНТА") {
+		return aiReply{}, false
+	}
+	ws := strings.Fields(strings.Trim(c.lastUserText(), " .,!"))
+	if len(ws) < 2 || len(ws) > 3 {
+		return aiReply{Text: `{"client":""}`}, true
+	}
+	for _, w := range ws {
+		r := []rune(w)
+		if !unicode.IsUpper(r[0]) {
+			return aiReply{Text: `{"client":""}`}, true
+		}
+		for _, x := range r {
+			if !unicode.IsLetter(x) && x != '-' {
+				return aiReply{Text: `{"client":""}`}, true
+			}
+		}
+	}
+	return aiReply{Text: `{"client":"` + strings.Join(ws, " ") + `"}`}, true
 }
 
 // Наличка без имени клиента — не «повтор» другой такой же налички.
@@ -84,6 +113,9 @@ func TestSweepPaymentQuestionPlainAnswer(t *testing.T) {
 				return aiReply{Text: `{"payments":[{"name":"Исаев Дени","amount":5000}],"clarify":""}`}
 			}
 			return aiReply{Text: `{"payments":[],"clarify":"Чья это наличка 27000?"}`}
+		}
+		if r, ok := fakeNameExtract(c); ok {
+			return r
 		}
 		return aiReply{Text: ""}
 	}

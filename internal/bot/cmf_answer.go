@@ -176,6 +176,46 @@ func enteredReply(toks []string, names ...string) bool {
 	return true
 }
 
+// statusWords — «ещё/пока/вечером внесём»: про то, когда внесут, а не про клиента.
+var statusWords = map[string]bool{
+	"ещё": true, "еще": true, "пока": true, "вечером": true, "утром": true, "внесём": true, "внесем": true,
+	"занесём": true, "занесем": true, "внесу": true, "занесу": true, "сейчас": true, "щас": true, "позже": true,
+	"завтра": true, "скоро": true, "сегодня": true, "потом": true, "успели": true, "успела": true, "успел": true,
+}
+
+// notYetReply — «не внесли», «Каталову пока не внесли, вечером внесём», «нет
+// ещё»: ответ про то, что оплату ещё не внесли (клиент тот же).
+func notYetReply(toks []string, names ...string) bool {
+	if !hasNegation(toks) {
+		return false
+	}
+	var own []string
+	for _, n := range names {
+		own = append(own, normWords(n)...)
+	}
+	status := false
+	for _, t := range toks {
+		switch {
+		case enteredWords[t] || statusWords[t]:
+			status = true
+		case t == "не" || t == "нет" || t == "неа" || t == "а" || fillerWords[t]:
+		case t == "в" || t == "программу" || t == "программе" || t == "его" || t == "её" || t == "ее" || t == "оплату":
+		default:
+			same := false
+			for _, w := range own {
+				if nameWordSame(t, w) {
+					same = true
+					break
+				}
+			}
+			if !same {
+				return false // названо что-то ещё (другой клиент) — это поправка
+			}
+		}
+	}
+	return status
+}
+
 // ackWords — подтверждение/спасибо/отмашка: на сообщение бота это не ответ, а
 // «принято» — бот молчит.
 var ackWords = map[string]bool{
@@ -1002,8 +1042,10 @@ func (b *Bot) applyCmfWatchAnswerOpts(ctx context.Context, chat types.JID, watch
 	if resolved && isAck(text) {
 		return true // «принято» на решённый чек — молчим
 	}
-	// «Каталова внесли», «занесла» на напоминание — это «сделано», а не новое имя.
-	if bound && enteredReply(toks, w.ClientName, w.ClientText) {
+	// «Каталова внесли», «занесла» на напоминание — это «сделано», а не новое имя;
+	// «Каталову не внесли», «пока нет, вечером внесём» — «ещё не внесли»: клиент
+	// остаётся, напоминание тоже.
+	if bound && (enteredReply(toks, w.ClientName, w.ClientText) || notYetReply(toks, w.ClientName, w.ClientText)) {
 		return true
 	}
 	ans, confident := parseCmfAnswer(text, w.ClientText, cands)
@@ -1264,8 +1306,19 @@ func (b *Bot) bindCmfWatch(ctx context.Context, chat types.JID, w db.CmfWatchFul
 		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 			cidPtr = &cid
 		}
+		// Текстовая копия этого платежа («Магомедов Ахмед 15000» рядом с чеком)
+		// переходит к тому же клиенту — иначе текст и чек разойдутся по разным
+		// клиентам и платёж посчитается дважды.
+		var twins []int
+		if rid, ok, err := b.db.ReceiptIDByMessage(ctx, w.WaMessageID); err == nil && ok {
+			twins, _ = b.db.ReceiptTextTwins(ctx, rid)
+		}
 		if _, err := b.db.SetReceiptClientByMessage(ctx, w.WaMessageID, canonical, cidPtr); err != nil {
 			fmt.Println("cmf: не записал клиента чеку:", err)
+		} else if cidPtr != nil {
+			for _, tx := range twins {
+				_ = b.db.SetTxClient(ctx, tx, *cidPtr, canonical)
+			}
 		}
 	}
 	note := ""

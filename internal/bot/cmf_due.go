@@ -2,6 +2,7 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"whatsapp-bot/internal/db"
@@ -43,7 +44,14 @@ func (b *Bot) loadDueLedger(ctx context.Context, ws []db.CmfWatch) (*dueLedger, 
 	return l, nil
 }
 
-func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string, ws []db.CmfWatch) (map[int]reconVerdict, error) {
+// dueVerdict — вердикт сверки по наблюдению и позиция учёта, к которой оно
+// относится (копии одного чека в двух группах — одна позиция).
+type dueVerdict struct {
+	v    reconVerdict
+	item int
+}
+
+func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string, ws []db.CmfWatch) (map[int]dueVerdict, error) {
 	if l == nil || len(ws) == 0 {
 		return nil, nil
 	}
@@ -106,11 +114,41 @@ func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string
 		mode = unitsKopecks
 	}
 	mr := humanMatchFull(items, pays, mode)
-	out := map[int]reconVerdict{}
+	out := map[int]dueVerdict{}
 	for id, i := range itemOf {
 		if i < len(mr.Verdicts) {
-			out[id] = mr.Verdicts[i]
+			out[id] = dueVerdict{mr.Verdicts[i], i}
 		}
 	}
 	return out, nil
+}
+
+// judgeClientWatches — вердикты по наблюдениям клиентов (по каждому клиенту
+// сверка видит всю его картину).
+func (b *Bot) judgeClientWatches(ctx context.Context, ws []db.CmfWatch) map[int]dueVerdict {
+	out := map[int]dueVerdict{}
+	ledger, err := b.loadDueLedger(ctx, ws)
+	if err != nil || ledger == nil {
+		if err != nil {
+			fmt.Println("cmf: учёт для напоминаний не прочитался:", err)
+		}
+		return out
+	}
+	byClient := map[string][]db.CmfWatch{}
+	for _, w := range ws {
+		if w.ClientID != "" {
+			byClient[w.ClientID] = append(byClient[w.ClientID], w)
+		}
+	}
+	for cid, cws := range byClient {
+		vs, err := b.judgeDueWatches(ctx, ledger, cid, cws)
+		if err != nil {
+			fmt.Println("cmf: сверка клиента для напоминания не удалась:", err)
+			continue
+		}
+		for id, v := range vs {
+			out[id] = v
+		}
+	}
+	return out
 }

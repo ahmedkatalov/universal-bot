@@ -423,6 +423,7 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// это в чате, чтобы было видно, что отчёт обновился.
 	if prot := msg.Message.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_REVOKE {
 		revokedID := prot.GetKey().GetID()
+		corrN, _ := b.db.CorrectionsByMessage(ctx, revokedID)
 		txN, rcN, err := b.db.MarkMessageDeleted(ctx, revokedID)
 		if err != nil {
 			fmt.Println("Ошибка обработки удалённого сообщения:", err)
@@ -434,6 +435,9 @@ func (b *Bot) handleEvent(evt interface{}) {
 				b.sendText(msg.Info.Chat, fmt.Sprintf(
 					"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
 			}
+		}
+		if corrN > 0 && !b.groupSilent(msg.Info.Chat) {
+			b.sendText(msg.Info.Chat, "🗑 Поправку суммы удалили — вернул прежнюю сумму.")
 		}
 		return
 	}
@@ -576,75 +580,10 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 
-	// Ответ (свайп) на ВОПРОС-УТОЧНЕНИЕ бота («чей это чек?», «у кого наличка?»,
-	// «новый платёж или тот же?») обрабатываем ПЕРВЫМ — ДО маршрутизации реплая
-	// в ассистента. Иначе ответ владельца («у Нура») уходил в ИИ, и тот отвечал
-	// не по делу («привязать может только владелец…»), а ответственный по наличке
-	// не записывался. Работает и без ассистента.
-	if !hasMedia {
-		// Если владелец обращается к боту по имени («Джарвис, …») — это диалог с
-		// ассистентом, даже если сообщение — ответ на вопрос бота. Иначе фраза
-		// вроде «Джарвис, покажи этот чек» ушла бы в клариф как «имя клиента».
-		// Исключение — свайп на вопрос сверки «за кого платёж» с понятным ответом
-		// («Джарвис, это Альмурзаева Разет»): его понимает код, по ЭТОМУ чеку.
-		if stripped, addressed := b.stripBotName(text); addressed {
-			if b.cmfReplyAnswer(ctx, msg, stripped, modeAddressed) {
-				return
-			}
-			quoted := extractQuotedStanzaID(msg)
-			if quoted == "" && b.cmfAddressedContext(ctx, msg, stripped) {
-				return
-			}
-			// «Джарвис, это Каталов Ахмед» свайпом на «чей чек?» / «у кого
-			// наличка?» — это ответ на вопрос, а не команда ассистенту.
-			if quoted != "" && b.handleClarifyReply(ctx, msg, stripped) {
-				return
-			}
-			// Сотрудник отвечает на открытый вопрос бота, обращаясь по имени.
-			// (Владельцу оставляем ассистента — у него есть инструменты.)
-			if quoted == "" && !b.isReportAdmin(msg.Info) && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, stripped) {
-				return
-			}
-		} else {
-			if b.handleClarifyReply(ctx, msg, text) {
-				return
-			}
-			// Ответ БЕЗ свайпа на последний вопрос бота в этой группе («10000р»
-			// под вопросом «какая сумма?») — понимаем по контексту. Свайп на
-			// вопрос сверки по чеку — это ответ НА НЕГО (уже разобран выше), а не
-			// на последний вопрос.
-			if extractQuotedStanzaID(msg) == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, text) {
-				return
-			}
-		}
-	}
-
-	// Обращение к боту по имени ("Джарвис скинь отчет") или ответом (реплаем)
-	// на его сообщение — отвечаем ассистентом прямо в группе, в учёт такое
-	// сообщение не идёт. В фоне, чтобы не блокировать разбор остальных.
-	if !hasMedia && b.assistant != nil {
-		// Платёж сотрудника, написанный боту («Джарвис, Каталов Ахмед 15000») или
-		// свайпом на сообщение бота, — это обычный платёж: записываем как всегда.
-		// Ассистент сотруднику его не запишет (у не-админов нет инструментов).
-		if query, ok := b.stripBotName(text); ok {
-			if b.employeePayment(msg, query) {
-				text = query
-			} else {
-				go b.handleGroupAssistant(context.Background(), msg, query)
-				return
-			}
-		} else if b.isReplyToBot(msg) && !b.employeePayment(msg, text) {
-			go b.handleGroupAssistant(context.Background(), msg, text)
-			return
-		}
-		// @-упоминание бота (WhatsApp-меншен его номера), даже если имя не в начале
-		// строки: «скинь отчёт @Джарвис» раньше уходило в учёт как обычное сообщение.
-		if b.isMentioned(msg) {
-			go b.handleGroupAssistant(context.Background(), msg, b.stripBotMention(text))
-			return
-		}
-	}
-
+	// Сообщение сохраняем СРАЗУ — и ответ на вопрос бота, и обращение к
+	// ассистенту: их правку/удаление учёт должен понять (ответ на «чей чек?»
+	// поменяли — чек переходит), а импорт истории не должен посчитать их
+	// платежами повторно.
 	rawID, existed, err := b.db.SaveRawMessage(ctx, msg.Info.ID, msg.Info.Chat.String(), msg.Info.Sender.String(),
 		senderPhoneString(msg.Info), senderName, text, hasMedia, mediaPath, msg.Info.Timestamp)
 	if err != nil {
@@ -656,6 +595,90 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		// НЕ обрабатываем снова, иначе платежи/чек запишутся дважды. (Если запись
 		// не была разобрана из-за прошлого сбоя, её подхватит пересчёт по parsed=false.)
 		return
+	}
+	ctx = withAnswerRaw(ctx, rawID)
+	answered := func() { _ = b.db.SetHandledAs(ctx, rawID, "answer") }
+	toAssistant := func(query string) {
+		_ = b.db.SetHandledAs(ctx, rawID, "assistant")
+		go b.handleGroupAssistant(context.Background(), msg, query)
+	}
+
+	// Ответ (свайп) на ВОПРОС-УТОЧНЕНИЕ бота («чей это чек?», «у кого наличка?»,
+	// «новый платёж или тот же?») обрабатываем ПЕРВЫМ — ДО маршрутизации реплая
+	// в ассистента. Иначе ответ («у Нура») уходил в ИИ, и тот отвечал не по делу,
+	// а ответственный по наличке не записывался. Работает и без ассистента.
+	if !hasMedia {
+		if stripped, addressed := b.stripBotName(text); addressed {
+			// Свайп на вопрос сверки «за кого платёж» с понятным ответом
+			// («Джарвис, это Альмурзаева Разет») понимает код, по ЭТОМУ чеку.
+			if b.cmfReplyAnswer(ctx, msg, stripped, modeAddressed) {
+				answered()
+				return
+			}
+			quoted := extractQuotedStanzaID(msg)
+			if quoted == "" && b.cmfAddressedContext(ctx, msg, stripped) {
+				answered()
+				return
+			}
+			// Сотрудник отвечает на вопрос бота, обращаясь по имени («Джарвис, это
+			// Каталов Ахмед»). Владельцу — ассистент: у него есть инструменты, а
+			// «Джарвис, отправь этот чек Мансуру» — команда, а не имя клиента.
+			if !b.isReportAdmin(msg.Info) {
+				if quoted != "" && b.handleClarifyReply(ctx, msg, stripped) {
+					answered()
+					return
+				}
+				if quoted == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, stripped) {
+					answered()
+					return
+				}
+			}
+		} else {
+			if b.handleClarifyReply(ctx, msg, text) {
+				answered()
+				return
+			}
+			// Ответ БЕЗ свайпа на последний вопрос бота в этой группе («10000р»
+			// под вопросом «какая сумма?») — понимаем по контексту. Свайп на
+			// вопрос сверки по чеку — это ответ НА НЕГО (уже разобран выше), а не
+			// на последний вопрос.
+			if extractQuotedStanzaID(msg) == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, text) {
+				answered()
+				return
+			}
+		}
+	}
+
+	// Обращение к боту по имени ("Джарвис скинь отчет"), ответом (реплаем) на
+	// его сообщение или @-упоминанием — отвечаем ассистентом прямо в группе, в
+	// учёт такое сообщение не идёт. В фоне, чтобы не блокировать разбор остальных.
+	// Но платёж или ФИО клиента от сотрудника («Джарвис, Каталов Ахмед 15000»,
+	// «@Джарвис это Каталов Ахмед») — это обычная запись учёта: ассистент
+	// сотруднику её не запишет (у не-админов нет инструментов).
+	if !hasMedia && b.assistant != nil {
+		if query, ok := b.stripBotName(text); ok {
+			if t, ok := b.employeeAccountingText(ctx, msg, query); ok {
+				text = t
+				_ = b.db.SetMessageBody(ctx, rawID, text)
+			} else {
+				toAssistant(query)
+				return
+			}
+		} else if b.isReplyToBot(msg) {
+			if !b.employeePayment(msg, text) {
+				toAssistant(text)
+				return
+			}
+		} else if b.isMentioned(msg) {
+			query := b.stripBotMention(text)
+			if t, ok := b.employeeAccountingText(ctx, msg, query); ok {
+				text = t
+				_ = b.db.SetMessageBody(ctx, rawID, text)
+			} else {
+				toAssistant(query)
+				return
+			}
+		}
 	}
 
 	// Команда отчёта (актуально только для текстовых сообщений)
@@ -761,6 +784,41 @@ func (b *Bot) employeePayment(msg *events.Message, text string) bool {
 	return len(res.Transactions) > 0 || parser.LooksMessyPayment(text, res)
 }
 
+// employeeAccountingText — сообщение сотрудника боту («Джарвис, …») на самом
+// деле запись учёта: платёж или ФИО клиента (к соседнему чеку). Возвращает
+// текст без обращения.
+func (b *Bot) employeeAccountingText(ctx context.Context, msg *events.Message, text string) (string, bool) {
+	if b.isReportAdmin(msg.Info) {
+		return "", false
+	}
+	text = strings.TrimSpace(text)
+	if b.employeePayment(msg, text) {
+		return text, true
+	}
+	name := strings.TrimSpace(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(text, "это"), "Это"), " ,:-—"))
+	if _, ok := looksLikeName(name); ok {
+		if _, ok := b.confirmClientName(ctx, name); ok {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// answerRawKey — id сообщения-ответа в базе (кладём в контекст, чтобы ответ на
+// «чей чек?» запомнил, какое сообщение назвало клиента).
+type answerRawKey struct{}
+
+func withAnswerRaw(ctx context.Context, rawID int) context.Context {
+	return context.WithValue(ctx, answerRawKey{}, rawID)
+}
+
+func answerRawFrom(ctx context.Context) int {
+	if v, ok := ctx.Value(answerRawKey{}).(int); ok {
+		return v
+	}
+	return 0
+}
+
 // processText — разбор текста из группы: имя для чека или платежи. aiSync —
 // дождаться разбора ИИ (при правке сообщения нужен итог, чтобы ответить).
 // isName — сообщение оказалось именем клиента для чека (не платёж).
@@ -856,18 +914,47 @@ func mightBePayment(text string) bool {
 // подстраховкой лишь для явных платежей известным людям (реальный платёж, что ИИ
 // пропустил), но НЕ превращает болтовню вроде «сказал взять 5000» в операцию.
 func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawID int, txDate time.Time, cashHint, knownOnly bool) (saved int, failed bool) {
-	result := parser.ParseMessage(text)
-	isCashMsg := parser.IsCash(text) || cashHint
-	for _, tr := range result.Transactions {
-		canonical, matched := b.aliases.ResolveName(tr.RawName)
-		if knownOnly && !matched {
-			continue
-		}
+	mode := detAll
+	if knownOnly {
+		mode = detKnown
+	}
+	return b.recordDeterministicPaymentsMode(ctx, text, rawID, txDate, cashHint, mode)
+}
+
+// detMode — какие строки запасной разбор без ИИ записывает.
+type detMode int
+
+const (
+	detAll                detMode = iota // все платежи (ИИ нет вообще)
+	detKnown                             // только известным клиентам (алиас), без заглушек
+	detKnownOrPlaceholder                // известным и «Нал 27000» без имени (заглушка «Наличка»)
+)
+
+// deterministicLines — какие строки парсера запасной разбор записал бы (и
+// сколько пропустил бы как неизвестные).
+func (b *Bot) deterministicLines(text string, mode detMode) (keep []parser.Transaction, unknown int) {
+	for _, tr := range parser.ParseMessage(text).Transactions {
 		// Без ИИ не записываем явные не-платежи: вопросы, планы («завтра
 		// принесёт»), телефоны, поправки «не 5000 а 6000».
 		if parser.LooksLikeNonPayment(tr) {
 			continue
 		}
+		canonical, matched := b.aliases.ResolveName(tr.RawName)
+		placeholder := whoPlaceholders[canonical] || whoPlaceholders[tr.RawName]
+		if mode != detAll && (!matched || placeholder && mode != detKnownOrPlaceholder) {
+			unknown++
+			continue
+		}
+		keep = append(keep, tr)
+	}
+	return keep, unknown
+}
+
+func (b *Bot) recordDeterministicPaymentsMode(ctx context.Context, text string, rawID int, txDate time.Time, cashHint bool, mode detMode) (saved int, failed bool) {
+	keep, _ := b.deterministicLines(text, mode)
+	isCashMsg := parser.IsCash(text) || cashHint
+	for _, tr := range keep {
+		canonical, _ := b.aliases.ResolveName(tr.RawName)
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 		if err != nil {
 			fmt.Println("Ошибка получения контакта:", err)
@@ -2878,7 +2965,15 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 
 			// "Это не дубль" — снимаем пометку дубля с последнего такого чека.
 			if args.Action == "not_duplicate" {
-				found, name, txDate, err := b.db.ClearDuplicateFlag(ctx, args.Amount, strings.TrimSpace(args.Person), groupJID)
+				found, name, txDate, waID, err := b.db.ClearDuplicateFlagRef(ctx, args.Amount, strings.TrimSpace(args.Person), groupJID)
+				if err == nil && found && waID != "" {
+					// Засчитанный чек сверяется с программой, как любой другой.
+					if info, ok, _ := b.db.ReceiptWatchInfoByMessage(ctx, waID); ok {
+						if gj, perr := types.ParseJID(info.GroupJID); perr == nil {
+							b.syncWatchByCheckWa(ctx, gj, waID, name)
+						}
+					}
+				}
 				if err != nil {
 					return "", fmt.Errorf("не удалось снять пометку дубля: %w", err)
 				}
@@ -2999,7 +3094,7 @@ func collapseTextTwins(ops []db.OperationRef) []db.OperationRef {
 				if d < 0 {
 					d = -d
 				}
-				if r.GroupJID == op.GroupJID && math.Abs(r.Amount-op.Amount) < 1 && d <= 48*time.Hour &&
+				if math.Abs(r.Amount-op.Amount) < 1 && d <= 48*time.Hour &&
 					nameKeyBot(r.Name) == nameKeyBot(op.Name) {
 					twin = true
 					break
@@ -3299,6 +3394,8 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 				payer = name
 			}
 			b.handleBankReceipt(ctx, targetJID, "", "", text, rawID, ts, media, ext, payer, 0)
+			// Копия сразу повторяет исходный чек (поправленную сумму, исключение…).
+			_, _ = b.db.SyncForwardCopies(ctx)
 		}
 	}
 }
@@ -3753,9 +3850,13 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// НЕ сверяем по печатному получателю: в рассрочке это владелец карты-сборщика,
 	// а не плательщик — сверка и напоминания ушли бы не на того. Оставляем клиента
 	// пустым (noname): сверка подхватится после того, как клиента уточнят.
-	// Копию пересланного чека (senderJID пуст) не сверяем — сверка и напоминание
-	// идут по исходному чеку, иначе напоминали бы дважды.
-	if b.cmf != nil && !isDuplicate && senderJID != "" {
+	// Копию чека, пересланного из группы, не сверяем — сверка и напоминание идут
+	// по исходному чеку, иначе напоминали бы дважды. Копия из лички — основная.
+	groupCopy := false
+	if senderJID == "" {
+		groupCopy, _ = b.db.IsGroupForwardCopy(ctx, rawID)
+	}
+	if b.cmf != nil && !isDuplicate && !groupCopy {
 		clientText := ""
 		if clientConfirmed {
 			clientText = rd.Recipient

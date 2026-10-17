@@ -87,6 +87,10 @@ func newE2E(t *testing.T, o e2eOpts) *e2eBot {
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
+	t.Cleanup(func() {
+		time.Sleep(300 * time.Millisecond) // фоновые горутины теста дописывают в базу
+		d.Close()
+	})
 	ctx := context.Background()
 	if err := d.TestResetAll(ctx); err != nil {
 		t.Fatalf("очистка тестовой базы: %v", err)
