@@ -212,6 +212,11 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_status ON cmf_watch(status)`); err != nil {
 		return fmt.Errorf("индекс cmf_watch: %w", err)
 	}
+	// Какое сообщение назвало клиента чека (имя после чека): удалят его —
+	// привязку откатываем, чек снова ждёт клиента.
+	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS client_source_raw_id INT`); err != nil {
+		return fmt.Errorf("колонка bank_receipts.client_source_raw_id: %w", err)
+	}
 	// id вопроса бота «за кого этот платёж?» — чтобы ответ свайпом на вопрос нашёл
 	// своё наблюдение даже после перезапуска бота.
 	if _, err := pool.Exec(ctx, `ALTER TABLE cmf_watch ADD COLUMN IF NOT EXISTS ask_msg_id TEXT`); err != nil {
@@ -1459,6 +1464,18 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 	`, rawID); e != nil {
 		fmt.Println("Промоут дубля после удаления оригинала не удался:", e)
 	}
+	// Имя из удалённого сообщения больше не ждёт чека, а чеки, которым оно дало
+	// клиента, снова ждут клиента (имя написали по ошибке и удалили).
+	if _, e := d.pool.Exec(ctx, `UPDATE pending_client_names SET consumed = true, consumed_at = now() WHERE raw_message_id = $1 AND consumed = false`, rawID); e != nil {
+		fmt.Println("Очередь имён: не снял имя удалённого сообщения:", e)
+	}
+	if _, e := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET
+			recipient_raw = COALESCE(NULLIF(card_owner, ''), recipient_raw),
+			needs_review = true, client_confirmed = false, client_source_raw_id = NULL
+		WHERE client_source_raw_id = $1`, rawID); e != nil {
+		fmt.Println("Откат привязки клиента от удалённого сообщения не удался:", e)
+	}
 	// Сверка по удалённому чеку больше не нужна — ни вопросов, ни напоминаний.
 	if _, e := d.pool.Exec(ctx, `UPDATE cmf_watch SET status = 'deleted' WHERE raw_message_id = $1 AND status <> 'found'`, rawID); e != nil {
 		fmt.Println("Закрытие сверки удалённого чека не удалось:", e)
@@ -2085,6 +2102,7 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
 		LIMIT 1
 	`, groupJID, senderJID, since).Scan(&one)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -2098,10 +2116,48 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 // WhatsApp (rm.received_at), а не по времени вставки строки: так привязка не
 // зависит от того, какая горутина/OCR закончилась первой, и переживает рестарт.
 func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int) (found bool, amount float64, err error) {
+	found, amount, _, err = d.ReattributeOldestUnconfirmedReceiptFrom(ctx, groupJID, senderJID, since, name, contactID, 0, 0)
+	return found, amount, err
+}
+
+// OldestUnconfirmedReceiptAmount — сумма самого старого неподтверждённого чека
+// отправителя (тот, к которому привяжется имя), ok=false — такого нет.
+func (d *DB) OldestUnconfirmedReceiptAmount(ctx context.Context, groupJID, senderJID string, since time.Time) (float64, bool, error) {
+	var amount float64
+	err := d.pool.QueryRow(ctx, `
+		SELECT br.amount::float8 FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.created_at >= $3::timestamptz
+		  AND br.client_confirmed = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		ORDER BY rm.received_at ASC, br.id ASC
+		LIMIT 1
+	`, groupJID, senderJID, since).Scan(&amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return amount, true, nil
+}
+
+// ReattributeOldestUnconfirmedReceiptFrom — то же, с запоминанием, КАКОЕ
+// сообщение назвало клиента (sourceRawID: удалят его — привязка откатится), и
+// (amount > 0) только к чеку на эту сумму.
+func (d *DB) ReattributeOldestUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID string, since time.Time, name string, contactID *int, sourceRawID int, amount0 float64) (found bool, amount float64, checkRawID int, err error) {
+	var src any
+	if sourceRawID > 0 {
+		src = sourceRawID
+	}
 	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
 			card_owner = COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')),
-			recipient_raw = $4, contact_id = $5, needs_review = false, client_confirmed = true
+			recipient_raw = $4, contact_id = $5, needs_review = false, client_confirmed = true,
+			client_source_raw_id = $6
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -2114,18 +2170,59 @@ func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, 
 			  AND br.created_at >= $3::timestamptz
 			  AND br.client_confirmed = false
 			  AND br.is_duplicate = false AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND ($7::float8 <= 0 OR abs(br.amount - $7::float8) < 1)
 			ORDER BY rm.received_at ASC, br.id ASC
 			LIMIT 1
 		)
-		RETURNING amount::float8
-	`, groupJID, senderJID, since, name, contactID).Scan(&amount)
+		RETURNING amount::float8, COALESCE(raw_message_id, 0)
+	`, groupJID, senderJID, since, name, contactID, src, amount0).Scan(&amount, &checkRawID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, nil
+		return false, 0, 0, nil
 	}
 	if err != nil {
-		return false, 0, err
+		return false, 0, 0, err
 	}
-	return true, amount, nil
+	return true, amount, checkRawID, nil
+}
+
+// CmfWatchByRawMessage — наблюдение сверки по сообщению с чеком (id в нашей базе).
+func (d *DB) CmfWatchByRawMessage(ctx context.Context, rawID int) (int, bool, error) {
+	var id int
+	err := d.pool.QueryRow(ctx, `SELECT id FROM cmf_watch WHERE raw_message_id = $1 ORDER BY id DESC LIMIT 1`, rawID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// TextTxByMessage — текстовые платежи сообщения (для уточнения клиента свайпом).
+func (d *DB) TextTxByMessage(ctx context.Context, waMessageID string) ([]int, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT t.id FROM transactions t JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE rm.wa_message_id = $1 AND t.ignored = false ORDER BY t.id`, waMessageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// SetTxClient — поменять клиента текстового платежа (уточнили ФИО свайпом).
+func (d *DB) SetTxClient(ctx context.Context, txID, contactID int, rawName string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE transactions SET contact_id = $2, raw_name = $3 WHERE id = $1`, txID, contactID, rawName)
+	return err
 }
 
 // EnqueuePendingName сохраняет ФИО клиента, присланное ПЕРЕД чеком, в durable
@@ -2169,10 +2266,77 @@ func (d *DB) TakePendingNameWithAmount(ctx context.Context, groupJID, senderJID 
 	return d.takePendingName(ctx, groupJID, senderJID, since, true)
 }
 
+// PendingName — имя из очереди «имя перед чеком».
+type PendingName struct {
+	ID     int
+	Name   string
+	Amount float64
+	RawID  int
+}
+
+// TakePendingNameFor — самое раннее ждущее имя отправителя, подходящее чеку на
+// сумму checkAmount: без суммы или с той же суммой (имя «Ахмед 15000» не
+// достанется чеку на 20000). Имена из удалённых сообщений не берём.
+func (d *DB) TakePendingNameFor(ctx context.Context, groupJID, senderJID string, since time.Time, checkAmount float64) (PendingName, bool, error) {
+	var p PendingName
+	var rid *int
+	err := d.pool.QueryRow(ctx, `
+		UPDATE pending_client_names SET consumed = true, consumed_at = now()
+		WHERE id = (
+			SELECT pn.id FROM pending_client_names pn
+			WHERE pn.group_jid = $1 AND pn.sender_jid = $2 AND pn.consumed = false
+			  AND pn.created_at >= $3::timestamptz
+			  AND (pn.amount = 0 OR ($4::float8 > 0 AND abs(pn.amount - $4::float8) < 1))
+			  AND NOT EXISTS (SELECT 1 FROM raw_messages rm WHERE rm.id = pn.raw_message_id AND rm.deleted)
+			ORDER BY pn.received_at ASC, pn.id ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		RETURNING id, name, amount, raw_message_id
+	`, groupJID, senderJID, since, checkAmount).Scan(&p.ID, &p.Name, &p.Amount, &rid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return p, false, nil
+	}
+	if err != nil {
+		return p, false, err
+	}
+	if rid != nil {
+		p.RawID = *rid
+	}
+	return p, true, nil
+}
+
+// PendingNamesOf — несъеденные имена отправителя (для сверки с подписью к чеку).
+func (d *DB) PendingNamesOf(ctx context.Context, groupJID, senderJID string, since time.Time) ([]PendingName, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id, name, amount, COALESCE(raw_message_id, 0) FROM pending_client_names
+		WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false AND created_at >= $3::timestamptz
+		ORDER BY received_at ASC, id ASC`, groupJID, senderJID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []PendingName
+	for rows.Next() {
+		var p PendingName
+		if err := rows.Scan(&p.ID, &p.Name, &p.Amount, &p.RawID); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// ConsumePendingNameByID — пометить имя из очереди использованным.
+func (d *DB) ConsumePendingNameByID(ctx context.Context, id int) error {
+	_, err := d.pool.Exec(ctx, `UPDATE pending_client_names SET consumed = true, consumed_at = now() WHERE id = $1`, id)
+	return err
+}
+
 func (d *DB) takePendingName(ctx context.Context, groupJID, senderJID string, since time.Time, requireAmount bool) (string, float64, bool, error) {
-	amountCond := ""
+	amountCond := "AND NOT EXISTS (SELECT 1 FROM raw_messages rm WHERE rm.id = pending_client_names.raw_message_id AND rm.deleted)"
 	if requireAmount {
-		amountCond = "AND amount > 0"
+		amountCond += " AND amount > 0"
 	}
 	var name string
 	var amount float64
@@ -2374,10 +2538,21 @@ func (d *DB) FindReceiptOccurrences(ctx context.Context, ident ReceiptIdentity) 
 // ReattributeReceiptByMessage переписывает получателя у чека, на который
 // ответили (свайп), — по id сообщения WhatsApp.
 func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int) (found bool, amount float64, err error) {
+	return d.ReattributeReceiptByMessageFrom(ctx, waMessageID, name, contactID, 0)
+}
+
+// ReattributeReceiptByMessageFrom — то же, с запоминанием сообщения, которое
+// назвало клиента (удалят — привязка откатится).
+func (d *DB) ReattributeReceiptByMessageFrom(ctx context.Context, waMessageID, name string, contactID *int, sourceRawID int) (found bool, amount float64, err error) {
+	var src any
+	if sourceRawID > 0 {
+		src = sourceRawID
+	}
 	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
 			card_owner = COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')),
-			recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true
+			recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true,
+			client_source_raw_id = COALESCE($4, client_source_raw_id)
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -2385,7 +2560,7 @@ func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name 
 			ORDER BY br.id DESC LIMIT 1
 		)
 		RETURNING amount::float8
-	`, waMessageID, name, contactID).Scan(&amount)
+	`, waMessageID, name, contactID, src).Scan(&amount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, 0, nil
 	}
@@ -3079,6 +3254,29 @@ func (d *DB) CmfPayerHistory(ctx context.Context, firstWord string, excludeID in
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+// TestReceipt — состояние чека по id сообщения (для тестов).
+type TestReceipt struct {
+	Recipient   string
+	Amount      float64
+	NeedsReview bool
+	Confirmed   bool
+	Duplicate   bool
+	TxDate      time.Time
+	Found       bool
+}
+
+// TestReceiptByMessage — чек по id сообщения WhatsApp (только для тестов).
+func (d *DB) TestReceiptByMessage(ctx context.Context, waMessageID string) TestReceipt {
+	var r TestReceipt
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(br.recipient_raw,''), br.amount::float8, br.needs_review, br.client_confirmed, br.is_duplicate, br.tx_date
+		FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE rm.wa_message_id = $1 ORDER BY br.id DESC LIMIT 1`, waMessageID).
+		Scan(&r.Recipient, &r.Amount, &r.NeedsReview, &r.Confirmed, &r.Duplicate, &r.TxDate)
+	r.Found = err == nil
+	return r
 }
 
 // TestResetCmfWatches — очистка наблюдений сверки (только для тестовой БД).

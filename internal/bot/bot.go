@@ -3247,6 +3247,13 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// (владельца карты) сохраняем отдельно в cardOwner для истории.
 	// receiptRecipient — получатель, как он НАПЕЧАТАН на чеке (до подмены на
 	// клиента): по нему решаем, похоже ли изображение на чек вообще.
+	// Имя, написанное ПЕРЕД чеком (очередь), — только если оно без суммы или с
+	// суммой этого чека.
+	if payerOverride == "" {
+		if name, ok := b.takeQueuedPayer(ctx, chat, senderJID, rd.Amount); ok {
+			payerOverride = name
+		}
+	}
 	receiptRecipient := rd.Recipient
 	cardOwner := ""
 	if payerOverride != "" {

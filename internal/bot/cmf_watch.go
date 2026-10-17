@@ -16,6 +16,7 @@ import (
 	"time"
 	"unicode"
 
+	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 
@@ -142,35 +143,66 @@ func firstNameLine(text string) (string, bool) {
 // для фото наличных: «ФИО+сумма» + фото денег = наличка на эту сумму). Для
 // обычного чека сумма берётся с самого чека, и это значение игнорируется.
 func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, caption string) (string, float64) {
+	found := func(name string, amount float64) (string, float64) {
+		// Имя этого клиента, написанное ПЕРЕД чеком, уже использовано — снимаем
+		// его из очереди, иначе оно достанется следующему чеку другого клиента.
+		b.consumeQueuedSameName(ctx, msg.Info.Chat, msg.Info.Sender.String(), name)
+		return name, amount
+	}
 	// 1. Подпись к чеку.
 	if strings.TrimSpace(caption) != "" {
 		if name := b.cmfExtractClientName(ctx, caption); name != "" {
-			return name, parser.ExtractAmount(caption)
+			return found(name, parser.ExtractAmount(caption))
 		}
 		// ИИ не выделил, но подпись сама похожа на ФИО ("цихаев саляхь").
 		if name, ok := looksLikeName(caption); ok {
-			return name, parser.ExtractAmount(caption)
+			return found(name, parser.ExtractAmount(caption))
 		}
 	}
 	// 2. Чек — это ответ (свайп) на сообщение с именем.
 	if quoted := extractQuotedText(msg); strings.TrimSpace(quoted) != "" {
 		if name := b.cmfExtractClientName(ctx, quoted); name != "" {
-			return name, parser.ExtractAmount(quoted)
+			return found(name, parser.ExtractAmount(quoted))
 		}
 		if name, ok := looksLikeName(quoted); ok {
-			return name, parser.ExtractAmount(quoted)
+			return found(name, parser.ExtractAmount(quoted))
 		}
 	}
-	// 3. Имя из durable-очереди (FIFO) — самое РАННЕЕ по времени сообщения из
-	// написанных перед чеком, не старше окна спаривания. Очередь в БD, поэтому
-	// переживает рестарт; забор атомарный (не отдаст одно имя двум чекам).
-	since := time.Now().Add(-b.pairWindow)
-	if name, amount, ok, err := b.db.TakePendingName(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), since); err != nil {
-		fmt.Println("Очередь имён: ошибка выборки:", err)
-	} else if ok {
-		return name, amount
-	}
+	// 3. Имя из очереди «написали перед чеком» берётся уже при разборе чека
+	// (takeQueuedPayer), когда известна его сумма: «Ахмед 15000» не достанется
+	// чеку на 20000.
 	return "", 0
+}
+
+// takeQueuedPayer — имя из очереди «написали перед чеком» для чека на эту сумму.
+func (b *Bot) takeQueuedPayer(ctx context.Context, chat types.JID, senderJID string, amount float64) (string, bool) {
+	if senderJID == "" || b.db == nil {
+		return "", false
+	}
+	p, ok, err := b.db.TakePendingNameFor(ctx, chat.String(), senderJID, time.Now().Add(-b.pairWindow), amount)
+	if err != nil {
+		fmt.Println("Очередь имён: ошибка выборки:", err)
+		return "", false
+	}
+	return p.Name, ok
+}
+
+// consumeQueuedSameName — снять из очереди имя того же клиента (оно уже
+// использовано подписью или свайпом).
+func (b *Bot) consumeQueuedSameName(ctx context.Context, chat types.JID, senderJID, name string) {
+	if b.db == nil || name == "" {
+		return
+	}
+	ps, err := b.db.PendingNamesOf(ctx, chat.String(), senderJID, time.Now().Add(-b.pairWindow))
+	if err != nil {
+		return
+	}
+	for _, p := range ps {
+		if sameClientName(p.Name, name) || normCyr(p.Name) == normCyr(name) {
+			_ = b.db.ConsumePendingNameByID(ctx, p.ID)
+			return
+		}
+	}
 }
 
 // enqueuePendingName кладёт имя в durable-очередь (имя ПЕРЕД будущим чеком).
@@ -200,17 +232,30 @@ func (b *Bot) consumePendingNameCash(ctx context.Context, chat types.JID, sender
 // handleNameMessage разбирает сообщение-имя (ФИО без чека) и по порядку
 // сообщений (FIFO) решает: это имя ПОСЛЕ чека (есть ждущий чек -> привязать)
 // или ПЕРЕД чеком (нет -> в очередь). Свайп на конкретный чек имеет приоритет.
-// Возвращает true, если сообщение — имя (обработано).
+// Возвращает true, если сообщение — только имя (обработано). «ФИО + сумма» —
+// это ПЛАТЁЖ: он записывается (возвращаем false), а имя заодно ждёт чек НА ТУ ЖЕ
+// сумму (текст + чек одного платежа сводятся в отчётах в один).
 func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string, rawID int) bool {
 	chat := msg.Info.Chat
 	sender := msg.Info.Sender.String()
 	quotedID := extractQuotedStanzaID(msg)
 	since := time.Now().Add(-b.pairWindow)
 	amount := parser.ExtractAmount(text) // сумма из того же сообщения, если была
+	amountLines := countAmountLines(text)
 
-	// Есть ли ждущий чек (ответ на чек или неподтверждённый чек от отправителя)?
+	// Есть ли ждущий чек (неподтверждённый чек от отправителя)?
 	hasUnconfirmed, _ := b.db.HasUnconfirmedReceiptFrom(ctx, chat.String(), sender, since)
 	checkNearby := quotedID != "" || hasUnconfirmed
+
+	// Наличка («Исаев Ислам нал 5000», «Ахмед 10000 у Дени») и список из
+	// нескольких платежей — это платежи, а не подпись к чеку. Если рядом ждёт чек,
+	// подпишем его строкой с ТОЙ ЖЕ суммой, остальное запишется как платежи.
+	if amount > 0 && (parser.IsCash(text) || amountLines > 1) {
+		if hasUnconfirmed && quotedID == "" && amountLines > 1 {
+			b.labelCheckFromLines(ctx, msg, text, rawID, since)
+		}
+		return false
+	}
 
 	name, ok := looksLikeName(text)
 	if !ok {
@@ -231,10 +276,8 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	// Уверены ли, что это ВООБЩЕ ФИО человека, а не фраза, случайно прошедшая
 	// эвристику («Доброе Утро», «Новый Клиент»)? Уверенно — если совпал известный
 	// алиас. Иначе спрашиваем ИИ: он подтвердит/нормализует настоящее ФИО или
-	// вернёт пусто для не-имени. Без этого любая 2–5-словная фраза с заглавной
-	// перехватывалась как «клиент» ДО ИИ — и привязывала чужой чек к выдуманному
-	// человеку либо плодила мусорные контакты. Без ассистента доверяем только
-	// известным алиасам, остальное НЕ перехватываем (чек останется на проверку).
+	// вернёт пусто для не-имени. Без ассистента доверяем только известным
+	// алиасам, остальное НЕ перехватываем (чек останется на проверку).
 	if _, known := b.aliases.ResolveName(name); !known {
 		confirmed := ""
 		if b.assistant != nil {
@@ -246,82 +289,172 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 		name = confirmed
 	}
 
-	if !checkNearby {
-		// Чека рядом нет. Если это «ФИО+сумма» и рядом было фото пачки денег —
-		// это НАЛИЧКА, записываем сразу.
-		if amount > 0 && b.consumePendingCash(chat, sender) {
-			b.recordCashPayment(ctx, chat, name, amount, rawID, msg.Info.Timestamp)
+	canonical, _ := b.aliases.ResolveName(name)
+	contact := func() *int {
+		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			return &cid
+		}
+		return nil
+	}
+
+	// Свайп на конкретное сообщение — имя относится к НЕМУ.
+	if quotedID != "" {
+		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, contact(), rawID); err == nil && found {
+			_ = b.db.MarkMessageParsed(ctx, rawID)
+			if !b.reresolveWatchByCheck(ctx, chat, quotedID, canonical) {
+				fmt.Printf("Чек переатрибутирован на клиента %q (свайп с ФИО на чек)\n", canonical)
+			}
 			return true
 		}
-		// Иначе имя (возможно с суммой) — в очередь: перед будущим чеком или
-		// фото наличных.
+		// Свайп на текстовый платёж — уточнили ФИО его клиента.
+		if amount == 0 {
+			if txs, err := b.db.TextTxByMessage(ctx, quotedID); err == nil && len(txs) == 1 {
+				if cid := contact(); cid != nil {
+					_ = b.db.SetTxClient(ctx, txs[0], *cid, canonical)
+					_ = b.db.MarkMessageParsed(ctx, rawID)
+					fmt.Printf("Клиент текстового платежа уточнён свайпом: %q\n", canonical)
+					return true
+				}
+			}
+		}
+		// Свайп на что-то другое — это не имя для БУДУЩЕГО чека отправителя.
+		return false
+	}
+
+	if amount > 0 {
+		// «ФИО + сумма» рядом с ждущим чеком на ТУ ЖЕ сумму — подпись к нему.
+		if hasUnconfirmed {
+			if checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since); ok && (checkAmt <= 0 || math.Abs(checkAmt-amount) < 1) {
+				if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, contact(), rawID, 0); err == nil && found {
+					_ = b.db.MarkMessageParsed(ctx, rawID)
+					b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+					fmt.Printf("Чек переатрибутирован на клиента %q (ФИО+сумма рядом с чеком)\n", canonical)
+					return true
+				}
+			}
+		}
+		// Иначе это платёж: запишется как текстовый, а имя подождёт чек на эту сумму.
 		b.enqueuePendingName(ctx, msg, name, amount, rawID)
+		return false
+	}
+
+	if !checkNearby {
+		// Чека рядом нет — имя (перед чеком) в очередь.
+		b.enqueuePendingName(ctx, msg, name, 0, rawID)
+		_ = b.db.MarkMessageParsed(ctx, rawID)
 		return true
 	}
 
-	canonical, _ := b.aliases.ResolveName(name)
-	var contactIDPtr *int
-	if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
-		contactIDPtr = &cid
+	// Имя без свайпа: самый старый неподтверждённый чек от отправителя
+	// (FIFO по порядку чата).
+	found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, contact(), rawID, 0)
+	if err != nil || !found {
+		b.enqueuePendingName(ctx, msg, name, 0, rawID)
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+		return true
 	}
-
-	updated := false
-	if quotedID != "" {
-		if found, _, err := b.db.ReattributeReceiptByMessage(ctx, quotedID, canonical, contactIDPtr); err == nil && found {
-			updated = true
-			// Сверка по этому чеку тоже переключается на нового клиента.
-			if b.reresolveWatchByCheck(ctx, chat, quotedID, canonical) {
-				fmt.Printf("Чек переатрибутирован на клиента %q (свайп с ФИО на чек), сверка обновлена\n", canonical)
-				return true
-			}
-		} else {
-			// Свайп пришёлся НЕ на чек (например, на вопрос бота, чья привязка уже
-			// вытеснена из askMap) — не привязываем вслепую к самому старому чеку
-			// (это дало бы неверную атрибуцию). Запоминаем имя как ждущее.
-			b.enqueuePendingName(ctx, msg, name, amount, rawID)
-			return true
-		}
-	}
-	if !updated {
-		// Имя без свайпа: самый старый неподтверждённый чек от отправителя
-		// (FIFO по порядку чата).
-		found, _, err := b.db.ReattributeOldestUnconfirmedReceipt(ctx, chat.String(), sender, since, canonical, contactIDPtr)
-		if err != nil || !found {
-			// Не нашли чек — на всякий случай запомним имя как ждущее.
-			b.enqueuePendingName(ctx, msg, name, amount, rawID)
-			return true
-		}
-	}
+	_ = b.db.MarkMessageParsed(ctx, rawID)
 	fmt.Printf("Чек переатрибутирован на клиента %q (ФИО написали рядом с чеком)\n", canonical)
+	b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+	return true
+}
 
-	// Дополнительно обновляем наблюдение сверки, если программа подключена.
-	if b.cmf != nil {
-		if watchID, wok, err := b.db.LatestNonameWatch(ctx, chat.String(), msg.Info.Sender.String(), since); err == nil && wok {
-			_ = b.db.UpdateCmfWatch(ctx, watchID, canonical, "", "", "", "lookup")
-			var amount float64
-			if ws, err := b.db.ListCmfWatches(ctx, []string{"lookup"}, 50); err == nil {
-				for _, w := range ws {
-					if w.ID == watchID {
-						amount = w.Amount
-					}
-				}
-			}
-			go b.cmfResolveWatch(context.Background(), watchID, chat, canonical, amount)
+// countAmountLines — сколько строк сообщения содержат сумму (список платежей).
+func countAmountLines(text string) int {
+	n := 0
+	for _, ln := range strings.Split(text, "\n") {
+		if parser.ExtractAmount(ln) > 0 {
+			n++
 		}
 	}
-	return true
+	return n
+}
+
+// labelCheckFromLines — в сообщении-списке платежей («Магомедов Ахмед 15000\n
+// Исаев Дени 20000 нал») ищем строку на сумму ждущего чека и подписываем им чек.
+func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text string, rawID int, since time.Time) {
+	chat, sender := msg.Info.Chat, msg.Info.Sender.String()
+	checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since)
+	if !ok || checkAmt <= 0 {
+		return
+	}
+	for _, ln := range strings.Split(text, "\n") {
+		if math.Abs(parser.ExtractAmount(ln)-checkAmt) >= 1 || parser.IsCash(ln) {
+			continue
+		}
+		name, ok := looksLikeName(ln)
+		if !ok {
+			continue
+		}
+		if _, known := b.aliases.ResolveName(name); !known && b.assistant != nil {
+			if c := b.cmfExtractClientName(ctx, ln); c != "" {
+				name = c
+			}
+		}
+		canonical, _ := b.aliases.ResolveName(name)
+		var cid *int
+		if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			cid = &id
+		}
+		if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, cid, rawID, checkAmt); err == nil && found {
+			b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+		}
+		return
+	}
+}
+
+// syncWatchAfterLabel — клиента чека назвали отдельным сообщением: сверка с
+// программой по ЭТОМУ чеку тоже узнаёт клиента.
+func (b *Bot) syncWatchAfterLabel(ctx context.Context, chat types.JID, checkRawID int, canonical string) {
+	if b.cmf == nil || checkRawID == 0 {
+		return
+	}
+	wid, ok, err := b.db.CmfWatchByRawMessage(ctx, checkRawID)
+	if err != nil || !ok {
+		return
+	}
+	w, ok, err := b.db.CmfWatchByID(ctx, wid)
+	if err != nil || !ok || w.Status == "found" || w.Status == "deleted" {
+		return
+	}
+	_ = b.db.UpdateCmfWatch(ctx, wid, canonical, "", "", "", "lookup")
+	go b.cmfResolveWatch(context.Background(), wid, chat, canonical, w.Amount)
 }
 
 // extractQuotedStanzaID возвращает id сообщения, на которое ответили (свайп).
 func extractQuotedStanzaID(msg *events.Message) string {
-	ext := msg.Message.GetExtendedTextMessage()
-	if ext == nil {
-		return ""
-	}
-	if ci := ext.GetContextInfo(); ci != nil {
+	if ci := contextInfoOf(msg); ci != nil {
 		return ci.GetStanzaID()
 	}
 	return ""
+}
+
+// contextInfoOf — сведения об ответе (свайпе) у любого вида сообщения: текст,
+// фото, документ (PDF-чек), видео. Чек часто присылают ОТВЕТОМ на сообщение с
+// именем — у фото/документа цитата лежит в их собственном ContextInfo.
+func contextInfoOf(msg *events.Message) *waProto.ContextInfo {
+	m := msg.Message
+	if m == nil {
+		return nil
+	}
+	if e := m.GetExtendedTextMessage(); e != nil && e.GetContextInfo() != nil {
+		return e.GetContextInfo()
+	}
+	if i := m.GetImageMessage(); i != nil && i.GetContextInfo() != nil {
+		return i.GetContextInfo()
+	}
+	if d := m.GetDocumentMessage(); d != nil && d.GetContextInfo() != nil {
+		return d.GetContextInfo()
+	}
+	if dc := m.GetDocumentWithCaptionMessage(); dc != nil {
+		if d := dc.GetMessage().GetDocumentMessage(); d != nil && d.GetContextInfo() != nil {
+			return d.GetContextInfo()
+		}
+	}
+	if v := m.GetVideoMessage(); v != nil && v.GetContextInfo() != nil {
+		return v.GetContextInfo()
+	}
+	return nil
 }
 
 // cmfWatchReceipt заводит наблюдение сверки за уже разобранным чеком (с учётом
@@ -347,11 +480,7 @@ func (b *Bot) cmfWatchReceipt(ctx context.Context, chat types.JID, senderJID, cl
 
 // extractQuotedText возвращает текст сообщения, на которое ответили (свайп).
 func extractQuotedText(msg *events.Message) string {
-	ext := msg.Message.GetExtendedTextMessage()
-	if ext == nil {
-		return ""
-	}
-	ci := ext.GetContextInfo()
+	ci := contextInfoOf(msg)
 	if ci == nil {
 		return ""
 	}
