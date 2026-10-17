@@ -362,6 +362,7 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 	}
 	if canonical != "" {
 		b.sendText(chat, "Записал: чек — клиент "+canonical+".")
+		b.syncWatchByCheckWa(ctx, chat, receiptWaID, canonical)
 	} else {
 		b.sendText(chat, "Поправил сумму чека.")
 	}

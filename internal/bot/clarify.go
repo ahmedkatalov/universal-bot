@@ -341,6 +341,7 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		}
 		if found, _, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
 			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
+			b.syncWatchByCheckWa(ctx, jid, it.WaMessageID, canonical)
 			return true
 		}
 	}

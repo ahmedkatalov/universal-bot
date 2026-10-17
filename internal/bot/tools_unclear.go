@@ -726,6 +726,13 @@ func (b *Bot) fixReceiptTool() ai.Tool {
 			if err := b.db.FixReceipt(ctx, kind, id, contactIDPtr, canonical, args.Amount, txDatePtr); err != nil {
 				return "", fmt.Errorf("не удалось записать: %w", err)
 			}
+			if kind == "receipt" && canonical != "" {
+				if _, wa, g, err := b.db.ReceiptRef(ctx, id); err == nil {
+					if gj, err := types.ParseJID(g); err == nil {
+						b.syncWatchByCheckWa(ctx, gj, wa, canonical)
+					}
+				}
+			}
 
 			var parts []string
 			if canonical != "" {

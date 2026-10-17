@@ -57,6 +57,7 @@ type aiToolCall struct {
 type e2eBot struct {
 	*Bot
 	t     *testing.T
+	posts *fakePosts // что бот внёс в программу (POST)
 	mu    sync.Mutex
 	out   []e2eSent
 	next  int
@@ -134,7 +135,8 @@ func newE2E(t *testing.T, o e2eOpts) *e2eBot {
 		return id
 	}
 	if o.CMFClients != nil {
-		b.cmf = fakeCMFWithPays(t, o.CMFClients, o.CMFPays)
+		e.posts = &fakePosts{}
+		b.cmf = fakeCMFProgram(t, o.CMFClients, o.CMFPays, e.posts)
 	}
 	if o.WithAI {
 		b.assistant = e.fakeAI()
@@ -146,9 +148,45 @@ func newE2E(t *testing.T, o e2eOpts) *e2eBot {
 // fakeCMFWithPays — программа: поиск клиентов по подстроке, договоры и оплаты.
 // pays: client id → список оплат ({"amount":..,"paid_at":"2026-08-10",...}).
 func fakeCMFWithPays(t *testing.T, clients []cmf.ClientInfo, pays map[string][]map[string]any) *cmf.Client {
+	return fakeCMFProgram(t, clients, pays, nil)
+}
+
+// fakePosts — платежи, которые бот записал в фейковую программу.
+type fakePosts struct {
+	mu   sync.Mutex
+	list []map[string]any
+}
+
+func (p *fakePosts) n() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.list)
+}
+
+// fakeCMFProgram — программа, которая ещё и принимает внесение платежей (POST):
+// внесённое сразу видно в оплатах договора.
+func fakeCMFProgram(t *testing.T, clients []cmf.ClientInfo, pays map[string][]map[string]any, posts *fakePosts) *cmf.Client {
 	t.Helper()
+	var mu sync.Mutex
+	if pays == nil {
+		pays = map[string][]map[string]any{}
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
 		switch {
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/contract-payments"):
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			cid := strings.TrimPrefix(fmt.Sprint(body["contract_id"]), "c-")
+			pays[cid] = append(pays[cid], map[string]any{"amount": body["amount"], "paid_at": body["paid_at"]})
+			if posts != nil {
+				posts.mu.Lock()
+				posts.list = append(posts.list, body)
+				posts.mu.Unlock()
+			}
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"id": "p1"})
 		case r.URL.Path == "/api/auth/login":
 			_ = json.NewEncoder(w).Encode(map[string]string{"token": "t"})
 		case r.URL.Path == "/api/clients/lookup":

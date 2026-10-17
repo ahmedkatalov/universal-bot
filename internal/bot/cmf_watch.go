@@ -423,6 +423,18 @@ func (b *Bot) syncWatchAfterLabel(ctx context.Context, chat types.JID, checkRawI
 	go b.cmfResolveWatch(context.Background(), wid, chat, canonical, w.Amount)
 }
 
+// syncWatchByCheckWa — клиента чека назвали ответом на «чей чек?» или правкой:
+// сверка по этому чеку ищет его в программе (раньше оставалась «без имени»
+// навсегда и не напоминала).
+func (b *Bot) syncWatchByCheckWa(ctx context.Context, chat types.JID, checkWa, canonical string) {
+	if b.cmf == nil || checkWa == "" || canonical == "" {
+		return
+	}
+	if ref, err := b.db.RawMessageByWaID(ctx, checkWa); err == nil && ref.Found && !ref.Deleted {
+		b.syncWatchAfterLabel(ctx, chat, ref.ID, canonical)
+	}
+}
+
 // extractQuotedStanzaID возвращает id сообщения, на которое ответили (свайп).
 func extractQuotedStanzaID(msg *events.Message) string {
 	if ci := contextInfoOf(msg); ci != nil {
@@ -603,25 +615,59 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		client string
 		amount float64
 		date   time.Time
+		check  bool // похожая оплата есть, но сверка не уверена — «проверьте»
 	}
 	byGroup := map[string][]rem{}
 	var order []string
+	// Судим чеки клиента вместе, как сверка: одна оплата — один чек.
+	byClient := map[string][]db.CmfWatch{}
 	for _, w := range due {
-		found, err := b.cmf.HasPaymentAround(ctx, w.ClientID, w.Amount, w.TxDate, 5)
-		if err != nil {
-			fmt.Println("cmf: ошибка проверки платежа:", err)
+		byClient[w.ClientID] = append(byClient[w.ClientID], w)
+	}
+	verdicts := map[int]reconVerdict{}
+	ledger, lerr := b.loadDueLedger(ctx, due)
+	if lerr != nil {
+		fmt.Println("cmf: учёт для напоминаний не прочитался:", lerr)
+	}
+	for cid, ws := range byClient {
+		if cid == "" || ledger == nil {
 			continue
 		}
-		if found {
-			_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "found")
-			fmt.Printf("cmf: платёж %s на %.0f ₽ найден в программе\n", w.ClientName, w.Amount)
+		vs, err := b.judgeDueWatches(ctx, ledger, cid, ws)
+		if err != nil {
+			fmt.Println("cmf: сверка клиента для напоминания не удалась:", err)
 			continue
+		}
+		for id, v := range vs {
+			verdicts[id] = v
+		}
+	}
+	for _, w := range due {
+		needCheck := false
+		if v, ok := verdicts[w.ID]; ok {
+			if v.entered() {
+				_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "found")
+				fmt.Printf("cmf: платёж %s на %.0f ₽ найден в программе\n", w.ClientName, w.Amount)
+				continue
+			}
+			needCheck = v.needsCheck()
+		} else {
+			found, err := b.cmf.HasPaymentAround(ctx, w.ClientID, w.Amount, w.TxDate, 5)
+			if err != nil {
+				fmt.Println("cmf: ошибка проверки платежа:", err)
+				continue
+			}
+			if found {
+				_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "found")
+				fmt.Printf("cmf: платёж %s на %.0f ₽ найден в программе\n", w.ClientName, w.Amount)
+				continue
+			}
 		}
 		_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "reminded")
 		if _, ok := byGroup[w.GroupJID]; !ok {
 			order = append(order, w.GroupJID)
 		}
-		byGroup[w.GroupJID] = append(byGroup[w.GroupJID], rem{w.ID, w.ClientName, w.Amount, w.TxDate})
+		byGroup[w.GroupJID] = append(byGroup[w.GroupJID], rem{w.ID, w.ClientName, w.Amount, w.TxDate, needCheck})
 	}
 
 	for _, gj := range order {
@@ -636,8 +682,13 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		var sb strings.Builder
 		if len(items) == 1 {
 			it := items[0]
-			fmt.Fprintf(&sb, "⏰ Занесите, пожалуйста, оплату в программу: чек от %s на %.0f ₽ — клиент %s (в рассрочке пока НЕ отмечен).",
-				it.date.Format("02.01"), it.amount, it.client)
+			if it.check {
+				fmt.Fprintf(&sb, "⏰ Проверьте в программе: чек от %s на %.0f ₽ — клиент %s. Похожая оплата там есть, но не уверен, что она за этот чек.",
+					it.date.Format("02.01"), it.amount, it.client)
+			} else {
+				fmt.Fprintf(&sb, "⏰ Занесите, пожалуйста, оплату в программу: чек от %s на %.0f ₽ — клиент %s (в рассрочке пока НЕ отмечен).",
+					it.date.Format("02.01"), it.amount, it.client)
+			}
 			// Ответом на сам чек и со связью: поправку («это не он») поймём по этому чеку.
 			if w, ok, err := b.db.CmfWatchByID(ctx, it.id); err == nil && ok {
 				b.cmfSay(ctx, jid, w, sb.String())
@@ -646,7 +697,11 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		} else {
 			sb.WriteString("⏰ Занесите, пожалуйста, оплаты этих клиентов в программу (чеки пришли, но в рассрочке пока НЕ отмечены):")
 			for _, it := range items {
-				fmt.Fprintf(&sb, "\n• %s — %.0f ₽ (чек %s)", it.client, it.amount, it.date.Format("02.01"))
+				note := ""
+				if it.check {
+					note = " — похожая оплата есть, проверьте"
+				}
+				fmt.Fprintf(&sb, "\n• %s — %.0f ₽ (чек %s)%s", it.client, it.amount, it.date.Format("02.01"), note)
 			}
 		}
 		id := b.sendTextReturnID(jid, sb.String())
@@ -787,8 +842,10 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 			"properties": map[string]any{
 				"client_name": map[string]any{"type": "string", "description": "Имя клиента в программе"},
 				"amount":      map[string]any{"type": "number", "description": "Сумма платежа в рублях"},
-				"date":        map[string]any{"type": "string", "description": "Дата платежа YYYY-MM-DD (пусто = сегодня)"},
+				"date":        map[string]any{"type": "string", "description": "Дата операции на чеке YYYY-MM-DD (пусто = дата чека этого клиента на эту сумму из учёта, иначе сегодня)"},
 				"contract_id": map[string]any{"type": "string", "description": "ID договора, если у клиента их несколько (из предыдущего ответа инструмента)"},
+				"confirm_duplicate": map[string]any{"type": "boolean",
+					"description": "true — владелец ЯВНО подтвердил, что нужно внести ещё один такой же платёж, хотя похожий уже есть"},
 			},
 			"required": []string{"client_name", "amount"},
 		},
@@ -798,6 +855,7 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 				Amount     float64 `json:"amount"`
 				Date       string  `json:"date"`
 				ContractID string  `json:"contract_id"`
+				Confirm    bool    `json:"confirm_duplicate"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", err
@@ -809,6 +867,7 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 				return "", fmt.Errorf("нужна сумма платежа")
 			}
 			paidAt := time.Now()
+			dateNote := ""
 			if args.Date != "" {
 				if t, err := time.ParseInLocation("2006-01-02", args.Date, time.Local); err == nil {
 					paidAt = t
@@ -869,11 +928,48 @@ func (b *Bot) cmfAddPaymentTool() ai.Tool {
 			}
 			branchID = chosen.BranchID
 
+			// «Внеси чек …» без даты — дата операции с ЧЕКА этого клиента на эту
+			// сумму (иначе напоминание потом решит, что оплата не внесена).
+			watchID := 0
+			if args.Date == "" {
+				if id, txDate, ok, err := b.db.OpenWatchForClientAmount(ctx, clients[0].ID, args.Amount); err == nil && ok {
+					watchID, paidAt, dateNote = id, txDate, " — по чеку"
+				}
+			}
+
+			// Такой платёж уже есть в программе (внесли вручную, повторная просьба,
+			// прошлая попытка оборвалась) — второй раз без подтверждения не пишем.
+			if !args.Confirm {
+				key := fmt.Sprintf("%s|%.0f|%s", clients[0].ID, args.Amount, paidAt.Format("2006-01-02"))
+				if at, ok := b.cmfRecentWrite(key); ok {
+					return fmt.Sprintf("ПОХОЖЕ НА ПОВТОР: я уже вносил %s %.0f ₽ (дата %s) в %s. Не внёс ещё раз. Спроси владельца; если нужен ещё один платёж — повтори с confirm_duplicate=true.",
+						clients[0].FullName, args.Amount, paidAt.Format("02.01.2006"), at.Format("15:04")), nil
+				}
+				pays, err := b.cmf.PaymentsBetween(ctx, clients[0].ID, paidAt.AddDate(0, 0, -5), time.Now().AddDate(0, 0, 1))
+				if err != nil {
+					return fmt.Sprintf("Не внёс: не смог проверить, нет ли этого платежа в программе уже (%s). Попробуй чуть позже.", cmf.Human(err)), nil
+				}
+				wantRub, wantKop := int64(args.Amount+0.5), int64(args.Amount*100+0.5)
+				for _, p := range pays {
+					if p.Amount == wantRub || p.Amount == wantKop {
+						when := effDate(p)
+						return fmt.Sprintf("ПОХОЖЕ НА ПОВТОР: в программе уже есть %.0f ₽ от %s%s у %s. Не внёс. Спроси владельца: внести ещё один? Если да — повтори с confirm_duplicate=true.",
+							args.Amount, dayOrDash(when), contractLabel(p), clients[0].FullName), nil
+					}
+				}
+			}
+
+			key := fmt.Sprintf("%s|%.0f|%s", clients[0].ID, args.Amount, paidAt.Format("2006-01-02"))
 			if err := b.cmf.AddPayment(ctx, chosen.ID, branchID, int64(args.Amount+0.5), paidAt); err != nil {
+				b.cmfNoteWrite(key) // могло записаться до обрыва связи — повтор переспросит
 				return "", err
 			}
-			return fmt.Sprintf("✅ Внёс платёж в программу: %s, %.0f ₽, договор №%d, дата %s.",
-				clients[0].FullName, args.Amount, chosen.Number, paidAt.Format("02.01.2006")), nil
+			b.cmfNoteWrite(key)
+			if watchID != 0 {
+				_ = b.db.UpdateCmfWatch(ctx, watchID, "", "", "", "", "found")
+			}
+			return fmt.Sprintf("✅ Внёс платёж в программу: %s, %.0f ₽, договор №%d, дата %s%s.",
+				clients[0].FullName, args.Amount, chosen.Number, paidAt.Format("02.01.2006"), dateNote), nil
 		},
 	}
 }
@@ -1018,4 +1114,31 @@ func (b *Bot) cmfBranchTool() ai.Tool {
 			return "Запомнил: чеки, которых нет в программе, относятся к точке «" + strings.TrimSpace(args.Branch) + "».", nil
 		},
 	}
+}
+
+// cmfNoteWrite / cmfRecentWrite — журнал собственных записей в программу за
+// сутки: повторная просьба внести то же самое не пишет второй раз, даже если
+// программа ещё не показывает первую запись.
+func (b *Bot) cmfNoteWrite(key string) {
+	b.cmfWritesMu.Lock()
+	defer b.cmfWritesMu.Unlock()
+	if b.cmfWrites == nil {
+		b.cmfWrites = map[string]time.Time{}
+	}
+	for k, t := range b.cmfWrites {
+		if time.Since(t) > 24*time.Hour {
+			delete(b.cmfWrites, k)
+		}
+	}
+	b.cmfWrites[key] = time.Now()
+}
+
+func (b *Bot) cmfRecentWrite(key string) (time.Time, bool) {
+	b.cmfWritesMu.Lock()
+	defer b.cmfWritesMu.Unlock()
+	t, ok := b.cmfWrites[key]
+	if !ok || time.Since(t) > 24*time.Hour {
+		return time.Time{}, false
+	}
+	return t, true
 }

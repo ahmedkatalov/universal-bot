@@ -61,6 +61,8 @@ type Bot struct {
 	payerMu       sync.Mutex                                         // запись карты «плательщик → клиент»
 	aiRetryMu     sync.Mutex                                         // очередь текстов, не разобранных из-за сбоя ИИ
 	aiRetry       map[int]aiRetryItem
+	cmfWritesMu   sync.Mutex // журнал своих записей в программу (сутки)
+	cmfWrites     map[string]time.Time
 	selfUser      string // только для тестов без WhatsApp: номер самого бота
 	fontDir       string
 	reportDir     string

@@ -1235,6 +1235,7 @@ func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan t
 func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (found bool, amount_ float64, needsReview bool, err error) {
 	var got float64
 	var nr bool
+	var rid int
 	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
 			card_owner    = CASE WHEN $2 = '' THEN card_owner ELSE COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')) END,
@@ -1261,13 +1262,16 @@ func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string,
 			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
 		)
-		RETURNING amount::float8, needs_review
-	`, waMessageID, name, contactID, amount).Scan(&got, &nr)
+		RETURNING id, amount::float8, needs_review
+	`, waMessageID, name, contactID, amount).Scan(&rid, &got, &nr)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, 0, false, nil
 	}
 	if err != nil {
 		return false, 0, false, err
+	}
+	if amount > 0 {
+		_ = d.SyncWatchWithReceipt(ctx, rid)
 	}
 	return true, got, nr, nil
 }
@@ -1914,6 +1918,9 @@ func (d *DB) FixReceipt(ctx context.Context, kind string, id int, contactID *int
 				                      AND (CASE WHEN $4::numeric > 0 THEN $4::numeric ELSE COALESCE(amount, 0) END) > 0 )
 			WHERE id = $1
 		`, id, contactID, recipientName, amount, txDate)
+		if err == nil && (amount > 0 || txDate != nil) {
+			_ = d.SyncWatchWithReceipt(ctx, id)
+		}
 		return err
 	case "message":
 		var groupJID string
@@ -2055,8 +2062,10 @@ func (d *DB) CorrectReceiptAmountByMessage(ctx context.Context, waID string, old
 			ORDER BY br.id LIMIT 1),
 		u AS (UPDATE bank_receipts b SET amount = $3::numeric FROM r WHERE b.id = r.id
 			RETURNING b.contact_id, COALESCE(b.recipient_raw, '') AS raw),
-		w AS (UPDATE cmf_watch cw SET amount = $3::numeric FROM r
-			WHERE cw.raw_message_id = r.raw_message_id AND cw.status NOT IN ('found', 'deleted') RETURNING cw.id)
+		w AS (UPDATE cmf_watch cw SET amount = $3::numeric,
+				status = CASE WHEN cw.status IN ('found', 'reminded') AND COALESCE(cw.client_id, '') <> '' THEN 'watch' ELSE cw.status END
+			FROM r
+			WHERE cw.raw_message_id = r.raw_message_id AND cw.status <> 'deleted' RETURNING cw.id)
 		SELECT COALESCE((SELECT canonical_name FROM contacts WHERE id = u.contact_id), u.raw), r.was
 		FROM u, r`, waID, old, amount).Scan(&name, &was)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -3542,17 +3551,18 @@ func (d *DB) ListPhoneOwners(ctx context.Context) ([]PhoneOwner, error) {
 // (клиент не найден в программе), found (платёж внесён), reminded (напомнили,
 // платёж так и не внесён), dismissed (закрыто вручную).
 type CmfWatch struct {
-	ID         int
-	GroupJID   string
-	SenderJID  string
-	ClientText string
-	ClientID   string
-	ClientName string
-	Candidates string
-	Amount     float64
-	TxDate     time.Time
-	Status     string
-	CreatedAt  time.Time
+	ID          int
+	GroupJID    string
+	SenderJID   string
+	ClientText  string
+	ClientID    string
+	ClientName  string
+	Candidates  string
+	Amount      float64
+	TxDate      time.Time
+	Status      string
+	CreatedAt   time.Time
+	WaMessageID string // сообщение с чеком (для DueCmfWatches)
 }
 
 // InsertCmfWatch создаёт наблюдение, возвращает id.
@@ -3611,12 +3621,17 @@ func (d *DB) ListCmfWatches(ctx context.Context, statuses []string, limit int) (
 // пора проверить, внесён ли платёж в программу.
 func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]CmfWatch, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT id, group_jid, COALESCE(sender_jid,''), COALESCE(client_text,''), COALESCE(client_id,''),
-		       COALESCE(client_name,''), COALESCE(candidates,''), amount::float8, tx_date, status, created_at
+		SELECT cw.id, cw.group_jid, COALESCE(cw.sender_jid,''), COALESCE(cw.client_text,''), COALESCE(cw.client_id,''),
+		       COALESCE(cw.client_name,''), COALESCE(cw.candidates,''), cw.amount::float8, cw.tx_date, cw.status, cw.created_at,
+		       COALESCE(rm.wa_message_id, '')
 		FROM cmf_watch cw
-		WHERE status = 'watch' AND created_at < $1
-		  AND NOT EXISTS (SELECT 1 FROM raw_messages rm WHERE rm.id = cw.raw_message_id AND COALESCE(rm.deleted, false))
-		ORDER BY created_at
+		LEFT JOIN raw_messages rm ON rm.id = cw.raw_message_id
+		WHERE cw.status = 'watch' AND cw.created_at < $1
+		  AND NOT COALESCE(rm.deleted, false)
+		  -- Чек исключили из учёта («скинули по ошибке») или это дубль — не напоминаем.
+		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = cw.raw_message_id
+		                  AND (br.ignored OR br.is_duplicate))
+		ORDER BY cw.created_at
 		LIMIT $2
 	`, cutoff, limit)
 	if err != nil {
@@ -3627,12 +3642,54 @@ func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]
 	for rows.Next() {
 		var w CmfWatch
 		if err := rows.Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.ClientID, &w.ClientName,
-			&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt); err != nil {
+			&w.Candidates, &w.Amount, &w.TxDate, &w.Status, &w.CreatedAt, &w.WaMessageID); err != nil {
 			return nil, err
 		}
 		out = append(out, w)
 	}
 	return out, rows.Err()
+}
+
+// SyncWatchWithReceipt — у чека поправили сумму или дату: сверка с программой
+// ждёт уже исправленное (а не ошибку распознавания). Привязанное наблюдение,
+// которое уже нашли/напомнили, проверяется заново.
+func (d *DB) SyncWatchWithReceipt(ctx context.Context, receiptID int) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE cmf_watch cw SET amount = br.amount, tx_date = br.tx_date,
+			status = CASE WHEN cw.status IN ('found', 'reminded') AND COALESCE(cw.client_id, '') <> '' THEN 'watch' ELSE cw.status END
+		FROM bank_receipts br
+		WHERE br.id = $1 AND cw.raw_message_id = br.raw_message_id AND cw.status <> 'deleted'
+		  AND br.amount > 0 AND (cw.amount <> br.amount OR cw.tx_date <> br.tx_date)`, receiptID)
+	return err
+}
+
+// OpenWatchForClientAmount — самый ранний невнесённый чек клиента программы на
+// эту сумму (для «внеси чек … в программу» без даты).
+func (d *DB) OpenWatchForClientAmount(ctx context.Context, clientID string, amount float64) (int, time.Time, bool, error) {
+	var id int
+	var t time.Time
+	err := d.pool.QueryRow(ctx, `
+		SELECT cw.id, cw.tx_date FROM cmf_watch cw
+		LEFT JOIN raw_messages rm ON rm.id = cw.raw_message_id
+		WHERE cw.client_id = $1 AND abs(cw.amount - $2) < 1 AND cw.status IN ('watch', 'reminded')
+		  AND NOT COALESCE(rm.deleted, false)
+		ORDER BY cw.tx_date LIMIT 1`, clientID, amount).Scan(&id, &t)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, t, false, nil
+	}
+	if err != nil {
+		return 0, t, false, err
+	}
+	return id, t, true, nil
+}
+
+// ReceiptRef — сообщение и группа чека (по id чека).
+func (d *DB) ReceiptRef(ctx context.Context, receiptID int) (rawID int, waID, groupJID string, err error) {
+	err = d.pool.QueryRow(ctx, `
+		SELECT COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_message_id, ''), COALESCE(br.group_jid, '')
+		FROM bank_receipts br LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id WHERE br.id = $1`, receiptID).
+		Scan(&rawID, &waID, &groupJID)
+	return
 }
 
 // SetCmfWatchAsk запоминает id сообщения бота по наблюдению (вопрос, переспрос,
@@ -3763,6 +3820,21 @@ func (d *DB) TestAgeGroup(ctx context.Context, groupJID string, by time.Duration
 	_, err := d.pool.Exec(ctx, `UPDATE transactions t SET created_at = t.created_at - make_interval(secs => $2)
 		FROM raw_messages rm WHERE rm.id = t.raw_message_id AND rm.wa_group_jid = $1`, groupJID, sec)
 	return err
+}
+
+// TestAgeCmfWatches — «состарить» наблюдения сверки (только для тестов).
+func (d *DB) TestAgeCmfWatches(ctx context.Context, by time.Duration) error {
+	_, err := d.pool.Exec(ctx, `UPDATE cmf_watch SET created_at = created_at - make_interval(secs => $1)`, int(by.Seconds()))
+	return err
+}
+
+// TestCmfWatchState — статус, клиент и сумма наблюдения по чеку (для тестов).
+func (d *DB) TestCmfWatchState(ctx context.Context, waID string) (status, clientID string, amount float64) {
+	_ = d.pool.QueryRow(ctx, `
+		SELECT cw.status, COALESCE(cw.client_id, ''), cw.amount::float8 FROM cmf_watch cw
+		JOIN raw_messages rm ON rm.id = cw.raw_message_id WHERE rm.wa_message_id = $1
+		ORDER BY cw.id DESC LIMIT 1`, waID).Scan(&status, &clientID, &amount)
+	return
 }
 
 // TestResetAll — очистить все данные (только для тестовой БД!): каждый

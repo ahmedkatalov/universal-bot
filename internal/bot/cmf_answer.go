@@ -125,6 +125,57 @@ var unclearWords = map[string]bool{
 	"номер": true, "платит": true, "платила": true, "платил": true,
 }
 
+// enteredWords — «внесли/занесли/готово»: ответ на напоминание «занесите в программу».
+var enteredWords = map[string]bool{
+	"внесли": true, "внесла": true, "внёс": true, "внес": true, "внесено": true, "внесена": true,
+	"занесли": true, "занесла": true, "занёс": true, "занес": true, "занесено": true,
+	"добавили": true, "добавила": true, "добавил": true, "провели": true, "провела": true, "провёл": true, "провел": true,
+	"отметили": true, "отметила": true, "отметил": true, "сделано": true, "сделала": true, "сделал": true,
+	"сделали": true, "готово": true, "уже": true,
+}
+
+// enteredReply — ответ «сделано» про привязанного клиента: есть слово «внесли»
+// без отрицания, а остальное — служебные слова или имя этого же клиента
+// («Каталова внесли», «внесли Каталову Ахмеду»).
+func enteredReply(toks []string, names ...string) bool {
+	if hasNegation(toks) {
+		return false
+	}
+	had := false
+	for _, t := range toks {
+		if enteredWords[t] {
+			had = true
+		}
+	}
+	if !had {
+		return false
+	}
+	var own []string
+	for _, n := range names {
+		own = append(own, normWords(n)...)
+	}
+	for _, t := range toks {
+		if enteredWords[t] || fillerWords[t] || ackWords[t] {
+			continue
+		}
+		switch t {
+		case "в", "программу", "программе", "базу", "всё", "все", "его", "её", "ее", "за", "по", "чек", "оплату", "платёж", "платеж":
+			continue
+		}
+		same := false
+		for _, w := range own {
+			if nameWordSame(t, w) {
+				same = true
+				break
+			}
+		}
+		if !same {
+			return false
+		}
+	}
+	return true
+}
+
 // ackWords — подтверждение/спасибо/отмашка: на сообщение бота это не ответ, а
 // «принято» — бот молчит.
 var ackWords = map[string]bool{
@@ -950,6 +1001,10 @@ func (b *Bot) applyCmfWatchAnswerOpts(ctx context.Context, chat types.JID, watch
 	}
 	if resolved && isAck(text) {
 		return true // «принято» на решённый чек — молчим
+	}
+	// «Каталова внесли», «занесла» на напоминание — это «сделано», а не новое имя.
+	if bound && enteredReply(toks, w.ClientName, w.ClientText) {
+		return true
 	}
 	ans, confident := parseCmfAnswer(text, w.ClientText, cands)
 	negated := hasNegation(toks)
