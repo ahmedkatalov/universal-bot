@@ -59,6 +59,7 @@ type Bot struct {
 	botName       string                                             // обращение в группах: "Джарвис скинь отчет"
 	sendHook      func(chat types.JID, text, quotedID string) string // только для тестов: перехват отправки
 	payerMu       sync.Mutex                                         // запись карты «плательщик → клиент»
+	selfUser      string                                             // только для тестов без WhatsApp: номер самого бота
 	fontDir       string
 	reportDir     string
 
@@ -1212,6 +1213,9 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 // на сообщение самого бота — такой ответ считается обращением к боту,
 // имя писать не обязательно.
 func (b *Bot) isReplyToBot(msg *events.Message) bool {
+	if b.client == nil {
+		return b.selfUser != "" && quotedParticipantUser(msg) == b.selfUser
+	}
 	ext := msg.Message.GetExtendedTextMessage()
 	if ext == nil {
 		return false
@@ -1233,10 +1237,26 @@ func (b *Bot) isReplyToBot(msg *events.Message) bool {
 	return false
 }
 
+// quotedParticipantUser — чей номер у сообщения, на которое ответили свайпом.
+func quotedParticipantUser(msg *events.Message) string {
+	ext := msg.Message.GetExtendedTextMessage()
+	if ext == nil || ext.GetContextInfo() == nil {
+		return ""
+	}
+	j, err := types.ParseJID(ext.GetContextInfo().GetParticipant())
+	if err != nil {
+		return ""
+	}
+	return j.User
+}
+
 // isMentioned — сообщение @-упоминает бота (WhatsApp-меншен его номера/LID).
 // Меншены лежат в ContextInfo.MentionedJID; сверяем .User и с номером, и с LID,
 // чтобы «@Джарвис» срабатывало при любой адресации.
 func (b *Bot) isMentioned(msg *events.Message) bool {
+	if b.client == nil {
+		return false
+	}
 	ext := msg.Message.GetExtendedTextMessage()
 	if ext == nil {
 		return false
@@ -1267,6 +1287,9 @@ func (b *Bot) isMentioned(msg *events.Message) bool {
 // stripBotMention убирает из текста @-упоминание номера/LID бота («@79887…»),
 // чтобы в ассистент ушёл чистый запрос без служебного меншена.
 func (b *Bot) stripBotMention(text string) string {
+	if b.client == nil {
+		return strings.TrimSpace(text)
+	}
 	out := text
 	if own := b.client.Store.ID; own != nil {
 		out = strings.ReplaceAll(out, "@"+own.User, "")
@@ -1394,6 +1417,12 @@ var silenceMark = regexp.MustCompile(`(?i)\[\s*молчу\s*\]|^[\s\p{P}\p{S}]*�
 func (b *Bot) joinedGroups(ctx context.Context) map[types.JID]string {
 	b.groupsMu.Lock()
 	defer b.groupsMu.Unlock()
+	if b.client == nil {
+		if b.groupsCache == nil {
+			b.groupsCache = map[types.JID]string{}
+		}
+		return b.groupsCache // тесты без WhatsApp: группы задаёт тест
+	}
 
 	if b.groupsCache != nil && time.Since(b.groupsFetched) < 5*time.Minute {
 		return b.groupsCache
@@ -1482,6 +1511,9 @@ func (b *Bot) resolveGroups(ctx context.Context, spec string) (jids []string, la
 // а ответ ИИ может занимать заметно дольше). Возвращает функцию остановки,
 // которая убирает статус — вызывать через defer.
 func (b *Bot) startTyping(chat types.JID) func() {
+	if b.client == nil {
+		return func() {} // тесты без WhatsApp
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	if err := b.client.SendChatPresence(ctx, chat, types.ChatPresenceComposing, types.ChatPresenceMediaText); err != nil {
 		fmt.Println("Не удалось включить статус 'печатает…':", err)
@@ -3566,6 +3598,10 @@ func (b *Bot) sendImageBytes(chat types.JID, data []byte) {
 
 // sendImageWithCaption отправляет фото с подписью (пусто = без подписи).
 func (b *Bot) sendImageWithCaption(chat types.JID, data []byte, caption string) {
+	if b.sendHook != nil {
+		b.sendHook(chat, "[фото] "+caption, "")
+		return
+	}
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaImage)
 	if err != nil {
 		fmt.Println("Ошибка загрузки фото в WhatsApp:", err)
@@ -3593,6 +3629,10 @@ func (b *Bot) sendImageWithCaption(chat types.JID, data []byte, caption string) 
 
 // sendDocumentBytes отправляет документ (PDF-чек) из памяти.
 func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype string) error {
+	if b.sendHook != nil {
+		b.sendHook(chat, "[документ] "+fileName, "")
+		return nil
+	}
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaDocument)
 	if err != nil {
 		fmt.Println("Ошибка загрузки документа в WhatsApp:", err)
@@ -3621,6 +3661,10 @@ func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype 
 }
 
 func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) error {
+	if b.sendHook != nil {
+		b.sendHook(chat, "[документ] "+fileName, "")
+		return nil
+	}
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		fmt.Println("Ошибка чтения файла отчёта:", err)
