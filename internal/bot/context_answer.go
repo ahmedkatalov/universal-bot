@@ -159,6 +159,25 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		}
 		return true
 
+	case "payment_who":
+		// Без свайпа — только голое ФИО (с суммой — только той же).
+		if !shortPlainReply(text, 4) && parser.ExtractAmount(text) <= 0 {
+			return false
+		}
+		b.clarify.mu.Lock()
+		var pa paymentAsk
+		var askID string
+		for k, v := range b.clarify.paymentAsks {
+			if v.rawID == a.txID {
+				pa, askID = v, k
+			}
+		}
+		b.clarify.mu.Unlock()
+		if askID == "" {
+			return false
+		}
+		return b.applyPaymentWhoAnswer(ctx, chat, askID, pa, text)
+
 	case "cmf_watch":
 		wantName := a.wantName && time.Since(a.at) < cmfNameWindow
 		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, modeContext, wantName)

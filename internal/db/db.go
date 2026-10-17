@@ -716,7 +716,13 @@ func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
 				  AND t.ignored = false AND t.dup_pending = false
 				  AND t.tx_date >= $3 AND t.tx_date <= $4
 				  AND rm.wa_group_jid = (SELECT wa_group_jid FROM raw_messages WHERE id = $5)
-			)`, tx.ContactID, tx.Amount, since, tx.TxDate, tx.RawMessageID).Scan(&dupPending); err != nil {
+				  -- Строки ТОГО ЖЕ сообщения («5000 / 5000» в одном списке) — не повтор;
+				  -- удалённая наличка — тоже: её нет.
+				  AND t.raw_message_id <> $5
+				  AND COALESCE(rm.deleted, false) = false
+			)
+			-- Наличка без имени («Нал 27000») — разные люди: не повтор.
+			AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.id = $1 AND c.canonical_name IN ('Наличка', '(не указано)'))`, tx.ContactID, tx.Amount, since, tx.TxDate, tx.RawMessageID).Scan(&dupPending); err != nil {
 			dupPending = false // при ошибке не придерживаем — лучше засчитать, чем потерять
 		}
 	}
@@ -744,9 +750,11 @@ func (d *DB) CashDupNeedingConfirm(ctx context.Context, groupJID string, olderTh
 		SELECT t.id, COALESCE(c.canonical_name, t.raw_name, ''), t.amount::float8,
 		       COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''),
 		       (SELECT max(p.tx_date) FROM transactions p
+		         JOIN raw_messages prm ON prm.id = p.raw_message_id
 		         WHERE p.contact_id = t.contact_id AND p.amount = t.amount
 		           AND p.is_cash = true AND p.ignored = false AND p.dup_pending = false
-		           AND p.tx_date < t.tx_date)
+		           AND COALESCE(prm.deleted, false) = false
+		           AND p.tx_date <= t.tx_date AND p.id <> t.id)
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
@@ -1553,6 +1561,26 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 		WHERE client_source_raw_id = $1`, rawID); e != nil {
 		fmt.Println("Откат привязки клиента от удалённого сообщения не удался:", e)
 	}
+	// Удалили наличку, из-за которой следующую такую же придержали как «повтор»,
+	// — повтора больше нет: отпускаем ОДНУ придержанную (если других живых
+	// таких же нет).
+	if _, e := d.pool.Exec(ctx, `
+		UPDATE transactions SET dup_pending = false
+		WHERE id = (
+			SELECT h.id FROM transactions h
+			JOIN raw_messages hrm ON hrm.id = h.raw_message_id
+			JOIN transactions del ON del.raw_message_id = $1 AND del.is_cash = true
+			     AND del.contact_id = h.contact_id AND del.amount = h.amount
+			WHERE h.dup_pending = true AND h.ignored = false AND COALESCE(hrm.deleted, false) = false
+			  AND NOT EXISTS (
+				SELECT 1 FROM transactions o JOIN raw_messages orm ON orm.id = o.raw_message_id
+				WHERE o.contact_id = h.contact_id AND o.amount = h.amount AND o.is_cash = true
+				  AND o.ignored = false AND o.dup_pending = false AND o.id <> h.id
+				  AND COALESCE(orm.deleted, false) = false AND o.tx_date >= h.tx_date - 30
+				  AND orm.wa_group_jid = hrm.wa_group_jid)
+			ORDER BY h.created_at LIMIT 1)`, rawID); e != nil {
+		fmt.Println("Освобождение придержанной налички после удаления не удалось:", e)
+	}
 	// Сверка по удалённому чеку больше не нужна — ни вопросов, ни напоминаний.
 	if _, e := d.pool.Exec(ctx, `UPDATE cmf_watch SET status = 'deleted' WHERE raw_message_id = $1 AND status <> 'found'`, rawID); e != nil {
 		fmt.Println("Закрытие сверки удалённого чека не удалось:", e)
@@ -1874,6 +1902,156 @@ type UnparsedMessage struct {
 	SenderName string
 	Body       string
 	ReceivedAt time.Time
+}
+
+// TxIDsByRawID — живые платежи сообщения (id в нашей базе).
+func (d *DB) TxIDsByRawID(ctx context.Context, rawID int) ([]int, error) {
+	rows, err := d.pool.Query(ctx, `SELECT id FROM transactions WHERE raw_message_id = $1 AND ignored = false ORDER BY id`, rawID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []int
+	for rows.Next() {
+		var id int
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
+}
+
+// SenderJIDByRawID — кто прислал сообщение (id в нашей базе).
+func (d *DB) SenderJIDByRawID(ctx context.Context, rawID int) (string, error) {
+	var s string
+	err := d.pool.QueryRow(ctx, `SELECT COALESCE(sender_jid,'') FROM raw_messages WHERE id = $1`, rawID).Scan(&s)
+	return s, err
+}
+
+// RawMessageRef — сообщение из нашей базы по id WhatsApp.
+type RawMessageRef struct {
+	ID         int
+	GroupJID   string
+	SenderJID  string
+	SenderName string
+	Body       string
+	HasMedia   bool
+	ReceivedAt time.Time
+	Found      bool
+}
+
+// RawMessageByWaID — сообщение по id WhatsApp (для правок «изменить сообщение»).
+func (d *DB) RawMessageByWaID(ctx context.Context, waID string) (RawMessageRef, error) {
+	var r RawMessageRef
+	err := d.pool.QueryRow(ctx, `
+		SELECT id, COALESCE(wa_group_jid,''), COALESCE(sender_jid,''), COALESCE(sender_name,''), COALESCE(body,''), has_media, received_at
+		FROM raw_messages WHERE wa_message_id = $1 ORDER BY id DESC LIMIT 1`, waID).
+		Scan(&r.ID, &r.GroupJID, &r.SenderJID, &r.SenderName, &r.Body, &r.HasMedia, &r.ReceivedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	r.Found = true
+	return r, nil
+}
+
+// ReplaceMessageText — сообщение исправили: старые платежи из него снимаем,
+// текст обновляем и отдаём на повторный разбор. Возвращает сумму снятых.
+func (d *DB) ReplaceMessageText(ctx context.Context, rawID int, body string) (float64, error) {
+	var removed float64
+	if err := d.pool.QueryRow(ctx, `
+		WITH x AS (UPDATE transactions SET ignored = true WHERE raw_message_id = $1 AND ignored = false RETURNING amount)
+		SELECT COALESCE(SUM(amount), 0)::float8 FROM x`, rawID).Scan(&removed); err != nil {
+		return 0, err
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET body = $2, parsed = false WHERE id = $1`, rawID, body)
+	return removed, err
+}
+
+// TxRef — текстовый платёж (для поправки суммы).
+type TxRef struct {
+	ID     int
+	Name   string
+	Amount float64
+	Found  bool
+}
+
+// TextTxOfMessage — единственный живой платёж сообщения (по id WhatsApp).
+func (d *DB) TextTxOfMessage(ctx context.Context, waID string) (TxRef, error) {
+	var r TxRef
+	rows, err := d.pool.Query(ctx, `
+		SELECT t.id, COALESCE(t.raw_name,''), t.amount::float8 FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE rm.wa_message_id = $1 AND t.ignored = false ORDER BY t.id`, waID)
+	if err != nil {
+		return r, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+		if err := rows.Scan(&r.ID, &r.Name, &r.Amount); err != nil {
+			return r, err
+		}
+	}
+	r.Found = n == 1
+	return r, rows.Err()
+}
+
+// LatestTxFromSenderWithAmount — свежий платёж отправителя на эту сумму (для
+// «не 5000 а 6000» следом без свайпа).
+func (d *DB) LatestTxFromSenderWithAmount(ctx context.Context, groupJID, senderJID string, amount float64, since time.Time) (TxRef, error) {
+	var r TxRef
+	err := d.pool.QueryRow(ctx, `
+		SELECT t.id, COALESCE(t.raw_name,''), t.amount::float8 FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE rm.wa_group_jid = $1 AND rm.sender_jid = $2 AND t.ignored = false
+		  AND abs(t.amount - $3) < 1 AND t.created_at >= $4
+		ORDER BY t.created_at DESC LIMIT 1`, groupJID, senderJID, amount, since).Scan(&r.ID, &r.Name, &r.Amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	r.Found = true
+	return r, nil
+}
+
+// SetTxAmount — поправить сумму платежа.
+func (d *DB) SetTxAmount(ctx context.Context, txID int, amount float64) error {
+	_, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1`, txID, amount)
+	return err
+}
+
+// UnparsedTextMessagesSince — неразобранные текстовые сообщения групп с момента
+// since (для повторного разбора, когда ИИ снова доступен).
+func (d *DB) UnparsedTextMessagesSince(ctx context.Context, since time.Time, limit int) ([]UnparsedMessage, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT rm.id, rm.wa_group_jid, COALESCE(rm.sender_name, ''), COALESCE(rm.body, ''), rm.received_at
+		FROM raw_messages rm
+		WHERE rm.parsed = false AND rm.has_media = false AND rm.deleted = false
+		  AND COALESCE(rm.body, '') <> '' AND rm.received_at >= $1
+		  AND COALESCE(rm.wa_group_jid, '') LIKE '%@g.us'
+		  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id)
+		ORDER BY rm.received_at
+		LIMIT $2`, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []UnparsedMessage
+	for rows.Next() {
+		var m UnparsedMessage
+		if err := rows.Scan(&m.ID, &m.GroupJID, &m.SenderName, &m.Body, &m.ReceivedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
 }
 
 func (d *DB) UnparsedTextMessages(ctx context.Context, limit int) ([]UnparsedMessage, error) {

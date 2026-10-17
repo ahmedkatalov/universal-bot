@@ -174,9 +174,15 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// Ни одно чтение не удалось (ИИ недоступен) — вердикта НЕТ. Откат к парсеру,
 		// но если он ничего не записал — оставляем сообщение на пересчёт (не помечаем
 		// разобранным): реальный платёж не должен пропасть только потому, что ИИ лежал.
+		// Без ИИ записываем только явные платежи ИЗВЕСТНЫМ клиентам; остальное
+		// ждёт повторного разбора, когда ИИ снова доступен (textRetryLoop).
 		fmt.Println("ИИ-доразбор: ни одно чтение не удалось, откат к обычному парсеру")
-		saved, _ := b.recordDeterministicPayments(ctx, joined, rawID, txDate, cashHint, false)
+		saved, _ := b.recordDeterministicPayments(ctx, joined, rawID, txDate, cashHint, true)
 		keepUnparsed = saved == 0
+		if keepUnparsed {
+			b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+				txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
+		}
 		return
 	}
 
@@ -186,7 +192,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// (не «одна строка с суммой» — при «20000 + 5000» подмена ломала бы итог) и на
 	// выходе РОВНО один платёж с другой суммой — берём сумму из текста (парсер
 	// читает её надёжно). Так «10.000р» точно не станет 5000.
-	if len(tokens) == 1 && len(payments) == 1 {
+	if len(tokens) == 1 && len(payments) == 1 && !multiplierFits(joined, tokens[0], payments[0].Amount) {
 		if det := tokens[0]; det > 0 && payments[0].Amount != det {
 			fmt.Printf("ИИ-доразбор: сумма ИИ %.0f заменена на точную из текста %.0f\n", payments[0].Amount, det)
 			payments[0].Amount = det
@@ -199,7 +205,15 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// формате) — по такой болтовне переспрашивать в группе нельзя.
 	if paymentLikely && len(payments) == 0 && !b.groupSilent(chat) {
 		if q := majorityString(clarifies, okRuns); q != "" {
-			b.sendText(chat, "❓ "+q)
+			// Ответ на этот вопрос (ФИО) применим к ЭТОМУ сообщению.
+			if id := b.sendTextReturnID(chat, "❓ "+q); id != "" {
+				amt := 0.0
+				if len(tokens) == 1 {
+					amt = tokens[0]
+				}
+				b.registerPaymentAsk(id, paymentAsk{rawID: rawID, amount: amt, cash: cashHint || parser.IsCash(joined), txDate: txDate})
+				b.setOpenAsk(chat.String(), openAsk{kind: "payment_who", txID: rawID, amount: amt, senderJID: senderJIDOfRaw(ctx, b, rawID)})
+			}
 		}
 	}
 
@@ -930,4 +944,111 @@ func parseAIDatetime(s string) (time.Time, bool) {
 		}
 	}
 	return time.Time{}, false
+}
+
+var multiplierRe = regexp.MustCompile(`(?i)(^|[^\p{L}])по\s*\d|[xх×*]\s*\d|\d\s*[xх×*]|за\s*\d+\s*мес`)
+
+// multiplierFits — в тексте «за 2 месяца по 7500», и сумма ИИ кратна числу из
+// текста: это осознанное умножение, а не ошибка в цифрах.
+func multiplierFits(text string, det, ai float64) bool {
+	if det <= 0 || ai <= det || !multiplierRe.MatchString(text) {
+		return false
+	}
+	k := ai / det
+	return k == float64(int(k)) && k >= 2 && k <= 12
+}
+
+// senderJIDOfRaw — кто прислал сообщение (для открытого вопроса).
+func senderJIDOfRaw(ctx context.Context, b *Bot, rawID int) string {
+	if b.db == nil {
+		return ""
+	}
+	if s, err := b.db.SenderJIDByRawID(ctx, rawID); err == nil {
+		return s
+	}
+	return ""
+}
+
+// aiRetryItem — текст, который не удалось разобрать, потому что ИИ был недоступен.
+type aiRetryItem struct {
+	chat          types.JID
+	senderName    string
+	lines         []string
+	rawID         int
+	txDate        time.Time
+	cashHint      bool
+	paymentLikely bool
+	at            time.Time
+	attempts      int
+}
+
+func (b *Bot) queueAIRetry(it aiRetryItem) {
+	b.aiRetryMu.Lock()
+	defer b.aiRetryMu.Unlock()
+	if b.aiRetry == nil {
+		b.aiRetry = map[int]aiRetryItem{}
+	}
+	if old, ok := b.aiRetry[it.rawID]; ok {
+		it.at, it.attempts = old.at, old.attempts
+	}
+	b.aiRetry[it.rawID] = it
+}
+
+// textRetryLoop — когда ИИ снова доступен, дочитывает тексты, которые пришли во
+// время сбоя: платёж не теряется и не ждёт ручного «пересчитай».
+func (b *Bot) textRetryLoop() {
+	if b.assistant == nil {
+		return
+	}
+	t := time.NewTicker(3 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		b.retryAIText(context.Background())
+	}
+}
+
+func (b *Bot) retryAIText(ctx context.Context) {
+	b.aiRetryMu.Lock()
+	var due []aiRetryItem
+	for id, it := range b.aiRetry {
+		if time.Since(it.at) > 24*time.Hour {
+			delete(b.aiRetry, id)
+			continue
+		}
+		it.attempts++
+		b.aiRetry[id] = it
+		due = append(due, it)
+	}
+	b.aiRetryMu.Unlock()
+	if len(due) == 0 {
+		return
+	}
+	// Только то, что всё ещё не разобрано (не удалено, не записано пересчётом).
+	open := map[int]bool{}
+	if ms, err := b.db.UnparsedTextMessagesSince(ctx, time.Now().Add(-25*time.Hour), 500); err == nil {
+		for _, m := range ms {
+			open[m.ID] = true
+		}
+	} else {
+		return
+	}
+	sort.Slice(due, func(i, j int) bool { return due[i].rawID < due[j].rawID })
+	for _, it := range due {
+		b.aiRetryMu.Lock()
+		delete(b.aiRetry, it.rawID)
+		b.aiRetryMu.Unlock()
+		if !open[it.rawID] {
+			continue
+		}
+		// Если ИИ всё ещё лежит, разбор сам вернёт сообщение в очередь.
+		b.aiRescueUnparsed(ctx, it.chat, it.senderName, it.lines, it.rawID, it.txDate, it.cashHint, it.paymentLikely)
+		b.aiRetryMu.Lock()
+		if again, ok := b.aiRetry[it.rawID]; ok {
+			again.at, again.attempts = it.at, it.attempts
+			b.aiRetry[it.rawID] = again
+			b.aiRetryMu.Unlock()
+			break // ИИ всё ещё недоступен — остальные подождут следующего круга
+		}
+		b.aiRetryMu.Unlock()
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"strings"
 	"sync"
@@ -47,6 +48,16 @@ type clarifyState struct {
 	// receiptAsks — открытые вопросы «чей чек?» группы по порядку (ответ без
 	// свайпа идёт к самому раннему или к чеку на названную сумму).
 	receiptAsks map[string][]openAsk
+	// paymentAsks — «❓ Чья это наличка 27000?»: id вопроса → сообщение-платёж.
+	paymentAsks map[string]paymentAsk
+}
+
+// paymentAsk — платёж из текста, по которому бот спросил, чей он.
+type paymentAsk struct {
+	rawID  int
+	amount float64
+	cash   bool
+	txDate time.Time
 }
 
 // openAsk — открытый вопрос бота в группе (для ответа без свайпа).
@@ -71,6 +82,7 @@ func newClarifyState() *clarifyState {
 		lastAsk:    make(map[string]openAsk),
 
 		receiptAsks: make(map[string][]openAsk),
+		paymentAsks: make(map[string]paymentAsk),
 	}
 }
 
@@ -202,8 +214,12 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			items, err := b.db.CashNeedingCollector(ctx, jid.String(), before, clarifyPerCycle-asked)
 			if err == nil {
 				for _, it := range items {
+					who := it.Client
+					if who == "Наличка" || who == "(не указано)" || who == "" {
+						who = "без имени клиента"
+					}
 					text := fmt.Sprintf("🤔 Наличка: %s — %.0f ₽. У кого она, кто забрал деньги? "+
-						"Ответьте на это сообщение именем (например «у Дени» / «Мансур взял»).", it.Client, it.Amount)
+						"Ответьте на это сообщение именем (например «у Дени» / «Мансур взял»).", who, it.Amount)
 					botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
 					if botMsgID != "" {
 						// Помечаем «спросили» ТОЛЬКО если вопрос реально ушёл. При
@@ -663,6 +679,14 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		return true
 	}
 
+	// Ответ на «❓ Чья это наличка?» по текстовому платежу.
+	b.clarify.mu.Lock()
+	pa, isPayAsk := b.clarify.paymentAsks[quotedID]
+	b.clarify.mu.Unlock()
+	if isPayAsk {
+		return b.applyPaymentWhoAnswer(ctx, msg.Info.Chat, quotedID, pa, text)
+	}
+
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».
 	b.clarify.mu.Lock()
 	dupTxID, isDupAsk := b.clarify.dupAskMap[quotedID]
@@ -768,4 +792,75 @@ func (b *Bot) sendTextReturnID(chat types.JID, text string) string {
 	}
 	b.rememberSent(chat, resp.ID)
 	return resp.ID
+}
+
+// registerPaymentAsk — запомнить вопрос «чей это платёж?» по сообщению.
+func (b *Bot) registerPaymentAsk(botMsgID string, a paymentAsk) {
+	b.clarify.mu.Lock()
+	b.clarify.paymentAsks[botMsgID] = a
+	if len(b.clarify.paymentAsks) > clarifyMapCap {
+		for k := range b.clarify.paymentAsks {
+			delete(b.clarify.paymentAsks, k)
+			break
+		}
+	}
+	b.clarify.mu.Unlock()
+}
+
+// applyPaymentWhoAnswer — ответ на «❓ чей это платёж?»: записываем платёж того
+// сообщения на названного клиента. Возвращает true, если ответ понят.
+func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID string, pa paymentAsk, text string) bool {
+	name, amount, deferToAI := clarifyNameFromReply(text)
+	if deferToAI || name == "" {
+		return false
+	}
+	if pa.amount > 0 && amount > 0 && math.Abs(pa.amount-amount) >= 1 {
+		return false // названа другая сумма — это не ответ на этот вопрос
+	}
+	if amount <= 0 {
+		amount = pa.amount
+	}
+	if amount <= 0 {
+		return false
+	}
+	canonical, _ := b.aliases.ResolveName(name)
+	cid, err := b.db.GetOrCreateContact(ctx, canonical)
+	if err != nil {
+		return false
+	}
+	card := ""
+	if pa.cash {
+		card = "наличные"
+	}
+	// Платёж из того сообщения уже записан без имени («Наличка») — даём ему
+	// клиента; иначе записываем.
+	if txs, err := b.db.TxIDsByRawID(ctx, pa.rawID); err == nil && len(txs) == 1 {
+		if err := b.db.SetTxClient(ctx, txs[0], cid, canonical); err != nil {
+			return false
+		}
+	} else if err := b.db.InsertTransaction(ctx, db.TransactionInput{
+		ContactID: cid, RawName: canonical, Amount: amount, CardTo: card, IsCash: pa.cash,
+		RawMessageID: pa.rawID, TxDate: pa.txDate, DupCheck: b.cashDupCheckOn(),
+	}); err != nil {
+		fmt.Println("Ответ «чей платёж»: ошибка записи:", err)
+		return false
+	}
+	_ = b.db.MarkMessageParsed(ctx, pa.rawID)
+	b.clarify.mu.Lock()
+	for k, v := range b.clarify.paymentAsks {
+		if v.rawID == pa.rawID {
+			delete(b.clarify.paymentAsks, k)
+		}
+	}
+	if cur, ok := b.clarify.lastAsk[chat.String()]; ok && cur.kind == "payment_who" && cur.txID == pa.rawID {
+		delete(b.clarify.lastAsk, chat.String())
+	}
+	b.clarify.mu.Unlock()
+	kind := "перевод"
+	if pa.cash {
+		kind = "наличка"
+	}
+	b.sendText(chat, fmt.Sprintf("Записал: %s %s ₽ — %s.", kind, formatMoney(amount), canonical))
+	_ = askID
+	return true
 }

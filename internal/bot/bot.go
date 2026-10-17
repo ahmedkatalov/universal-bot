@@ -59,7 +59,9 @@ type Bot struct {
 	botName       string                                             // обращение в группах: "Джарвис скинь отчет"
 	sendHook      func(chat types.JID, text, quotedID string) string // только для тестов: перехват отправки
 	payerMu       sync.Mutex                                         // запись карты «плательщик → клиент»
-	selfUser      string                                             // только для тестов без WhatsApp: номер самого бота
+	aiRetryMu     sync.Mutex                                         // очередь текстов, не разобранных из-за сбоя ИИ
+	aiRetry       map[int]aiRetryItem
+	selfUser      string // только для тестов без WhatsApp: номер самого бота
 	fontDir       string
 	reportDir     string
 
@@ -241,6 +243,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	go b.pendingNamesJanitor() // уборка durable-очереди «имён без чека»
 	go b.schedulerLoop()       // планировщик напоминаний/сообщений
 	go b.receiptRetryLoop()    // автоповтор распознавания чеков (если зрение падало)
+	go b.textRetryLoop()       // повторный разбор текстов, когда ИИ лежал
 	return b, nil
 }
 
@@ -792,6 +795,11 @@ func (b *Bot) recordDeterministicPayments(ctx context.Context, text string, rawI
 	for _, tr := range result.Transactions {
 		canonical, matched := b.aliases.ResolveName(tr.RawName)
 		if knownOnly && !matched {
+			continue
+		}
+		// Без ИИ не записываем явные не-платежи: вопросы, планы («завтра
+		// принесёт»), телефоны, поправки «не 5000 а 6000».
+		if parser.LooksLikeNonPayment(tr) {
 			continue
 		}
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)

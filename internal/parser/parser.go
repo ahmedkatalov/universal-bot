@@ -22,6 +22,7 @@ type Transaction struct {
 	Amount  float64 // сумма в рублях
 	Note    string  // "аванс", "премия", "долг" и т.п., если распознано
 	CardTo  string  // "втб", "сбер" и т.п., если указано, куда скинули
+	Line    string  // строка сообщения, из которой взят платёж
 }
 
 // ParseResult — результат разбора одного сообщения.
@@ -36,7 +37,7 @@ var (
 	// "5тысяч", "5 тысяч", "9тысяя" (опечатка), "40к", "40k" -> множитель 1000
 	// Примечание: Go's \b не распознаёт кириллицу как "word"-символы, поэтому
 	// граница задаётся явно через отрицание класса символов, а не через \b.
-	thousandWordRe = regexp.MustCompile(`(?i)^(\d+[.,]?\d*)\s*(тыс[а-яё]*|к|k)(?:[^а-яёa-zA-Z]|$)`)
+	thousandWordRe = regexp.MustCompile(`(?i)^(\d+[.,]?\d*)\s*(тыс[а-яё]*|тыщ[а-яё]*|т|к|k)(?:[^а-яёa-zA-Z]|$)`)
 
 	// Ключевые пометки внутри строки
 	noteKeywords = []string{"аванс", "премия", "долг", "перекур", "штраф", "бонус"}
@@ -46,7 +47,10 @@ var (
 
 	// "Кофейня 235364р", "Аренда 40тысяч", "Такси 8050" -> имя и сумма в одной строке.
 	// Имя - 1-3 слова без цифр в начале строки, затем число.
-	inlineNameAmountRe = regexp.MustCompile(`(?i)^([А-ЯЁа-яёA-Za-z][А-ЯЁа-яёA-Za-z\-]*(?:\s+[А-ЯЁа-яёA-Za-z\-]+){0,2})\s+(\d[\d\s.,]*(?:тыс[а-яё]*|к|k)?)\s*(р|руб|₽)?\.?\s*(аванс|премия|долг)?\s*$`)
+	inlineNameAmountRe = regexp.MustCompile(`(?i)^([А-ЯЁа-яёA-Za-z][А-ЯЁа-яёA-Za-z\-]*(?:\s+[А-ЯЁа-яёA-Za-z\-]+){0,2})\s+(\d[\d\s.,]*(?:\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к|k))?)\s*(р|руб|₽)?\.?\s*(аванс|премия|долг)?\s*$`)
+
+	// «15000 Магомедов Ахмед» — сумма ПЕРЕД именем (имя с заглавной буквы).
+	amountNameRe = regexp.MustCompile(`^(\d[\d\s.,]*(?:\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к|k))?)\s*(?:р|руб|₽)?\.?\s+([А-ЯЁ][а-яё\-]+(?:\s+[А-ЯЁ][а-яё\-]+){0,2})\s*$`)
 )
 
 // ParseMessage разбирает один текст сообщения (может содержать несколько блоков "имя + суммы").
@@ -73,8 +77,17 @@ func ParseMessage(text string) ParseResult {
 				Amount:  amount,
 				Note:    note,
 				CardTo:  card,
+				Line:    line,
 			})
 			continue
+		}
+		if m := amountNameRe.FindStringSubmatch(line); m != nil {
+			if amount := ExtractAmount(m[1]); amount > 0 {
+				res.Transactions = append(res.Transactions, Transaction{
+					RawName: strings.TrimSpace(m[2]), Amount: amount, CardTo: extractCard(strings.ToLower(line)), Line: line,
+				})
+				continue
+			}
 		}
 
 		amount, note, card, isAmountLine := tryParseAmountLine(line)
@@ -89,6 +102,7 @@ func ParseMessage(text string) ParseResult {
 				Amount:  amount,
 				Note:    note,
 				CardTo:  card,
+				Line:    line,
 			})
 			continue
 		}
@@ -110,6 +124,7 @@ func ParseMessage(text string) ParseResult {
 				Amount:  amount,
 				Note:    note,
 				CardTo:  card,
+				Line:    line,
 			})
 			continue
 		}
@@ -215,7 +230,7 @@ func tryParseInlineNameAmount(line string) (name string, amount float64, note st
 	}
 	numPart := strings.TrimSpace(m[2])
 
-	lowerNum := strings.ToLower(numPart)
+	lowerNum := strings.ToLower(strings.ReplaceAll(numPart, " ", ""))
 	if tm := thousandWordRe.FindStringSubmatch(lowerNum + " "); tm != nil {
 		val, err := strconv.ParseFloat(strings.ReplaceAll(tm[1], ",", "."), 64)
 		if err != nil {
@@ -340,4 +355,54 @@ func cleanNumber(s string) string {
 	// если есть и точка и запятая - это разделитель тысяч, убираем запятые
 	s = strings.ReplaceAll(s, ",", ".")
 	return s
+}
+
+// correctionRe — «не 5000 а 6000», «не 5 а 6 тысяч»: поправка суммы, а не платёж.
+var correctionRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}])не\s+(\d[\d\s.,]*\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)?)\s*,?\s*а\s+(\d[\d\s.,]*\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)?)`)
+
+// ParseAmountCorrection — поправка суммы «не X а Y» (или «исправь на Y»: old=0).
+func ParseAmountCorrection(text string) (oldAmount, newAmount float64, ok bool) {
+	if m := correctionRe.FindStringSubmatch(text); m != nil {
+		o, n := ExtractAmount(m[1]), ExtractAmount(m[2])
+		if o > 0 && n > 0 && o != n {
+			return o, n, true
+		}
+	}
+	low := strings.ToLower(text)
+	for _, p := range []string{"исправь на", "исправить на", "поправь на", "правильно", "сумма не та, правильная"} {
+		if i := strings.Index(low, p); i >= 0 {
+			if n := ExtractAmount(text[i+len(p):]); n > 0 {
+				return 0, n, true
+			}
+		}
+	}
+	return 0, 0, false
+}
+
+// planOrQuestion — строка про план/вопрос/контакт, а не про совершённый платёж
+// («Завтра принесет 15000», «Сколько будет 5000?», «Позвони 9287836800»).
+var planWordsRe = regexp.MustCompile(`(?i)(^|[^\p{L}])(завтра|послезавтра|принесет|принесёт|принесу|отдаст|скинет|переведет|переведёт|будет|может|надо|нужно|должен|должна|сколько|позвони|позвоните|звони|телефон|номер|квартир|кв|дом|тел)([^\p{L}]|$)`)
+
+// LooksLikeNonPayment — для запасного разбора без ИИ: строка явно не платёж.
+func LooksLikeNonPayment(tr Transaction) bool {
+	line := tr.Line
+	if strings.Contains(line, "?") || planWordsRe.MatchString(line) {
+		return true
+	}
+	if _, _, ok := ParseAmountCorrection(line); ok {
+		return true
+	}
+	// Телефон, номер договора/карты — не сумма: 9+ цифр подряд.
+	digits := 0
+	for _, r := range line {
+		if r >= '0' && r <= '9' {
+			digits++
+			if digits >= 9 {
+				return true
+			}
+		} else if r != ' ' {
+			digits = 0
+		}
+	}
+	return tr.Amount < 100 || tr.Amount >= 50_000_000
 }
