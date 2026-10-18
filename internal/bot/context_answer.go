@@ -198,6 +198,15 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		return false
 
 	case "receipt":
+		// Несколько сумм («Исаев Харон 15000 20000», «Исаев Харон 15000,
+		// Магомедов Ахмед 10000», строки сумм) — это платежи, а не ответ «чей
+		// чек?»: их запишет обычный разбор, а чек подпишет пара «ФИО сумма» на
+		// его сумму. Наличка с суммой («… нал», «… Мансур взял», «… отдал
+		// Адаму») — другой платёж, тоже не ответ про чек.
+		if countAmountLines(text) > 1 || severalAmounts(text) ||
+			parser.ExtractAmount(text) > 0 && textCash(text) {
+			return false
+		}
 		// Несколько открытых вопросов «чей чек?»: ответ — к самому раннему, а если
 		// в ответе сумма — к чеку на эту сумму.
 		amount := parser.ExtractAmount(text)
