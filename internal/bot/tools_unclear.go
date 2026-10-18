@@ -5,13 +5,13 @@
 package bot
 
 import (
-	"sync"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.mau.fi/whatsmeow/types"

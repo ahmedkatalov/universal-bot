@@ -68,7 +68,7 @@ func TestINV_01_CmfOutageSilentAndAbandoned(t *testing.T) {
 	e.cmf = cmf.NewFromEnv()
 
 	ck := e.sendReceipt(grp, emp, "Сафаи", sberCheckOn(time.Now().AddDate(0, 0, -1), "14000.00", "10:00:00"), "Каталов Ахмед")
-	n := 0 // предупреждение может прийти сразу, при первом же обращении к программе
+	n := 0        // предупреждение может прийти сразу, при первом же обращении к программе
 	e.remindNow() // +30 ч фоновой сверки
 	e.remindNow() // +60 ч
 	warned := false
