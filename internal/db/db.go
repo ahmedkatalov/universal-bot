@@ -3092,7 +3092,7 @@ func (d *DB) ReportExclusions(ctx context.Context, from, to time.Time, groupJIDs
 
 // ReportExclusionsBasis — то же, но byChat=true считает период по дате, когда
 // сообщение прислали в чат (для отчёта «по дате в чате»).
-func (d *DB) ReportExclusionsBasis(ctx context.Context, from, to time.Time, groupJIDs []string, byChat bool) (ReportExclusions, error) {
+func (d *DB) legacyReportExclusionsBasis(ctx context.Context, from, to time.Time, groupJIDs []string, byChat bool) (ReportExclusions, error) {
 	var ex ReportExclusions
 	brDate, oDate, tDate := "br.tx_date", "o.tx_date", "t.tx_date::timestamptz"
 	if byChat {
@@ -3926,7 +3926,7 @@ type LedgerRow struct {
 // ReceiptsLedger — ЕДИНЫЙ журнал ВСЕХ платежей за период: и чеки, и наличка/
 // переводы. По каждому видно тип (чек/наличка/перевод), клиента, сумму, дату,
 // КТО прислал и в какую ГРУППУ, а для налички — кто забрал. Фильтры: person, groupJIDs.
-func (d *DB) ReceiptsLedger(ctx context.Context, from, to time.Time, person string, groupJIDs []string, limit int) ([]LedgerRow, error) {
+func (d *DB) legacyReceiptsLedger(ctx context.Context, from, to time.Time, person string, groupJIDs []string, limit int) ([]LedgerRow, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT DISTINCT ON (COALESCE(br.contact_id::text, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 		        'чек' AS kind,
@@ -5200,7 +5200,7 @@ type PersonStats struct {
 // PersonReport ищет людей по подстроке имени (без учёта регистра) и для
 // каждого считает чеки и текстовые платежи. from/to — необязательные границы
 // периода, groupJID — необязательный фильтр по группе. До 5 совпадений.
-func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *time.Time, groupJID string) ([]PersonStats, error) {
+func (d *DB) legacyPersonReport(ctx context.Context, personQuery string, from, to *time.Time, groupJID string) ([]PersonStats, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT c.canonical_name,
 			COALESCE(r.cnt, 0), COALESCE(r.total, 0),
@@ -5422,7 +5422,7 @@ const fwdDedupNotExists = `AND NOT EXISTS (
 			  AND starts_with(rm.wa_message_id, orm.wa_message_id || '-fwd-')
 		)`
 
-func (d *DB) SummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
+func (d *DB) legacySummaryForPeriod(ctx context.Context, from, to time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
 		FROM transactions t
@@ -5502,7 +5502,7 @@ func scanContactSummaries(rows pgx.Rows) ([]ContactSummary, error) {
 // которых дата операции ВНЕ месяца периода [monthStart, monthEnd), в основную
 // сумму НЕ берём — их отдельно показывает ChecksPostedOldOperation. Наличка и
 // текст датируются присылкой, поэтому попадают как обычно.
-func (d *DB) SummaryForPeriodByChat(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string) ([]ContactSummary, error) {
+func (d *DB) legacySummaryForPeriodByChat(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string) ([]ContactSummary, error) {
 	rows, err := d.pool.Query(ctx, `
 		(SELECT c.canonical_name, t.card_to, t.amount
 		FROM transactions t
@@ -5550,7 +5550,7 @@ type OldCheck struct {
 // ChecksPostedOldOperation — чеки, присланные (received_at) в [from,to), у
 // которых дата операции вне месяца периода [monthStart, monthEnd). Для отдельной
 // «⚠️ старые чеки» секции в режиме по дате чата.
-func (d *DB) ChecksPostedOldOperation(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string, limit int) ([]OldCheck, error) {
+func (d *DB) legacyChecksPostedOldOperation(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string, limit int) ([]OldCheck, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT DISTINCT ON (COALESCE(br.contact_id::text, br.recipient_raw, '') || '|' || br.amount::text || '|' || COALESCE(NULLIF(br.doc_number, ''), br.tx_date::text))
 			COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date,
@@ -5602,7 +5602,7 @@ type CardTotal struct {
 // CardTotals — разбивка «на чьи карты сколько перевели» за период. Владелец
 // карты = получатель, напечатанный на чеке (card_owner, а если нет — recipient_raw).
 // Не путать с клиентом рассрочки: сюда идёт именно владелец карты-получателя.
-func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []string) ([]CardTotal, error) {
+func (d *DB) legacyCardTotals(ctx context.Context, from, to time.Time, groupJIDs []string) ([]CardTotal, error) {
 	// Берём построчно и агрегируем в Go по нормализованному имени владельца
 	// карты — чтобы варианты написания одного человека («Танзила Рахмановна С»
 	// и «Танзила Рахмановна С.») не разбивались на две карты и не недосчитывали.
@@ -5670,7 +5670,7 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 // кто сколько чеков прислал и на какую сумму. Дубли не считаются.
 // groupJID — фильтр по группе (пусто = все), senderQuery — фильтр по человеку:
 // подстрока имени или номера телефона (пусто = все отправители).
-func (d *DB) SenderStats(ctx context.Context, from, to time.Time, groupJIDs []string, senderQuery string) ([]SenderStat, error) {
+func (d *DB) legacySenderStats(ctx context.Context, from, to time.Time, groupJIDs []string, senderQuery string) ([]SenderStat, error) {
 	// "Сбор" по ответственному включает И чеки (bank_receipts), И наличку/
 	// текстовые платежи (transactions) — всё, что человек собрал. Имя берём
 	// в приоритете из памяти номеров (phone_owners по телефону отправителя),
@@ -5746,7 +5746,7 @@ func scanSenderStats(rows pgx.Rows) ([]SenderStat, error) {
 // Чеки с датой операции вне месяца периода [monthStart, monthEnd) в сбор не
 // берём (их отдельно покажет ChecksPostedOldOperation). Наличка/текст —
 // по дате присылки.
-func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string, senderQuery string) ([]SenderStat, error) {
+func (d *DB) legacySenderStatsByChat(ctx context.Context, from, to, monthStart, monthEnd time.Time, groupJIDs []string, senderQuery string) ([]SenderStat, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT s.sender_name, s.phone, COUNT(*), COALESCE(SUM(s.amount), 0)
 		FROM (
