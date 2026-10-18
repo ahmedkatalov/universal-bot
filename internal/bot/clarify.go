@@ -153,6 +153,12 @@ func (b *Bot) cashDupCheckOn() bool {
 	return askReceiptsEnabled() && cashDupCheckEnabled()
 }
 
+// Повтор налички ловится и при ином написании клиента: «Магамедов Ахмед нал
+// 15000», а следом «Магомедов Ахмед нал 15000» (опечатку исправили, отправив
+// заново) — тот же клиент, придержать и спросить. Сравнение строгое, как для
+// всех денежных решений: «Омаров» и «Умаров» — разные клиенты.
+func init() { db.SameCashClient = sameClientMoney }
+
 // clarifyLoop раз в 45 секунд проверяет группы на чеки без клиента и задаёт
 // по ним вопросы (аккуратно, не спамя).
 func (b *Bot) clarifyLoop() {
@@ -272,9 +278,13 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 						if !it.PrevWhen.IsZero() {
 							when = "была " + it.PrevWhen.Format("02.01")
 						}
-						text := fmt.Sprintf("🤔 У клиента %s уже %s наличка на %.0f ₽. Это НОВЫЙ платёж или тот же самый (повтор)? "+
+						asWritten := ""
+						if it.PrevName != "" {
+							asWritten = " (записана как «" + it.PrevName + "»)"
+						}
+						text := fmt.Sprintf("🤔 У клиента %s уже %s наличка на %.0f ₽%s. Это НОВЫЙ платёж или тот же самый (повтор)? "+
 							"Ответьте на это сообщение: «новый» — засчитаю отдельно, «тот же» — не считаю повтором.",
-							it.Client, when, it.Amount)
+							it.Client, when, it.Amount, asWritten)
 						botMsgID := b.sendReply(jid, text, it.WaMessageID, it.SenderJID)
 						if botMsgID != "" {
 							_ = b.db.MarkCashDupAsked(ctx, it.TxID, botMsgID)

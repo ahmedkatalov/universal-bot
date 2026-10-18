@@ -1022,33 +1022,101 @@ type TransactionInput struct {
 	ClientSourceRawID int
 }
 
+// SameCashClient — один ли это клиент для проверки повтора налички, когда
+// контакты разные: опечатка («Магамедов»/«Магомедов»), падеж, порядок слов.
+// Бот подставляет строгое сравнение имён для денег (Омаров ≠ Умаров); по
+// умолчанию — те же слова без учёта регистра, ё/е и порядка.
+var SameCashClient = func(a, b string) bool {
+	ka := contactKey(a)
+	return ka != "" && ka == contactKey(b)
+}
+
+// cashPlaceholder — «клиент»-заглушка налички без имени: разные люди.
+func cashPlaceholder(name string) bool {
+	return name == "Наличка" || name == "(не указано)"
+}
+
+// cashRepeatProbe — наличка, которую проверяем на повтор.
+type cashRepeatProbe struct {
+	TxID      int // сам платёж (не сравниваем с собой); 0 — ещё не записан
+	ContactID int
+	Name      string // каноничное имя клиента
+	Amount    float64
+	TxDate    time.Time
+	RawID     int  // сообщение платежа: его группа; строки того же сообщения — не повтор
+	Later     bool // считать и наличку ПОЗЖЕ платежа (освобождение придержки)
+}
+
+// cashRepeatPrev — засчитанная наличка, повтором которой может быть платёж:
+// та же группа, та же сумма, за 30 дней до него, другое сообщение, не удалена,
+// не исключена и сама не придержана. Клиент — тот же контакт ИЛИ то же имя,
+// написанное иначе (SameCashClient): переотправленная с исправленной опечаткой
+// наличка — тоже повтор. Контакты при этом НЕ склеиваются. Возвращает дату и
+// имя самой свежей такой налички.
+func (d *DB) cashRepeatPrev(ctx context.Context, p cashRepeatProbe) (when time.Time, name string, found bool, err error) {
+	if p.Amount <= 0 || p.RawID == 0 || cashPlaceholder(p.Name) {
+		return time.Time{}, "", false, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(t.contact_id, 0), COALESCE(c.canonical_name, t.raw_name, ''), t.tx_date
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE t.amount = $1 AND t.is_cash = true
+		  AND t.ignored = false AND t.dup_pending = false
+		  AND t.tx_date >= $2::date - 30 AND ($5 OR t.tx_date <= $2::date)
+		  AND rm.wa_group_jid = (SELECT wa_group_jid FROM raw_messages WHERE id = $3)
+		  AND t.raw_message_id <> $3 AND t.id <> $4
+		  AND COALESCE(rm.deleted, false) = false
+		ORDER BY t.tx_date DESC, t.id DESC
+		LIMIT 500`, p.Amount, p.TxDate, p.RawID, p.TxID, p.Later)
+	if err != nil {
+		return time.Time{}, "", false, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var n string
+		var at time.Time
+		if err := rows.Scan(&cid, &n, &at); err != nil {
+			return time.Time{}, "", false, err
+		}
+		if cashPlaceholder(n) {
+			continue // «Наличка» без имени — не тот же клиент
+		}
+		if p.ContactID != 0 && cid == p.ContactID || p.Name != "" && SameCashClient(p.Name, n) {
+			return at, n, true, nil
+		}
+	}
+	return time.Time{}, "", false, rows.Err()
+}
+
+// contactName — каноничное имя контакта ("" если нет).
+func (d *DB) contactName(ctx context.Context, contactID int) string {
+	var n string
+	if contactID == 0 {
+		return ""
+	}
+	_ = d.pool.QueryRow(ctx, `SELECT canonical_name FROM contacts WHERE id = $1`, contactID).Scan(&n)
+	return n
+}
+
 func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
 	dupPending := false
 	if tx.IsCash && tx.DupCheck && tx.ContactID != 0 && tx.Amount > 0 {
-		// Есть ли уже засчитанная наличка тому же клиенту на ТУ ЖЕ сумму за
-		// последние 30 дней В ТОЙ ЖЕ ГРУППЕ? Если да — это может быть случайный
-		// повтор (одну и ту же наличку скинули дважды). Придерживаем платёж
-		// (dup_pending) и просим владельца подтвердить «новый / тот же». Группу
-		// учитываем обязательно: тот же клиент на ту же сумму в РАЗНЫХ группах —
-		// это разные платежи, придерживать нельзя (как и у чеков, см.
-		// FindDuplicateReceipt).
-		since := tx.TxDate.AddDate(0, 0, -30)
-		if err := d.pool.QueryRow(ctx, `
-			SELECT EXISTS (
-				SELECT 1 FROM transactions t
-				JOIN raw_messages rm ON rm.id = t.raw_message_id
-				WHERE t.contact_id = $1 AND t.amount = $2 AND t.is_cash = true
-				  AND t.ignored = false AND t.dup_pending = false
-				  AND t.tx_date >= $3 AND t.tx_date <= $4
-				  AND rm.wa_group_jid = (SELECT wa_group_jid FROM raw_messages WHERE id = $5)
-				  -- Строки ТОГО ЖЕ сообщения («5000 / 5000» в одном списке) — не повтор;
-				  -- удалённая наличка — тоже: её нет.
-				  AND t.raw_message_id <> $5
-				  AND COALESCE(rm.deleted, false) = false
-			)
-			-- Наличка без имени («Нал 27000») — разные люди: не повтор.
-			AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.id = $1 AND c.canonical_name IN ('Наличка', '(не указано)'))`, tx.ContactID, tx.Amount, since, tx.TxDate, tx.RawMessageID).Scan(&dupPending); err != nil {
-			dupPending = false // при ошибке не придерживаем — лучше засчитать, чем потерять
+		// Есть ли уже засчитанная наличка тому же клиенту (или то же имя с
+		// опечаткой/в другом порядке слов) на ТУ ЖЕ сумму за последние 30 дней
+		// В ТОЙ ЖЕ ГРУППЕ? Если да — это может быть случайный повтор (одну и ту
+		// же наличку скинули дважды, второй раз — с исправленной опечаткой).
+		// Придерживаем платёж (dup_pending) и просим подтвердить «новый / тот
+		// же». Группу учитываем обязательно: тот же клиент на ту же сумму в
+		// РАЗНЫХ группах — это разные платежи, придерживать нельзя (как и у
+		// чеков, см. FindDuplicateReceipt). Наличка без имени («Нал 27000») —
+		// разные люди: не повтор.
+		if name := d.contactName(ctx, tx.ContactID); !cashPlaceholder(name) {
+			_, _, held, err := d.cashRepeatPrev(ctx, cashRepeatProbe{ContactID: tx.ContactID, Name: name,
+				Amount: tx.Amount, TxDate: tx.TxDate, RawID: tx.RawMessageID})
+			dupPending = held && err == nil // при ошибке не придерживаем — лучше засчитать, чем потерять
 		}
 	}
 	_, err := d.pool.Exec(ctx, `
@@ -1067,6 +1135,9 @@ type CashDupAsk struct {
 	WaMessageID string
 	SenderJID   string
 	PrevWhen    time.Time // дата предыдущего такого платежа (для текста вопроса)
+	// PrevName — как записан клиент предыдущей налички, если иначе (опечатка,
+	// другой порядок слов): сотрудник видит, с какой записью сравнили.
+	PrevName string
 }
 
 // CashDupNeedingConfirm — придержанные повторы налички, по которым пора спросить.
@@ -1079,7 +1150,8 @@ func (d *DB) CashDupNeedingConfirm(ctx context.Context, groupJID string, olderTh
 		         WHERE p.contact_id = t.contact_id AND p.amount = t.amount
 		           AND p.is_cash = true AND p.ignored = false AND p.dup_pending = false
 		           AND COALESCE(prm.deleted, false) = false
-		           AND p.tx_date <= t.tx_date AND p.id <> t.id)
+		           AND p.tx_date <= t.tx_date AND p.id <> t.id),
+		       COALESCE(t.contact_id, 0), t.tx_date, t.raw_message_id
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
@@ -1095,18 +1167,40 @@ func (d *DB) CashDupNeedingConfirm(ctx context.Context, groupJID string, olderTh
 	}
 	defer rows.Close()
 	var out []CashDupAsk
+	var probes []cashRepeatProbe
 	for rows.Next() {
 		var a CashDupAsk
 		var prev *time.Time
-		if err := rows.Scan(&a.TxID, &a.Client, &a.Amount, &a.WaMessageID, &a.SenderJID, &prev); err != nil {
+		var p cashRepeatProbe
+		if err := rows.Scan(&a.TxID, &a.Client, &a.Amount, &a.WaMessageID, &a.SenderJID, &prev,
+			&p.ContactID, &p.TxDate, &p.RawID); err != nil {
 			return nil, err
 		}
 		if prev != nil {
 			a.PrevWhen = *prev
 		}
+		p.TxID, p.Name, p.Amount = a.TxID, a.Client, a.Amount
 		out = append(out, a)
+		probes = append(probes, p)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	rows.Close()
+	// Придержали из-за той же налички, записанной на клиента иначе (опечатка) —
+	// называем ту запись: иначе сотрудник не поймёт, с чем сравнили.
+	for k := range out {
+		if !out[k].PrevWhen.IsZero() {
+			continue
+		}
+		if when, name, ok, err := d.cashRepeatPrev(ctx, probes[k]); err == nil && ok {
+			out[k].PrevWhen = when
+			if contactKey(name) != contactKey(out[k].Client) {
+				out[k].PrevName = name
+			}
+		}
+	}
+	return out, nil
 }
 
 // CountCashDupNeedingConfirm — сколько придержанных повторов налички ждут ответа.
@@ -1961,23 +2055,85 @@ func (d *DB) releaseMessageLinks(ctx context.Context, rawID int) {
 	// Удалили наличку, из-за которой следующую такую же придержали как «повтор»,
 	// — повтора больше нет: отпускаем ОДНУ придержанную (если других живых
 	// таких же нет).
-	if _, e := d.pool.Exec(ctx, `
-		UPDATE transactions SET dup_pending = false
-		WHERE id = (
-			SELECT h.id FROM transactions h
-			JOIN raw_messages hrm ON hrm.id = h.raw_message_id
-			JOIN transactions del ON del.raw_message_id = $1 AND del.is_cash = true
-			     AND del.contact_id = h.contact_id AND del.amount = h.amount
-			WHERE h.dup_pending = true AND h.ignored = false AND COALESCE(hrm.deleted, false) = false
-			  AND NOT EXISTS (
-				SELECT 1 FROM transactions o JOIN raw_messages orm ON orm.id = o.raw_message_id
-				WHERE o.contact_id = h.contact_id AND o.amount = h.amount AND o.is_cash = true
-				  AND o.ignored = false AND o.dup_pending = false AND o.id <> h.id
-				  AND COALESCE(orm.deleted, false) = false AND o.tx_date >= h.tx_date - 30
-				  AND orm.wa_group_jid = hrm.wa_group_jid)
-			ORDER BY h.created_at LIMIT 1)`, rawID); e != nil {
+	if e := d.releaseCashRepeatOf(ctx, rawID); e != nil {
 		fmt.Println("Освобождение придержанной налички после удаления не удалось:", e)
 	}
+}
+
+// releaseCashRepeatOf — наличку сообщения rawID удалили (или правят): по каждой
+// её строке отпускаем ОДНУ наличку, придержанную как её повтор (тот же клиент
+// или то же имя, записанное иначе; та же сумма), если других живых таких же,
+// повтором которых она может быть, больше нет.
+func (d *DB) releaseCashRepeatOf(ctx context.Context, rawID int) error {
+	type cashRow struct {
+		contactID int
+		name      string
+		amount    float64
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(t.contact_id, 0), COALESCE(c.canonical_name, t.raw_name, ''), t.amount::float8
+		FROM transactions t LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE t.raw_message_id = $1 AND t.is_cash = true AND t.amount > 0
+		ORDER BY t.id`, rawID)
+	if err != nil {
+		return err
+	}
+	var dels []cashRow
+	for rows.Next() {
+		var r cashRow
+		if err := rows.Scan(&r.contactID, &r.name, &r.amount); err != nil {
+			rows.Close()
+			return err
+		}
+		if !cashPlaceholder(r.name) {
+			dels = append(dels, r)
+		}
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	for _, del := range dels {
+		hrows, err := d.pool.Query(ctx, `
+			SELECT h.id, COALESCE(h.contact_id, 0), COALESCE(c.canonical_name, h.raw_name, ''),
+			       h.tx_date, h.raw_message_id
+			FROM transactions h
+			JOIN raw_messages hrm ON hrm.id = h.raw_message_id
+			LEFT JOIN contacts c ON c.id = h.contact_id
+			WHERE h.dup_pending = true AND h.ignored = false AND h.is_cash = true
+			  AND COALESCE(hrm.deleted, false) = false AND h.amount = $1
+			ORDER BY h.created_at, h.id
+			LIMIT 200`, del.amount)
+		if err != nil {
+			return err
+		}
+		var held []cashRepeatProbe
+		for hrows.Next() {
+			p := cashRepeatProbe{Amount: del.amount, Later: true}
+			if err := hrows.Scan(&p.TxID, &p.ContactID, &p.Name, &p.TxDate, &p.RawID); err != nil {
+				hrows.Close()
+				return err
+			}
+			held = append(held, p)
+		}
+		hrows.Close()
+		if err := hrows.Err(); err != nil {
+			return err
+		}
+		for _, h := range held {
+			if !(del.contactID != 0 && h.ContactID == del.contactID || SameCashClient(del.name, h.Name)) {
+				continue
+			}
+			if _, _, still, err := d.cashRepeatPrev(ctx, h); err != nil || still {
+				continue // есть другая живая такая же наличка — повтор остаётся вопросом
+			}
+			if _, err := d.pool.Exec(ctx, `UPDATE transactions SET dup_pending = false WHERE id = $1 AND dup_pending = true`, h.TxID); err != nil {
+				return err
+			}
+			break
+		}
+	}
+	return nil
 }
 
 // OperationRef — ссылка на операцию (текстовый платёж или чек) для ручных
@@ -2884,19 +3040,33 @@ func (d *DB) CorrectionsByMessage(ctx context.Context, waID string) (int, error)
 // теперь она совпала с прежней наличкой клиента за 30 дней, или отпустить, если
 // больше не совпадает. Подтверждённую владельцем («новый») не трогаем.
 func (d *DB) RecheckCashRepeat(ctx context.Context, txID int) error {
-	_, err := d.pool.Exec(ctx, `
-		UPDATE transactions t SET dup_pending = (
-			EXISTS (
-				SELECT 1 FROM transactions p JOIN raw_messages prm ON prm.id = p.raw_message_id
-				WHERE p.contact_id = t.contact_id AND p.amount = t.amount AND p.is_cash = true
-				  AND p.ignored = false AND p.dup_pending = false AND p.id <> t.id
-				  AND p.raw_message_id <> t.raw_message_id
-				  AND p.tx_date >= t.tx_date - interval '30 days' AND p.tx_date <= t.tx_date
-				  AND prm.wa_group_jid = rm.wa_group_jid AND COALESCE(prm.deleted, false) = false)
-			AND NOT EXISTS (SELECT 1 FROM contacts c WHERE c.id = t.contact_id AND c.canonical_name IN ('Наличка', '(не указано)')))
-		FROM raw_messages rm
-		WHERE t.id = $1 AND rm.id = t.raw_message_id AND t.is_cash = true AND t.ignored = false
-		  AND NOT (t.dup_asked AND NOT t.dup_pending)`, txID)
+	// Повтор — та же наличка того же клиента (или того же имени, записанного
+	// иначе: опечатка, порядок слов) за 30 дней в той же группе, см. cashRepeatPrev.
+	p := cashRepeatProbe{TxID: txID}
+	var hasContact bool
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(t.contact_id, 0), t.contact_id IS NOT NULL, COALESCE(c.canonical_name, ''),
+		       t.amount::float8, t.tx_date, t.raw_message_id
+		FROM transactions t
+		JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		WHERE t.id = $1 AND t.is_cash = true AND t.ignored = false
+		  AND NOT (t.dup_asked AND NOT t.dup_pending)`, txID).Scan(&p.ContactID, &hasContact, &p.Name, &p.Amount, &p.TxDate, &p.RawID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil // не наличка, исключена или владелец уже подтвердил «новый»
+	}
+	if err != nil {
+		return err
+	}
+	held := false
+	if hasContact {
+		if _, _, held, err = d.cashRepeatPrev(ctx, p); err != nil {
+			return err
+		}
+	}
+	_, err = d.pool.Exec(ctx, `
+		UPDATE transactions SET dup_pending = $2
+		WHERE id = $1 AND is_cash = true AND ignored = false AND NOT (dup_asked AND NOT dup_pending)`, txID, held)
 	return err
 }
 
