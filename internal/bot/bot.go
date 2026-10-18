@@ -3252,6 +3252,8 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 			"Чек и текст про него («Магомедов Ахмед 5000» рядом с чеком) — ОДИН платёж: исключаются вместе. " +
 			"Если один платёж записан дважды (чек и отдельный такой же текст, два одинаковых текста) — исключай " +
 			"лишнюю запись, указав kind и/или sender («исключи текст Ислама» → kind=text, sender=Ислам). " +
+			"В группе исключение касается только этой группы: если тот же чек прислан и в другую группу, " +
+			"инструмент скажет об этом — спроси владельца, убрать ли и там (тогда group). " +
 			"Если под описание подходит несколько платежей, инструмент вернёт список — уточни у пользователя, " +
 			"какой (дата, имя, группа, кто прислал, чек или текст), не выбирай сам.",
 		InputSchema: map[string]any{
@@ -3375,6 +3377,12 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				}
 			}
 			groups := b.joinedGroups(ctx)
+			groupName := func(g string) string {
+				if jid, err := types.ParseJID(g); err == nil {
+					return groups[jid]
+				}
+				return ""
+			}
 			opLabel := func(op db.OperationRef) string {
 				kind := "текст"
 				switch {
@@ -3395,6 +3403,30 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				return fmt.Sprintf("[%s] %s, %.0f ₽, %s%s", kind, op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04"), g)
 			}
 
+			// «Исключи лишний» среди одинаковых текстов, которые владелец ничем
+			// не может различить, — исключаем лишний (отдельный платёж), а не
+			// задаём вопрос без ответа.
+			if args.Action == "exclude" {
+				if i, ok := extraTextCopy(entries); ok {
+					res, err := b.excludePayment(ctx, entries[i], idx, true, groupJID)
+					if err != nil {
+						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+					}
+					res.extra = true
+					for j, e := range entries {
+						switch {
+						case j == i:
+						case len(e.pay.Checks) > 0:
+							res.extraPaired = true
+						default:
+							res.extraLeft++
+						}
+					}
+					op := entries[i].op
+					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op, groupName), nil
+				}
+			}
+
 			switch len(entries) {
 			case 0:
 				if args.Action == "restore" {
@@ -3405,11 +3437,11 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				op := entries[0].op
 				if args.Action == "exclude" {
 					// Владелец назвал именно эту запись (kind/sender) — только её.
-					res, err := b.excludePayment(ctx, entries[0], idx, opKind(args.Kind) != "" || sender != "")
+					res, err := b.excludePayment(ctx, entries[0], idx, opKind(args.Kind) != "" || sender != "", groupJID)
 					if err != nil {
 						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
 					}
-					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op), nil
+					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op, groupName), nil
 				}
 				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
 					return "", fmt.Errorf("не удалось обновить операцию: %w", err)

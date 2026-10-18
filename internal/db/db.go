@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"whatsapp-bot/internal/ledger"
 )
 
 // nameKey нормализует имя для группировки в отчётах: регистр и лишние пробелы
@@ -2091,6 +2093,41 @@ func (d *DB) ClearDuplicateFlagRef(ctx context.Context, amount float64, person, 
 		return false, "", time.Time{}, "", err
 	}
 	return true, name, txDate, waID, nil
+}
+
+// BookSpans — ОДНА книга движка подсчёта по записям нескольких несмежных
+// периодов [from, to) (с тем же запасом по краям, что у LoadBook; запись,
+// попавшая в несколько периодов, берётся один раз). Старый чек (дата операции
+// на месяц раньше присылки) и текст, присланный рядом с ним, должны оказаться в
+// одной книге: в книге «вокруг даты операции» текста нет, и чек там — платёж
+// без своей пары.
+func (d *DB) BookSpans(ctx context.Context, spans [][2]time.Time) (*ledger.Book, error) {
+	var checks []ledger.Check
+	var texts []ledger.Text
+	seenC, seenT := map[int]bool{}, map[int]bool{}
+	for _, s := range spans {
+		cs, err := d.loadLedgerChecks(ctx, s[0].Add(-ledgerPad), s[1].Add(ledgerPad), "")
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cs {
+			if !seenC[c.ID] {
+				seenC[c.ID] = true
+				checks = append(checks, c)
+			}
+		}
+		ts, err := d.loadLedgerTexts(ctx, s[0].Add(-ledgerPad), s[1].Add(ledgerPad), "")
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range ts {
+			if !seenT[t.ID] {
+				seenT[t.ID] = true
+				texts = append(texts, t)
+			}
+		}
+	}
+	return ledger.Build(checks, texts), nil
 }
 
 // SetOperationIgnored включает/выключает ручное исключение операции из учёта.

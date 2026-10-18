@@ -351,9 +351,9 @@ type corrGroup struct {
 // — одна цель поправки; текст, который движок считает отдельным платежом, —
 // своя цель.
 func (b *Bot) groupCorrTargets(ctx context.Context, ts []db.CorrTarget) []corrGroup {
-	var at []time.Time
+	var at [][]time.Time
 	for _, t := range ts {
-		at = append(at, t.Received)
+		at = append(at, []time.Time{t.Received})
 	}
 	x := b.loadPayIndex(ctx, at)
 	var groups []corrGroup
