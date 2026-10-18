@@ -272,14 +272,17 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	hasUnconfirmed, _ := b.db.HasUnconfirmedReceiptFrom(ctx, chat.String(), sender, since)
 	checkNearby := quotedID != "" || hasUnconfirmed
 
-	// Наличка («Исаев Ислам нал 5000», «Ахмед 10000 у Дени») и список из
-	// нескольких платежей — это платежи, а не подпись к чеку. Если рядом ждёт чек,
-	// подпишем его строкой с ТОЙ ЖЕ суммой, остальное запишется как платежи.
-	// Решаем по строкам с суммой, а не по сумме всего текста: у «Исаев Харон\n
-	// 10000\n5000» общая сумма не читается (числа на разных строках), а это всё
-	// равно два платежа — подписью к чеку его не съедаем.
-	if amountLines > 1 || ((amount > 0 || amountLines > 0) && parser.IsCash(text)) {
-		if checkNearby && amountLines > 1 {
+	// Наличка («Исаев Ислам нал 5000», «Ахмед 10000 у Дени», «… Мансур взял»,
+	// «… отдал Адаму») и список из нескольких платежей — это платежи, а не
+	// подпись к чеку. Если рядом ждёт чек, подпишем его платежом на ТУ ЖЕ сумму,
+	// остальное запишется как платежи. Считаем суммы, а не только строки: у
+	// «Исаев Харон\n10000\n5000» общая сумма не читается (числа на разных
+	// строках), а в «Исаев Харон 15000 20000», «Магомедов Ахмед 7500 и 5000»,
+	// «Исаев Харон 15000, Магомедов Ахмед 10000» сумм несколько в одной строке —
+	// это всё равно несколько платежей, подписью к чеку их не съедаем.
+	multi := amountLines > 1 || severalAmounts(text)
+	if multi || ((amount > 0 || amountLines > 0) && textCash(text)) {
+		if checkNearby && multi {
 			b.labelCheckFromLines(ctx, msg, text, rawID, since)
 		}
 		return false
@@ -392,6 +395,154 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	return true
 }
 
+// Наличка, написанная через того, кто её забрал, без слова «нал»: «Мансур
+// взял», «Адам забрал», «Мансур собрал», «принёс», «отдал Адаму», «передала к
+// Дени», «отдал мне». Так её читают и разбор платежей (ИИ, хвост строки у
+// парсера), и вопрос «у кого наличка?».
+var (
+	collectorTakeWords = map[string]bool{
+		"взял": true, "взяла": true, "забрал": true, "забрала": true, "собрал": true, "собрала": true,
+		"принёс": true, "принес": true, "принесла": true, "занёс": true, "занес": true, "занесла": true,
+	}
+	collectorGiveWords = map[string]bool{"отдал": true, "отдала": true, "передал": true, "передала": true}
+	// после «отдал/передал» — не тот, кому отдали: «передал через сбер», «отдал сегодня».
+	notCollectorWords = map[string]bool{
+		"через": true, "на": true, "по": true, "за": true, "с": true, "со": true, "из": true, "от": true,
+		"до": true, "в": true, "во": true, "сегодня": true, "вчера": true, "сейчас": true, "уже": true,
+		"только": true, "всё": true, "все": true, "полностью": true, "частично": true, "деньги": true,
+		"сумму": true, "оплату": true, "долг": true, "остаток": true,
+	}
+)
+
+// collectorCash — в тексте сказано, кто забрал деньги или кому их отдали.
+func collectorCash(text string) bool {
+	ws := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	for i, w := range ws {
+		if collectorTakeWords[w] {
+			return true
+		}
+		if !collectorGiveWords[w] {
+			continue
+		}
+		j := i + 1
+		if j < len(ws) && ws[j] == "к" {
+			j++
+		}
+		if j < len(ws) && strings.IndexFunc(ws[j], unicode.IsDigit) < 0 && !notCollectorWords[ws[j]] && !pairNoiseWords[ws[j]] {
+			return true // «отдал Адаму», «отдал к Дени», «отдал мне»
+		}
+	}
+	return false
+}
+
+// textCash — текст помечен как наличка так же, как его читает разбор платежей:
+// «нал», «наличка», «у Дени», «офис» (parser.IsCash), пометка в строке платежа
+// по разбору парсера или «кто забрал» («Мансур взял», «отдал Адаму»). Наличка —
+// отдельный платёж: такой текст не называет чек и не ждёт его в очереди имён.
+func textCash(text string) bool {
+	if parser.IsCash(text) || collectorCash(text) {
+		return true
+	}
+	for _, tr := range parser.ParseMessage(text).Transactions {
+		if tr.IsCash {
+			return true
+		}
+	}
+	return false
+}
+
+// amountPair — платёж внутри строки: ФИО перед суммой (как написано) и сумма.
+type amountPair struct {
+	name   string // "" — ФИО перед суммой не написано
+	amount float64
+}
+
+// pairJoinWords — союзы списка между суммами («7500 и 5000», «15000 плюс 5000»).
+var pairJoinWords = map[string]bool{"и": true, "плюс": true, "ещё": true, "еще": true}
+
+// pairNoiseWords — пометки к сумме, которые не ФИО: банк, карта, перевод.
+var pairNoiseWords = map[string]bool{
+	"сбер": true, "сбербанк": true, "втб": true, "альфа": true, "тинькофф": true, "тинек": true,
+	"озон": true, "карта": true, "карту": true, "карты": true, "картой": true, "переводом": true,
+	"наличкой": true, "налом": true, "наличные": true, "кэш": true, "кеш": true, "cash": true,
+}
+
+// gapNameWords — слова ФИО между суммами строки и есть ли между ними союз
+// списка («+», «,», «;», «/», «и»). Хвосты сумм («т.р.», «руб»), числа,
+// пометки и служебные слова — не ФИО.
+func gapNameWords(gap string, afterNumber bool) (words []string, joined bool) {
+	joined = strings.ContainsAny(gap, "+,;/&")
+	tail := afterNumber
+	for _, w := range strings.Fields(gap) {
+		if tail && parser.IsMoneyWord(w, true) {
+			continue
+		}
+		tail = false
+		clean := strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
+		lw := strings.ToLower(clean)
+		switch {
+		case lw == "":
+		case pairJoinWords[lw]:
+			joined = true
+		case strings.IndexFunc(w, unicode.IsDigit) >= 0, nameStopwords[lw], pairNoiseWords[lw]:
+		default:
+			words = append(words, clean)
+		}
+	}
+	return words, joined
+}
+
+// lineAmountPairs — платежи строки по её суммам: каждая сумма — платёж ФИО,
+// написанного перед ней («Исаев Харон 15000 + 20000» — два платежа Исаева,
+// «Исаев Харон 15000, Магомедов Ахмед 10000» — Исаева и Магомедова). Строка,
+// начинающаяся с суммы, — платежи ФИО заголовка блока block; если же после
+// последней суммы ещё стоит ФИО («15000 Исаев Харон 20000 Магомедов Ахмед» —
+// сумма перед именем), чьи суммы — не угадываем: ФИО у пар пустые. Та же сумма
+// повтором без союза между ними («15000 (15т)») — один платёж. Учитываются
+// только суммы, похожие на деньги («за 2 месяца» — не платёж).
+func lineAmountPairs(line, block string) []amountPair {
+	var out []amountPair
+	name, prevEnd := "", 0
+	startsWithAmount := false
+	for _, h := range parser.AmountsAt(line) {
+		if !h.Real {
+			continue
+		}
+		words, joined := gapNameWords(line[prevEnd:h.Start], len(out) > 0)
+		prevEnd = h.End
+		switch {
+		case len(out) == 0:
+			name = strings.Join(words, " ")
+			if name == "" {
+				name, startsWithAmount = block, true
+			}
+		case len(words) > 0:
+			name = strings.Join(words, " ")
+		case !joined && nearAmount(out[len(out)-1].amount, h.Value):
+			continue // «15000 (15т)» — та же сумма ещё раз
+		}
+		out = append(out, amountPair{name: name, amount: h.Value})
+	}
+	if tail, _ := gapNameWords(line[prevEnd:], len(out) > 0); startsWithAmount && len(tail) > 0 {
+		for i := range out {
+			out[i].name = ""
+		}
+	}
+	return out
+}
+
+// severalAmounts — в какой-то строке текста несколько сумм-платежей
+// («Исаев Харон 15000 20000», «15000 + 20000», «7500 и 5000», «Исаев 15000,
+// Магомедов 10000»). Такой текст — список платежей, а не подпись к одному чеку.
+func severalAmounts(text string) bool {
+	for _, ln := range nonEmptyLines(text) {
+		if len(lineAmountPairs(ln, "")) > 1 {
+			return true
+		}
+	}
+	return false
+}
+
 // countAmountLines — сколько строк сообщения содержат сумму (список платежей).
 func countAmountLines(text string) int {
 	n := 0
@@ -492,7 +643,7 @@ func paymentsCash(text string) ([]parser.Transaction, []bool) {
 	}
 	cash := make([]bool, len(trs))
 	for k, tr := range trs {
-		cash[k] = tr.IsCash || parser.IsCash(tr.Line) || parser.IsCash(tr.RawName)
+		cash[k] = tr.IsCash || textCash(tr.Line) || textCash(tr.RawName)
 	}
 	markBelow := func(i int, wholeBlockOnly bool) {
 		seen := false
@@ -501,13 +652,14 @@ func paymentsCash(text string) ([]parser.Transaction, []bool) {
 				seen, cash[k] = true, true
 				continue
 			}
-			if wholeBlockOnly && seen && !parser.IsCash(lines[j]) {
+			if wholeBlockOnly && seen && !textCash(lines[j]) {
 				return // новый блок другого клиента
 			}
 		}
 	}
 	for i, ln := range lines {
-		if txAt[i] >= 0 || !parser.IsCash(ln) {
+		// «Мансур взял», «отдал Адаму» отдельной строкой — та же пометка налички.
+		if txAt[i] >= 0 || !textCash(ln) {
 			continue
 		}
 		below := false
@@ -546,8 +698,22 @@ func nameForCheckAmount(text string, amt float64) (hit checkNameHit, seen, ok bo
 	if amt <= 0 {
 		return hit, false, false
 	}
+	conflict := false
+	take := func(n, src string) {
+		if ok && normCyr(n) != normCyr(hit.name) {
+			conflict = true
+			return
+		}
+		if !ok {
+			hit, ok = checkNameHit{name: n, nameText: src}, true
+		}
+		hit.n++
+	}
 	trs, cash := paymentsCash(text)
 	for k, tr := range trs {
+		if len(lineAmountPairs(tr.Line, "")) > 1 {
+			continue // строку с несколькими суммами разбираем ниже — по парам «ФИО сумма»
+		}
 		if !nearAmount(tr.Amount, amt) && !nearAmount(parser.ExtractAmount(tr.Line), amt) {
 			continue
 		}
@@ -563,16 +729,50 @@ func nameForCheckAmount(text string, amt float64) (hit checkNameHit, seen, ok bo
 		} else if n, found = looksLikeName(tr.Line); found {
 			src = tr.Line
 		}
-		if !found {
+		if found {
+			take(n, src)
+		}
+	}
+	// Строка с несколькими суммами («Исаев Харон 15000 20000», «Исаев Харон
+	// 15000, Магомедов Ахмед 10000», «7500 и 5000» под заголовком «Магомедов
+	// Ахмед»): чек называет только ФИО, написанное перед суммой чека. Пометка
+	// налички в этой строке или отдельной строкой без суммы — граница неясна,
+	// наличка вся строка (чек не называем, бот спросит).
+	lines := nonEmptyLines(text)
+	looseCash := false
+	for _, ln := range lines {
+		if parser.ExtractAmount(ln) <= 0 && textCash(ln) {
+			looseCash = true
+		}
+	}
+	block := ""
+	for _, ln := range lines {
+		if parser.ExtractAmount(ln) <= 0 {
+			if n, isName := looksLikeName(ln); isName {
+				block = n
+			}
 			continue
 		}
-		if ok && normCyr(n) != normCyr(hit.name) {
-			return checkNameHit{}, true, false
+		pairs := lineAmountPairs(ln, block)
+		if len(pairs) < 2 {
+			continue
 		}
-		if !ok {
-			hit, ok = checkNameHit{name: n, nameText: src}, true
+		lineCash := looseCash || textCash(ln)
+		for _, p := range pairs {
+			if !nearAmount(p.amount, amt) {
+				continue
+			}
+			seen = true
+			if lineCash {
+				continue
+			}
+			if n, found := looksLikeName(p.name); found {
+				take(n, p.name)
+			}
 		}
-		hit.n++
+	}
+	if conflict {
+		return checkNameHit{}, true, false
 	}
 	return hit, seen, ok
 }
@@ -602,13 +802,17 @@ func amountLinePayer(text string) (checkNameHit, bool) {
 // называет (по числу таких платежей в тексте).
 func checkNameSource(text string, checkAmt float64) (src string, exact bool, n int, ok bool) {
 	lines := countAmountLines(text)
-	if lines > 1 {
+	// Список платежей — несколько строк с суммой или несколько сумм в строке
+	// («Исаев Харон 15000 20000», «Магомедов Ахмед 7500 и 5000»): ФИО берём
+	// только у платежа на сумму чека.
+	if lines > 1 || severalAmounts(text) {
 		if hit, _, found := nameForCheckAmount(text, checkAmt); found {
 			return hit.nameText, true, hit.n, true
 		}
 		return "", false, 0, false
 	}
-	if parser.IsCash(text) {
+	// Наличка («нал», «у Дени», «Мансур взял», «отдал Адаму») — другой платёж.
+	if textCash(text) {
 		return "", false, 0, false
 	}
 	if lines == 0 {
