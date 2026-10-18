@@ -206,15 +206,16 @@ func TestBuildIsFastOnBigVolume(t *testing.T) {
 
 // Текст, написанный задолго до операции на чеке, — про другой платёж.
 func TestTextLongBeforeOperationIsAnotherPayment(t *testing.T) {
-	c := chk(1, "g", "Магомедов Ахмед", 1, 5000, t0, "")
-	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 5000, t0.Add(-15*time.Hour), false)})
+	op := t0.Add(7 * time.Minute) // не ровно 12:00 — время прочитано с чека
+	c := chk(1, "g", "Магомедов Ахмед", 1, 5000, op, "")
+	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 5000, op.Add(-15*time.Hour), false)})
 	if got := total(b.Counted(all)); got != 10000 {
 		t.Fatalf("%v, хочу 10000", got)
 	}
 	// Время на чеке не прочитано — сравниваем только по времени присылки.
 	c.TimeGuessed = true
-	c.PostedAt = t0.Add(-14 * time.Hour)
-	b = Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 5000, t0.Add(-15*time.Hour), false)})
+	c.PostedAt = op.Add(-14 * time.Hour)
+	b = Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 5000, op.Add(-15*time.Hour), false)})
 	if got := total(b.Counted(all)); got != 5000 {
 		t.Fatalf("время чека не прочитано, текст за час до присылки: %v, хочу 5000", got)
 	}
@@ -223,9 +224,12 @@ func TestTextLongBeforeOperationIsAnotherPayment(t *testing.T) {
 // Итог частями, когда одна часть ждёт имени: итог сверх чеков не считается.
 func TestSplitTotalWithWaitingPart(t *testing.T) {
 	a := chk(1, "g", "Магомедов Ахмед", 1, 10000, t0, "")
+	a.Phone = "7901"
 	w := chk(2, "g", "Хадижат Ибрагимовна И.", 0, 5000, t0.Add(time.Minute), "")
-	w.Review, w.Confirmed = true, false
-	b := Build([]Check{a, w}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false)})
+	w.Review, w.Confirmed, w.Phone = true, false, "7901"
+	tx := txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false)
+	tx.Phone = "7901"
+	b := Build([]Check{a, w}, []Text{tx})
 	if got := total(b.Counted(all)); got != 10000 {
 		t.Fatalf("%v, хочу 10000 (5000 ждёт имени)", got)
 	}
@@ -284,19 +288,85 @@ func TestSameDocDifferentClientsConflict(t *testing.T) {
 	}
 }
 
-// По дате в чате платёж с чеком датируется присылкой чека, а не текста.
-func TestByChatDatesByCheck(t *testing.T) {
+// По дате в чате платёж датируется самой ранней уликой в месяце операции: текст
+// про платёж — днём текста, даже если чек прислали позже; если в месяце
+// операции улик нет — присылкой чека (это «старый чек»).
+func TestByChatDatesByEarliestEvidenceInMonth(t *testing.T) {
 	c := chk(1, "g", "Магомедов Ахмед", 1, 15000, t0, "")
 	c.PostedAt = t0.Add(6 * 24 * time.Hour)
 	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false)})
 	day := func(d time.Time) Filter {
-		return Filter{From: d.Truncate(24 * time.Hour), To: d.Truncate(24 * time.Hour).Add(24 * time.Hour), ByChat: true}
+		from := time.Date(d.Year(), d.Month(), d.Day(), 0, 0, 0, 0, d.Location())
+		return Filter{From: from, To: from.AddDate(0, 0, 1), ByChat: true}
 	}
-	if got := total(b.Counted(day(t0))); got != 0 {
-		t.Fatalf("день текста по дате чата: %v, хочу 0", got)
+	if got := total(b.Counted(day(t0))); got != 15000 {
+		t.Fatalf("день текста по дате чата: %v, хочу 15000", got)
 	}
-	if got := total(b.Counted(day(c.PostedAt))); got != 15000 {
-		t.Fatalf("день присылки чека: %v, хочу 15000", got)
+	if got := total(b.Counted(day(c.PostedAt))); got != 0 {
+		t.Fatalf("день присылки чека: %v, хочу 0", got)
+	}
+	// Текст 30.09 23:58, операция 30.09 23:57, чек прислан 01.10 00:03 — сентябрь.
+	op := time.Date(2026, 9, 30, 23, 57, 0, 0, time.Local)
+	c2 := chk(2, "g", "Магомедов Ахмед", 1, 15000, op, "")
+	c2.PostedAt = time.Date(2026, 10, 1, 0, 3, 0, 0, time.Local)
+	b = Build([]Check{c2}, []Text{txt(2, "g", "Магомедов Ахмед", 1, 15000, op.Add(time.Minute), false)})
+	sep := Filter{From: time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local), To: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local), ByChat: true,
+		MonthStart: time.Date(2026, 9, 1, 0, 0, 0, 0, time.Local), MonthEnd: time.Date(2026, 10, 1, 0, 0, 0, 0, time.Local)}
+	if got := total(b.Counted(sep)); got != 15000 {
+		t.Fatalf("сентябрь по дате чата: %v, хочу 15000", got)
+	}
+}
+
+// Итог частями: итог в группе без чеков (или написан там раньше) — тот же платёж.
+func TestSplitTotalOrderIndependent(t *testing.T) {
+	cs := []Check{
+		chk(1, "sb", "Магомедов Ахмед", 1, 10000, t0, ""),
+		chk(2, "sb", "Магомедов Ахмед", 1, 5000, t0.Add(time.Minute), ""),
+	}
+	for _, ts := range [][]Text{
+		{txt(1, "main", "Магомедов Ахмед", 1, 15000, t0.Add(4*time.Minute), false)},
+		{txt(1, "main", "Магомедов Ахмед", 1, 15000, t0.Add(4*time.Minute), false), txt(2, "sb", "Магомедов Ахмед", 1, 15000, t0.Add(6*time.Minute), false)},
+	} {
+		b := Build(append([]Check(nil), cs...), ts)
+		if got := total(b.Counted(all)); got != 15000 {
+			t.Fatalf("тексты %d: %v, хочу 15000", len(ts), got)
+		}
+	}
+}
+
+// Недостающая часть итога — только от того же работника: чужой чек без имени
+// не «съедает» отдельный перевод.
+func TestSplitMissingPartSameSenderOnly(t *testing.T) {
+	a := chk(1, "g", "Магомедов Ахмед", 1, 10000, t0, "")
+	a.Phone = "7901"
+	w := chk(2, "g", "", 0, 5000, t0.Add(40*time.Minute), "")
+	w.Review, w.Confirmed, w.Phone = true, false, "7902"
+	tx := txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(90*time.Minute), false)
+	tx.Phone = "7901"
+	b := Build([]Check{a, w}, []Text{tx})
+	if got := total(b.Counted(all)); got != 25000 {
+		t.Fatalf("%v, хочу 25000 (чек 10000 + отдельный перевод 15000)", got)
+	}
+}
+
+// Вторая часть подписана только фамилией — тот же клиент для итога.
+func TestSplitShortNamePart(t *testing.T) {
+	a := chk(1, "g", "Магомедов Ахмед", 1, 10000, t0, "")
+	c := chk(2, "g", "Магомедов", 2, 5000, t0.Add(time.Minute), "")
+	b := Build([]Check{a, c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false)})
+	if got := total(b.Counted(all)); got != 15000 {
+		t.Fatalf("%v, хочу 15000", got)
+	}
+}
+
+// Чек с одной датой (время подставлено 12:00) не мешает паре с утренним текстом.
+func TestDateOnlyCheckPairsWithMorningText(t *testing.T) {
+	op := time.Date(2026, 10, 14, 12, 0, 0, 0, time.Local)
+	c := chk(1, "g", "Магомедов Ахмед", 1, 15000, op, "")
+	c.PostedAt = time.Date(2026, 10, 14, 13, 0, 0, 0, time.Local)
+	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 15000, time.Date(2026, 10, 14, 8, 40, 0, 0, time.Local), false)})
+	if got := total(b.Counted(Filter{From: op.AddDate(0, 0, -1), To: op.AddDate(0, 0, 1)})); got != 15000 {
+		t.Fatalf("%v, хочу 15000", got)
 	}
 }
 

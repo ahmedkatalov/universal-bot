@@ -17,19 +17,51 @@ import (
 
 const ledgerPad = 4 * 24 * time.Hour
 
-const ledgerSenderExpr = `COALESCE(NULLIF(po.name, ''), NULLIF(%s, ''), NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), '')`
-
 // LoadBook — книга платежей по всем группам для периода [from, to) (по дате
 // операции или присылки — с запасом), client — необязательный фильтр (подстрока
 // имени клиента; пусто — все).
 func (d *DB) LoadBook(ctx context.Context, from, to time.Time, client string) (*ledger.Book, error) {
-	checks, err := d.loadLedgerChecks(ctx, from.Add(-ledgerPad), to.Add(ledgerPad), client)
+	lo, hi := from.Add(-ledgerPad), to.Add(ledgerPad)
+	checks, err := d.loadLedgerChecks(ctx, lo, hi, client)
 	if err != nil {
 		return nil, err
 	}
-	texts, err := d.loadLedgerTexts(ctx, from.Add(-ledgerPad), to.Add(ledgerPad), client)
+	texts, err := d.loadLedgerTexts(ctx, lo, hi, client)
 	if err != nil {
 		return nil, err
+	}
+	// Текст про чек пишут рядом с операцией, а чек могут прислать позже (или
+	// это тот же чек из другого дня): тексты вокруг операций таких чеков тоже
+	// нужны, иначе дневной отчёт и отчёт за период увидят разные улики.
+	var starts, ends []time.Time
+	seen := map[string]bool{}
+	for _, c := range checks {
+		if c.OpDate.IsZero() || (!c.OpDate.Before(lo.Add(ledger.TwinWindow)) && c.OpDate.Before(hi.Add(-ledger.TwinWindow))) {
+			continue
+		}
+		day := c.OpDate.Format("2006-01-02")
+		if seen[day] {
+			continue
+		}
+		seen[day] = true
+		starts = append(starts, c.OpDate.Add(-ledger.TwinWindow-24*time.Hour))
+		ends = append(ends, c.OpDate.Add(ledger.TwinWindow+24*time.Hour))
+	}
+	if len(starts) > 0 {
+		more, err := d.loadLedgerTextsAround(ctx, starts, ends, client)
+		if err != nil {
+			return nil, err
+		}
+		have := map[int]bool{}
+		for _, t := range texts {
+			have[t.ID] = true
+		}
+		for _, t := range more {
+			if !have[t.ID] {
+				have[t.ID] = true
+				texts = append(texts, t)
+			}
+		}
 	}
 	return ledger.Build(checks, texts), nil
 }
@@ -134,15 +166,34 @@ func scanLedgerChecks(rows pgx.Rows) ([]ledger.Check, error) {
 	return out, rows.Err()
 }
 
-func (d *DB) loadLedgerTexts(ctx context.Context, from, to time.Time, client string) ([]ledger.Text, error) {
+// loadLedgerTextsAround — текстовые платежи, присланные в любом из окон [starts[i], ends[i]).
+func (d *DB) loadLedgerTextsAround(ctx context.Context, starts, ends []time.Time, client string) ([]ledger.Text, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT t.id, COALESCE(t.raw_message_id, 0), COALESCE(rm.wa_message_id, ''), COALESCE(rm.wa_group_jid, ''),
-		       `+strings.Replace(ledgerSenderExpr, "%s", "NULL", 1)+`,
+		SELECT `+ledgerTextCols+`
+		FROM transactions t
+		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
+		WHERE EXISTS (SELECT 1 FROM unnest($1::timestamptz[], $2::timestamptz[]) AS w(a, b)
+		              WHERE rm.received_at >= w.a AND rm.received_at < w.b)
+		  AND ($3 = '' OR COALESCE(c.canonical_name, t.raw_name, '') ILIKE '%' || $3 || '%')`, starts, ends, client)
+	if err != nil {
+		return nil, err
+	}
+	return scanLedgerTexts(rows)
+}
+
+const ledgerTextCols = `t.id, COALESCE(t.raw_message_id, 0), COALESCE(rm.wa_message_id, ''), COALESCE(rm.wa_group_jid, ''),
+		       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), ''),
 		       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1),
 		       COALESCE(t.contact_id, 0), COALESCE(c.canonical_name, t.raw_name, ''),
 		       COALESCE(t.amount, 0)::float8, t.is_cash, COALESCE(t.card_to, ''), COALESCE(t.collector, ''),
 		       t.dup_pending, t.ignored, COALESCE(rm.deleted, false),
-		       t.tx_date::timestamptz, COALESCE(rm.received_at, t.tx_date::timestamptz)
+		       t.tx_date::timestamptz, COALESCE(rm.received_at, t.tx_date::timestamptz)`
+
+func (d *DB) loadLedgerTexts(ctx context.Context, from, to time.Time, client string) ([]ledger.Text, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT `+ledgerTextCols+`
 		FROM transactions t
 		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
@@ -152,6 +203,10 @@ func (d *DB) loadLedgerTexts(ctx context.Context, from, to time.Time, client str
 	if err != nil {
 		return nil, err
 	}
+	return scanLedgerTexts(rows)
+}
+
+func scanLedgerTexts(rows pgx.Rows) ([]ledger.Text, error) {
 	defer rows.Close()
 	var out []ledger.Text
 	for rows.Next() {

@@ -91,8 +91,19 @@ type Payment struct {
 	// Conflicts — экземпляры того же чека (тот же номер документа), подписанные
 	// другим клиентом: платёж один, но чей он — надо уточнить.
 	Conflicts []*Check
-	groups    map[string]bool
-	mark      int // служебная метка при подборе пар
+	// ChatAt — дата для отчёта «по дате в чате»: самая ранняя улика платежа,
+	// присланная в том же месяце, что и операция (иначе — присылка чека).
+	ChatAt time.Time
+	groups map[string]bool
+	mark   int // служебная метка при подборе пар
+}
+
+// chatTime — дата «по дате в чате» (для книг, собранных не через Build, — присылка).
+func (p *Payment) chatTime() time.Time {
+	if p.ChatAt.IsZero() {
+		return p.PostedAt
+	}
+	return p.ChatAt
 }
 
 // Main — главный чек платежа (nil — платёж только из текста).
@@ -440,7 +451,7 @@ const textLead = 3 * time.Hour
 // часовой пояс), по нему не судим.
 func textBeforePayment(p *Payment, t *Text) bool {
 	for _, c := range p.Checks {
-		if c.Review || c.TimeGuessed || c.OpDate.IsZero() || c.OpDate.After(c.PostedAt.Add(10*time.Minute)) {
+		if c.Review || !timeReliable(c) {
 			continue
 		}
 		if c.OpDate.After(t.PostedAt.Add(textLead)) {
@@ -448,6 +459,18 @@ func textBeforePayment(p *Payment, t *Text) bool {
 		}
 	}
 	return false
+}
+
+// timeReliable — по времени операции на чеке можно судить: оно прочитано (не
+// подставлено), не позже присылки самого чека (иначе — ошибка чтения или другой
+// часовой пояс) и не ровно 12:00:00 (так ставится время, когда на чеке только
+// дата).
+func timeReliable(c *Check) bool {
+	op := c.OpDate
+	if c.TimeGuessed || op.IsZero() || op.After(c.PostedAt.Add(10*time.Minute)) {
+		return false
+	}
+	return !(op.Hour() == 12 && op.Minute() == 0 && op.Second() == 0 && op.Nanosecond() == 0)
 }
 
 // gapBucket — близость текста к чеку крупно: рядом (2 часа), в тот же день,
@@ -759,23 +782,14 @@ func Build(checks []Check, texts []Text) *Book {
 		textIn[c.p][c.t.Group] = true
 	}
 
-	// 7: текст-итог платежа частями. Тот же итог в другой группе — тот же
-	// платёж (как и обычный текст).
+	// 7: текст-итог платежа частями. Сначала — итоги рядом со своими чеками
+	// (в той же группе), потом — тот же итог в другой группе (или итог только
+	// в группе без чеков): результат не зависит от того, где написали раньше.
 	splitOf := map[*Text]split{}
 	var splits []*Text
 	byTime := newTimeIndex(checkPays)
 	extra := uncountedChecks(b.Excluded)
-	for _, t := range transfers {
-		if t.Cash || twinOf[t] != nil {
-			continue
-		}
-		sp, ok := sameSplitElsewhere(t, splits, splitOf, textIn, nm)
-		if !ok {
-			sp = splitParts(t, byTime.around(t.PostedAt, splitWindow), extra, textIn, nm)
-		}
-		if len(sp.parts) == 0 {
-			continue
-		}
+	record := func(t *Text, sp split) {
 		splitOf[t] = sp
 		splits = append(splits, t)
 		for _, p := range sp.parts {
@@ -783,6 +797,22 @@ func Build(checks []Check, texts []Text) *Book {
 				textIn[p] = map[string]bool{}
 			}
 			textIn[p][t.Group] = true
+		}
+	}
+	for _, anyGroup := range []bool{false, true} {
+		for _, t := range transfers {
+			if t.Cash || twinOf[t] != nil || len(splitOf[t].parts) > 0 {
+				continue
+			}
+			if anyGroup {
+				if sp, ok := sameSplitElsewhere(t, splits, splitOf, textIn, nm); ok {
+					record(t, sp)
+					continue
+				}
+			}
+			if sp := splitParts(t, byTime.around(t.PostedAt, splitWindow), extra, textIn, nm, anyGroup); len(sp.parts) > 0 {
+				record(t, sp)
+			}
 		}
 	}
 
@@ -806,7 +836,37 @@ func Build(checks []Check, texts []Text) *Book {
 			OpDate: t.OpDate, PostedAt: t.PostedAt, Texts: []*Text{t}, groups: map[string]bool{t.Group: true},
 		})
 	}
+	for _, p := range b.Payments {
+		p.ChatAt = chatAt(p)
+	}
 	return b
+}
+
+// chatAt — когда платёж впервые появился в чате: самая ранняя улика (чек или
+// текст про него), присланная в месяце операции; если таких нет — присылка
+// чека (тогда это «старый чек» для месяца присылки).
+func chatAt(p *Payment) time.Time {
+	m := p.Main()
+	if m == nil {
+		return p.PostedAt
+	}
+	inMonth := func(t time.Time) bool { return t.Year() == p.OpDate.Year() && t.Month() == p.OpDate.Month() }
+	var best time.Time
+	consider := func(t time.Time) {
+		if inMonth(t) && (best.IsZero() || t.Before(best)) {
+			best = t
+		}
+	}
+	for _, c := range p.Checks {
+		consider(c.PostedAt)
+	}
+	for _, t := range p.Texts {
+		consider(t.PostedAt)
+	}
+	if best.IsZero() {
+		return p.PostedAt
+	}
+	return best
 }
 
 // split — части платежа, итог которого написан текстом: посчитанные платежи
@@ -816,17 +876,24 @@ type split struct {
 	missing []*Check
 }
 
+// waiting — непосчитанный экземпляр чека и его корень (один чек в нескольких
+// группах — один корень).
+type waiting struct {
+	inst, root *Check
+	reason     Reason
+}
+
 // uncountedChecks — чеки, которые могут быть частью платежа, но сейчас не в
 // сборе: ждут «чей чек?», исключены владельцем, удалены в WhatsApp.
-func uncountedChecks(ex []Excluded) []*Check {
-	var out []*Check
+func uncountedChecks(ex []Excluded) []waiting {
+	var out []waiting
 	for _, e := range ex {
-		if e.Check == nil || e.Check.Amount <= 0 || e.Check.FwdOrigin != "" || e.Of != nil {
+		if e.Check == nil || e.Check.Amount <= 0 {
 			continue
 		}
 		switch e.Reason {
 		case ReasonReview, ReasonIgnored, ReasonDeleted:
-			out = append(out, e.Check)
+			out = append(out, waiting{inst: e.Check, root: e.Root(), reason: e.Reason})
 		}
 	}
 	return out
@@ -864,20 +931,25 @@ func sameSplitElsewhere(t *Text, splits []*Text, splitOf map[*Text]split, textIn
 	return split{}, false
 }
 
-// splitParts — 2–3 чека того же клиента без своего текста в этой группе, в
-// той же группе и рядом по времени, сумма которых равна сумме текста (платёж
-// частями из-за лимита банка). Хотя бы одна часть посчитана; остальные могут
-// ждать «чей чек?», быть исключены или удалены — тогда текст всё равно не
-// считается сверх своих чеков. Из подходящих наборов — с меньшим числом
-// непосчитанных частей, меньший и самый близкий по времени.
-func splitParts(t *Text, pays []*Payment, extra []*Check, textIn map[*Payment]map[string]bool, nm *nameMemo) split {
+// splitParts — 2–3 чека того же клиента без своего текста в этой группе, рядом
+// по времени, сумма которых равна сумме текста (платёж частями из-за лимита
+// банка). Части ищутся в группе текста (anyGroup — в любой группе: итог
+// написали там, где чеков нет). Хотя бы одна часть посчитана; остальные могут
+// ждать «чей чек?», быть исключены или удалены — но только от того же
+// работника и не от другого плательщика: тогда текст не считается сверх своих
+// чеков. Из подходящих наборов — с меньшим числом непосчитанных частей, меньший
+// и самый близкий по времени.
+func splitParts(t *Text, pays []*Payment, extra []waiting, textIn map[*Payment]map[string]bool, nm *nameMemo, anyGroup bool) split {
 	var cand []*Payment
 	for _, p := range pays {
-		if textIn[p][t.Group] || p.Amount >= t.Amount || twinGap(p, t) > splitWindow || textBeforePayment(p, t) ||
-			textMatch(p, t, false, nm) != 0 {
+		if textIn[p][t.Group] || p.Amount >= t.Amount || textBeforePayment(p, t) {
 			continue
 		}
-		inGroup := false
+		gap := twinGap(p, t)
+		if gap > splitWindow || textMatch(p, t, gap <= shortNameWindow, nm) < 0 {
+			continue
+		}
+		inGroup := anyGroup
 		for _, c := range p.Checks {
 			if c.Group == t.Group {
 				inGroup = true
@@ -890,16 +962,42 @@ func splitParts(t *Text, pays []*Payment, extra []*Check, textIn map[*Payment]ma
 	if len(cand) == 0 {
 		return split{}
 	}
+	phones := map[string]bool{}
+	payers := map[string]bool{}
+	if t.Phone != "" {
+		phones[t.Phone] = true
+	}
+	for _, p := range cand {
+		for _, c := range p.Checks {
+			if c.Phone != "" {
+				phones[c.Phone] = true
+			}
+			if c.Payer != "" {
+				payers[ClientKey(c.Payer)] = true
+			}
+		}
+	}
 	var miss []*Check
-	for _, c := range extra {
-		if c.Group != t.Group || c.Amount >= t.Amount || checkGap(c, t) > splitWindow {
+	seenRoot := map[*Check]bool{}
+	for _, w := range extra {
+		c := w.inst
+		if seenRoot[w.root] || (!anyGroup && c.Group != t.Group) || c.Amount >= t.Amount || checkGap(c, t) > splitWindow {
 			continue
+		}
+		// Часть платежа присылает тот же работник; удалённый чек — только тот,
+		// кто написал итог.
+		if c.Phone == "" || !phones[c.Phone] || (w.reason == ReasonDeleted && c.Phone != t.Phone) {
+			continue
+		}
+		if c.Payer != "" && len(payers) > 0 && !payers[ClientKey(c.Payer)] {
+			continue // другой плательщик — другой перевод
 		}
 		// Чек без названного клиента может быть частью; названный — только тот же клиент.
 		if c.ContactID != 0 && c.Confirmed && !nm.sameClient(c.ContactID, c.Client, t.ContactID, t.Client) {
 			continue
 		}
-		miss = append(miss, c)
+		seenRoot[w.root] = true
+		miss = append(miss, w.root)
 	}
 	if len(cand)+len(miss) < 2 {
 		return split{}
@@ -1109,7 +1207,7 @@ func (b *Book) Counted(f Filter) []*Payment {
 			continue
 		}
 		if f.ByChat {
-			if !f.inPeriod(p.PostedAt) || f.oldOperation(p) {
+			if !f.inPeriod(p.chatTime()) || f.oldOperation(p) {
 				continue
 			}
 		} else if !f.inPeriod(p.OpDate) {
@@ -1128,7 +1226,7 @@ func (b *Book) OldChecks(f Filter) []*Payment {
 	}
 	var out []*Payment
 	for _, p := range b.Payments {
-		if p.InGroups(f.Groups) && f.inPeriod(p.PostedAt) && f.oldOperation(p) {
+		if p.InGroups(f.Groups) && f.inPeriod(p.chatTime()) && f.oldOperation(p) {
 			out = append(out, p)
 		}
 	}
