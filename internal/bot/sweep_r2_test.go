@@ -1013,7 +1013,7 @@ func TestR2_32_CollapsedCopyDoubleCounted(t *testing.T) {
 	}
 	e.sendGroup(groupReply(src, emp, "Сафаи", "Магомедов Ахмед", q.ID, e.botJID(), q.Text))
 	e.clarifyTick(ctx)
-	sendWithMedia(sberCheck("5000", "11:00:00"))
+	sendWithMedia(sberCheck("5000", l5collapsedPastHMS()))
 	e.clarifyTick(ctx)
 	if got := dayTotals(e, src); sum(got) != 5000 {
 		t.Fatalf("исходная группа: %v", got)

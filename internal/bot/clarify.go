@@ -811,8 +811,11 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		return b.applyDupFixAnswer(ctx, msg.Info.Chat, quotedID, fix, text)
 	}
 	// «Похоже, это тот же чек, что уже засчитан» — «другой» засчитывает отдельно.
-	if isSameAsk {
-		return b.applySameCheckAnswer(ctx, msg.Info.Chat, quotedID, same, text)
+	// Не «тот же/другой», а, например, ФИО — дальше: вопрос по свёрнутому экрану
+	// («похоже, тот же перевод, что чек выше… или ответьте ФИО») связан и с
+	// самим экраном.
+	if isSameAsk && b.applySameCheckAnswer(ctx, msg.Info.Chat, quotedID, same, text) {
+		return true
 	}
 
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».
