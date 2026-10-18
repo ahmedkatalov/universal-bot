@@ -157,7 +157,10 @@ func (b *Bot) cashDupCheckOn() bool {
 // 15000», а следом «Магомедов Ахмед нал 15000» (опечатку исправили, отправив
 // заново) — тот же клиент, придержать и спросить. Сравнение строгое, как для
 // всех денежных решений: «Омаров» и «Умаров» — разные клиенты.
-func init() { db.SameCashClient = sameClientMoney }
+func init() {
+	db.SameCashClient = sameClientMoney
+	db.CashDupCheck = func() bool { return askReceiptsEnabled() && cashDupCheckEnabled() }
+}
 
 // clarifyLoop раз в 45 секунд проверяет группы на чеки без клиента и задаёт
 // по ним вопросы (аккуратно, не спамя).

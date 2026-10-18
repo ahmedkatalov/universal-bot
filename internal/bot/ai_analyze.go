@@ -243,7 +243,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		return
 	}
 
-	payments := consensusPayments(runs, okRuns)
+	payments, rest := consensusSplit(runs, okRuns)
 
 	// Чтения разошлись: платёж видят, но по-разному (разные клиенты), и ни один
 	// не набрал большинства — вердикта НЕТ. Молча закрыть сообщение нельзя:
@@ -251,10 +251,30 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// (как при недоступном ИИ); иначе (или уже перечитывали) — спрашиваем
 	// сотрудника «❓». Где спрашивать нельзя (пересчёт, импорт истории, болтовня
 	// с цифрой, группа на «молчи») — оставляем сообщение неразобранным: его
-	// подберёт «пересчитай», а фоновый повтор по кругу не гоняет.
-	disputed := readsUndecided(runs, okRuns, payments)
+	// подберёт «пересчитай», а фоновый повтор не гоняет его по кругу и не
+	// спрашивает о нём задним числом и после перезапуска (отметка в базе).
+	// То же, когда спорен лишь один из платежей сообщения: остальные
+	// согласованы, а этот одни чтения записали на одного клиента, другие — на
+	// другого.
+	disputed := readsUndecided(rest, okRuns)
+	var slots []aiPayment // спорные платежи при согласованных остальных: сумма есть, клиента нет
+	if disputed && len(payments) > 0 {
+		slots = disputedSlots(rest, okRuns)
+		if len(slots) == 0 {
+			slots = b.uncoveredLines(joined, payments, cashHint)
+		}
+		if len(slots) == 0 {
+			// Лишний платёж видели по-разному и в сумме, а в тексте лишней
+			// строки нет — это шум чтений, а не потерянные деньги.
+			disputed = false
+		}
+	}
 	if disputed {
 		times := b.noteDisputedRead(rawID)
+		cantAsk := !paymentLikely || b.groupSilent(chat)
+		if cantAsk {
+			_ = b.db.MarkAIDisputed(ctx, rawID)
+		}
 		switch {
 		case times == 1 && okRuns < n:
 			fmt.Printf("ИИ-доразбор: сообщение %d — чтения разошлись (%d из %d удались), перечитаю позже\n", rawID, okRuns, n)
@@ -262,7 +282,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
 				txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
 			return
-		case !paymentLikely || b.groupSilent(chat):
+		case cantAsk:
 			fmt.Printf("ИИ-доразбор: сообщение %d — чтения разошлись, спросить нельзя; оставляю неразобранным\n", rawID)
 			keepUnparsed = true
 			return
@@ -293,6 +313,19 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 	if disputed && question == "" {
 		question = "Не смог точно разобрать платёж — чей он и на какую сумму? Ответьте на это сообщение: ФИО клиента и сумма."
+	}
+	if len(slots) > 0 {
+		// Спорен лишь один из платежей: остальные записываем, а его деньги
+		// держим в сборе заглушкой без клиента (ответ на «❓» даст ей клиента).
+		var sums []string
+		for _, sl := range slots {
+			sums = append(sums, formatMoney(sl.Amount))
+		}
+		if len(slots) == 1 {
+			question = "Не смог точно разобрать, чей платёж на " + sums[0] + " ₽. Ответьте на это сообщение: ФИО клиента."
+		} else {
+			question = "Не смог точно разобрать, чьи платежи на " + strings.Join(sums, ", ") + " ₽. Ответьте на это сообщение: ФИО и сумма по каждому."
+		}
 	}
 
 	saved := 0
@@ -341,6 +374,27 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 		saved++
 	}
+	for _, sl := range slots {
+		if insertFailed {
+			break
+		}
+		isCash := sl.Cash || cashHint
+		name, card := "(не указано)", ""
+		if isCash {
+			name, card = "Наличка", "наличные"
+		}
+		contactID, err := b.db.GetOrCreateContact(ctx, name)
+		if err == nil {
+			err = b.db.InsertTransaction(ctx, db.TransactionInput{ContactID: contactID, RawName: name, Amount: sl.Amount,
+				CardTo: card, IsCash: isCash, RawMessageID: rawID, TxDate: txDate, DupCheck: b.cashDupCheckOn()})
+		}
+		if err != nil {
+			fmt.Println("ИИ-доразбор: ошибка сохранения спорного платежа:", err)
+			insertFailed = true
+			break
+		}
+		saved++
+	}
 	if question != "" && !insertFailed {
 		// ИИ спросил, чей платёж. Деньги до ответа держим в сборе: строки
 		// «Нал 27000» без имени — заглушкой «Наличка» (ответ даст ей клиента), а
@@ -350,6 +404,9 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
 				savedAmts = append(savedAmts, p.Amount)
 			}
+		}
+		for _, sl := range slots {
+			savedAmts = append(savedAmts, sl.Amount)
 		}
 		lines, _ := b.deterministicLines(joined, detAll)
 		var keep []parser.Transaction
@@ -380,16 +437,20 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 		dsaved, _ := b.recordParsedLines(ctx, keep, joined, rawID, txDate, cashHint)
 		saved += dsaved
-		if (placeholders > 0 || saved == 0 || dsaved > 0) && !b.groupSilent(chat) {
-			if id := b.sendTextReturnID(chat, "❓ "+question); id != "" {
+		if (placeholders > 0 || saved == 0 || dsaved > 0 || len(slots) > 0) && !b.groupSilent(chat) {
+			if id := b.askAboutMessage(ctx, chat, rawID, "❓ "+question); id != "" {
 				amt := 0.0
+				isCash := cashHint || parser.IsCash(joined)
 				switch {
+				case len(slots) > 0:
+					if len(slots) == 1 && placeholders == 0 {
+						amt, isCash = slots[0].Amount, slots[0].Cash || cashHint
+					}
 				case placeholders == 1:
 					amt = phAmount
 				case placeholders == 0 && len(tokens) == 1:
 					amt = tokens[0]
 				}
-				isCash := cashHint || parser.IsCash(joined)
 				b.registerPaymentAsk(id, paymentAsk{rawID: rawID, amount: amt, cash: isCash, txDate: txDate})
 				_ = b.db.SetWhoAsk(ctx, rawID, id, amt, isCash)
 				b.setOpenAsk(chat.String(), openAsk{kind: "payment_who", txID: rawID, amount: amt, senderJID: senderJIDOfRaw(ctx, b, rawID)})
@@ -543,11 +604,20 @@ func paymentReads() int {
 // «10.000»→5000), признак наличка/перевод — строгим большинством голосов, имя —
 // самое частое написание.
 func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
+	agreed, _ := consensusSplit(runs, okRuns)
+	return agreed
+}
+
+// consensusSplit — то же, что consensusPayments, плюс «остаток» каждого
+// чтения: его платежи, не вошедшие в согласованные (их клиента чтения назвали
+// по-разному или платёж увидело меньшинство).
+func consensusSplit(runs [][]aiPayment, okRuns int) (agreed []aiPayment, rest [][]aiPayment) {
+	rest = make([][]aiPayment, len(runs))
 	if okRuns <= 1 {
 		if len(runs) > 0 {
-			return runs[0]
+			return runs[0], rest
 		}
-		return nil
+		return nil, rest
 	}
 	type agg struct {
 		names     map[string]int
@@ -559,10 +629,15 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 		card      map[string]int
 		note      string
 	}
+	type seen struct {
+		key string
+		p   aiPayment
+	}
 	clientOf := consensusClients(runs)
 	byName := map[string]*agg{}
 	var order []string
-	for _, run := range runs {
+	keysOf := make([][]seen, len(runs))
+	for i, run := range runs {
 		// Одно имя ДВАЖДЫ в одном чтении («Ахмед 5000 / Ахмед 10000») — это два
 		// платежа: нумеруем их по возрастанию суммы, чтобы «#0» и «#1» совпадали
 		// между чтениями. Раньше оба сливались в один и «встречались 2 раза» в
@@ -578,6 +653,7 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 			nameKey := clientOf(name)
 			key := nameKey + "#" + strconv.Itoa(ordinal[nameKey])
 			ordinal[nameKey]++
+			keysOf[i] = append(keysOf[i], seen{key, p})
 			a := byName[key]
 			if a == nil {
 				a = &agg{names: map[string]int{}, collector: map[string]int{}, card: map[string]int{}}
@@ -605,7 +681,6 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 		}
 	}
 	maj := okRuns/2 + 1 // строгое большинство прочтений
-	var out []aiPayment
 	for _, key := range order {
 		a := byName[key]
 		if a.total < maj {
@@ -617,7 +692,7 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 				name = n
 			}
 		}
-		out = append(out, aiPayment{
+		agreed = append(agreed, aiPayment{
 			Name:      name,
 			Amount:    medianFloat(a.amounts),
 			Cash:      a.cashVotes*2 > a.total, // строгое большинство голосов «наличка»
@@ -626,15 +701,29 @@ func consensusPayments(runs [][]aiPayment, okRuns int) []aiPayment {
 			Note:      a.note,
 		})
 	}
-	return out
+	for i, ks := range keysOf {
+		for _, k := range ks {
+			if byName[k.key].total < maj {
+				rest[i] = append(rest[i], k.p)
+			}
+		}
+	}
+	return agreed, rest
 }
 
 // consensusClients — кто есть кто в чтениях: функция «имя → ключ клиента».
 // Ключ — слова имени без порядка, регистра и ё (ledger.ClientKey). Иное
-// написание (падеж, опечатка) сливается с уже встреченным клиентом по строгому
-// сравнению для денег (sameClientMoney: Омаров ≠ Умаров) — и только если они ни
-// разу не встретились в ОДНОМ чтении: два похожих имени в одном чтении — два
-// разных клиента.
+// написание (падеж, опечатка, инициалы) сливается с клиентом по строгому
+// сравнению для денег (sameClientMoney: Омаров ≠ Умаров) — и только если:
+//   - они ни разу не встретились в ОДНОМ чтении (два похожих имени в одном
+//     чтении — два разных клиента);
+//   - написание не подходит к двум РАЗНЫМ клиентам: «Магомедов А.» годится и
+//     для «Магомедов Ахмед», и для «Магомедов Алихан» — такое имя ни с кем не
+//     сливается, иначе платёж достался бы тому, чьё чтение пришло первым;
+//   - сравнивается с представителем клиента (первым написанием), а не с любым
+//     уже слитым: цепочка через инициалы не склеивает разных людей.
+//
+// Итог не зависит от порядка, в котором пришли чтения.
 func consensusClients(runs [][]aiPayment) func(name string) string {
 	key := func(name string) string {
 		if k := ledger.ClientKey(name); k != "" {
@@ -662,44 +751,75 @@ func consensusClients(runs [][]aiPayment) func(name string) string {
 			keys[k].runs[i] = true
 		}
 	}
+	// Порядок ключей — по самим ключам, а не по тому, чьё чтение пришло первым.
+	sort.Strings(order)
+	disjoint := func(a, b map[int]bool) bool {
+		for i := range a {
+			if b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	n := len(order)
+	match := make([][]bool, n)
+	for i := range match {
+		match[i] = make([]bool, n)
+	}
+	for i := 0; i < n; i++ {
+		for j := i + 1; j < n; j++ {
+			a, b := keys[order[i]], keys[order[j]]
+			if disjoint(a.runs, b.runs) && sameClientMoney(a.name, b.name) {
+				match[i][j], match[j][i] = true, true
+			}
+		}
+	}
+	// Мост: имя подходит к двум написаниям, которые сами — разные клиенты.
+	bridge := make([]bool, n)
+	for i := 0; i < n && n > 2; i++ {
+		var nb []int
+		for j := 0; j < n; j++ {
+			if match[i][j] {
+				nb = append(nb, j)
+			}
+		}
+	pairs:
+		for x := 0; x < len(nb); x++ {
+			for y := x + 1; y < len(nb); y++ {
+				if !match[nb[x]][nb[y]] {
+					bridge[i] = true
+					break pairs
+				}
+			}
+		}
+	}
 	rep := map[string]string{}
-	var groups []string
-	groupRuns := map[string]map[int]bool{}
-	groupNames := map[string][]string{}
-	for _, k := range order {
-		in := keys[k]
-		target := ""
-		for _, g := range groups {
-			disjoint := true
-			for i := range in.runs {
-				if groupRuns[g][i] {
-					disjoint = false
-					break
-				}
-			}
-			if !disjoint {
-				continue
-			}
-			for _, n := range groupNames[g] {
-				if sameClientMoney(in.name, n) {
+	var groups []int
+	groupRuns := map[int]map[int]bool{}
+	for i := 0; i < n; i++ {
+		k := order[i]
+		target := -1
+		if !bridge[i] {
+			hits := 0
+			for _, g := range groups {
+				if !bridge[g] && match[i][g] && disjoint(keys[k].runs, groupRuns[g]) {
+					hits++
 					target = g
-					break
 				}
 			}
-			if target != "" {
-				break
+			if hits != 1 {
+				target = -1 // ни к кому или к нескольким сразу — отдельный клиент
 			}
 		}
-		if target == "" {
-			target = k
-			groups = append(groups, k)
-			groupRuns[k] = map[int]bool{}
+		if target < 0 {
+			target = i
+			groups = append(groups, i)
+			groupRuns[i] = map[int]bool{}
 		}
-		rep[k] = target
-		for i := range in.runs {
-			groupRuns[target][i] = true
+		rep[k] = order[target]
+		for r := range keys[k].runs {
+			groupRuns[target][r] = true
 		}
-		groupNames[target] = append(groupNames[target], in.name)
 	}
 	return func(name string) string {
 		k := key(name)
@@ -710,15 +830,19 @@ func consensusClients(runs [][]aiPayment) func(name string) string {
 	}
 }
 
-// readsUndecided — у чтений нет вердикта: ни один платёж не набрал большинства
-// (agreed пуст), но и «платежа нет» большинство НЕ сказало — платёж видели, только
-// по-разному. Разовая галлюцинация (1 из 3 при двух пустых) — вердикт «не платёж».
-func readsUndecided(runs [][]aiPayment, okRuns int, agreed []aiPayment) bool {
-	if okRuns <= 1 || len(agreed) > 0 {
+// readsUndecided — у чтений нет вердикта: платёж видели, но по-разному, и
+// большинство НЕ сказало «больше платежей нет». rest — остатки чтений (см.
+// consensusSplit): платежи, не набравшие большинства. Чтений, в остатке
+// которых ничего нет, должно быть большинство — иначе вердикта нет, даже если
+// другие платежи сообщения согласованы («Исаев Харон 20000 / Магомедов 5000»:
+// Исаева прочли одинаково, а 5000 — то «Магомедов», то «Магомедов Ахмед»).
+// Разовая галлюцинация (1 из 3 при двух пустых) — вердикт «не платёж».
+func readsUndecided(rest [][]aiPayment, okRuns int) bool {
+	if okRuns <= 1 {
 		return false
 	}
 	seen := 0
-	for _, run := range runs {
+	for _, run := range rest {
 		for _, p := range run {
 			if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
 				seen++
@@ -727,6 +851,88 @@ func readsUndecided(runs [][]aiPayment, okRuns int, agreed []aiPayment) bool {
 		}
 	}
 	return seen > 0 && okRuns-seen < okRuns/2+1
+}
+
+// disputedSlots — платежи остатка, сумму которых большинство чтений назвало
+// одинаково (расходятся только в клиенте): их деньги точно есть, неясно чьи.
+// Признак «наличка» — большинством голосов.
+func disputedSlots(rest [][]aiPayment, okRuns int) []aiPayment {
+	type slot struct {
+		amount float64
+		votes  int
+		cash   int
+	}
+	slots := map[string]*slot{}
+	var order []string
+	for _, run := range rest {
+		amts := append([]aiPayment(nil), run...)
+		sort.SliceStable(amts, func(i, j int) bool { return amts[i].Amount < amts[j].Amount })
+		ordinal := map[float64]int{}
+		for _, p := range amts {
+			if p.Amount <= 0 || strings.TrimSpace(p.Name) == "" {
+				continue
+			}
+			a := math.Round(p.Amount)
+			k := strconv.FormatFloat(a, 'f', 0, 64) + "#" + strconv.Itoa(ordinal[a])
+			ordinal[a]++
+			if slots[k] == nil {
+				slots[k] = &slot{amount: a}
+				order = append(order, k)
+			}
+			slots[k].votes++
+			if p.Cash {
+				slots[k].cash++
+			}
+		}
+	}
+	var out []aiPayment
+	for _, k := range order {
+		if s := slots[k]; s.votes >= okRuns/2+1 {
+			out = append(out, aiPayment{Amount: s.amount, Cash: s.cash*2 > s.votes})
+		}
+	}
+	return out
+}
+
+// uncoveredLines — строки парсера, суммы которых не покрыты согласованными
+// платежами (запасной способ найти спорный платёж, когда чтения разошлись и в
+// сумме): сумма — из текста, клиента нет.
+func (b *Bot) uncoveredLines(text string, agreed []aiPayment, cashHint bool) []aiPayment {
+	left := make([]float64, 0, len(agreed))
+	for _, p := range agreed {
+		left = append(left, p.Amount)
+	}
+	lines, _ := b.deterministicLines(text, detAll)
+	var out []aiPayment
+	for _, tr := range lines {
+		if tr.Amount <= 0 {
+			continue
+		}
+		covered := false
+		for k, a := range left {
+			if math.Abs(a-tr.Amount) < 1 {
+				left = append(left[:k], left[k+1:]...)
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			out = append(out, aiPayment{Amount: tr.Amount, Cash: cashHint || tr.IsCash || parser.IsCash(tr.Line)})
+		}
+	}
+	return out
+}
+
+// askAboutMessage — вопрос «❓» по сообщению. Свежее сообщение — вопрос сразу
+// под ним, цитата не нужна; давнее (перечитали после сбоя ИИ или перезапуска)
+// — вопрос цитирует его: иначе в группе не понять, о каком платеже речь.
+func (b *Bot) askAboutMessage(ctx context.Context, chat types.JID, rawID int, text string) string {
+	if b.db != nil {
+		if ref, err := b.db.RawQuoteRef(ctx, rawID); err == nil && ref.WaID != "" && time.Since(ref.ReceivedAt) > 2*time.Minute {
+			return b.sendReply(chat, text, ref.WaID, ref.SenderJID)
+		}
+	}
+	return b.sendTextReturnID(chat, text)
 }
 
 // noteDisputedRead — чтения ИИ по сообщению разошлись ещё раз; сколько всего.
@@ -1288,7 +1494,7 @@ func (b *Bot) retryAIText(ctx context.Context) {
 			_, flying := b.aiInFlight[m.ID]
 			// Чтения разошлись и спросить было нельзя — сообщение оставлено для
 			// «пересчитай»; по кругу каждые 3 минуты его не перечитываем.
-			disputed := b.aiDisputed[m.ID] > 0
+			disputed := b.aiDisputed[m.ID] > 0 || m.Disputed
 			if _, ok := b.aiRetry[m.ID]; ok || fresh || flying || disputed {
 				continue // ещё разбирается, уже в очереди или ждёт пересчёта
 			}
