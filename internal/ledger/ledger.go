@@ -436,9 +436,11 @@ func twinGap(p *Payment, t *Text) time.Duration {
 const textLead = 3 * time.Hour
 
 // textBeforePayment — текст написан раньше операции на чеке больше чем на textLead.
+// Время операции позже присылки самого чека — ошибка чтения (или другой
+// часовой пояс), по нему не судим.
 func textBeforePayment(p *Payment, t *Text) bool {
 	for _, c := range p.Checks {
-		if c.Review || c.TimeGuessed || c.OpDate.IsZero() {
+		if c.Review || c.TimeGuessed || c.OpDate.IsZero() || c.OpDate.After(c.PostedAt.Add(10*time.Minute)) {
 			continue
 		}
 		if c.OpDate.After(t.PostedAt.Add(textLead)) {

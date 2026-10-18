@@ -4251,8 +4251,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		}
 		// Экран показывает уже сделанный перевод: экран, присланный раньше, чем
 		// сделана операция этого чека (время напечатано на чеке), — другой перевод.
+		// Время операции позже присылки самого чека — ошибка чтения (или другой
+		// часовой пояс): по нему не судим.
 		var opTime time.Time
-		if rd.HasTxTime {
+		if rd.HasTxTime && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
 			opTime = rd.TxTime
 		}
 		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, opTime, rawID, rankCollapsed); err != nil {

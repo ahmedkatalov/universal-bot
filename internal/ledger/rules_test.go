@@ -299,3 +299,14 @@ func TestByChatDatesByCheck(t *testing.T) {
 		t.Fatalf("день присылки чека: %v, хочу 15000", got)
 	}
 }
+
+// Время операции на чеке позже его присылки (ошибка чтения, другой часовой
+// пояс) — правилу «текст задолго до операции» не мешает.
+func TestFutureOperationTimeIgnored(t *testing.T) {
+	c := chk(1, "g", "Магомедов Ахмед", 1, 10000, t0.Add(9*time.Hour), "")
+	c.PostedAt = t0
+	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 10000, t0.Add(2*time.Minute), false)})
+	if got := total(b.Counted(Filter{From: t0.AddDate(0, 0, -10), To: t0.AddDate(0, 0, 10)})); got != 10000 {
+		t.Fatalf("%v, хочу 10000", got)
+	}
+}
