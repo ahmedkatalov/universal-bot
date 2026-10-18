@@ -99,7 +99,7 @@ func TestL4intake_15_CollapsedOfOtherClientKept(t *testing.T) {
 	}
 	for _, caption := range []string{"Исаев Харон", ""} {
 		e, grp, emp := l4intakeCollapsedNamed(t, "coll2")
-		l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", "11:30:00"), caption, "")
+		l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", l5collapsedPastHMS()), caption, "")
 		if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 || sum(got) != 5000 {
 			t.Errorf("подпись %q: сбор %v, ожидали один платёж Исаев Харон 5000 (полный заменил свёрнутый)", caption, got)
 		}
@@ -473,7 +473,7 @@ func TestL4intake_R2_CollapsedShortNameReplacedByFullCheck(t *testing.T) {
 			l4intakePhoto(e, grp, emp, "Сафаи", "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", "")
 			q := e.last()
 			e.sendGroup(groupReply(grp, emp, "Сафаи", tc.answer, q.ID, e.botJID(), q.Text))
-			l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", "11:30:00"), tc.caption, "")
+			l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", l5collapsedPastHMS()), tc.caption, "")
 			if got := dayTotals(e, grp); sum(got) != 5000 {
 				t.Errorf("один платёж: сбор %v, ожидали 5000", got)
 			}
@@ -559,7 +559,7 @@ func TestL4intake_R4_FullCheckReplacesSameClientCollapsedFirst(t *testing.T) {
 	q := e.last()
 	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаев Харон", q.ID, e.botJID(), q.Text))
 	other := l4intakePhoto(e, grp, emp, "Сафаи", "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", "")
-	l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", "11:30:00"), "Исаев Харон", "")
+	l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", l5collapsedPastHMS()), "Исаев Харон", "")
 	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
 		t.Errorf("сбор %v", got)
 	}

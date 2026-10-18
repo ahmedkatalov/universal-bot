@@ -79,7 +79,9 @@ type RecognizedReceipt struct {
 // его с очереди. Клиента, уже подтверждённого владельцем (client_confirmed), НЕ
 // затираем — обновляем только банковские поля и сумму. needs_review снимаем лишь
 // если есть и сумма, и подтверждённый клиент. Отклонённый банком перевод
-// (Declined) в учёт не идёт: ignored, как при приёме чека.
+// (Declined) в учёт не идёт: ignored, как при приёме чека. Свёрнутый экран
+// перестаёт быть свёрнутым, только если повтор прочитал дату, получателя или
+// номер документа.
 func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedReceipt) error {
 	_, err := d.pool.Exec(ctx, `
 		UPDATE bank_receipts SET
@@ -98,7 +100,10 @@ func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedRecei
 			                     WHEN $9::numeric > 0 THEN $9::numeric ELSE commission END,
 			tx_date       = CASE WHEN $11 THEN $10::timestamptz ELSE tx_date END,
 			tx_time_guessed = CASE WHEN $11 THEN false ELSE tx_time_guessed END,
-			collapsed     = false,
+			-- Свёрнутый экран «Перевод выполнен» остаётся свёрнутым, если и при
+			-- повторе не видно ни даты, ни получателя, ни номера: иначе полный чек
+			-- того же перевода его не заменит, и перевод посчитается дважды.
+			collapsed     = collapsed AND NOT ($11 OR NULLIF($3,'') IS NOT NULL OR NULLIF($5,'') IS NOT NULL),
 			recognition_status = 'ok',
 			next_retry_at      = NULL,
 			ignored       = ignored OR $12,

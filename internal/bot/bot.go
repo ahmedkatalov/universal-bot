@@ -3983,18 +3983,49 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// клиента, поэтому проверка payerOverride=="" здесь корректна.
 	looksCollapsed := rd.DocNumber == "" && rd.Recipient == "" && payerOverride == ""
 	if rd.Amount > 0 && !rd.HasTxTime && media != nil && looksCollapsed {
-		fmt.Printf("Чек (сообщение %d): неполный (нет даты операции) — прошу развёрнутый\n", rawID)
+		// Экран пришёл ПОСЛЕ полного чека: тот же работник только что прислал
+		// засчитанный чек на ту же сумму, сделанный до того, как прислали экран, —
+		// это, скорее всего, экран того же перевода (клиент скинул оба скрина).
+		// Второй раз не считаем, но говорим об этом и даём путь назад.
+		counted, err := b.db.CountedCheckOfCollapsedScreen(ctx, chat.String(), senderJID, rd.Amount, receivedAt)
+		if err != nil {
+			fmt.Println("Ошибка поиска полного чека для свёрнутого экрана:", err)
+		}
+		if counted.Found {
+			fmt.Printf("Чек (сообщение %d): свёрнутый экран на %.0f ₽ — похоже, того же перевода, что засчитанный чек %s\n", rawID, rd.Amount, counted.WaID)
+		} else {
+			fmt.Printf("Чек (сообщение %d): неполный (нет даты операции) — прошу развёрнутый\n", rawID)
+		}
 		if err := b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 			ClientSourceRawID: payerSrc,
 			RawMessageID:      rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
 			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
 			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true, TxTimeGuessed: !rd.HasTxTime,
+			IsDuplicate: counted.Found, SupersededByRaw: counted.RawID,
 		}); err != nil {
 			fmt.Println("Ошибка сохранения неполного чека:", err)
 		}
 		if visionUnavailable {
 			// Зрение было недоступно — поставим на автоповтор распознавания.
 			_ = b.db.MarkReceiptForRetry(ctx, rawID, "vision unavailable (collapsed)", time.Now().Add(retryBackoff(0)))
+		}
+		if counted.Found {
+			if askReceiptsEnabled() && waMsgID != "" && !b.groupSilent(chat) {
+				botMsgID := b.sendReply(chat, fmt.Sprintf(
+					"🤔 Чек на %.0f ₽ пришёл НЕПОЛНЫМ (свёрнутый экран «Перевод выполнен»). Похоже, это тот же перевод, что полный чек выше: "+
+						"%s, %.0f ₽, чек от %s — он уже учтён, этот экран второй раз не считаю. "+
+						"Если это ДРУГОЙ платёж — ответьте на это сообщение ФИО клиента (или «другой»).",
+					rd.Amount, counted.Client, rd.Amount, counted.TxDate.Format("02.01.2006 15:04")), waMsgID, senderJID)
+				if botMsgID != "" {
+					// ФИО в ответ — тот же клиент: «уже учтён»; другой клиент — экран
+					// снова отдельный платёж (answerForRepeatedCheck). «другой» —
+					// отдельный платёж, бот спросит клиента.
+					_ = b.db.MarkScreenAsked(ctx, rawID, botMsgID)
+					b.registerClarifyAsk(botMsgID, waMsgID)
+					b.registerSameCheckAsk(botMsgID, sameCheckAsk{checkWa: waMsgID})
+				}
+			}
+			return
 		}
 		if askReceiptsEnabled() && waMsgID != "" && !b.groupSilent(chat) {
 			botMsgID := b.sendReply(chat, fmt.Sprintf(
@@ -4218,7 +4249,13 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			}
 			return 0
 		}
-		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, rankCollapsed); err != nil {
+		// Экран показывает уже сделанный перевод: экран, присланный раньше, чем
+		// сделана операция этого чека (время напечатано на чеке), — другой перевод.
+		var opTime time.Time
+		if rd.HasTxTime {
+			opTime = rd.TxTime
+		}
+		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, opTime, rawID, rankCollapsed); err != nil {
 			fmt.Println("Ошибка замены свёрнутого чека:", err)
 		} else if sup.Found {
 			fmt.Printf("Чек (сообщение %d): полный чек заменил ранее присланный свёрнутый на %.0f ₽\n", rawID, rd.Amount)
@@ -4263,6 +4300,28 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)
+	}
+	// Время операции на чеке не прочиталось и номера нет (экран «Перевод
+	// выполнен» с получателем, подписанный свёрнутый экран): у него время
+	// сообщения, и проверка «уже присылали» выше (±5 минут от времени операции)
+	// засчитанный чек того же перевода, сделанный раньше, не находит. Тот же
+	// клиент и сумма, чек сделан не позже, чем прислали этот, — похоже, тот же
+	// перевод: второй раз не считаем и спрашиваем «тот же или другой?».
+	if err == nil && !isDuplicate && !declined && clientConfirmed && contactIDPtr != nil &&
+		!rd.HasTxTime && rd.DocNumber == "" && rd.AuthCode == "" && senderJID != "" {
+		if rid, _, ok, e := b.db.ReceiptOfRaw(ctx, rawID); e != nil {
+			fmt.Println("Ошибка поиска сохранённого чека:", e)
+		} else if ok {
+			same, e := b.db.DedupeCompletedReceipt(ctx, rid, false, true)
+			if e != nil {
+				fmt.Println("Ошибка проверки повтора чека без времени операции:", e)
+			} else if same.Found {
+				b.reportSameCheck(ctx, chat, waMsgID, senderJID, same, false)
+				if same.VictimIsThis {
+					return // в сбор не идёт, пока не ответят «другой»
+				}
+			}
+		}
 	}
 	if needsReview {
 		fmt.Printf("Чек (сообщение %d): получатель %q не найден в списке известных — нужна проверка\n", rawID, rd.Recipient)

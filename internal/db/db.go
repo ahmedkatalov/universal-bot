@@ -525,6 +525,14 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// Время операции на чеке НЕ прочиталось — в tx_date время сообщения
 		// (по нему нельзя сравнивать «тот же чек» с точным временем другого).
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS tx_time_guessed BOOLEAN NOT NULL DEFAULT false`,
+		// Свёрнутый экран «Перевод выполнен», признанный тем же переводом, что
+		// полный чек: сообщение (raw_messages.id) этого полного чека. Ответ ФИО
+		// другого клиента на вопрос по экрану возвращает экран в учёт, удалят
+		// полный чек — экран снова в работе.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS superseded_by_raw INT`,
+		// Человек ответил «другой» на «похоже, это тот же чек» — назовут клиента,
+		// бот не переспрашивает «тот же?» по слабому совпадению.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_denied BOOLEAN NOT NULL DEFAULT false`,
 		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
 		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,
@@ -1469,6 +1477,7 @@ type BankReceiptInput struct {
 	Collapsed         bool      // свёрнутый экран банка (без даты/номера/получателя) — ждёт полного чека
 	Ignored           bool      // в сбор не идёт (например, перевод отклонён банком)
 	TxTimeGuessed     bool      // время операции с чека не прочиталось — TxDate это время сообщения
+	SupersededByRaw   int       // свёрнутый экран того же перевода, что полный чек этого сообщения (0 — нет)
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
@@ -1476,12 +1485,15 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 		INSERT INTO bank_receipts
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
 			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
-			 client_confirmed, group_jid, submitted_by, tx_date, collapsed, ignored, client_source_raw_id, tx_time_guessed)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NULLIF($24, 0), $25)
+			 client_confirmed, group_jid, submitted_by, tx_date, collapsed, ignored, client_source_raw_id, tx_time_guessed,
+			 superseded_by_raw)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NULLIF($24, 0), $25,
+			NULLIF($26, 0))
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
 		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
 		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
-		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed, r.Ignored, r.ClientSourceRawID, r.TxTimeGuessed)
+		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed, r.Ignored, r.ClientSourceRawID, r.TxTimeGuessed,
+		r.SupersededByRaw)
 	return err
 }
 
@@ -1520,10 +1532,20 @@ type SupersededCollapsed struct {
 // его не трогаем, иначе платёж А молча пропал бы). Из подходящих берём с самым
 // высоким рангом (свёрнутый ТОГО ЖЕ клиента важнее ничьего), при равенстве —
 // самый свежий.
-func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID string, amount float64, before time.Time, rank func(SupersededCollapsed) int) (SupersededCollapsed, error) {
+//
+// opTime — время операции, НАПЕЧАТАННОЕ на полном чеке (нулевое — не
+// прочиталось). Экран показывает перевод, который уже сделан: экран, присланный
+// в группу РАНЬШЕ, чем сделана операция полного чека (больше чем на пару минут
+// — разница часов), — это другой перевод, его не заменяем. byRaw — сообщение
+// полного чека: запоминаем у экрана, каким чеком он заменён.
+func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID string, amount float64, before, opTime time.Time, byRaw int, rank func(SupersededCollapsed) int) (SupersededCollapsed, error) {
 	var res SupersededCollapsed
 	if amount <= 0 || groupJID == "" || senderJID == "" {
 		return res, nil
+	}
+	var op *time.Time
+	if !opTime.IsZero() {
+		op = &opTime
 	}
 	rows, err := d.pool.Query(ctx, `
 		SELECT br.id, br.contact_id, COALESCE(br.recipient_raw, ''), br.client_confirmed
@@ -1534,9 +1556,11 @@ func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID 
 		  AND br.amount = $3::numeric
 		  AND br.collapsed = true
 		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
 		  AND rm.received_at >= $4::timestamptz - interval '3 days' AND rm.received_at <= $4::timestamptz
+		  AND ($5::timestamptz IS NULL OR rm.received_at >= $5::timestamptz - interval '2 minutes')
 		ORDER BY rm.received_at DESC LIMIT 20
-	`, groupJID, senderJID, amount, before)
+	`, groupJID, senderJID, amount, before, op)
 	if err != nil {
 		return res, err
 	}
@@ -1575,8 +1599,8 @@ func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID 
 		if best < 0 {
 			return res, nil
 		}
-		tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true
-			WHERE id = $1 AND is_duplicate = false AND collapsed = true`, cands[best].id)
+		tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true, superseded_by_raw = NULLIF($2, 0)
+			WHERE id = $1 AND is_duplicate = false AND collapsed = true`, cands[best].id, byRaw)
 		if err != nil {
 			return res, err
 		}
@@ -1585,6 +1609,80 @@ func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID 
 		}
 		ranks[best] = 0 // его уже кто-то заменил — берём следующий
 	}
+}
+
+// CountedCheckForScreen — засчитанный полный чек, перевод которого, похоже,
+// показывает пришедший следом свёрнутый экран.
+type CountedCheckForScreen struct {
+	Found  bool
+	RawID  int       // сообщение полного чека
+	WaID   string    // его wa_message_id
+	Client string    // на кого записан
+	TxDate time.Time // время операции с чека
+}
+
+// CountedCheckOfCollapsedScreen — пришёл свёрнутый экран «Перевод выполнен»
+// (сумма без даты, получателя и номера) — обратный порядок к
+// SupersedeCollapsedReceipt: тот же работник незадолго до этого (3 часа)
+// прислал в эту группу ПОЛНЫЙ чек на ту же сумму, уже засчитанный клиенту, с
+// напечатанным временем операции не позже, чем прислали экран, и ни с каким
+// другим экраном этот чек ещё не сопоставлен. Тогда экран, скорее всего, того
+// же перевода. Подходящих чеков два и больше — не угадываем (Found=false).
+func (d *DB) CountedCheckOfCollapsedScreen(ctx context.Context, groupJID, senderJID string, amount float64, screenAt time.Time) (CountedCheckForScreen, error) {
+	var res CountedCheckForScreen
+	if amount <= 0 || groupJID == "" || senderJID == "" || senderJID == "bot-forward" {
+		return res, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT rm.id, COALESCE(rm.wa_message_id, ''), COALESCE(c.canonical_name, br.recipient_raw, ''), br.tx_date
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.amount = $3::numeric
+		  AND br.collapsed = false AND br.tx_time_guessed = false
+		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
+		  AND br.client_confirmed AND br.contact_id IS NOT NULL
+		  AND COALESCE(rm.deleted, false) = false
+		  AND rm.received_at BETWEEN $4::timestamptz - interval '3 hours' AND $4::timestamptz
+		  AND br.tx_date <= $4::timestamptz + interval '2 minutes'
+		  AND br.tx_date >= $4::timestamptz - interval '3 days'
+		  AND NOT EXISTS (
+			SELECT 1 FROM bank_receipts s
+			WHERE s.superseded_by_raw = br.raw_message_id AND s.is_duplicate AND NOT s.ignored)
+		ORDER BY rm.received_at DESC
+		LIMIT 2
+	`, groupJID, senderJID, amount, screenAt)
+	if err != nil {
+		return res, err
+	}
+	defer rows.Close()
+	n := 0
+	for rows.Next() {
+		n++
+		if err := rows.Scan(&res.RawID, &res.WaID, &res.Client, &res.TxDate); err != nil {
+			return CountedCheckForScreen{}, err
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return CountedCheckForScreen{}, err
+	}
+	if n != 1 {
+		return CountedCheckForScreen{}, nil
+	}
+	res.Found = true
+	return res, nil
+}
+
+// MarkScreenAsked — вопрос бота по свёрнутому экрану сообщения rawID (в т.ч.
+// уже признанному тем же переводом, что полный чек): ответ на него найдёт экран
+// и после перезапуска бота.
+func (d *DB) MarkScreenAsked(ctx context.Context, rawID int, askMsgID string) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET clarify_asked = true, clarify_ask_msg_id = COALESCE(NULLIF($2, ''), clarify_ask_msg_id)
+		WHERE raw_message_id = $1 AND collapsed = true`, rawID, askMsgID)
+	return err
 }
 
 // ClarifyReceipt — чек, по которому бот не уверен, чей это клиент, и хочет
@@ -2106,7 +2204,7 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 	// владельца карты — подписан был оригинал или нет (копию-повтор вставляют
 	// без needs_review: клиента у оригинала не спрашивали дважды).
 	if _, e := d.pool.Exec(ctx, `
-		UPDATE bank_receipts u SET is_duplicate = false,
+		UPDATE bank_receipts u SET is_duplicate = false, superseded_by_raw = NULL,
 			needs_review = u.needs_review OR NOT u.client_confirmed
 		FROM (
 			SELECT DISTINCT ON (orig.id) dd.id
@@ -2114,6 +2212,8 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 			JOIN bank_receipts dd ON dd.id <> orig.id AND dd.is_duplicate = true AND dd.ignored = false
 				AND COALESCE(dd.group_jid, '') = COALESCE(orig.group_jid, '')
 				AND (
+					-- Свёрнутый экран, заменённый этим полным чеком.
+					dd.superseded_by_raw = orig.raw_message_id OR
 					(NULLIF(orig.doc_number, '') IS NOT NULL AND dd.doc_number = orig.doc_number) OR
 					(NULLIF(orig.auth_code, '') IS NOT NULL AND dd.auth_code = orig.auth_code) OR
 					(dd.contact_id = orig.contact_id AND dd.amount = orig.amount

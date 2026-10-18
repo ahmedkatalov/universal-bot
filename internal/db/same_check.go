@@ -40,6 +40,7 @@ type completedReceipt struct {
 	client               string
 	p                    PrintedReceipt
 	guessed, collapsed   bool
+	denied               bool // человек уже ответил «другой» на «похоже, тот же чек»
 }
 
 func (d *DB) loadCompletedReceipt(ctx context.Context, id int) (completedReceipt, bool, error) {
@@ -52,14 +53,14 @@ func (d *DB) loadCompletedReceipt(ctx context.Context, id int) (completedReceipt
 		       COALESCE(c.canonical_name, br.recipient_raw, ''),
 		       `+printedRecipientOf("br")+`, COALESCE(br.sender_raw, ''), COALESCE(br.bank, ''),
 		       COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''), COALESCE(br.amount, 0)::float8, br.tx_date,
-		       br.tx_time_guessed, br.collapsed
+		       br.tx_time_guessed, br.collapsed, br.same_check_denied
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE br.id = $1`, id).
 		Scan(&r.groupJID, &r.sender, &r.wa, &r.received, &r.live, &r.named, &r.contactID, &r.client,
 			&r.p.Recipient, &r.p.Sender, &r.p.Bank, &r.p.DocNumber, &r.p.AuthCode, &r.p.Amount, &r.p.TxDate,
-			&r.guessed, &r.collapsed)
+			&r.guessed, &r.collapsed, &r.denied)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, false, nil
 	}
@@ -90,15 +91,23 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 	if err != nil || !ok {
 		return res, err
 	}
-	if !r.live || r.collapsed || r.p.Amount <= 0 || r.sender == "bot-forward" || r.groupJID == "" {
+	// Свёрнутый экран тоже проверяем: его назвали (ответ ФИО на «пришёл
+	// НЕПОЛНЫМ»), а полный чек того же перевода уже засчитан — шаг 3 ниже.
+	if !r.live || r.p.Amount <= 0 || r.sender == "bot-forward" || r.groupJID == "" {
 		return res, nil
 	}
 	if r.named {
 		res.ThisClient = r.client
 	}
-	mark := func(victim int, victimIsThis bool, keptWa, victimWa, client string, tx time.Time) (SameCheck, error) {
+	mark := func(victim, kept int, victimIsThis bool, keptWa, victimWa, client string, tx time.Time) (SameCheck, error) {
 		ok, err := d.MarkReceiptDuplicate(ctx, victim)
 		if err != nil || !ok {
+			return SameCheck{}, err
+		}
+		// Повтором стал свёрнутый экран — запоминаем, каким чеком он учтён (ответ
+		// ФИО другого клиента по экрану вернёт его в учёт, см. DuplicateOriginalOf).
+		if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts v SET superseded_by_raw = k.raw_message_id
+			FROM bank_receipts k WHERE v.id = $1 AND k.id = $2 AND v.collapsed`, victim, kept); err != nil {
 			return SameCheck{}, err
 		}
 		res.Found, res.VictimIsThis = true, victimIsThis
@@ -160,10 +169,10 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		res.Tentative = !oStrong
 		if r.named && !oNamed {
 			// Этот назван, а копия ничья (ждёт «чей чек?») — повтором становится она.
-			return mark(oID, false, r.wa, oWa, r.client, r.p.TxDate)
+			return mark(oID, receiptID, false, r.wa, oWa, r.client, r.p.TxDate)
 		}
 		res.OtherClient = r.named && oNamed && (oContact == nil || r.contactID == nil || *oContact != *r.contactID)
-		return mark(receiptID, true, oWa, r.wa, oClient, oTx)
+		return mark(receiptID, oID, true, oWa, r.wa, oClient, oTx)
 	}
 
 	// 2. Тот же напечатанный чек без номера (только у названного: ничьей копии
@@ -176,12 +185,12 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		if tw.Found {
 			switch {
 			case !tw.Named && !MinutePrecision(r.p.TxDate):
-				return mark(tw.ID, false, r.wa, tw.WaMessage, r.client, r.p.TxDate)
+				return mark(tw.ID, receiptID, false, r.wa, tw.WaMessage, r.client, r.p.TxDate)
 			case tw.Named && tw.ContactID != nil && r.contactID != nil && *tw.ContactID == *r.contactID:
 				// Время до минуты — второй перевод тому же клиенту в ту же минуту
 				// маловероятен, но возможен: вызывающий спросит «тот же или другой?».
 				res.Tentative = MinutePrecision(r.p.TxDate)
-				return mark(receiptID, true, tw.WaMessage, r.wa, tw.Client, tw.TxDate)
+				return mark(receiptID, tw.ID, true, tw.WaMessage, r.wa, tw.Client, tw.TxDate)
 			}
 			// Ничья копия при времени до минуты — решит её «чей чек?»; названные
 			// разными клиентами — не склеиваем.
@@ -189,8 +198,11 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 	}
 
 	// 3. Время операции у этого чека не прочиталось (и номера нет) — тот же
-	// клиент, сумма, карта, и чек сделан не позже, чем прислали этот.
-	if allowTentative && amountFilled && r.named && r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
+	// клиент, сумма, карта, и чек сделан не позже, чем прислали этот. И когда
+	// дочитали сумму, и когда назвали клиента (экран «Перевод выполнен» без
+	// даты, названный в ответ на вопрос бота, при уже засчитанном полном чеке).
+	// Человек уже сказал про этот чек «другой» — это слабое совпадение не ищем.
+	if allowTentative && !r.denied && r.named && r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
 		ownerNorm := printedNorm("$6::text")
 		senderNorm := printedNorm("$7::text")
 		err = d.pool.QueryRow(ctx, `
@@ -219,18 +231,19 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 			return res, err
 		default:
 			res.Tentative = true
-			return mark(receiptID, true, oWa, r.wa, oClient, oTx)
+			return mark(receiptID, oID, true, oWa, r.wa, oClient, oTx)
 		}
 	}
 	return res, nil
 }
 
 // UndoReceiptDuplicate — человек сказал, что чек сообщения waID не повтор, а
-// отдельный платёж: снова учитываем его. needsReview — клиент у него ещё не
+// отдельный платёж: снова учитываем его (и запоминаем ответ — «тот же?» по
+// слабому совпадению больше не спрашиваем). needsReview — клиент у него ещё не
 // назван (спросить «чей чек?»).
 func (d *DB) UndoReceiptDuplicate(ctx context.Context, waID string) (found bool, amount float64, client string, needsReview bool, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts br SET is_duplicate = false
+		UPDATE bank_receipts br SET is_duplicate = false, superseded_by_raw = NULL, same_check_denied = true
 		WHERE br.id = (
 			SELECT b2.id FROM bank_receipts b2 JOIN raw_messages rm ON rm.id = b2.raw_message_id
 			WHERE rm.wa_message_id = $1 AND COALESCE(rm.deleted, false) = false
@@ -268,7 +281,8 @@ type DupOriginal struct {
 
 // DuplicateOriginalOf — чек сообщения waID помечен повтором (сам при приёме или
 // позже, когда пришла его подписанная копия): какой живой чек остался в учёте.
-// Found=false — чек не повтор или оригинал не найден.
+// У свёрнутого экрана «Перевод выполнен» — полный чек, которым он учтён
+// (superseded_by_raw). Found=false — чек не повтор или оригинал не найден.
 func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal, error) {
 	var o DupOriginal
 	err := d.pool.QueryRow(ctx, `
@@ -280,6 +294,9 @@ func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal,
 		JOIN bank_receipts o ON o.id <> dd.id AND o.is_duplicate = false AND o.ignored = false
 			AND COALESCE(o.group_jid, '') = COALESCE(dd.group_jid, '')
 			AND (
+				-- Свёрнутый экран: каким полным чеком он учтён.
+				(dd.collapsed AND o.raw_message_id = dd.superseded_by_raw) OR
+				(NOT dd.collapsed AND (
 				(NULLIF(dd.doc_number, '') IS NOT NULL AND o.doc_number = dd.doc_number) OR
 				(NULLIF(dd.auth_code, '') IS NOT NULL AND o.auth_code = dd.auth_code) OR
 				(o.contact_id = dd.contact_id AND o.amount = dd.amount
@@ -291,13 +308,15 @@ func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal,
 				 AND o.contact_id = dd.contact_id AND o.amount = dd.amount
 				 AND o.tx_date <= drm.received_at + interval '2 minutes'
 				 AND o.tx_date >= drm.received_at - interval '3 days')
+				))
 			)
 		JOIN raw_messages orm ON orm.id = o.raw_message_id AND COALESCE(orm.deleted, false) = false
 			AND COALESCE(orm.sender_jid, '') <> 'bot-forward'
-			AND (NOT dd.tx_time_guessed OR orm.received_at BETWEEN drm.received_at - interval '1 day' AND drm.received_at + interval '1 day')
+			AND (NOT dd.tx_time_guessed OR dd.collapsed
+			     OR orm.received_at BETWEEN drm.received_at - interval '1 day' AND drm.received_at + interval '1 day')
 		LEFT JOIN contacts c ON c.id = o.contact_id
 		WHERE drm.wa_message_id = $1 AND COALESCE(drm.deleted, false) = false
-		  AND dd.is_duplicate = true AND dd.ignored = false AND dd.collapsed = false
+		  AND dd.is_duplicate = true AND dd.ignored = false
 		ORDER BY 7 DESC, orm.received_at, o.id
 		LIMIT 1`, waID).
 		Scan(&o.KeptWa, &o.KeptNamed, &o.KeptContactID, &o.KeptClient, &o.Amount, &o.TxDate, &o.Strong)
