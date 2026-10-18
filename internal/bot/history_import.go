@@ -311,7 +311,10 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 			recipient, cardOwner, needsReview = client, rd.Recipient, false
 		}
 	}
-	isDup, _, _ := b.db.FindDuplicateReceipt(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, recipient, rd.Amount, txDate)
+	isDup, _, err := b.db.FindDuplicateReceipt(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, recipient, rd.Amount, txDate, !rd.HasTxTime)
+	if err != nil {
+		fmt.Println("Импорт истории: ошибка проверки повтора чека:", err)
+	}
 	if err := b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 		RawMessageID: rawID, Bank: rd.Bank, RecipientRaw: recipient, RecipientBank: rd.RecipientBank, CardOwner: cardOwner,
 		RecipientPhone: rd.RecipientPhone, SenderRaw: rd.Sender, SenderBank: rd.SenderBank, SenderAccount: rd.SenderAccount,

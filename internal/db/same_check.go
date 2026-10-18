@@ -69,8 +69,9 @@ func (d *DB) loadCompletedReceipt(ctx context.Context, id int) (completedReceipt
 // DedupeCompletedReceipt — чек receiptID только что стал полным (amountFilled:
 // сумму дочитал автоповтор или назвал человек) или «чьим» (назвали клиента).
 // Если в группе уже живёт тот же чек — платёж один:
-//   - тот же номер операции / код авторизации, или тот же клиент, сумма и время
-//     операции в пределах 5 минут (как при приёме чека);
+//   - тот же номер операции / код авторизации, или тот же клиент, сумма и то же
+//     напечатанное время операции (как при приёме чека, см. sameOpTimeSQL; без
+//     общего номера — tentative: это мог быть и второй перевод);
 //   - тот же НАПЕЧАТАННЫЙ чек без номера (получатель, плательщик, сумма, время;
 //     при времени до минуты — tentative);
 //   - (tentative) у этого чека время операции не прочиталось, а в группе уже
@@ -111,7 +112,8 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		return res, nil
 	}
 
-	// 1. Номер операции / код авторизации; тот же клиент и время (как при приёме).
+	// 1. Номер операции / код авторизации; тот же клиент и время (как при приёме:
+	// напечатанное время у обоих — то же самое, см. sameOpTimeSQL).
 	heur := amountFilled && !r.guessed
 	var (
 		oID             int
@@ -123,7 +125,7 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 	err = d.pool.QueryRow(ctx, `
 		SELECT br.id, COALESCE(rm.wa_message_id, ''), (br.client_confirmed AND br.contact_id IS NOT NULL), br.contact_id,
 		       COALESCE(c.canonical_name, br.recipient_raw, ''), br.tx_date,
-		       (($3 <> '' AND br.doc_number = $3) OR ($4 <> '' AND br.auth_code = $4)) AS strong
+		       COALESCE(($3 <> '' AND br.doc_number = $3) OR ($4 <> '' AND br.auth_code = $4), false) AS strong
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
@@ -138,6 +140,7 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		        AND br.tx_date BETWEEN $6::timestamptz - interval '3 days' AND $6::timestamptz + interval '3 days')
 		    OR ($7 AND $8::int IS NOT NULL AND br.contact_id = $8
 		        AND br.tx_date BETWEEN $6::timestamptz - interval '5 minutes' AND $6::timestamptz + interval '5 minutes'
+		        AND `+sameOpTimeSQL("br.tx_date", "br.tx_time_guessed", "$6::timestamptz", "false")+`
 		        AND (COALESCE(br.doc_number, '') = '' OR $3 = '' OR br.doc_number = $3)
 		        AND (COALESCE(br.auth_code, '') = '' OR $4 = '' OR br.auth_code = $4)
 		        AND (COALESCE(br.sender_raw, '') = '' OR $9 = ''
@@ -152,6 +155,9 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		return res, err
 	default:
 		res.Strong = oStrong
+		// Без общего номера совпали клиент, сумма и время — это может быть и
+		// второй перевод: как при приёме, говорим «похоже» и ждём «другой».
+		res.Tentative = !oStrong
 		if r.named && !oNamed {
 			// Этот назван, а копия ничья (ждёт «чей чек?») — повтором становится она.
 			return mark(oID, false, r.wa, oWa, r.client, r.p.TxDate)
@@ -268,8 +274,7 @@ func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal,
 	err := d.pool.QueryRow(ctx, `
 		SELECT COALESCE(orm.wa_message_id, ''), (o.client_confirmed AND o.contact_id IS NOT NULL), o.contact_id,
 		       COALESCE(c.canonical_name, o.recipient_raw, ''), COALESCE(o.amount, 0)::float8, o.tx_date,
-		       ((NULLIF(dd.doc_number, '') IS NOT NULL AND o.doc_number = dd.doc_number) OR
-		        (NULLIF(dd.auth_code, '') IS NOT NULL AND o.auth_code = dd.auth_code)) AS strong
+		       `+sameStrongIDSQL("dd.doc_number", "dd.auth_code", "o.doc_number", "o.auth_code")+` AS strong
 		FROM bank_receipts dd
 		JOIN raw_messages drm ON drm.id = dd.raw_message_id
 		JOIN bank_receipts o ON o.id <> dd.id AND o.is_duplicate = false AND o.ignored = false
@@ -278,7 +283,7 @@ func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal,
 				(NULLIF(dd.doc_number, '') IS NOT NULL AND o.doc_number = dd.doc_number) OR
 				(NULLIF(dd.auth_code, '') IS NOT NULL AND o.auth_code = dd.auth_code) OR
 				(o.contact_id = dd.contact_id AND o.amount = dd.amount
-				 AND abs(extract(epoch FROM o.tx_date - dd.tx_date)) <= 300) OR
+				 AND `+sameOpTimeSQL("o.tx_date", "o.tx_time_guessed", "dd.tx_date", "dd.tx_time_guessed")+`) OR
 				`+printedMatchSQL("o", "dd")+` OR
 				-- Время с чека не прочиталось: тот же клиент и сумма, чек сделан не
 				-- позже, чем прислали этот (см. DedupeCompletedReceipt).
@@ -317,4 +322,58 @@ func (d *DB) ReceiptReplyRef(ctx context.Context, receiptID int) (waID, senderJI
 		return "", "", "", nil
 	}
 	return
+}
+
+// OtherGroupCopy — тот же чек (общий номер операции), засчитанный в другой
+// группе на названного клиента.
+type OtherGroupCopy struct {
+	GroupJID  string
+	WaMessage string
+	ContactID *int
+	Client    string
+}
+
+// NamedCopiesInOtherGroups — живые копии чека с тем же номером операции (или
+// кодом авторизации при той же сумме) в ДРУГИХ группах, где клиент назван
+// (подпись, ответ) и записан не на contactID. Копии, пересланные ботом, не в
+// счёт — они повторяют свой исходный чек. excludeRawID — сообщение самого чека.
+func (d *DB) NamedCopiesInOtherGroups(ctx context.Context, groupJID string, excludeRawID int, docNumber, authCode string, amount float64, txDate time.Time, contactID *int) ([]OtherGroupCopy, error) {
+	if docNumber == "" && authCode == "" {
+		return nil, nil
+	}
+	// Номер операции — тот же чек (короткий номер — только при той же сумме, как
+	// в отчёте); код авторизации короткий — та же сумма и несколько дней.
+	rows, err := d.pool.Query(ctx, `
+		SELECT COALESCE(br.group_jid, rm.wa_group_jid, ''), COALESCE(rm.wa_message_id, ''), br.contact_id,
+		       COALESCE(c.canonical_name, br.recipient_raw, '')
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid, '') NOT IN ('', $1)
+		  AND br.raw_message_id <> $2
+		  AND br.is_duplicate = false AND br.ignored = false AND br.collapsed = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
+		  AND br.client_confirmed AND br.contact_id IS NOT NULL
+		  AND ($7::int IS NULL OR br.contact_id <> $7)
+		  AND br.tx_date BETWEEN $6::timestamptz - interval '3 days' AND $6::timestamptz + interval '3 days'
+		  AND (
+		    ($3 <> '' AND br.doc_number = $3 AND (char_length($3) >= 8 OR br.amount = $5::numeric))
+		    OR ($4 <> '' AND br.auth_code = $4 AND br.amount = $5::numeric)
+		  )
+		ORDER BY rm.received_at, br.id
+		LIMIT 5`, groupJID, excludeRawID, docNumber, authCode, amount, txDate, contactID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []OtherGroupCopy
+	for rows.Next() {
+		var o OtherGroupCopy
+		if err := rows.Scan(&o.GroupJID, &o.WaMessage, &o.ContactID, &o.Client); err != nil {
+			return nil, err
+		}
+		out = append(out, o)
+	}
+	return out, rows.Err()
 }

@@ -908,7 +908,9 @@ func TestR2_28_LaterCompletedCheckNeverReconciled(t *testing.T) {
 				"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽"
 		}
 		e.sendReceipt(grp, emp, "Сафаи", mk("10:00:00"), "Каталов Ахмед")
-		ck2 := e.sendReceipt(grp, emp, "Сафаи", mk("10:02:00"), "Каталов Ахмед")
+		// То же напечатанное время (похоже на повтор): чек с другим временем на
+		// чеке — уже другой перевод и повтором не помечается (L5dedupe_3).
+		ck2 := e.sendReceipt(grp, emp, "Сафаи", mk("10:00:00"), "Каталов Ахмед")
 		if out := e.tool("correct_operation", grp, `{"action":"not_duplicate","amount":5000,"person":"Каталов"}`); !strings.Contains(out, "учитывается") {
 			t.Fatalf("снятие дубля: %s", out)
 		}

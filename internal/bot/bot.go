@@ -2161,7 +2161,7 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 			}
 		}
 		// Информационная проверка — по всем группам сразу (groupJID пустой).
-		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, "", rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime)
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, "", rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime, !rd.HasTxTime)
 		switch {
 		case err != nil:
 			fmt.Println("Ошибка проверки дубля чека из лички:", err)
@@ -3547,7 +3547,7 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 
 		// Дубли ищем только внутри целевой группы: тот же чек в ДРУГОЙ группе
 		// (например, в группе СБ, откуда его переслали) — это не дубль.
-		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, groupJID.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate)
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, groupJID.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate, !rd.HasTxTime)
 		if err != nil {
 			fmt.Println("Ошибка проверки дубля при дозагрузке:", err)
 		}
@@ -4136,9 +4136,15 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// документа, см. FindDuplicateReceipt) — до вставки, иначе новая запись
 	// найдёт сама себя. Тот же чек в другой группе дублем не считается: это
 	// рабочий процесс (чеки из группы СБ пересылают в основную группу).
-	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate)
+	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, !rd.HasTxTime)
 	if err != nil {
-		fmt.Println("Ошибка проверки дубля чека:", err)
+		// Сбой проверки — не считаем чек сразу «новым» (тот же чек вошёл бы в
+		// сбор дважды): пробуем ещё раз.
+		fmt.Println("Ошибка проверки дубля чека (повторяю):", err)
+		dupMatch, err = b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, !rd.HasTxTime)
+		if err != nil {
+			fmt.Println("Ошибка проверки дубля чека:", err)
+		}
 	}
 	// Чек без номера операции, присланный ещё раз (сначала без ФИО, потом с ФИО
 	// — или наоборот): «тот же клиент» тут не помогает — у неподписанной копии
@@ -4303,6 +4309,12 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 
 	if twinAskedNote != "" && !b.groupSilent(chat) {
 		b.sendReply(chat, twinAskedNote, waMsgID, senderJID)
+	}
+
+	// Тот же чек (тот же номер операции) уже засчитан в ДРУГОЙ группе на другого
+	// клиента — спрашиваем здесь, чей он (ответ поправит обе копии).
+	if !isDuplicate && payerOverride != "" && senderJID != "" && (rd.DocNumber != "" || rd.AuthCode != "") {
+		b.askCrossGroupClient(ctx, chat, rawID, waMsgID, senderJID, canonical, contactIDPtr, rd.DocNumber, rd.AuthCode, rd.Amount, txDate)
 	}
 
 	// Подозрительно большая сумма (вероятно, лишний ноль при распознавании) —

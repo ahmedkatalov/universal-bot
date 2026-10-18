@@ -57,6 +57,9 @@ type clarifyState struct {
 	// sameAsks — «похоже, это тот же чек, что уже засчитан» (ответ «другой»
 	// засчитывает чек отдельно): id вопроса → чек.
 	sameAsks map[string]sameCheckAsk
+	// crossAsks — «этот чек уже прислан в другой группе на другого клиента —
+	// чей он?»: id вопроса → обе копии чека.
+	crossAsks map[string]crossClientAsk
 }
 
 // dupFixAsk — повторно присланный чек подписан другим клиентом.
@@ -98,6 +101,7 @@ func newClarifyState() *clarifyState {
 		paymentAsks: make(map[string]paymentAsk),
 		dupFixAsks:  make(map[string]dupFixAsk),
 		sameAsks:    make(map[string]sameCheckAsk),
+		crossAsks:   make(map[string]crossClientAsk),
 	}
 }
 
@@ -798,6 +802,7 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	pa, isPayAsk := b.clarify.paymentAsks[quotedID]
 	fix, isFixAsk := b.clarify.dupFixAsks[quotedID]
 	same, isSameAsk := b.clarify.sameAsks[quotedID]
+	cross, isCrossAsk := b.clarify.crossAsks[quotedID]
 	b.clarify.mu.Unlock()
 	if !isPayAsk {
 		// Связь могла потеряться из памяти (рестарт бота) — ищем в БД.
@@ -815,6 +820,10 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	// «Похоже, это тот же чек, что уже засчитан» — «другой» засчитывает отдельно.
 	if isSameAsk {
 		return b.applySameCheckAnswer(ctx, msg.Info.Chat, quotedID, same, text)
+	}
+	// «Этот чек уже прислан в другой группе как X — чей он?» — ФИО решает за обе копии.
+	if isCrossAsk {
+		return b.applyCrossClientAnswer(ctx, msg.Info.Chat, quotedID, cross, text)
 	}
 
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».

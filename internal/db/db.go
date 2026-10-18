@@ -1952,7 +1952,8 @@ const DuplicateWindow = 5 * time.Minute
 // совокупности всех параметров сразу:
 //   - получатель (сопоставленный контакт, а если он не определён — ФИО как в чеке);
 //   - сумма (точное совпадение);
-//   - время операции (в пределах DuplicateWindow);
+//   - время операции: напечатанное на обоих чеках — то же самое, угаданное
+//     (не прочиталось) — в пределах DuplicateWindow;
 //   - номер документа / код авторизации НЕ противоречат: либо совпадают, либо
 //     у одного из чеков их нет. Разные номера = разные операции, поэтому два
 //     реально разных перевода одному человеку на одну сумму дублем не станут,
@@ -1966,8 +1967,12 @@ const DuplicateWindow = 5 * time.Minute
 // работники кидают чеки в одну группу, оттуда их пересылают в другую, и это
 // НЕ дубль. Пустой groupJID = поиск по всем группам (для информационной
 // проверки чеков из лички).
-func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time) (bool, time.Time, error) {
-	dup, err := d.FindDuplicateReceiptEx(ctx, groupJID, docNumber, authCode, contactID, recipientRaw, "", amount, txDate)
+//
+// txGuessed — время операции не прочиталось с чека (txDate — время сообщения):
+// тогда совпадение по времени ищем в окне DuplicateWindow; напечатанное время
+// должно совпасть (см. sameOpTimeSQL).
+func (d *DB) FindDuplicateReceipt(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw string, amount float64, txDate time.Time, txGuessed bool) (bool, time.Time, error) {
+	dup, err := d.FindDuplicateReceiptEx(ctx, groupJID, docNumber, authCode, contactID, recipientRaw, "", amount, txDate, txGuessed)
 	return dup.Found, dup.TxDate, err
 }
 
@@ -1983,13 +1988,17 @@ type DuplicateMatch struct {
 // FindDuplicateReceiptEx ищет тот же чек, присланный раньше. Совпадение
 // номера операции (документа) или кода авторизации — это тот же чек, КАК БЫ
 // его ни подписали. Без номеров — тот же клиент/получатель, та же сумма,
-// время операции в пределах окна и тот же ПЛАТЕЛЬЩИК на чеке: два разных
-// клиента, перечислившие одинаковую сумму на одну карту, — не дубль.
-func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw, senderRaw string, amount float64, txDate time.Time) (DuplicateMatch, error) {
+// то же время операции и тот же ПЛАТЕЛЬЩИК на чеке: два разных клиента,
+// перечислившие одинаковую сумму на одну карту, — не дубль. Время: оба
+// напечатаны — одно и то же (до секунды; до минуты, если чек печатает только
+// минуты), иначе это разные переводы; угадано хоть одно — окно DuplicateWindow.
+func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw, senderRaw string, amount float64, txDate time.Time, txGuessed bool) (DuplicateMatch, error) {
 	var m DuplicateMatch
+	// Номера на чеке может не быть (NULL в базе) — «совпал номер» должен быть
+	// false, а не NULL: иначе Scan в bool падает и повтор не ловится вовсе.
 	err := d.pool.QueryRow(ctx, `
 		SELECT br.tx_date, COALESCE(c.canonical_name, br.recipient_raw, ''),
-		       (($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8)),
+		       COALESCE(($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8), false),
 		       COALESCE(rm.wa_message_id, '')
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -2011,6 +2020,7 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 		    OR (
 		      (($4::int IS NOT NULL AND br.contact_id = $4) OR ($4::int IS NULL AND br.recipient_raw = $5))
 		      AND br.tx_date BETWEEN $2::timestamptz AND $3::timestamptz
+		      AND `+sameOpTimeSQL("br.tx_date", "br.tx_time_guessed", "$11::timestamptz", "$10::boolean")+`
 		      AND (COALESCE(br.doc_number, '') = '' OR $7 = '' OR br.doc_number = $7)
 		      AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8)
 		      AND (COALESCE(br.sender_raw, '') = '' OR $9 = ''
@@ -2019,7 +2029,8 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 		  )
 		ORDER BY 3 DESC, br.tx_date
 		LIMIT 1
-	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode, senderRaw).
+	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode, senderRaw,
+		txGuessed, txDate).
 		Scan(&m.TxDate, &m.Client, &m.StrongID, &m.WaMessage)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, nil
@@ -2106,7 +2117,7 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 					(NULLIF(orig.doc_number, '') IS NOT NULL AND dd.doc_number = orig.doc_number) OR
 					(NULLIF(orig.auth_code, '') IS NOT NULL AND dd.auth_code = orig.auth_code) OR
 					(dd.contact_id = orig.contact_id AND dd.amount = orig.amount
-					 AND abs(extract(epoch FROM dd.tx_date - orig.tx_date)) <= 300) OR
+					 AND `+sameOpTimeSQL("dd.tx_date", "dd.tx_time_guessed", "orig.tx_date", "orig.tx_time_guessed")+`) OR
 					-- Тот же напечатанный чек (копия без ФИО при подписанном оригинале).
 					`+printedMatchSQL("dd", "orig")+` OR
 					-- Копия без прочитанного времени, признанная «похоже, тот же»
