@@ -262,13 +262,20 @@ func absDur(d time.Duration) time.Duration {
 	return d
 }
 
+// SameName — одно ли имя клиента при разном написании (падеж, опечатка,
+// порядок слов, инициалы). Бот подставляет своё сравнение имён; по умолчанию —
+// совпадение слов без учёта регистра и порядка.
+var SameName = func(a, b string) bool {
+	ka, kb := ClientKey(a), ClientKey(b)
+	return ka != "" && ka == kb
+}
+
 // sameClient — один ли клиент у двух улик.
 func sameClient(aID int, a string, bID int, b string) bool {
 	if aID != 0 && aID == bID {
 		return true
 	}
-	ka, kb := ClientKey(a), ClientKey(b)
-	return ka != "" && ka == kb
+	return strings.TrimSpace(a) != "" && strings.TrimSpace(b) != "" && SameName(a, b)
 }
 
 // Build собирает книгу платежей из чеков и текстов. Правила:
