@@ -345,11 +345,19 @@ func corrNameMatches(query, name string) bool {
 type corrGroup struct {
 	ts    []db.CorrTarget
 	twins []db.CorrTarget
+	// split — цель — текст-итог платежа частями: его сумма — сумма чеков,
+	// поправка итога на чеки не переносится.
+	split *splitTotal
+	// totals — итоги платежа частями, в которые входит исправляемый чек: итог
+	// следует за суммой своей части (иначе он перестанет сходиться с чеками и
+	// посчитается отдельным платежом сверх них).
+	totals []*splitTotal
 }
 
 // groupCorrTargets — чек и его текст-пара (тот же платёж по движку подсчёта)
 // — одна цель поправки; текст, который движок считает отдельным платежом, —
-// своя цель.
+// своя цель. Текст-итог платежа частями — своя цель без чеков: его чеки — не
+// его копии.
 func (b *Bot) groupCorrTargets(ctx context.Context, ts []db.CorrTarget) []corrGroup {
 	var at [][]time.Time
 	for _, t := range ts {
@@ -359,6 +367,11 @@ func (b *Bot) groupCorrTargets(ctx context.Context, ts []db.CorrTarget) []corrGr
 	var groups []corrGroup
 	var pays []*ledger.Payment
 	for _, t := range ts {
+		if st := x.splitOf(t.Kind, t.ID); st != nil {
+			groups = append(groups, corrGroup{ts: []db.CorrTarget{t}, split: st})
+			pays = append(pays, nil)
+			continue
+		}
 		p := x.payment(t.Kind, t.ID)
 		placed := false
 		if p != nil {
@@ -376,6 +389,18 @@ func (b *Bot) groupCorrTargets(ctx context.Context, ts []db.CorrTarget) []corrGr
 		}
 	}
 	for gi, p := range pays {
+		if groups[gi].split != nil {
+			continue
+		}
+		// Итоги платежа частями, в которые входит этот чек (и посчитанная
+		// часть, и часть, которой сейчас нет в сборе).
+		ids := checkIDs(p)
+		for _, t := range groups[gi].ts {
+			if t.Kind == "receipt" {
+				ids = append(ids, t.ID)
+			}
+		}
+		groups[gi].totals = x.totalsOf(ids...)
 		if p == nil {
 			continue
 		}
@@ -481,13 +506,23 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 	if math.Abs(g[0].Amount-c.New) < 0.01 {
 		return done() // «правильно 5000» — подтверждение, менять нечего
 	}
+	if st := groups[0].split; st != nil && math.Abs(st.sum()-c.New) >= 0.5 {
+		// Итог платежа частями — сумма его чеков. Другой итог с чеками не
+		// сойдётся: текст посчитался бы отдельным платежом сверх них, а на
+		// какой-то из чеков новую сумму не перенести. Ничего не меняем — спрашиваем.
+		say(splitTotalQuestion(st, c.New))
+		return done()
+	}
 	was := g[0].Amount
 	changed, onlyChecks := 0, true
+	ids := map[int]bool{}
 	for _, t := range g {
 		if b.setCorrectedAmount(ctx, rawID, t, c.New) {
 			changed++
 			if t.Kind != "receipt" {
 				onlyChecks = false
+			} else {
+				ids[t.ID] = true
 			}
 		}
 	}
@@ -499,9 +534,54 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 		if g[0].Name != "" {
 			who = " (" + g[0].Name + ")"
 		}
-		say(fmt.Sprintf("✏️ Исправил сумму чека%s: было %s ₽, стало %s ₽.", who, formatMoney(was), formatMoney(c.New)))
+		say(fmt.Sprintf("✏️ Исправил сумму чека%s: было %s ₽, стало %s ₽.", who, formatMoney(was), formatMoney(c.New)) +
+			b.followSplitTotals(ctx, rawID, groups[0].totals, ids, c.New-was, c.New))
 	} else {
-		say(fmt.Sprintf("✏️ Исправил: %s — было %s ₽, стало %s ₽.", g[0].Name, formatMoney(was), formatMoney(c.New)))
+		say(fmt.Sprintf("✏️ Исправил: %s — было %s ₽, стало %s ₽.", g[0].Name, formatMoney(was), formatMoney(c.New)) +
+			b.followSplitTotals(ctx, rawID, groups[0].totals, ids, c.New-was, c.New))
 	}
 	return done()
+}
+
+// followSplitTotals — поправили сумму чека, который входит в платёж частями с
+// итогом текстом: итог — сумма частей и меняется на ту же разницу (поправка
+// записана — удалят её, вернётся и итог). Иначе итог перестал бы сходиться с
+// чеками и посчитался отдельным платежом сверх них. Возвращает пояснение.
+func (b *Bot) followSplitTotals(ctx context.Context, rawID int, totals []*splitTotal, ids map[int]bool, delta, to float64) string {
+	var out string
+	for _, st := range totals {
+		nt := math.Round((st.text.Amount+delta)*100) / 100
+		if nt <= 0 || math.Abs(delta) < 0.01 {
+			continue
+		}
+		t := db.CorrTarget{Kind: "tx", ID: st.text.ID, Name: st.text.Client, Amount: st.text.Amount, ContactID: st.text.ContactID}
+		if !b.setCorrectedAmount(ctx, rawID, t, nt) {
+			continue
+		}
+		out += fmt.Sprintf(" Это часть платежа «%s» (итог текстом): итог — сумма чеков %s, поправил и его: было %s ₽, стало %s ₽."+
+			" Если итог %s ₽ был верный — значит, ошибка в другом чеке: поправьте его сумму свайпом.",
+			st.label(), st.partsLine(ids, to), formatMoney(st.text.Amount), formatMoney(nt), formatMoney(st.text.Amount))
+	}
+	return out
+}
+
+// splitTotalQuestion — поправили сумму текста-итога платежа частями: чеки
+// дают другую сумму. Спрашиваем, что это — доплата или ошибка, и как её внести.
+func splitTotalQuestion(st *splitTotal, to float64) string {
+	sum := st.sum()
+	who := strings.TrimSpace(st.text.Client)
+	if who == "" {
+		who = "<ФИО клиента>"
+	}
+	q := fmt.Sprintf("❓ «%s» — это итог платежа частями: чеки %s = %s ₽. Итог %s ₽ с чеками не сходится",
+		st.label(), st.partsLine(nil, 0), formatMoney(sum), formatMoney(to))
+	diff := to - sum
+	if diff > 0 {
+		plain := strconv.FormatFloat(math.Round(diff*100)/100, 'f', -1, 64) // «1000» — как пишут платёж
+		q += fmt.Sprintf(" — это доплата %s ₽ или ошибка? Сумму пока не менял. Если доплата — пришлите её чек или напишите отдельно: «%s %s».",
+			formatMoney(diff), who, plain)
+	} else {
+		q += fmt.Sprintf(" (на %s ₽ меньше) — это ошибка в сумме какого-то чека? Сумму пока не менял.", formatMoney(-diff))
+	}
+	return q + " Если ошибка в сумме чека — ответьте свайпом на нужный чек: «не <сумма на чеке> а <правильная>»."
 }
