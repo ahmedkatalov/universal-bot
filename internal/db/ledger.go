@@ -6,6 +6,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+
 	"whatsapp-bot/internal/ledger"
 )
 
@@ -34,24 +36,7 @@ func (d *DB) LoadBook(ctx context.Context, from, to time.Time, client string) (*
 
 func (d *DB) loadLedgerChecks(ctx context.Context, from, to time.Time, client string) ([]ledger.Check, error) {
 	rows, err := d.pool.Query(ctx, `
-		SELECT br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_message_id, ''),
-		       -- Копию, которую владелец поправил в целевой группе, считаем
-		       -- самостоятельным чеком (тот же номер документа склеит её с исходным).
-		       CASE WHEN COALESCE(rm.sender_jid, '') = 'bot-forward' AND position('-fwd-' in COALESCE(rm.wa_message_id, '')) > 0
-		                 AND NOT br.mirror_locked
-		            THEN split_part(rm.wa_message_id, '-fwd-', 1) ELSE '' END,
-		       COALESCE(br.group_jid, rm.wa_group_jid, ''),
-		       `+strings.Replace(ledgerSenderExpr, "%s", "br.submitted_by", 1)+`,
-		       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1),
-		       COALESCE(br.contact_id, 0), COALESCE(c.canonical_name, br.recipient_raw, ''),
-		       br.client_confirmed, br.needs_review, COALESCE(br.amount, 0)::float8, br.tx_date,
-		       COALESCE(rm.received_at, br.tx_date),
-		       COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''),
-		       COALESCE(NULLIF(br.bank, ''), ''),
-		       COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), ''),
-		       COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), ''),
-		       COALESCE(br.collector, ''),
-		       br.ignored, br.is_duplicate, COALESCE(rm.deleted, false), br.created_at
+		SELECT `+ledgerCheckCols+`
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
@@ -61,13 +46,85 @@ func (d *DB) loadLedgerChecks(ctx context.Context, from, to time.Time, client st
 	if err != nil {
 		return nil, err
 	}
+	out, err := scanLedgerChecks(rows)
+	if err != nil || client != "" {
+		return out, err
+	}
+	// Тот же чек (тот же номер документа), присланный в другую группу намного
+	// раньше или позже периода, тоже нужен: иначе дневной отчёт не узнает, что
+	// чек уже посчитан в другой день, и посчитает его второй раз.
+	have := map[int]bool{}
+	var docs []string
+	seen := map[string]bool{}
+	for _, c := range out {
+		have[c.ID] = true
+		if nd := ledger.NormDoc(c.Doc); len([]rune(nd)) >= 6 && !seen[nd] {
+			seen[nd] = true
+			docs = append(docs, nd)
+		}
+	}
+	if len(docs) == 0 {
+		return out, nil
+	}
+	more, err := d.loadLedgerChecksByDocs(ctx, docs, from.AddDate(0, 0, -60), to.AddDate(0, 0, 60))
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range more {
+		if !have[c.ID] {
+			have[c.ID] = true
+			out = append(out, c)
+		}
+	}
+	return out, nil
+}
+
+const ledgerCheckCols = `br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_message_id, ''),
+		       CASE WHEN COALESCE(rm.sender_jid, '') = 'bot-forward' AND position('-fwd-' in COALESCE(rm.wa_message_id, '')) > 0
+		                 AND NOT br.mirror_locked
+		            THEN split_part(rm.wa_message_id, '-fwd-', 1) ELSE '' END,
+		       COALESCE(br.group_jid, rm.wa_group_jid, ''),
+		       COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1), ''),
+		       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1),
+		       COALESCE(br.contact_id, 0), COALESCE(c.canonical_name, br.recipient_raw, ''),
+		       br.client_confirmed, br.needs_review, COALESCE(br.amount, 0)::float8, br.tx_date,
+		       COALESCE(rm.received_at, br.tx_date),
+		       COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''),
+		       COALESCE(NULLIF(br.bank, ''), ''),
+		       COALESCE(NULLIF(br.recipient_bank, ''), NULLIF(br.bank, ''), ''),
+		       COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), ''),
+		       COALESCE(NULLIF(br.card_owner, ''), CASE WHEN NOT br.client_confirmed THEN NULLIF(br.recipient_raw, '') END, ''),
+		       COALESCE(br.sender_raw, ''),
+		       EXISTS (SELECT 1 FROM amount_corrections ac WHERE ac.kind = 'receipt' AND ac.target_id = br.id AND NOT ac.reverted),
+		       COALESCE(br.collector, ''),
+		       br.ignored, br.is_duplicate, COALESCE(rm.deleted, false), br.created_at`
+
+// loadLedgerChecksByDocs — чеки с теми же номерами документов (в пределах ±60 дней).
+func (d *DB) loadLedgerChecksByDocs(ctx context.Context, docs []string, from, to time.Time) ([]ledger.Check, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT `+ledgerCheckCols+`
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
+		WHERE br.doc_number IS NOT NULL AND br.doc_number <> ''
+		  AND br.tx_date >= $2 AND br.tx_date < $3
+		  AND regexp_replace(translate(upper(br.doc_number), 'АВСЕЁНКМОРТХУ', 'ABCEEHKMOPTXY'), '[^0-9A-ZА-Я]', '', 'g') = ANY($1)`,
+		docs, from, to)
+	if err != nil {
+		return nil, err
+	}
+	return scanLedgerChecks(rows)
+}
+
+func scanLedgerChecks(rows pgx.Rows) ([]ledger.Check, error) {
 	defer rows.Close()
 	var out []ledger.Check
 	for rows.Next() {
 		var c ledger.Check
 		if err := rows.Scan(&c.ID, &c.RawID, &c.WaID, &c.FwdOrigin, &c.Group, &c.Sender, &c.Phone,
 			&c.ContactID, &c.Client, &c.Confirmed, &c.Review, &c.Amount, &c.OpDate, &c.PostedAt,
-			&c.Doc, &c.Auth, &c.Bank, &c.CardBank, &c.CardOwner, &c.Collector,
+			&c.Doc, &c.Auth, &c.Bank, &c.CardBank, &c.CardOwner, &c.Printed, &c.Payer, &c.Fixed, &c.Collector,
 			&c.Ignored, &c.Duplicate, &c.Deleted, &c.Created); err != nil {
 			return nil, err
 		}
@@ -210,8 +267,12 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 			add(m, p.Amount)
 		}
 	}
+	// Непроверенные чеки: деньги на карту пришли, клиент ещё не назван. Один
+	// чек, присланный в две группы, — один раз.
+	seen := map[*ledger.Check]bool{}
 	for _, e := range book.Left(f) {
-		if e.Check != nil && e.Reason == ledger.ReasonReview && e.Check.Amount > 0 {
+		if e.Check != nil && e.Reason == ledger.ReasonReview && e.Check.Amount > 0 && !seen[e.Root()] {
+			seen[e.Root()] = true
 			add(e.Check, e.Check.Amount)
 		}
 	}
@@ -378,30 +439,17 @@ func (d *DB) ReportExclusionsBasis(ctx context.Context, from, to time.Time, grou
 		return ex, err
 	}
 	f := ledger.Filter{From: from, To: to, ByChat: byChat, Groups: groupSet(groupJIDs)}
-	// Номера документов посчитанных чеков: копия непроверенного чека, которая
-	// уже засчитана в другой группе, в «не вошло» не идёт.
-	counted := map[string]bool{}
-	for _, p := range book.Payments {
-		for _, c := range p.Checks {
-			if nd := ledger.NormDoc(c.Doc); nd != "" {
-				counted[nd] = true
-			}
-		}
-	}
-	seenDoc := map[string]bool{}
+	// Тот же непроверенный чек в нескольких группах — один раз (копии уже
+	// посчитанного чека движок относит к его платежу).
+	seen := map[*ledger.Check]bool{}
 	for _, e := range book.Left(f) {
 		switch e.Reason {
 		case ledger.ReasonReview:
 			c := e.Check
-			if c.Amount <= 0 {
+			if c.Amount <= 0 || seen[e.Root()] {
 				continue
 			}
-			if nd := ledger.NormDoc(c.Doc); nd != "" {
-				if counted[nd] || seenDoc[nd] {
-					continue
-				}
-				seenDoc[nd] = true
-			}
+			seen[e.Root()] = true
 			ex.NeedsReviewCount++
 			ex.NeedsReviewSum += c.Amount
 		case ledger.ReasonHeld:
@@ -409,7 +457,7 @@ func (d *DB) ReportExclusionsBasis(ctx context.Context, from, to time.Time, grou
 				ex.HeldCashCount++
 				ex.HeldCashSum += e.Text.Amount
 			}
-		case ledger.ReasonTwin:
+		case ledger.ReasonTwin, ledger.ReasonSplit:
 			ex.TextDupCount++
 			ex.TextDupSum += e.Text.Amount
 		}

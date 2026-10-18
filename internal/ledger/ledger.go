@@ -40,11 +40,16 @@ type Check struct {
 	Bank      string // банк чека (отправителя)
 	CardBank  string // банк получателя (для разбивки по картам)
 	CardOwner string // получатель на чеке (владелец карты)
+	Printed   string // получатель, как напечатан на чеке (пусто — не прочитан)
+	Payer     string // плательщик, как напечатан на чеке
+	Fixed     bool   // сумму чека поправили вручную («не 15000 а 13000»)
 	Collector string
 	Ignored   bool // исключён владельцем / не прошёл (отклонён)
 	Duplicate bool // повтор уже присланного чека (решено при получении)
 	Deleted   bool // сообщение удалено в WhatsApp
 	Created   time.Time
+
+	nd string // NormDoc(Doc), считается в Build
 }
 
 // Text — платёж, записанный из текста («Магомедов Ахмед 15000», наличка).
@@ -81,6 +86,7 @@ type Payment struct {
 	Checks   []*Check // главный — первый
 	Texts    []*Text  // тексты про этот платёж (для чека — его «текст-дубль»)
 	groups   map[string]bool
+	mark     int // служебная метка при подборе пар
 }
 
 // Main — главный чек платежа (nil — платёж только из текста).
@@ -168,6 +174,7 @@ const (
 	ReasonNoAmount  Reason = "сумма не распознана"
 	ReasonHeld      Reason = "придержан как возможный повтор налички"
 	ReasonTwin      Reason = "текст про уже посчитанный чек"
+	ReasonSplit     Reason = "текст-итог платежа частями (чеки уже посчитаны)"
 	ReasonCopy      Reason = "копия чека, исходный не в сборе"
 )
 
@@ -176,7 +183,19 @@ type Excluded struct {
 	Reason Reason
 	Check  *Check
 	Text   *Text
-	Into   *Payment // для текста-дубля: к какому платежу он относится
+	Into   *Payment   // для текста-дубля: к какому платежу он относится
+	Parts  []*Payment // для текста-итога платежа частями: все его чеки
+	// Of — для непроверенного чека: первый непроверенный экземпляр того же
+	// чека (присланного ещё и в другую группу); в «не вошло» считается один раз.
+	Of *Check
+}
+
+// Root — экземпляр, по которому непроверенный чек считают один раз.
+func (e Excluded) Root() *Check {
+	if e.Of != nil {
+		return e.Of
+	}
+	return e.Check
 }
 
 // Amount, Client, Group, OpDate, PostedAt — поля улики.
@@ -270,12 +289,159 @@ var SameName = func(a, b string) bool {
 	return ka != "" && ka == kb
 }
 
+// NameCovers — все слова короткого имени part есть в полном имени full
+// («Ахмед» — в «Магомедов Ахмед», «Исаев» — в «Исаев Харон»). Бот подставляет
+// сравнение слов с падежами и опечатками.
+var NameCovers = func(part, full string) bool {
+	pw, fw := strings.Fields(ClientKey(part)), strings.Fields(ClientKey(full))
+	if len(pw) == 0 {
+		return false
+	}
+	have := map[string]bool{}
+	for _, w := range fw {
+		have[w] = true
+	}
+	for _, w := range pw {
+		if !have[w] {
+			return false
+		}
+	}
+	return true
+}
+
+// nameMemo — сравнения имён в одной сборке книги: одни и те же клиенты
+// сравниваются тысячи раз, а у улик с клиентом из справочника имя одно.
+type nameMemo struct {
+	same   map[[2]int]bool
+	covers map[[2]int]bool
+}
+
+func newNameMemo() *nameMemo {
+	return &nameMemo{same: map[[2]int]bool{}, covers: map[[2]int]bool{}}
+}
+
 // sameClient — один ли клиент у двух улик.
-func sameClient(aID int, a string, bID int, b string) bool {
+func (nm *nameMemo) sameClient(aID int, a string, bID int, b string) bool {
 	if aID != 0 && aID == bID {
 		return true
 	}
-	return strings.TrimSpace(a) != "" && strings.TrimSpace(b) != "" && SameName(a, b)
+	if strings.TrimSpace(a) == "" || strings.TrimSpace(b) == "" {
+		return false
+	}
+	if aID == 0 || bID == 0 {
+		return SameName(a, b)
+	}
+	k := [2]int{aID, bID}
+	if v, ok := nm.same[k]; ok {
+		return v
+	}
+	v := SameName(a, b)
+	nm.same[k] = v
+	return v
+}
+
+// nameCovers — неполное имя одной улики входит в полное имя другой (в любую сторону).
+func (nm *nameMemo) nameCovers(aID int, a string, bID int, b string) bool {
+	if aID == 0 || bID == 0 {
+		return NameCovers(a, b) || NameCovers(b, a)
+	}
+	k := [2]int{aID, bID}
+	if v, ok := nm.covers[k]; ok {
+		return v
+	}
+	v := NameCovers(a, b) || NameCovers(b, a)
+	nm.covers[k] = v
+	return v
+}
+
+// samePrinted — одно ли напечатанное имя (получатель/плательщик на чеке).
+func samePrinted(a, b string) bool {
+	return ClientKey(a) == ClientKey(b) || SameName(a, b)
+}
+
+// longDoc — номер документа достаточно длинный, чтобы совпадение значило «тот
+// же чек» даже при разной прочитанной сумме.
+func longDoc(nd string) bool { return len([]rune(nd)) >= 8 }
+
+func sameLongDoc(a, b *Check) bool { return longDoc(a.nd) && a.nd == b.nd }
+
+// sameCheck — c и m — один и тот же чек (присланный дважды / в двух группах).
+// named — оба чека с названным клиентом (иначе клиента сравнить нельзя, и без
+// номера документа нужны совпадающие напечатанные получатель и время).
+func sameCheck(c, m *Check, named bool, nm *nameMemo) bool {
+	if absDur(c.OpDate.Sub(m.OpDate)) > 36*time.Hour {
+		return false
+	}
+	dc, dm := c.nd, m.nd
+	if dc != "" && dm != "" {
+		if dc != dm {
+			return false
+		}
+		return longDoc(dc) || sameMoney(c.Amount, m.Amount)
+	}
+	if !sameMoney(c.Amount, m.Amount) || absDur(c.OpDate.Sub(m.OpDate)) > 2*time.Minute {
+		return false
+	}
+	if c.Printed != "" && m.Printed != "" && !samePrinted(c.Printed, m.Printed) {
+		return false // разные получатели на чеках — разные переводы
+	}
+	if c.Payer != "" && m.Payer != "" && !samePrinted(c.Payer, m.Payer) {
+		return false // разные плательщики — разные переводы
+	}
+	if a, b := NormDoc(c.Auth), NormDoc(m.Auth); a != "" && b != "" && a != b {
+		return false
+	}
+	if named {
+		return nm.sameClient(c.ContactID, c.Client, m.ContactID, m.Client)
+	}
+	return c.Printed != "" && m.Printed != "" && absDur(c.OpDate.Sub(m.OpDate)) <= time.Minute
+}
+
+// twinGap — насколько текст далёк от чеков платежа: по времени присылки чека
+// или по времени операции на нём (чек могут прислать через выходные).
+func twinGap(p *Payment, t *Text) time.Duration {
+	best := time.Duration(math.MaxInt64)
+	for _, c := range p.Checks {
+		if g := absDur(c.PostedAt.Sub(t.PostedAt)); g < best {
+			best = g
+		}
+		if !c.OpDate.IsZero() {
+			if g := absDur(c.OpDate.Sub(t.PostedAt)); g < best {
+				best = g
+			}
+		}
+	}
+	return best
+}
+
+// shortNameWindow — текст с неполным именем («Ахмед 10000») относим к чеку
+// только рядом по времени и от того же человека или в той же группе.
+const shortNameWindow = 2 * time.Hour
+
+// splitWindow — текст-итог платежа частями и его чеки присылают рядом.
+const splitWindow = 3 * time.Hour
+
+// textMatch — подходит ли клиент текста к чеку платежа: 0 — тот же клиент,
+// 1 — неполное имя (слова одного есть в другом) от того же человека или в той
+// же группе (только если short), -1 — нет.
+func textMatch(p *Payment, t *Text, short bool, nm *nameMemo) int {
+	kind := -1
+	for _, c := range p.Checks {
+		if c.Review || c.ContactID == 0 || strings.TrimSpace(c.Client) == "" {
+			continue // у непроверенного чека клиент не назван (там напечатанный получатель)
+		}
+		if nm.sameClient(c.ContactID, c.Client, t.ContactID, t.Client) {
+			return 0
+		}
+		if !short || kind == 1 || strings.TrimSpace(t.Client) == "" {
+			continue
+		}
+		near := (t.Phone != "" && t.Phone == c.Phone) || t.Group == c.Group
+		if near && nm.nameCovers(t.ContactID, t.Client, c.ContactID, c.Client) {
+			kind = 1
+		}
+	}
+	return kind
 }
 
 // Build собирает книгу платежей из чеков и текстов. Правила:
@@ -285,19 +451,30 @@ func sameClient(aID int, a string, bID int, b string) bool {
 //  2. Копия чека, пересланная ботом в другую группу, — тот же платёж, что
 //     исходный чек (своего платежа не даёт).
 //  3. Чек, у которого не ясен клиент или сумма, ждёт проверки (не в сборе).
+//     Если тот же чек уже посчитан в другой группе — он часть того платежа;
+//     несколько непроверенных экземпляров одного чека — один в «не вошло».
 //  4. Один и тот же чек, присланный вручную в две разные группы (тот же номер
-//     документа, а без номера — тот же клиент, сумма и минута операции), —
-//     один платёж.
+//     документа — даже если сумму в одной группе поправили; без номера — тот
+//     же клиент, сумма, минута операции, получатель и плательщик), — один платёж.
 //  5. Наличка-повтор, ожидающая ответа «новый или тот же?», не в сборе.
 //  6. Текстовый перевод про чек (тот же клиент и сумма, присланы в пределах
-//     двух суток) — тот же платёж: считается чек, текст подтверждает его.
-//     Один чек — один текст: два одинаковых текста при одном чеке — два платежа.
-//  7. Наличка — всегда отдельный платёж (чеком не подтверждается).
+//     двух суток от присылки чека или от операции на нём) — тот же платёж:
+//     считается чек, текст подтверждает его. Пары подбираются по близости во
+//     времени (ближайшие — первыми). В одной группе один чек — один текст: два
+//     одинаковых текста при одном чеке — два платежа; тот же текст в другой
+//     группе — тот же платёж. Неполное имя («Ахмед 10000») — к чеку
+//     «Магомедов Ахмед» той же суммы, только от того же человека или в той же
+//     группе и в пределах двух часов.
+//  7. Текст-итог платежа частями («Исаев 100000» и два чека по 50000 того же
+//     клиента в той же группе рядом по времени) — чеки уже посчитаны.
+//  8. Наличка — всегда отдельный платёж (чеком не подтверждается).
 func Build(checks []Check, texts []Text) *Book {
 	b := &Book{}
+	nm := newNameMemo()
 	cs := make([]*Check, len(checks))
 	for i := range checks {
 		cs[i] = &checks[i]
+		cs[i].nd = NormDoc(cs[i].Doc)
 	}
 	sort.SliceStable(cs, func(i, j int) bool {
 		if !cs[i].PostedAt.Equal(cs[j].PostedAt) {
@@ -314,8 +491,7 @@ func Build(checks []Check, texts []Text) *Book {
 
 	// 1–3: состояние каждого чека.
 	paymentOf := map[*Check]*Payment{}
-	var copies []*Check
-	var live []*Check
+	var copies, live, review []*Check
 	for _, c := range cs {
 		switch {
 		case c.Deleted:
@@ -329,60 +505,95 @@ func Build(checks []Check, texts []Text) *Book {
 		case c.Amount <= 0:
 			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonNoAmount, Check: c})
 		case c.Review || c.ContactID == 0:
-			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonReview, Check: c})
+			review = append(review, c)
 		default:
 			live = append(live, c)
 		}
 	}
 
+	attach := func(p *Payment, c *Check) {
+		p.Checks = append(p.Checks, c)
+		p.groups[c.Group] = true
+		paymentOf[c] = p
+	}
+
 	// 4: один чек в разных группах — один платёж.
+	mains := newCheckIndex()
 	for _, c := range live {
 		var into *Payment
-		for _, p := range b.Payments {
-			m := p.Main()
-			if m == nil || p.groups[c.Group] || !sameMoney(m.Amount, c.Amount) {
-				continue
+		for _, m := range mains.near(c) {
+			p := paymentOf[m]
+			if p.groups[c.Group] && (c.nd == "" || c.nd != m.nd) {
+				continue // без номера в одной группе — могут быть два перевода частями
 			}
-			dc, dm := NormDoc(c.Doc), NormDoc(m.Doc)
-			switch {
-			case dc != "" && dm != "":
-				if dc == dm && absDur(c.OpDate.Sub(m.OpDate)) <= 36*time.Hour {
-					into = p
-				}
-			case sameClient(c.ContactID, c.Client, m.ContactID, m.Client) && absDur(c.OpDate.Sub(m.OpDate)) <= 2*time.Minute:
+			if sameCheck(c, m, true, nm) {
 				into = p
-			}
-			if into != nil {
 				break
 			}
 		}
 		if into != nil {
-			into.Checks = append(into.Checks, c)
-			into.groups[c.Group] = true
-			paymentOf[c] = into
+			attach(into, c)
+			if !sameMoney(into.Amount, c.Amount) && c.Fixed && !into.Main().Fixed {
+				into.Amount = c.Amount // сумму исправили в этой группе — верна она
+			}
 			continue
 		}
 		p := &Payment{
 			Key: "c" + itoa(c.ID), Client: c.Client, ClientID: c.ContactID, Amount: c.Amount,
-			OpDate: c.OpDate, PostedAt: c.PostedAt, Checks: []*Check{c}, groups: map[string]bool{c.Group: true},
+			OpDate: c.OpDate, PostedAt: c.PostedAt, groups: map[string]bool{},
 		}
+		attach(p, c)
+		mains.add(c)
 		b.Payments = append(b.Payments, p)
-		paymentOf[c] = p
+	}
+
+	// 3: непроверенный чек, уже посчитанный в другой группе, — часть того
+	// платежа; непроверенные экземпляры одного чека — один в «не вошло».
+	// Без номера документа в одной группе это могут быть два перевода частями —
+	// там решает проверка повтора при получении.
+	counted := newCheckIndex()
+	for _, p := range b.Payments {
+		for _, m := range p.Checks {
+			counted.add(m)
+		}
+	}
+	pending := newCheckIndex()
+	for _, c := range review {
+		var into *Payment
+		for _, m := range counted.near(c) {
+			if (m.Group != c.Group || sameLongDoc(c, m)) && sameCheck(c, m, false, nm) {
+				into = paymentOf[m]
+				break
+			}
+		}
+		if into != nil {
+			attach(into, c)
+			continue
+		}
+		e := Excluded{Reason: ReasonReview, Check: c}
+		for _, o := range pending.near(c) {
+			if (o.Group != c.Group || sameLongDoc(c, o)) && sameCheck(c, o, false, nm) {
+				e.Of = o
+				break
+			}
+		}
+		if e.Of == nil {
+			pending.add(c)
+		}
+		b.Excluded = append(b.Excluded, e)
 	}
 
 	// 2: копии — к платежу исходного чека (или туда же, где исходный отброшен).
 	for _, c := range copies {
 		orig := byWa[c.FwdOrigin]
 		if p := paymentOf[orig]; p != nil {
-			p.Checks = append(p.Checks, c)
-			p.groups[c.Group] = true
-			paymentOf[c] = p
+			attach(p, c)
 			continue
 		}
 		b.Excluded = append(b.Excluded, Excluded{Reason: ReasonCopy, Check: c})
 	}
 
-	// 5–7: тексты.
+	// 5–8: тексты.
 	ts := make([]*Text, len(texts))
 	for i := range texts {
 		ts[i] = &texts[i]
@@ -394,46 +605,133 @@ func Build(checks []Check, texts []Text) *Book {
 		return ts[i].ID < ts[j].ID
 	})
 	checkPays := append([]*Payment(nil), b.Payments...)
-	hasText := map[*Payment]bool{}
+	var transfers []*Text
 	for _, t := range ts {
 		switch {
 		case t.Amount <= 0:
-			continue
 		case t.Deleted:
 			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonDeleted, Text: t})
-			continue
 		case t.Ignored:
-			continue // старая версия исправленного сообщения или исключённый платёж
+			// старая версия исправленного сообщения или исключённый платёж
 		case t.Held:
 			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonHeld, Text: t})
+		default:
+			transfers = append(transfers, t)
+		}
+	}
+
+	// 6: пары «текст — чек» по близости (ближайшие — первыми).
+	type cand struct {
+		t    *Text
+		p    *Payment
+		kind int
+		gap  time.Duration
+	}
+	// Платежи с чеками по сумме и дню (присылки и операции): текст ищет пару
+	// только среди чеков той же суммы за соседние дни.
+	byAmountDay := map[[2]int64][]*Payment{}
+	for _, p := range checkPays {
+		k := amountKey(p.Amount)
+		days := map[int64]bool{}
+		for _, c := range p.Checks {
+			days[dayKey(c.PostedAt)] = true
+			if !c.OpDate.IsZero() {
+				days[dayKey(c.OpDate)] = true
+			}
+		}
+		for d := range days {
+			byAmountDay[[2]int64{k, d}] = append(byAmountDay[[2]int64{k, d}], p)
+		}
+	}
+	var cands []cand
+	mark := 0
+	for _, t := range transfers {
+		if t.Cash {
 			continue
 		}
-		if !t.Cash {
-			var best *Payment
-			var bestGap time.Duration
-			for _, p := range checkPays {
-				if hasText[p] || !sameMoney(p.Amount, t.Amount) {
-					continue
-				}
-				m := p.Main()
-				if !sameClient(m.ContactID, m.Client, t.ContactID, t.Client) {
-					continue
-				}
-				gap := absDur(m.PostedAt.Sub(t.PostedAt))
-				if gap >= TwinWindow {
-					continue
-				}
-				if best == nil || gap < bestGap {
-					best, bestGap = p, gap
+		k, d0 := amountKey(t.Amount), dayKey(t.PostedAt)
+		mark++
+		for k2 := k - 1; k2 <= k+1; k2++ {
+			for d := d0 - 3; d <= d0+3; d++ {
+				for _, p := range byAmountDay[[2]int64{k2, d}] {
+					if p.mark == mark || !sameMoney(p.Amount, t.Amount) {
+						continue
+					}
+					p.mark = mark
+					gap := twinGap(p, t)
+					if gap >= TwinWindow {
+						continue
+					}
+					kind := textMatch(p, t, gap <= shortNameWindow, nm)
+					if kind < 0 {
+						continue
+					}
+					cands = append(cands, cand{t, p, kind, gap})
 				}
 			}
-			if best != nil {
-				best.Texts = append(best.Texts, t)
-				best.groups[t.Group] = true
-				hasText[best] = true
-				b.Excluded = append(b.Excluded, Excluded{Reason: ReasonTwin, Text: t, Into: best})
-				continue
+		}
+	}
+	sort.SliceStable(cands, func(i, j int) bool {
+		a, c := cands[i], cands[j]
+		if a.kind != c.kind {
+			return a.kind < c.kind
+		}
+		if a.gap != c.gap {
+			return a.gap < c.gap
+		}
+		if a.t.ID != c.t.ID {
+			return a.t.ID < c.t.ID
+		}
+		return a.p.Key < c.p.Key
+	})
+	twinOf := map[*Text]*Payment{}
+	textIn := map[*Payment]map[string]bool{}
+	for _, c := range cands {
+		if twinOf[c.t] != nil || textIn[c.p][c.t.Group] {
+			continue
+		}
+		twinOf[c.t] = c.p
+		if textIn[c.p] == nil {
+			textIn[c.p] = map[string]bool{}
+		}
+		textIn[c.p][c.t.Group] = true
+	}
+
+	// 7: текст-итог платежа частями.
+	splitOf := map[*Text][]*Payment{}
+	byTime := newTimeIndex(checkPays)
+	for _, t := range transfers {
+		if t.Cash || twinOf[t] != nil {
+			continue
+		}
+		if parts := splitParts(t, byTime.around(t.PostedAt, splitWindow), textIn, nm); len(parts) > 0 {
+			splitOf[t] = parts
+			for _, p := range parts {
+				if textIn[p] == nil {
+					textIn[p] = map[string]bool{}
+				}
+				textIn[p][t.Group] = true
 			}
+		}
+	}
+
+	for _, t := range transfers {
+		if p := twinOf[t]; p != nil {
+			p.Texts = append(p.Texts, t)
+			p.groups[t.Group] = true
+			if t.PostedAt.Before(p.PostedAt) {
+				p.PostedAt = t.PostedAt
+			}
+			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonTwin, Text: t, Into: p})
+			continue
+		}
+		if parts := splitOf[t]; len(parts) > 0 {
+			parts[0].Texts = append(parts[0].Texts, t)
+			for _, p := range parts {
+				p.groups[t.Group] = true
+			}
+			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonSplit, Text: t, Into: parts[0], Parts: parts})
+			continue
 		}
 		b.Payments = append(b.Payments, &Payment{
 			Key: "t" + itoa(t.ID), Client: t.Client, ClientID: t.ContactID, Amount: t.Amount, Cash: t.Cash,
@@ -441,6 +739,153 @@ func Build(checks []Check, texts []Text) *Book {
 		})
 	}
 	return b
+}
+
+// splitParts — 2–3 чека того же клиента без своего текста, в той же группе и
+// рядом по времени, сумма которых равна сумме текста (платёж частями из-за
+// лимита банка). Из подходящих наборов — самый близкий по времени.
+func splitParts(t *Text, pays []*Payment, textIn map[*Payment]map[string]bool, nm *nameMemo) []*Payment {
+	var cand []*Payment
+	for _, p := range pays {
+		if len(textIn[p]) > 0 || p.Amount >= t.Amount || twinGap(p, t) > splitWindow || textMatch(p, t, false, nm) != 0 {
+			continue
+		}
+		inGroup := false
+		for _, c := range p.Checks {
+			if c.Group == t.Group {
+				inGroup = true
+			}
+		}
+		if inGroup {
+			cand = append(cand, p)
+		}
+	}
+	if len(cand) < 2 {
+		return nil
+	}
+	sort.SliceStable(cand, func(i, j int) bool { return twinGap(cand[i], t) < twinGap(cand[j], t) })
+	if len(cand) > 10 {
+		cand = cand[:10]
+	}
+	var best []*Payment
+	var bestGap time.Duration
+	consider := func(set []*Payment) {
+		var sum float64
+		var worst time.Duration
+		for _, p := range set {
+			sum += p.Amount
+			if g := twinGap(p, t); g > worst {
+				worst = g
+			}
+		}
+		if !sameMoney(sum, t.Amount) {
+			return
+		}
+		if best == nil || len(set) < len(best) || (len(set) == len(best) && worst < bestGap) {
+			best, bestGap = append([]*Payment(nil), set...), worst
+		}
+	}
+	for i := range cand {
+		for j := i + 1; j < len(cand); j++ {
+			consider([]*Payment{cand[i], cand[j]})
+			for k := j + 1; k < len(cand); k++ {
+				consider([]*Payment{cand[i], cand[j], cand[k]})
+			}
+		}
+	}
+	sort.SliceStable(best, func(i, j int) bool { return best[i].PostedAt.Before(best[j].PostedAt) })
+	return best
+}
+
+func amountKey(a float64) int64 { return int64(math.Round(a)) }
+
+// checkIndex — поиск «того же чека» без перебора всех чеков: по номеру
+// документа и по сумме (в порядке добавления).
+type checkIndex struct {
+	byDoc map[string][]*Check
+	byAmt map[[2]int64][]*Check // сумма и день операции
+}
+
+func newCheckIndex() *checkIndex {
+	return &checkIndex{byDoc: map[string][]*Check{}, byAmt: map[[2]int64][]*Check{}}
+}
+
+func (x *checkIndex) add(c *Check) {
+	if c.nd != "" {
+		x.byDoc[c.nd] = append(x.byDoc[c.nd], c)
+	}
+	k := [2]int64{amountKey(c.Amount), dayKey(c.OpDate)}
+	x.byAmt[k] = append(x.byAmt[k], c)
+}
+
+// near — чеки с тем же номером документа, затем с той же суммой и датой
+// операции в пределах двух дней (дальше «тот же чек» не ищем).
+func (x *checkIndex) near(c *Check) []*Check {
+	var out []*Check
+	seen := map[*Check]bool{}
+	push := func(cs []*Check) {
+		for _, m := range cs {
+			if !seen[m] {
+				seen[m] = true
+				out = append(out, m)
+			}
+		}
+	}
+	if c.nd != "" {
+		push(x.byDoc[c.nd])
+	}
+	k, d0 := amountKey(c.Amount), dayKey(c.OpDate)
+	for k2 := k - 1; k2 <= k+1; k2++ {
+		for d := d0 - 2; d <= d0+2; d++ {
+			push(x.byAmt[[2]int64{k2, d}])
+		}
+	}
+	return out
+}
+
+func dayKey(t time.Time) int64 { return t.Unix() / 86400 }
+
+// timeIndex — платежи с чеками по времени присылки и операции.
+type timeIndex struct {
+	at []time.Time
+	ps []*Payment
+}
+
+func newTimeIndex(pays []*Payment) *timeIndex {
+	type ev struct {
+		at time.Time
+		p  *Payment
+	}
+	var evs []ev
+	for _, p := range pays {
+		for _, c := range p.Checks {
+			evs = append(evs, ev{c.PostedAt, p})
+			if !c.OpDate.IsZero() {
+				evs = append(evs, ev{c.OpDate, p})
+			}
+		}
+	}
+	sort.SliceStable(evs, func(i, j int) bool { return evs[i].at.Before(evs[j].at) })
+	x := &timeIndex{}
+	for _, e := range evs {
+		x.at = append(x.at, e.at)
+		x.ps = append(x.ps, e.p)
+	}
+	return x
+}
+
+// around — платежи, у которых чек прислан или проведён в пределах d от t.
+func (x *timeIndex) around(t time.Time, d time.Duration) []*Payment {
+	lo := sort.Search(len(x.at), func(i int) bool { return !x.at[i].Before(t.Add(-d)) })
+	var out []*Payment
+	seen := map[*Payment]bool{}
+	for i := lo; i < len(x.at) && !x.at[i].After(t.Add(d)); i++ {
+		if !seen[x.ps[i]] {
+			seen[x.ps[i]] = true
+			out = append(out, x.ps[i])
+		}
+	}
+	return out
 }
 
 func itoa(n int) string {

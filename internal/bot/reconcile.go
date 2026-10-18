@@ -231,7 +231,10 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 // Движок подсчёта сравнивает клиентов текста и чека строже сверки
 // (sameClientMoney): «Магомедову Ахмеду» и «Магомедов Ахмед» — один клиент,
 // а «Омаров» и «Умаров» — разные.
-func init() { ledger.SameName = sameNameMemo }
+func init() {
+	ledger.SameName = sameNameMemo
+	ledger.NameCovers = func(part, full string) bool { return nameCoversWith(part, full, nameWordMoney) }
+}
 
 // sameNameMemo — sameClientName с запоминанием: в сверке одни и те же имена
 // сравниваются тысячи раз (каждый клиент со всеми чеками за полтора месяца).
