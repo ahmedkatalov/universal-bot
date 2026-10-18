@@ -551,7 +551,12 @@ func isUnknownReply(lower string) bool {
 // на «имя», лучше отдать ассистенту, который поймёт по смыслу (и запишет через
 // fix_receipt). Так вопрос владельца перестаёт превращаться в ФИО клиента.
 func clarifyNameFromReply(text string) (name string, amount float64, deferToAI bool) {
-	amount = parser.ExtractAmount(text)
+	// Сумма — только если она в ответе ОДНА («Исаев Харон 15000 18.10» — 15000,
+	// дата не в счёт). Две разные суммы — 0: бот переспросит, а не угадает.
+	amount, _ = parser.ExtractSingleAmount(text)
+	// Хвост суммы («15 т.р.», «15 тыс. руб.») — не слова ответа: иначе он
+	// попадал в ФИО («Исаев Харон т.р») или делал ответ «длинной фразой».
+	text = stripMoneyTails(text)
 	// «Молчи в группе», «перечитай группу», «найди чек Каталова» — команда, не имя.
 	if isCommandText(text) {
 		return "", amount, true
@@ -603,6 +608,35 @@ func clarifyNameFromReply(text string) (name string, amount float64, deferToAI b
 	default:
 		return "", amount, true
 	}
+}
+
+// stripMoneyTails убирает из текста слова-хвосты сумм («т.р.», «тыс.», «руб.»)
+// после чисел: «Исаев Харон 15 тыс. р.» -> «Исаев Харон 15». Переносы строк
+// сохраняются.
+func stripMoneyTails(text string) string {
+	lines := strings.Split(text, "\n")
+	for k, ln := range lines {
+		fields := strings.Fields(ln)
+		kept := fields[:0]
+		prevNum, dropped := false, false
+		for _, w := range fields {
+			if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+				prevNum = true
+				kept = append(kept, w)
+				continue
+			}
+			if parser.IsMoneyWord(w, prevNum) {
+				dropped = true
+				continue // prevNum сохраняем: «15 тыс. руб.» — хвост из двух слов
+			}
+			prevNum = false
+			kept = append(kept, w)
+		}
+		if dropped {
+			lines[k] = strings.Join(kept, " ")
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 // looksLikeCorrectionSentence распознаёт ответ-ИСПРАВЛЕНИЕ (а не ФИО): отрицание
@@ -893,6 +927,9 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 		name, amount, deferToAI := clarifyNameFromReply(ln)
 		if deferToAI || name == "" {
 			return false
+		}
+		if _, ambiguous := parser.ExtractSingleAmount(ln); ambiguous {
+			return false // «Исаев 15000 20000» — какая сумма его, неясно: не угадываем
 		}
 		if len(lines) > 1 && amount <= 0 {
 			return false
