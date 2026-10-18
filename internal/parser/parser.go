@@ -24,6 +24,41 @@ type Transaction struct {
 	Note    string  // "аванс", "премия", "долг" и т.п., если распознано
 	CardTo  string  // "втб", "сбер" и т.п., если указано, куда скинули
 	Line    string  // строка сообщения, из которой взят платёж
+	// IsCash — в строке (или в заголовке блока) явно сказано, что это наличка:
+	// «нал», «наличка», «у Дени» (кто забрал). Collector — кто забрал.
+	IsCash    bool
+	Collector string
+}
+
+// cashWordRe — слово налички отдельным словом.
+var cashWordRe = regexp.MustCompile(`(?i)(^|[\s,.:;—-])(нал|наличка|наличкой|наличку|наличные|наличными|наличных|налом|кэш|кеш|cash)([\s,.:;!—-]|$)`)
+
+// collectorTailRe — «… у Дени», «… Мансур взял», «… отдал Адаму» в конце строки.
+var collectorTailRe = regexp.MustCompile(`(?:\s+у\s+([А-ЯЁ][а-яё]+)|\s+([А-ЯЁ][а-яё]+)\s+(?:взял|взяла|забрал|забрала)|\s+(?:отдал|отдала|передал|передала)\s+([А-ЯЁ][а-яё]+))\s*[.!]?\s*$`)
+
+// pureAmountRe — строка — только сумма («27000», «27 000р», «27к»).
+var pureAmountRe = regexp.MustCompile(`(?i)^\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к|k)?\s*(?:₽|руб[а-яё]*|р\.?)?\s*$`)
+
+// stripCashMarkers — убрать из строки пометки налички и «у кого»: «Магомедов
+// Ахмед 15000 нал» → «Магомедов Ахмед 15000», наличка. onlyCash — строка
+// состояла только из пометки («Наличка:» — заголовок блока).
+func stripCashMarkers(line string) (rest string, cash bool, collector string, onlyCash bool) {
+	rest = line
+	if m := collectorTailRe.FindStringSubmatchIndex(rest); m != nil && regexp.MustCompile(`\d`).MatchString(rest[:m[0]]) {
+		for k := 2; k+1 < len(m); k += 2 {
+			if m[k] >= 0 {
+				collector = rest[m[k]:m[k+1]]
+			}
+		}
+		rest, cash = strings.TrimSpace(rest[:m[0]]), true
+	}
+	for cashWordRe.MatchString(rest) {
+		rest = cashWordRe.ReplaceAllString(rest, "$1$3")
+		cash = true
+	}
+	rest = strings.TrimSpace(strings.Trim(strings.TrimSpace(rest), ",.:;—-"))
+	rest = strings.Join(strings.Fields(rest), " ")
+	return rest, cash, collector, cash && rest == ""
 }
 
 // ParseResult — результат разбора одного сообщения.
@@ -62,12 +97,60 @@ func ParseMessage(text string) ParseResult {
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 
 	currentName := ""
+	blockCash := false // заголовок «Наличка:» — дальше по блоку наличка
+	nonEmpty := 0
 	for _, raw := range lines {
-		line := strings.TrimSpace(raw)
-		if line == "" {
+		if strings.TrimSpace(raw) != "" {
+			nonEmpty++
+		}
+	}
+	seen := 0
+	for _, raw := range lines {
+		orig := strings.TrimSpace(raw)
+		if orig == "" {
 			continue // пустая строка — просто разделитель блоков, не сбрасываем currentName,
 			// т.к. в реальных сообщениях люди не всегда аккуратно отбивают блоки
 		}
+		seen++
+		line, lineCash, collector, onlyCash := stripCashMarkers(orig)
+		if onlyCash {
+			// «Магомедов Ахмед 15000\nналичка» — пометка к единственному платежу.
+			if seen == nonEmpty && len(res.Transactions) == 1 {
+				res.Transactions[0].IsCash = true
+			}
+			if currentName == "" {
+				// Заголовок блока «Нал» — суммы под ним — наличка без имени клиента.
+				currentName = strings.Trim(orig, " :.,—-")
+			}
+			blockCash = true
+			continue
+		}
+		start := len(res.Transactions)
+		lineDone := func() {
+			for k := start; k < len(res.Transactions); k++ {
+				res.Transactions[k].Line = orig
+				if lineCash || blockCash {
+					res.Transactions[k].IsCash = true
+				}
+				if collector != "" {
+					res.Transactions[k].Collector = collector
+				}
+			}
+		}
+		prevName := currentName
+		parseLine(&res, line, &currentName, lineCash || blockCash)
+		if currentName != prevName {
+			blockCash = lineCash // новый блок — новое имя: наличка только если сказано
+		}
+		lineDone()
+	}
+
+	return res
+}
+
+// parseLine — разбор одной строки (уже без пометок налички).
+func parseLine(res *ParseResult, line string, currentName *string, cash bool) {
+	{ //nolint:gocritic // тело бывшего цикла
 
 		// Формат "Имя Сумма" в одной строке (типично для списков расходов):
 		// проверяем раньше остальных, т.к. такая строка начинается с буквы,
@@ -80,43 +163,48 @@ func ParseMessage(text string) ParseResult {
 				CardTo:  card,
 				Line:    line,
 			})
-			continue
+			return
 		}
 		if m := amountNameRe.FindStringSubmatch(line); m != nil {
 			if amount := ExtractAmount(m[1]); amount > 0 {
 				res.Transactions = append(res.Transactions, Transaction{
 					RawName: strings.TrimSpace(m[2]), Amount: amount, CardTo: extractCard(strings.ToLower(line)), Line: line,
 				})
-				continue
+				return
 			}
 		}
 
 		amount, note, card, isAmountLine := tryParseAmountLine(line)
 
 		if isAmountLine {
-			if currentName == "" {
+			if *currentName == "" {
+				if cash && pureAmountRe.MatchString(strings.TrimSpace(line)) {
+					// «27000 наличка» без имени — наличка без клиента (заглушка).
+					res.Transactions = append(res.Transactions, Transaction{RawName: "Наличка", Amount: amount, Note: note, CardTo: card, Line: line})
+					return
+				}
 				res.Unparsed = append(res.Unparsed, line+" (сумма без имени)")
-				continue
+				return
 			}
 			res.Transactions = append(res.Transactions, Transaction{
-				RawName: currentName,
+				RawName: *currentName,
 				Amount:  amount,
 				Note:    note,
 				CardTo:  card,
 				Line:    line,
 			})
-			continue
+			return
 		}
 
 		// Не похоже на сумму -> считаем, что это имя нового блока
 		if looksLikeName(line) {
-			currentName = line
-			continue
+			*currentName = line
+			return
 		}
 
 		// Иначе — свободный текст (типа "Скинул 15к на карту втб" без явного имени сверху)
 		if amount, note, card, ok := tryParseFreeformLine(line); ok {
-			name := currentName
+			name := *currentName
 			if name == "" {
 				name = "(не указано)"
 			}
@@ -127,13 +215,11 @@ func ParseMessage(text string) ParseResult {
 				CardTo:  card,
 				Line:    line,
 			})
-			continue
+			return
 		}
 
 		res.Unparsed = append(res.Unparsed, line)
 	}
-
-	return res
 }
 
 // tryParseAmountLine пытается распознать строку как "чистую" сумму, возможно с пометкой.
@@ -359,7 +445,7 @@ func cleanNumber(s string) string {
 }
 
 // correctionRe — «не 5000 а 6000», «не 5 а 6 тысяч»: поправка суммы, а не платёж.
-var correctionRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}])не\s+(\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к)?)\s*,?\s*а\s+(\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к)?)`)
+var correctionRe = regexp.MustCompile(`(?i)(?:^|[^\p{L}])не\s+(\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к)?)\s*(?:₽|руб[а-яё]*|р\.?)?\s*,?\s*а\s+(\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к)?)`)
 
 // Correction — поправка суммы: «не 5000 а 6000», «Магомедов не 5000 а 6000»,
 // «правильно 6000». Name — ФИО/фамилия, если её назвали; Old=0 — старую сумму
@@ -375,7 +461,14 @@ var correctionFillers = map[string]bool{
 	"ошиблась": true, "ошибка": true, "опечатка": true, "извините": true, "извиняюсь": true, "там": true,
 	"у": true, "по": true, "чек": true, "платёж": true, "платеж": true, "это": true, "для": true, "за": true,
 	"нет": true, "ой": true, "сорри": true, "пардон": true, "вот": true, "тут": true,
+	"нал": true, "наличка": true, "наличные": true, "наличными": true, "налом": true, "перевод": true,
+	"переводом": true, "итого": true, "сегодня": true, "ок": true, "да": true, "давай": true, "короче": true,
+	"слушай": true, "блин": true, "ладно": true, "так": true, "точнее": true, "вернее": true, "всё": true,
+	"все": true, "же": true, "а": true, "и": true, "уже": true, "сорян": true,
 }
+
+// lowerSurnameRe — фамилия, написанная с маленькой буквы («магомедов»).
+var lowerSurnameRe = regexp.MustCompile(`(?:ов|ев|ёв|ин|ын|ова|ева|ёва|ина|ына|ову|еву|ину|ым|ой|ий|ская|ский|ян|енко|аев|иев|аева|иева|аеву|иеву|ому|ему)$`)
 
 // thousandSuffixRe — у суммы есть «т/к/тыс/тыщ».
 var thousandSuffixRe = regexp.MustCompile(`(?i)\d\s*(?:т|к|тыс[а-яё]*|тыщ[а-яё]*)\s*$`)
@@ -426,6 +519,8 @@ func ParseCorrection(text string) (Correction, bool) {
 		case correctionFillers[lw]:
 		case len([]rune(w)) >= 3 && unicode.IsUpper([]rune(w)[0]):
 			name = append(name, w)
+		case len([]rune(w)) >= 5 && lowerSurnameRe.MatchString(lw):
+			name = append(name, w) // фамилия с маленькой буквы
 		default:
 			return Correction{}, false // посторонние слова — это разговор, а не поправка
 		}

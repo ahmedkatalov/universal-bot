@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 )
 
 // Правки: сообщение изменили в WhatsApp («изменить») или написали поправку
@@ -58,11 +60,23 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 		b.applyCaptionEdit(ctx, chat, origID, ref, newText, say)
 		return true
 	}
+	// Платёж/ФИО сотрудника, написанный боту («Джарвис, Каталов Ахмед 15000»),
+	// хранится без обращения — и правку сравниваем без него.
+	if stripped, addressed := b.stripBotName(newText); addressed {
+		t, ok := b.employeeAccountingText(ctx, msg, stripped)
+		switch {
+		case ok:
+			newText = t
+		case ref.HandledAs == "answer":
+			newText = stripped
+		default:
+			return false // теперь это обращение к боту, а не запись учёта
+		}
+	} else if b.isMentionedText(newText) {
+		newText = b.stripBotMention(newText)
+	}
 	if newText == "" || newText == strings.TrimSpace(ref.Body) {
 		return false
-	}
-	if _, addressed := b.stripBotName(newText); addressed && ref.HandledAs == "" {
-		return false // теперь это обращение к боту, а не платёж
 	}
 
 	undo, err := b.db.PrepareMessageEdit(ctx, ref.ID, newText)
@@ -70,49 +84,65 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 		fmt.Println("Правка сообщения: ошибка:", err)
 		return false
 	}
+	em := b.editedMessage(msg, ref, newText)
+	em.Info.ID = origID
 
-	// Изменили поправку «не 5000 а 6000» — те же платежи получают новую сумму.
+	// Ответ на вопрос бота — применяем новый ответ к тому же вопросу.
+	if ref.HandledAs == "answer" {
+		if !q.quiet() {
+			b.reapplyAnswer(withAnswerRaw(ctx, ref.ID), em, ref, newText, say)
+		}
+		return true
+	}
+
+	// Изменили поправку «не 5000 а 6000» — ищем, что исправлять, заново (могли
+	// поменять и клиента, и старую сумму).
 	if len(undo.Corrections) > 0 {
-		if c, ok := parser.ParseCorrection(newText); ok {
-			var done []string
-			for _, co := range undo.Corrections {
-				if b.setCorrectedAmount(ctx, ref.ID, db.CorrTarget{Kind: co.Kind, ID: co.TargetID, Amount: co.Old}, c.New) {
-					done = append(done, formatMoney(c.New))
-				}
-			}
-			_ = b.db.MarkMessageParsed(ctx, ref.ID)
-			if len(done) > 0 {
-				say(fmt.Sprintf("✏️ Поправку изменили — теперь %s ₽.", formatMoney(c.New)))
-			}
+		if !q.quiet() && b.applyAmountCorrection(ctx, em, newText, ref.ID) {
 			return true
 		}
 		say("✏️ Поправку изменили — вернул прежнюю сумму.")
 	}
 
-	// Сообщение-имя, которое уже подписало чек или уточнило клиента платежа
-	// (или ответ на «чей чек?»): новое имя — тем же чекам/платежам. Повторно как
-	// имя «для следующего чека» его не ставим — оно уже было использовано.
-	if len(undo.LabeledChecks)+len(undo.LabeledTxs) > 0 || ref.HandledAs == "answer" {
+	// Сообщение-имя, которое уже подписало чек или уточнило клиента платежа:
+	// новое имя — тем же чекам/платежам. Повторно как имя «для следующего чека»
+	// его не ставим — оно уже было использовано.
+	if len(undo.LabeledChecks)+len(undo.LabeledTxs) > 0 {
 		name := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(newText, "это "), "Это "))
-		if canonical, ok := b.confirmClientName(ctx, name); ok {
+		if n, ok := looksLikeName(name); ok {
+			name = n
+		} else if n, ok := firstNameLine(name); ok {
+			name = n // «Магомедов Ахмед\n12000» — имя на первой строке
+		}
+		changed := 0
+		canonical, ok := b.confirmClientName(ctx, name)
+		if ok {
 			var cid *int
 			if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 				cid = &id
 			}
 			for _, w := range undo.LabeledChecks {
 				if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, w, canonical, cid, ref.ID); err == nil && found {
+					changed++
 					b.reresolveWatchByCheck(ctx, chat, w, canonical)
 				}
 			}
 			if cid != nil {
 				for _, tx := range undo.LabeledTxs {
-					_ = b.db.SetTxClientFrom(ctx, tx, *cid, canonical, ref.ID)
+					if b.db.SetTxClientFrom(ctx, tx, *cid, canonical, ref.ID) == nil {
+						changed++
+					}
 				}
 			}
-			fmt.Printf("Правка сообщения %s: клиент теперь %q\n", origID, canonical)
-			say("✏️ Имя исправили — теперь клиент " + canonical + ".")
 		}
 		_ = b.db.MarkMessageParsed(ctx, ref.ID)
+		switch {
+		case changed > 0:
+			fmt.Printf("Правка сообщения %s: клиент теперь %q\n", origID, canonical)
+			say("✏️ Имя исправили — теперь клиент " + canonical + ".")
+		case len(undo.LabeledChecks) > 0:
+			say("✏️ В сообщении больше нет ФИО клиента — чек снова без клиента, спрошу, чей он.")
+		}
 		return true
 	}
 
@@ -124,17 +154,93 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 		if _, viaAI := b.importTextSilent(ctx, chat, senderName, ref.ID, ref.ReceivedAt, newText, q.budget); !viaAI {
 			_ = b.db.MarkMessageParsed(ctx, ref.ID)
 		}
+		_ = b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates)
 		return true
 	}
-	em := &events.Message{Info: msg.Info, Message: newMsg}
-	em.Info.ID = origID
 	em.Info.Timestamp = ref.ReceivedAt
 	b.processText(ctx, em, newText, ref.ID, senderName, true)
+	// Что узнали о старых платежах (клиент из свайпа, «новый», поправки) — новым.
+	if err := b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates); err != nil {
+		fmt.Println("Правка сообщения: перенос уточнений не удался:", err)
+	}
 
 	now, _ := b.db.TxRefsByRawID(ctx, ref.ID)
 	say(editNote(undo.OldTx, now))
 	fmt.Printf("Правка сообщения %s: было %v, стало %v\n", origID, undo.OldTx, now)
 	return true
+}
+
+// editedMessage — исправленное сообщение как обычное (тот же отправитель и
+// свайп, что у исходного), чтобы разобрать его тем же путём.
+func (b *Bot) editedMessage(msg *events.Message, ref db.RawMessageRef, text string) *events.Message {
+	em := &events.Message{Info: msg.Info}
+	if ref.QuotedID != "" {
+		em.Message = &waProto.Message{ExtendedTextMessage: &waProto.ExtendedTextMessage{
+			Text: proto.String(text), ContextInfo: &waProto.ContextInfo{StanzaID: proto.String(ref.QuotedID)}}}
+	} else {
+		em.Message = &waProto.Message{Conversation: proto.String(text)}
+	}
+	return em
+}
+
+// reapplyAnswer — изменили ответ на вопрос бота: тот же вопрос получает новый
+// ответ (имя и/или сумма чека, клиент налички, «новый/тот же», кто забрал).
+func (b *Bot) reapplyAnswer(ctx context.Context, em *events.Message, ref db.RawMessageRef, text string, say func(string)) {
+	chat := em.Info.Chat
+	target, _ := strconv.Atoi(ref.AnswerTo)
+	switch ref.AnswerKind {
+	case "receipt":
+		if handled, _ := b.applyReceiptAnswer(ctx, chat, ref.AnswerTo, text); handled {
+			return
+		}
+	case "who":
+		name := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "это "), "Это "))
+		if n, _, defer2 := clarifyNameFromReply(name); n != "" && !defer2 {
+			name = n
+		}
+		canonical, ok := b.confirmClientName(ctx, name)
+		if !ok {
+			break
+		}
+		cid, err := b.db.GetOrCreateContact(ctx, canonical)
+		if err != nil {
+			break
+		}
+		txs, _ := b.db.TxIDsBySource(ctx, ref.ID)
+		changed := 0
+		for _, tx := range txs {
+			if b.db.SetTxClientFrom(ctx, tx, cid, canonical, ref.ID) == nil {
+				changed++
+				if b.cashDupCheckOn() {
+					_ = b.db.RecheckCashRepeat(ctx, tx)
+				}
+			}
+		}
+		if changed > 0 {
+			say("✏️ Ответ изменили — теперь клиент " + canonical + ".")
+			return
+		}
+	case "dup":
+		if resolved, isNew := parseCashDupAnswer(text); resolved && target > 0 {
+			if amount, client, err := b.db.RedecideCashDup(ctx, target, isNew); err == nil {
+				if isNew {
+					say(fmt.Sprintf("✏️ Ответ изменили — засчитал как новый платёж: наличка %s %s ₽.", client, formatMoney(amount)))
+				} else {
+					say(fmt.Sprintf("✏️ Ответ изменили — это повтор, не считаю: %s %s ₽.", client, formatMoney(amount)))
+				}
+				return
+			}
+		}
+	case "collector":
+		if target > 0 && b.applyCashCollectorReply(ctx, chat, target, text, true) {
+			return
+		}
+	case "cmf":
+		if target > 0 && b.applyCmfWatchAnswerOpts(ctx, chat, target, text, answerOpts{mode: modeSwipe}) {
+			return
+		}
+	}
+	fmt.Printf("Правка ответа %s (%s): новый ответ не понял — оставил прежний\n", ref.QuotedID, ref.AnswerKind)
 }
 
 // editNote — короткий ответ о том, что поменялось в учёте после правки.

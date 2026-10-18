@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go.mau.fi/whatsmeow/types"
+	"math"
 	"os"
 	"regexp"
 	"sort"
@@ -54,6 +55,39 @@ type aiPayment struct {
 }
 
 func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName string, lines []string, rawID int, txDate time.Time, cashHint, paymentLikely bool) {
+	// Одно сообщение — один разбор за раз (повтор из очереди и живой разбор не
+	// должны записать платёж дважды).
+	// Правка сообщения во время разбора — новый текст ждёт, пока старый разбор
+	// закончится (он свой итог не запишет), и разбирается сам.
+	myEdits, _ := b.db.MessageEditCount(ctx, rawID)
+	for wait := 0; ; wait++ {
+		b.aiRetryMu.Lock()
+		if b.aiInFlight == nil {
+			b.aiInFlight = map[int]aiFlight{}
+		}
+		f, busy := b.aiInFlight[rawID]
+		if !busy {
+			b.aiInFlight[rawID] = aiFlight{edits: myEdits, done: make(chan struct{})}
+			b.aiRetryMu.Unlock()
+			break
+		}
+		b.aiRetryMu.Unlock()
+		if f.edits >= myEdits || wait > 0 {
+			return // этот же текст уже разбирается
+		}
+		select {
+		case <-f.done:
+		case <-time.After(2 * time.Minute):
+		}
+	}
+	defer func() {
+		b.aiRetryMu.Lock()
+		if f, ok := b.aiInFlight[rawID]; ok {
+			close(f.done)
+			delete(b.aiInFlight, rawID)
+		}
+		b.aiRetryMu.Unlock()
+	}()
 
 	keepUnparsed := false
 	// Сообщение могли изменить, пока ИИ читал старый текст: тогда итог этого
@@ -221,23 +255,12 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 	}
 
-	// Вопрос-уточнение задаём, только если платежей нет, его задало БОЛЬШИНСТВО
-	// чтений И сообщение вообще было похоже на платёж. Последнее важно: теперь ИИ
-	// получает и «просто сообщения с цифрой» (чтобы не упустить платёж в необычном
-	// формате) — по такой болтовне переспрашивать в группе нельзя.
-	if paymentLikely && len(payments) == 0 && !b.groupSilent(chat) {
-		if q := majorityString(clarifies, okRuns); q != "" {
-			// Ответ на этот вопрос (ФИО) применим к ЭТОМУ сообщению.
-			if id := b.sendTextReturnID(chat, "❓ "+q); id != "" {
-				amt := 0.0
-				if len(tokens) == 1 {
-					amt = tokens[0]
-				}
-				b.registerPaymentAsk(id, paymentAsk{rawID: rawID, amount: amt, cash: cashHint || parser.IsCash(joined), txDate: txDate})
-				_ = b.db.SetWhoAsk(ctx, rawID, id, amt, cashHint || parser.IsCash(joined))
-				b.setOpenAsk(chat.String(), openAsk{kind: "payment_who", txID: rawID, amount: amt, senderJID: senderJIDOfRaw(ctx, b, rawID)})
-			}
-		}
+	// Вопрос-уточнение: его задало БОЛЬШИНСТВО чтений И сообщение вообще было
+	// похоже на платёж. Последнее важно: ИИ получает и «просто сообщения с
+	// цифрой» — по такой болтовне переспрашивать в группе нельзя.
+	question := ""
+	if paymentLikely {
+		question = majorityString(clarifies, okRuns)
 	}
 
 	saved := 0
@@ -286,6 +309,62 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 		saved++
 	}
+	if question != "" && !insertFailed {
+		// ИИ спросил, чей платёж. Деньги до ответа держим в сборе: строки
+		// «Нал 27000» без имени — заглушкой «Наличка» (ответ даст ей клиента), а
+		// если ИИ не записал ничего — и строки с ФИО из текста. Потом спрашиваем.
+		var savedAmts []float64
+		for _, p := range payments {
+			if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
+				savedAmts = append(savedAmts, p.Amount)
+			}
+		}
+		lines, _ := b.deterministicLines(joined, detAll)
+		var keep []parser.Transaction
+		placeholders := 0
+		var phAmount float64
+		for _, tr := range lines {
+			canonical, _ := b.aliases.ResolveName(tr.RawName)
+			ph := whoPlaceholders[canonical] || whoPlaceholders[tr.RawName]
+			if !ph && saved > 0 {
+				continue // строки с именем ИИ уже записал
+			}
+			if ph {
+				taken := false
+				for k, a := range savedAmts {
+					if math.Abs(a-tr.Amount) < 1 {
+						savedAmts = append(savedAmts[:k], savedAmts[k+1:]...)
+						taken = true
+						break
+					}
+				}
+				if taken {
+					continue
+				}
+				placeholders++
+				phAmount = tr.Amount
+			}
+			keep = append(keep, tr)
+		}
+		dsaved, _ := b.recordParsedLines(ctx, keep, joined, rawID, txDate, cashHint)
+		saved += dsaved
+		if (placeholders > 0 || saved == 0 || dsaved > 0) && !b.groupSilent(chat) {
+			if id := b.sendTextReturnID(chat, "❓ "+question); id != "" {
+				amt := 0.0
+				switch {
+				case placeholders == 1:
+					amt = phAmount
+				case placeholders == 0 && len(tokens) == 1:
+					amt = tokens[0]
+				}
+				isCash := cashHint || parser.IsCash(joined)
+				b.registerPaymentAsk(id, paymentAsk{rawID: rawID, amount: amt, cash: isCash, txDate: txDate})
+				_ = b.db.SetWhoAsk(ctx, rawID, id, amt, isCash)
+				b.setOpenAsk(chat.String(), openAsk{kind: "payment_who", txID: rawID, amount: amt, senderJID: senderJIDOfRaw(ctx, b, rawID)})
+			}
+		}
+		return
+	}
 	if saved > 0 {
 		fmt.Printf("ИИ-доразбор: сообщение %d — извлечено и сохранено %d платеж(ей), которые не понял обычный парсер\n", rawID, saved)
 	} else if insertFailed {
@@ -297,14 +376,8 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// (обсуждение/план: «сказал взять 5000»). Доверяем ему и НЕ пишем мусор.
 		// Подстраховка только для платежей ИЗВЕСТНЫМ клиентам (совпал алиас),
 		// которых ИИ мог ошибочно пропустить: болтовню это не заденет.
-		// «Нал 27000» без имени: ИИ спросил «чья наличка?» — заглушка «Наличка»
-		// держит деньги в сборе, пока не ответят (ответ даст ей клиента). Если ИИ
-		// не спрашивал (итог дня «Наличка 50000»), заглушку не пишем.
-		mode := detKnown
-		if paymentLikely && majorityString(clarifies, okRuns) != "" {
-			mode = detKnownOrPlaceholder
-		}
-		dsaved, dfailed := b.recordDeterministicPaymentsMode(ctx, joined, rawID, txDate, cashHint, mode)
+		// Заглушку «Наличка» (итог дня «Наличка 50000») без вопроса ИИ не пишем.
+		dsaved, dfailed := b.recordDeterministicPaymentsMode(ctx, joined, rawID, txDate, cashHint, detKnown)
 		keepUnparsed = dsaved == 0 && dfailed
 	}
 }
@@ -999,6 +1072,12 @@ func senderJIDOfRaw(ctx context.Context, b *Bot, rawID int) string {
 	return ""
 }
 
+// aiFlight — идущий разбор сообщения: с какой правкой и когда закончится.
+type aiFlight struct {
+	edits int
+	done  chan struct{}
+}
+
 // aiRetryItem — текст, который не удалось разобрать, потому что ИИ был недоступен.
 type aiRetryItem struct {
 	chat          types.JID
@@ -1038,10 +1117,33 @@ func (b *Bot) textRetryLoop() {
 }
 
 func (b *Bot) retryAIText(ctx context.Context) {
+	// Очередь в памяти теряется при перезапуске бота — добираем из базы тексты,
+	// которые так и не разобрали (ИИ лежал), за последнюю неделю.
+	if ms, err := b.db.UnparsedTextMessagesSince(ctx, time.Now().AddDate(0, 0, -7), 50); err == nil {
+		b.aiRetryMu.Lock()
+		if b.aiRetry == nil {
+			b.aiRetry = map[int]aiRetryItem{}
+		}
+		for _, m := range ms {
+			fresh := !b.startedAt.IsZero() && !m.ReceivedAt.Before(b.startedAt) && time.Since(m.ReceivedAt) < 2*time.Minute
+			_, flying := b.aiInFlight[m.ID]
+			if _, ok := b.aiRetry[m.ID]; ok || fresh || flying {
+				continue // ещё разбирается или уже в очереди
+			}
+			jid, err := types.ParseJID(m.GroupJID)
+			if err != nil {
+				continue
+			}
+			res := parser.ParseMessage(m.Body)
+			b.aiRetry[m.ID] = aiRetryItem{chat: jid, senderName: m.SenderName, lines: []string{m.Body}, rawID: m.ID,
+				txDate: m.ReceivedAt, paymentLikely: len(res.Transactions) > 0 || parser.LooksMessyPayment(m.Body, res), at: time.Now()}
+		}
+		b.aiRetryMu.Unlock()
+	}
 	b.aiRetryMu.Lock()
 	var due []aiRetryItem
 	for id, it := range b.aiRetry {
-		if time.Since(it.at) > 24*time.Hour {
+		if time.Since(it.at) > 7*24*time.Hour {
 			delete(b.aiRetry, id)
 			continue
 		}
@@ -1055,7 +1157,7 @@ func (b *Bot) retryAIText(ctx context.Context) {
 	}
 	// Только то, что всё ещё не разобрано (не удалено, не записано пересчётом).
 	open := map[int]bool{}
-	if ms, err := b.db.UnparsedTextMessagesSince(ctx, time.Now().Add(-25*time.Hour), 500); err == nil {
+	if ms, err := b.db.UnparsedTextMessagesSince(ctx, time.Now().AddDate(0, 0, -8), 500); err == nil {
 		for _, m := range ms {
 			open[m.ID] = true
 		}

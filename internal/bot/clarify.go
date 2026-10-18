@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -173,13 +174,10 @@ func askReceiptsEnabled() bool {
 }
 
 func (b *Bot) clarifyTick(ctx context.Context) {
-	// Клиента исходного чека назвали — копии в других группах получают его.
-	if n, err := b.db.SyncForwardCopies(ctx); err == nil && n > 0 {
-		fmt.Printf("Пересланные копии чеков: клиент подтянут из исходных (%d)\n", n)
-	}
-	if b.assistant == nil {
-		return // без ИИ имена не разбираем — вопросы бессмысленны
-	}
+	// Без ИИ имена в ответах про чеки не разбираем — эти вопросы не задаём; про
+	// наличку («у кого?», «новый или тот же?») спрашиваем и без ИИ: ответы
+	// понимает код, а придержанная наличка без вопроса так и осталась бы вне сбора.
+	withAI := b.assistant != nil
 	if !askReceiptsEnabled() {
 		return
 	}
@@ -196,7 +194,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			continue // владелец попросил молчать в этой группе — вопросов не задаём
 		}
 		// 1. Чеки без имени клиента — «чей это чек?».
-		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); withAI && err == nil && n > 0 && n <= clarifyMaxAsk {
 			items, err := b.db.UnconfirmedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
 			if err == nil {
 				for _, it := range items {
@@ -283,7 +281,7 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			break
 		}
 		// 2. Чеки, у которых не прочиталась сумма — «не смог разобрать, что на чеке?».
-		if n, err := b.db.CountUnrecognized(ctx, jid.String(), before); err == nil && n > 0 && n <= clarifyMaxAsk {
+		if n, err := b.db.CountUnrecognized(ctx, jid.String(), before); withAI && err == nil && n > 0 && n <= clarifyMaxAsk {
 			items, err := b.db.UnrecognizedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
 			if err == nil {
 				for _, it := range items {
@@ -372,6 +370,7 @@ func (b *Bot) applyCashCollectorReply(ctx context.Context, chat types.JID, txID 
 	if err != nil || !found {
 		return false
 	}
+	b.noteAnswer(ctx, "collector", strconv.Itoa(txID))
 	b.sendText(chat, fmt.Sprintf("Записал: наличка %s %.0f ₽ — забрал %s.", client, amount, collector))
 	return true
 }
@@ -747,6 +746,7 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		if err != nil || !found {
 			return false
 		}
+		b.noteAnswer(ctx, "dup", strconv.Itoa(dupTxID))
 		b.clearOpenAskTx(msg.Info.Chat.String(), "cash_dup", dupTxID)
 		if isNew {
 			b.sendText(msg.Info.Chat, fmt.Sprintf("Засчитал как новый платёж: наличка %s %.0f ₽.", client, amount))
@@ -843,82 +843,168 @@ var whoPlaceholders = map[string]bool{"Наличка": true, "(не указа�
 // понят (или бот переспросил по этому вопросу).
 func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID string, pa paymentAsk, text string, swipe bool) bool {
 	t := strings.TrimSpace(text)
-	low := strings.ToLower(t)
-	// «у Дени» — это кто забрал деньги, а не клиент.
-	if strings.HasPrefix(low, "у ") {
-		return false
-	}
-	name, amount, deferToAI := clarifyNameFromReply(t)
-	if deferToAI || name == "" {
-		return false
-	}
-	if amount > 0 && (pa.amount <= 0 && !swipe || pa.amount > 0 && math.Abs(pa.amount-amount) >= 1) {
-		return false // названа другая сумма — это новый платёж, а не ответ
-	}
-	// Только настоящее ФИО («Мансур знает», «Позже скажу» — не клиент).
-	canonical, ok := b.confirmClientName(ctx, name)
-	if !ok {
-		return false
-	}
-	cid, err := b.db.GetOrCreateContact(ctx, canonical)
-	if err != nil {
-		return false
-	}
-	cash := pa.cash
+	// Исключённый владельцем платёж ответом не возвращаем.
 	live, _ := b.db.TxRefsByRawID(ctx, pa.rawID)
-	switch {
-	case len(live) > 0:
-		// Платёж уже записан без имени — даём клиента ему (не добавляем второй).
-		var pick []db.TxRef
-		for _, tx := range live {
-			if amount > 0 && math.Abs(tx.Amount-amount) >= 1 {
-				continue
-			}
-			if whoPlaceholders[tx.Name] || len(live) == 1 {
-				pick = append(pick, tx)
-			}
-		}
-		if len(pick) != 1 {
-			var sums []string
-			for _, tx := range live {
-				sums = append(sums, formatMoney(tx.Amount))
-			}
-			b.sendText(chat, "Какой из платежей ("+strings.Join(sums, ", ")+" ₽)? Напишите «ФИО сумма».")
+	if len(live) == 0 {
+		if any, _ := b.db.HasAnyTx(ctx, pa.rawID); any {
+			b.closeWhoAsk(ctx, chat, pa)
+			b.sendText(chat, "Этот платёж исключили из учёта — не записываю.")
 			return true
 		}
-		if err := b.db.SetTxClient(ctx, pick[0].ID, cid, canonical); err != nil {
+	}
+	// Ответ списком («Магомедов Ахмед 20000\nИсаев Харон 7000») — по строке на сумму.
+	var lines []string
+	for _, ln := range strings.Split(t, "\n") {
+		if ln = strings.TrimSpace(ln); ln != "" {
+			lines = append(lines, ln)
+		}
+	}
+	if len(lines) == 0 {
+		return false
+	}
+	type pick struct {
+		name, canonical string
+		cid             int
+		amount          float64
+	}
+	var picks []pick
+	for _, ln := range lines {
+		if strings.HasPrefix(strings.ToLower(ln), "у ") {
+			return false // «у Дени» — это кто забрал деньги, а не клиент
+		}
+		name, amount, deferToAI := clarifyNameFromReply(ln)
+		if deferToAI || name == "" {
 			return false
 		}
-		if pick[0].Cash && b.cashDupCheckOn() {
-			_ = b.db.RecheckCashRepeat(ctx, pick[0].ID) // та же наличка этого клиента за 30 дней — «повтор?»
+		if len(lines) > 1 && amount <= 0 {
+			return false
 		}
-		amount, cash = pick[0].Amount, pick[0].Cash
-	default:
+		if amount > 0 && (pa.amount <= 0 && !swipe && len(live) == 0 || pa.amount > 0 && math.Abs(pa.amount-amount) >= 1) {
+			return false // названа другая сумма — это новый платёж, а не ответ
+		}
+		// Только настоящее ФИО («Мансур знает», «Позже скажу» — не клиент).
+		canonical, ok := b.confirmClientName(ctx, name)
+		if !ok {
+			return false
+		}
+		cid, err := b.db.GetOrCreateContact(ctx, canonical)
+		if err != nil {
+			return false
+		}
+		picks = append(picks, pick{name, canonical, cid, amount})
+	}
+	if len(picks) > 1 && len(live) == 0 {
+		return false
+	}
+	var done []string
+	cash := pa.cash
+	usedTx := map[int]bool{}
+	for _, pk := range picks {
+		amount := pk.amount
+		if len(live) > 0 {
+			// Платёж уже записан без имени — даём клиента ему (не добавляем второй).
+			var cand []db.TxRef
+			for _, tx := range live {
+				if usedTx[tx.ID] || amount > 0 && math.Abs(tx.Amount-amount) >= 1 {
+					continue
+				}
+				if whoPlaceholders[tx.Name] || len(live) == 1 {
+					cand = append(cand, tx)
+				}
+			}
+			if len(cand) > 1 {
+				same := true // несколько одинаковых заглушек — берём первую
+				for _, c := range cand {
+					if math.Abs(c.Amount-cand[0].Amount) >= 1 {
+						same = false
+					}
+				}
+				if same && amount > 0 {
+					cand = cand[:1]
+				}
+			}
+			if len(cand) != 1 {
+				var sums []string
+				for _, tx := range live {
+					if whoPlaceholders[tx.Name] {
+						sums = append(sums, formatMoney(tx.Amount))
+					}
+				}
+				if len(done) == 0 {
+					b.sendText(chat, "Какой из платежей ("+strings.Join(sums, ", ")+" ₽)? Напишите «ФИО сумма».")
+					return true
+				}
+				continue
+			}
+			tx := cand[0]
+			usedTx[tx.ID] = true
+			if err := b.db.SetTxClientFrom(ctx, tx.ID, pk.cid, pk.canonical, answerRawFrom(ctx)); err != nil {
+				return false
+			}
+			if tx.Cash && b.cashDupCheckOn() {
+				_ = b.db.RecheckCashRepeat(ctx, tx.ID) // та же наличка этого клиента за 30 дней — «повтор?»
+			}
+			cash = tx.Cash
+			done = append(done, fmt.Sprintf("%s ₽ — %s", formatMoney(tx.Amount), pk.canonical))
+			continue
+		}
 		if amount <= 0 {
 			amount = pa.amount
 		}
 		if amount <= 0 {
 			// В сообщении несколько сумм — перечитываем его с названным клиентом.
-			if b.rereadWithClient(ctx, chat, pa, canonical) == 0 {
-				b.sendText(chat, "Понял, клиент "+canonical+". А какая сумма? Напишите «ФИО сумма».")
+			if b.rereadWithClient(ctx, chat, pa, pk.canonical) == 0 {
+				b.sendText(chat, "Понял, клиент "+pk.canonical+". А какая сумма? Напишите «ФИО сумма».")
 				return true
 			}
-			amount = 0
-		} else {
-			card := ""
-			if cash {
-				card = "наличные"
+			now, _ := b.db.TxRefsByRawID(ctx, pa.rawID)
+			for _, tx := range now {
+				done = append(done, fmt.Sprintf("%s ₽ — %s", formatMoney(tx.Amount), tx.Name))
 			}
-			if err := b.db.InsertTransaction(ctx, db.TransactionInput{
-				ContactID: cid, RawName: canonical, Amount: amount, CardTo: card, IsCash: cash,
-				RawMessageID: pa.rawID, TxDate: pa.txDate, DupCheck: b.cashDupCheckOn(),
-			}); err != nil {
-				fmt.Println("Ответ «чей платёж»: ошибка записи:", err)
-				return false
+			continue
+		}
+		card := ""
+		if cash {
+			card = "наличные"
+		}
+		if err := b.db.InsertTransaction(ctx, db.TransactionInput{
+			ContactID: pk.cid, RawName: pk.canonical, Amount: amount, CardTo: card, IsCash: cash,
+			RawMessageID: pa.rawID, TxDate: pa.txDate, DupCheck: b.cashDupCheckOn(),
+			ClientSourceRawID: answerRawFrom(ctx),
+		}); err != nil {
+			fmt.Println("Ответ «чей платёж»: ошибка записи:", err)
+			return false
+		}
+		done = append(done, fmt.Sprintf("%s ₽ — %s", formatMoney(amount), pk.canonical))
+	}
+	if len(done) == 0 {
+		return false
+	}
+	_ = b.db.MarkMessageParsed(ctx, pa.rawID)
+	b.noteAnswer(ctx, "who", strconv.Itoa(pa.rawID))
+	// Вопрос закрываем, когда безымянных платежей в сообщении не осталось.
+	open := false
+	if now, err := b.db.TxRefsByRawID(ctx, pa.rawID); err == nil {
+		for _, tx := range now {
+			if whoPlaceholders[tx.Name] {
+				open = true
 			}
 		}
 	}
-	_ = b.db.MarkMessageParsed(ctx, pa.rawID)
+	if !open {
+		b.closeWhoAsk(ctx, chat, pa)
+	}
+	kind := "перевод"
+	if cash {
+		kind = "наличка"
+	}
+	b.sendText(chat, fmt.Sprintf("Записал: %s %s.", kind, strings.Join(done, "; ")))
+	_ = askID
+	return true
+}
+
+// closeWhoAsk — на «❓ чей платёж?» ответили (или он больше не нужен).
+func (b *Bot) closeWhoAsk(ctx context.Context, chat types.JID, pa paymentAsk) {
 	_ = b.db.ClearWhoAsk(ctx, pa.rawID)
 	b.clarify.mu.Lock()
 	for k, v := range b.clarify.paymentAsks {
@@ -930,22 +1016,6 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 		delete(b.clarify.lastAsk, chat.String())
 	}
 	b.clarify.mu.Unlock()
-	if amount <= 0 {
-		now, _ := b.db.TxRefsByRawID(ctx, pa.rawID)
-		var parts []string
-		for _, tx := range now {
-			parts = append(parts, formatMoney(tx.Amount)+" ₽")
-		}
-		b.sendText(chat, fmt.Sprintf("Записал: %s — %s.", strings.Join(parts, ", "), canonical))
-		return true
-	}
-	kind := "перевод"
-	if cash {
-		kind = "наличка"
-	}
-	b.sendText(chat, fmt.Sprintf("Записал: %s %s ₽ — %s.", kind, formatMoney(amount), canonical))
-	_ = askID
-	return true
 }
 
 // rereadWithClient — «❓ чей платёж?» по сообщению с несколькими суммами: ИИ
@@ -993,14 +1063,15 @@ func (b *Bot) applyDupFixAnswer(ctx context.Context, chat types.JID, askID strin
 	}
 	// «да нет», «да не, всё правильно», «да, это повтор», «оставь» — оставить как есть.
 	if hasNegation(toks) || strings.Contains(low, "повтор") || strings.Contains(low, "тот же") ||
-		strings.Contains(low, "оставь") || strings.Contains(low, "оставьте") || strings.Contains(low, "правильно") {
+		strings.Contains(low, "оставь") || strings.Contains(low, "оставьте") {
 		return keep()
 	}
 	name := ""
 	rest := toks
 	if len(rest) > 0 && (yesWords[rest[0]] || ackWords[rest[0]]) {
 		rest = rest[1:]
-		for len(rest) > 0 && (rest[0] == "это" || rest[0] == "он" || rest[0] == "она" || rest[0] == "верно") {
+		for len(rest) > 0 && (rest[0] == "это" || rest[0] == "он" || rest[0] == "она" || rest[0] == "верно" ||
+			rest[0] == "правильно" || rest[0] == "всё" || rest[0] == "все" || rest[0] == "да" || rest[0] == "так") {
 			rest = rest[1:]
 		}
 		if len(rest) == 0 {

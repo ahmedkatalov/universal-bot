@@ -61,7 +61,9 @@ type Bot struct {
 	payerMu       sync.Mutex                                         // запись карты «плательщик → клиент»
 	aiRetryMu     sync.Mutex                                         // очередь текстов, не разобранных из-за сбоя ИИ
 	aiRetry       map[int]aiRetryItem
-	cmfWritesMu   sync.Mutex // журнал своих записей в программу (сутки)
+	aiInFlight    map[int]aiFlight // сообщения, которые сейчас читает ИИ
+	startedAt     time.Time        // запуск процесса (что пришло раньше — точно не в разборе)
+	cmfWritesMu   sync.Mutex       // журнал своих записей в программу (сутки)
 	cmfWrites     map[string]time.Time
 	selfUser      string // только для тестов без WhatsApp: номер самого бота
 	fontDir       string
@@ -228,6 +230,7 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 		sentMsgs:      make(map[string][]string),
 		pendingCash:   make(map[string]time.Time),
 		lastProactive: make(map[string]time.Time),
+		startedAt:     time.Now(),
 		clarify:       newClarifyState(),
 		pairWindow:    receiptPairWindow(),
 		importHistory: os.Getenv("IMPORT_HISTORY") == "1",
@@ -423,7 +426,12 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// это в чате, чтобы было видно, что отчёт обновился.
 	if prot := msg.Message.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_REVOKE {
 		revokedID := prot.GetKey().GetID()
+		// Удалили фото чека, которое бот переслал сюда, — убираем копию.
+		if copyWa, ok, _ := b.db.CopyBySentID(ctx, revokedID); ok {
+			revokedID = copyWa
+		}
 		corrN, _ := b.db.CorrectionsByMessage(ctx, revokedID)
+		labeledN, _ := b.db.CountLabeledBy(ctx, revokedID)
 		txN, rcN, err := b.db.MarkMessageDeleted(ctx, revokedID)
 		if err != nil {
 			fmt.Println("Ошибка обработки удалённого сообщения:", err)
@@ -436,8 +444,12 @@ func (b *Bot) handleEvent(evt interface{}) {
 					"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
 			}
 		}
+		go b.ensureMissingWatches(context.Background()) // дубль мог стать основным чеком
 		if corrN > 0 && !b.groupSilent(msg.Info.Chat) {
 			b.sendText(msg.Info.Chat, "🗑 Поправку суммы удалили — вернул прежнюю сумму.")
+		}
+		if labeledN > 0 && txN+rcN == 0 && !b.groupSilent(msg.Info.Chat) {
+			b.sendText(msg.Info.Chat, "🗑 Сообщение с ФИО удалили — чек снова без клиента, спрошу, чей он.")
 		}
 		return
 	}
@@ -597,6 +609,9 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 		return
 	}
 	ctx = withAnswerRaw(ctx, rawID)
+	if q := extractQuotedStanzaID(msg); q != "" {
+		_ = b.db.SetQuotedID(ctx, rawID, q)
+	}
 	answered := func() { _ = b.db.SetHandledAs(ctx, rawID, "answer") }
 	toAssistant := func(query string) {
 		_ = b.db.SetHandledAs(ctx, rawID, "assistant")
@@ -623,18 +638,24 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			// Сотрудник отвечает на вопрос бота, обращаясь по имени («Джарвис, это
 			// Каталов Ахмед»). Владельцу — ассистент: у него есть инструменты, а
 			// «Джарвис, отправь этот чек Мансуру» — команда, а не имя клиента.
-			if !b.isReportAdmin(msg.Info) {
-				if quoted != "" && b.handleClarifyReply(ctx, msg, stripped) {
-					answered()
-					return
-				}
-				if quoted == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, stripped) {
-					answered()
-					return
-				}
+			// Владельцу тоже: если это просто ответ («Джарвис, новый», «Джарвис, у
+			// Дени», «Джарвис, Магомедов Ахмед»), а не команда.
+			admin := b.isReportAdmin(msg.Info)
+			if quoted != "" && (!admin || b.isPlainClarifyAnswer(ctx, quoted, stripped)) && b.handleClarifyReply(ctx, msg, stripped) {
+				answered()
+				return
+			}
+			if !admin && quoted == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, stripped) {
+				answered()
+				return
 			}
 		} else {
-			if b.handleClarifyReply(ctx, msg, text) {
+			// @-упоминание бота в ответе — не часть ответа (номер бота не сумма).
+			clean := text
+			if b.isMentioned(msg) || b.isMentionedText(text) {
+				clean = b.stripBotMention(text)
+			}
+			if b.handleClarifyReply(ctx, msg, clean) {
 				answered()
 				return
 			}
@@ -642,7 +663,7 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 			// под вопросом «какая сумма?») — понимаем по контексту. Свайп на
 			// вопрос сверки по чеку — это ответ НА НЕГО (уже разобран выше), а не
 			// на последний вопрос.
-			if extractQuotedStanzaID(msg) == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, text) {
+			if extractQuotedStanzaID(msg) == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, clean) {
 				answered()
 				return
 			}
@@ -792,6 +813,16 @@ func (b *Bot) employeeAccountingText(ctx context.Context, msg *events.Message, t
 		return "", false
 	}
 	text = strings.TrimSpace(text)
+	// «это не Каталов Ахмед, а Исаев Харон» — поправка, а не имя для чека.
+	toks := answerTokens(cleanAnswer(text))
+	if hasNegation(toks) {
+		return "", false
+	}
+	for _, t := range toks {
+		if t == "а" || t == "но" {
+			return "", false
+		}
+	}
 	if b.employeePayment(msg, text) {
 		return text, true
 	}
@@ -804,12 +835,61 @@ func (b *Bot) employeeAccountingText(ctx context.Context, msg *events.Message, t
 	return "", false
 }
 
+// commandVerbs — с них начинается команда боту, а не ответ на его вопрос.
+var commandVerbs = map[string]bool{
+	"отправь": true, "отправьте": true, "покажи": true, "покажите": true, "скинь": true, "скиньте": true,
+	"перешли": true, "перешлите": true, "удали": true, "удалите": true, "сделай": true, "посчитай": true,
+	"проверь": true, "добавь": true, "внеси": true, "найди": true, "напомни": true, "пришли": true,
+	"убери": true, "исключи": true, "верни": true, "дай": true, "скажи": true, "расскажи": true, "выведи": true,
+}
+
+// isPlainClarifyAnswer — текст владельца на вопрос бота — простой ответ на него
+// («новый», «у Дени», «Магомедов Ахмед», «15000»), а не команда ассистенту.
+func (b *Bot) isPlainClarifyAnswer(ctx context.Context, quoted, text string) bool {
+	low := cleanAnswer(text)
+	toks := answerTokens(low)
+	if len(toks) == 0 || len(toks) > 5 || strings.Contains(text, "?") || commandVerbs[toks[0]] {
+		return false
+	}
+	b.clarify.mu.Lock()
+	_, dup := b.clarify.dupAskMap[quoted]
+	_, cash := b.clarify.cashAskMap[quoted]
+	b.clarify.mu.Unlock()
+	if !dup {
+		_, dup, _ = b.db.DupTxByAskMsg(ctx, quoted)
+	}
+	if !cash {
+		_, cash, _ = b.db.TxByCollectorAskMsg(ctx, quoted)
+	}
+	switch {
+	case dup:
+		r, _ := parseCashDupAnswer(text)
+		return r
+	case cash:
+		return extractCollectorName(text) != ""
+	}
+	// «чей чек?» / «❓ чей платёж?»: ФИО и/или сумма.
+	name := strings.TrimSpace(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(text, "это"), "Это"), " ,:-—"))
+	if _, ok := looksLikeName(name); ok {
+		return true
+	}
+	return parser.ExtractAmount(text) > 0 && len(toks) <= 3
+}
+
 // answerRawKey — id сообщения-ответа в базе (кладём в контекст, чтобы ответ на
 // «чей чек?» запомнил, какое сообщение назвало клиента).
 type answerRawKey struct{}
 
 func withAnswerRaw(ctx context.Context, rawID int) context.Context {
 	return context.WithValue(ctx, answerRawKey{}, rawID)
+}
+
+// noteAnswer — сообщение ответило на вопрос бота kind о target (правка ответа
+// применится к тому же вопросу).
+func (b *Bot) noteAnswer(ctx context.Context, kind, target string) {
+	if id := answerRawFrom(ctx); id > 0 {
+		_ = b.db.SetAnswerTarget(ctx, id, kind, target)
+	}
 }
 
 func answerRawFrom(ctx context.Context) int {
@@ -952,9 +1032,25 @@ func (b *Bot) deterministicLines(text string, mode detMode) (keep []parser.Trans
 
 func (b *Bot) recordDeterministicPaymentsMode(ctx context.Context, text string, rawID int, txDate time.Time, cashHint bool, mode detMode) (saved int, failed bool) {
 	keep, _ := b.deterministicLines(text, mode)
+	return b.recordParsedLines(ctx, keep, text, rawID, txDate, cashHint)
+}
+
+// recordParsedLines — записать строки парсера платежами сообщения.
+func (b *Bot) recordParsedLines(ctx context.Context, keep []parser.Transaction, text string, rawID int, txDate time.Time, cashHint bool) (saved int, failed bool) {
 	isCashMsg := parser.IsCash(text) || cashHint
+	// В списке из нескольких платежей наличка — по своей строке («Нал 27000»
+	// не делает наличкой переводы соседних строк).
+	perLine := len(keep) > 1 && strings.Count(strings.TrimSpace(text), "\n") > 0
 	for _, tr := range keep {
 		canonical, _ := b.aliases.ResolveName(tr.RawName)
+		isCash := isCashMsg || tr.IsCash
+		if perLine && tr.Line != "" {
+			isCash = cashHint || parser.IsCash(tr.Line) || tr.IsCash
+		}
+		card := tr.CardTo
+		if isCash && card == "" {
+			card = "наличные"
+		}
 		contactID, err := b.db.GetOrCreateContact(ctx, canonical)
 		if err != nil {
 			fmt.Println("Ошибка получения контакта:", err)
@@ -966,8 +1062,9 @@ func (b *Bot) recordDeterministicPaymentsMode(ctx context.Context, text string, 
 			RawName:      tr.RawName,
 			Amount:       tr.Amount,
 			Note:         tr.Note,
-			CardTo:       tr.CardTo,
-			IsCash:       isCashMsg,
+			CardTo:       card,
+			IsCash:       isCash,
+			Collector:    tr.Collector,
 			RawMessageID: rawID,
 			TxDate:       txDate,
 			DupCheck:     b.cashDupCheckOn(),
@@ -1466,8 +1563,19 @@ func (b *Bot) isMentioned(msg *events.Message) bool {
 
 // stripBotMention убирает из текста @-упоминание номера/LID бота («@79887…»),
 // чтобы в ассистент ушёл чистый запрос без служебного меншена.
+// isMentionedText — в тексте есть @-упоминание номера бота.
+func (b *Bot) isMentionedText(text string) bool {
+	if !strings.Contains(text, "@") {
+		return false
+	}
+	return b.stripBotMention(text) != strings.TrimSpace(text)
+}
+
 func (b *Bot) stripBotMention(text string) string {
 	if b.client == nil {
+		if b.selfUser != "" {
+			text = strings.ReplaceAll(text, "@"+b.selfUser, "")
+		}
 		return strings.TrimSpace(text)
 	}
 	out := text
@@ -3368,16 +3476,20 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 			continue
 		}
 
+		sentID := ""
 		if ext == ".pdf" {
-			b.sendDocumentBytes(targetJID, media, "чек_"+ts.Format("2006-01-02_15-04")+".pdf", "application/pdf")
+			sentID, _ = b.sendDocumentReturnID(targetJID, media, "чек_"+ts.Format("2006-01-02_15-04")+".pdf", "application/pdf")
 		} else {
-			b.sendImageBytes(targetJID, media)
+			sentID = b.sendImageReturnID(targetJID, media, "")
 		}
 		fmt.Printf("Чек из %s переслан в %s (%s)\n", sourceKey, rule.TargetName, rule.TargetJID)
 
 		// Записываем чек в учёт целевой группы. Синтетический ID сообщения,
 		// чтобы не конфликтовать с исходным по уникальности.
-		if parser.LooksLikeBankReceipt(text) {
+		// Чек уже записан в исходной группе (в том числе прочитанный только
+		// зрением) — копия повторяет его. Из лички — разбираем как обычно.
+		srcID, hasSrc, _ := b.db.ReceiptIDByMessage(ctx, origMsgID)
+		if hasSrc || parser.LooksLikeBankReceipt(text) {
 			rawID, existed, err := b.db.SaveRawMessage(ctx, origMsgID+"-fwd-"+targetJID.User, rule.TargetJID,
 				"bot-forward", "", senderName, text, true, "", ts)
 			if err != nil {
@@ -3387,6 +3499,15 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 			if existed {
 				continue // эту копию уже записывали
 			}
+			if sentID != "" {
+				_ = b.db.SetForwardSentID(ctx, rawID, sentID)
+			}
+			if hasSrc {
+				if err := b.db.CloneReceiptToCopy(ctx, srcID, rawID, rule.TargetJID); err != nil {
+					fmt.Println("Ошибка записи копии чека:", err)
+				}
+				continue
+			}
 			// Клиент, названный у исходного чека, — и у копии (иначе в целевой
 			// группе чек не считался и бот спрашивал «чей это чек?»).
 			payer := ""
@@ -3395,7 +3516,7 @@ func (b *Bot) applyForwardRules(ctx context.Context, sourceKey, senderName, orig
 			}
 			b.handleBankReceipt(ctx, targetJID, "", "", text, rawID, ts, media, ext, payer, 0)
 			// Копия сразу повторяет исходный чек (поправленную сумму, исключение…).
-			_, _ = b.db.SyncForwardCopies(ctx)
+			_, _ = b.db.SyncForwardCopy(ctx, rawID)
 		}
 	}
 }
@@ -3970,14 +4091,18 @@ func (b *Bot) sendImageBytes(chat types.JID, data []byte) {
 
 // sendImageWithCaption отправляет фото с подписью (пусто = без подписи).
 func (b *Bot) sendImageWithCaption(chat types.JID, data []byte, caption string) {
+	b.sendImageReturnID(chat, data, caption)
+}
+
+// sendImageReturnID — отправить фото и вернуть id сообщения ("" — не ушло).
+func (b *Bot) sendImageReturnID(chat types.JID, data []byte, caption string) string {
 	if b.sendHook != nil {
-		b.sendHook(chat, "[фото] "+caption, "")
-		return
+		return b.sendHook(chat, "[фото] "+caption, "")
 	}
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaImage)
 	if err != nil {
 		fmt.Println("Ошибка загрузки фото в WhatsApp:", err)
-		return
+		return ""
 	}
 	img := &waProto.ImageMessage{
 		URL:           proto.String(uploaded.URL),
@@ -3994,21 +4119,27 @@ func (b *Bot) sendImageWithCaption(chat types.JID, data []byte, caption string) 
 	resp, err := b.client.SendMessage(context.Background(), chat, &waProto.Message{ImageMessage: img})
 	if err != nil {
 		fmt.Println("Ошибка отправки фото:", err)
-		return
+		return ""
 	}
 	b.rememberSent(chat, resp.ID)
+	return resp.ID
 }
 
 // sendDocumentBytes отправляет документ (PDF-чек) из памяти.
 func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype string) error {
+	_, err := b.sendDocumentReturnID(chat, data, fileName, mimetype)
+	return err
+}
+
+// sendDocumentReturnID — отправить документ и вернуть id сообщения.
+func (b *Bot) sendDocumentReturnID(chat types.JID, data []byte, fileName, mimetype string) (string, error) {
 	if b.sendHook != nil {
-		b.sendHook(chat, "[документ] "+fileName, "")
-		return nil
+		return b.sendHook(chat, "[документ] "+fileName, ""), nil
 	}
 	uploaded, err := b.client.Upload(context.Background(), data, whatsmeow.MediaDocument)
 	if err != nil {
 		fmt.Println("Ошибка загрузки документа в WhatsApp:", err)
-		return fmt.Errorf("загрузка документа в WhatsApp: %w", err)
+		return "", fmt.Errorf("загрузка документа в WhatsApp: %w", err)
 	}
 	msg := &waProto.Message{
 		DocumentMessage: &waProto.DocumentMessage{
@@ -4026,10 +4157,10 @@ func (b *Bot) sendDocumentBytes(chat types.JID, data []byte, fileName, mimetype 
 	resp, err := b.client.SendMessage(context.Background(), chat, msg)
 	if err != nil {
 		fmt.Println("Ошибка отправки документа:", err)
-		return fmt.Errorf("отправка документа: %w", err)
+		return "", fmt.Errorf("отправка документа: %w", err)
 	}
 	b.rememberSent(chat, resp.ID)
-	return nil
+	return resp.ID, nil
 }
 
 func (b *Bot) sendDocument(chat types.JID, filePath, fileName string) error {

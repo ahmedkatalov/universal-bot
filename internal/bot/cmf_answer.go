@@ -194,16 +194,28 @@ func notYetReply(toks []string, names ...string) bool {
 		own = append(own, normWords(n)...)
 	}
 	status := false
-	for _, t := range toks {
+	for k, t := range toks {
+		// «не он», «не ему», «не Каталову …, а …» — это про клиента, а не про то,
+		// что не внесли.
+		if t == "не" && k+1 < len(toks) && !enteredWords[toks[k+1]] && !statusWords[toks[k+1]] {
+			return false
+		}
+		switch t {
+		case "а", "но", "он", "она", "его", "ему", "её", "ее", "ей", "это":
+			if t == "а" || t == "но" || k > 0 && toks[k-1] == "не" {
+				return false
+			}
+		}
 		switch {
 		case enteredWords[t] || statusWords[t]:
 			status = true
-		case t == "не" || t == "нет" || t == "неа" || t == "а" || fillerWords[t]:
+		case t == "не" || t == "нет" || t == "неа" || fillerWords[t]:
 		case t == "в" || t == "программу" || t == "программе" || t == "его" || t == "её" || t == "ее" || t == "оплату":
 		default:
 			same := false
 			for _, w := range own {
-				if nameWordSame(t, w) {
+				// Строго: «Каталовой» — не «Каталов».
+				if nameWordStrict(t, w) {
 					same = true
 					break
 				}
@@ -999,6 +1011,14 @@ func (b *Bot) applyCmfWatchAnswer(ctx context.Context, chat types.JID, watchID i
 //   - чек уже решён: «спасибо/ок/👍» — молча; меняем решение только на явную
 //     поправку (другой клиент, «нет», «нет в программе»).
 func (b *Bot) applyCmfWatchAnswerOpts(ctx context.Context, chat types.JID, watchID int, text string, o answerOpts) bool {
+	if b.applyCmfWatchAnswerOpts0(ctx, chat, watchID, text, o) {
+		b.noteAnswer(ctx, "cmf", strconv.Itoa(watchID))
+		return true
+	}
+	return false
+}
+
+func (b *Bot) applyCmfWatchAnswerOpts0(ctx context.Context, chat types.JID, watchID int, text string, o answerOpts) bool {
 	w, ok, err := b.db.CmfWatchByID(ctx, watchID)
 	if err != nil || !ok {
 		return false
@@ -1306,19 +1326,9 @@ func (b *Bot) bindCmfWatch(ctx context.Context, chat types.JID, w db.CmfWatchFul
 		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 			cidPtr = &cid
 		}
-		// Текстовая копия этого платежа («Магомедов Ахмед 15000» рядом с чеком)
-		// переходит к тому же клиенту — иначе текст и чек разойдутся по разным
-		// клиентам и платёж посчитается дважды.
-		var twins []int
-		if rid, ok, err := b.db.ReceiptIDByMessage(ctx, w.WaMessageID); err == nil && ok {
-			twins, _ = b.db.ReceiptTextTwins(ctx, rid)
-		}
+		// Текстовая копия платежа переходит вместе с чеком (SetReceiptClientByMessage).
 		if _, err := b.db.SetReceiptClientByMessage(ctx, w.WaMessageID, canonical, cidPtr); err != nil {
 			fmt.Println("cmf: не записал клиента чеку:", err)
-		} else if cidPtr != nil {
-			for _, tx := range twins {
-				_ = b.db.SetTxClient(ctx, tx, *cidPtr, canonical)
-			}
 		}
 	}
 	note := ""
@@ -1646,7 +1656,12 @@ func (b *Bot) reresolveWatchByCheck(ctx context.Context, chat types.JID, checkWa
 		return false
 	}
 	wid, ok, err := b.db.CmfWatchByCheckMessage(ctx, checkWaID)
-	if err != nil || !ok {
+	if err != nil {
+		return false
+	}
+	if !ok {
+		// Наблюдения нет (чек без получателя, клиента назвали только сейчас) — заводим.
+		b.ensureMissingWatches(ctx)
 		return false
 	}
 	w, ok, err := b.db.CmfWatchByID(ctx, wid)

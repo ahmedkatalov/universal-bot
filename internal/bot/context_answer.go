@@ -8,7 +8,9 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"math"
+	"strconv"
 	"strings"
 	"time"
 
@@ -150,6 +152,7 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		if err != nil || !found {
 			return false
 		}
+		b.noteAnswer(ctx, "dup", strconv.Itoa(a.txID))
 		b.clearOpenAsk(groupJID)
 		if isNew {
 			b.sendText(chat, "Засчитал как новый платёж: наличка "+client+".")
@@ -350,8 +353,12 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 	}
 	found, amount, stillReview, err := b.db.FillReceiptByMessage(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
 	if err != nil || !found {
+		if err != nil {
+			fmt.Println("Ответ про чек: не записался:", err)
+		}
 		return false, false
 	}
+	b.noteAnswer(ctx, "receipt", receiptWaID)
 	if amount <= 0 {
 		b.askAboutReceipt(ctx, chat, receiptWaID, "Записал клиента "+canonical+", но сумму по этому чеку так и не знаю — напишите сумму (например «15000»), и чек войдёт в сбор.", true, false)
 		return true, false

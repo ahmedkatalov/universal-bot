@@ -78,6 +78,10 @@ func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string
 		}
 	}
 	itemOf := map[int]int{} // id наблюдения → индекс позиции
+	kept := map[int]bool{}  // чеки, оставшиеся после склейки копий
+	for _, r := range recs {
+		kept[r.ID] = true
+	}
 	var items []reconItem
 	for _, r := range recs {
 		if r.NeedsReview {
@@ -85,7 +89,16 @@ func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string
 		}
 		var mine []int
 		for _, w := range ws {
-			if raw, ok := rawByWa[w.WaMessageID]; ok && (raw.ID == r.ID || sameCheckCopy(raw, r.ReconReceipt)) {
+			if _, done := itemOf[w.ID]; done {
+				continue
+			}
+			raw, ok := rawByWa[w.WaMessageID]
+			if !ok {
+				continue
+			}
+			// Свой чек — точно; копия (склеенная с этим чеком) — по совпадению.
+			// Два разных чека одной группы на одну сумму — разные позиции.
+			if raw.ID == r.ID || !kept[raw.ID] && sameCheckCopy(raw, r.ReconReceipt) {
 				mine = append(mine, w.ID)
 			}
 		}
@@ -93,7 +106,9 @@ func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string
 			continue
 		}
 		for _, id := range mine {
-			itemOf[id] = len(items)
+			if _, done := itemOf[id]; !done {
+				itemOf[id] = len(items)
+			}
 		}
 		items = append(items, reconItem{ID: r.ID, Kind: "check", Amount: r.Amount, Date: r.TxDate, Report: len(mine) > 0})
 	}
