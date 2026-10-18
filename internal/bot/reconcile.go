@@ -291,6 +291,47 @@ func clientNamePartMoney(a, b string) bool {
 	return initialsAgree(ia, leftovers(fb, ub, ib)) && initialsAgree(ib, leftovers(fa, ua, ia))
 }
 
+// sameCashRepeatClient — тот же ли клиент у двух наличек одной суммы для
+// вопроса «новый или тот же?». Придержка деньги не сливает — она лишь
+// спрашивает, поэтому ловим и переотправку с исправленным именем: строгое
+// сравнение для денег (sameClientMoney), имя дописали («Исаев» → «Исаев
+// Харон», clientNamePartMoney) или вставили пропущенную букву в коротком слове
+// («Харн» → «Харон», «Иса» → «Исса», nameWordCashRepeat). Разные клиенты не
+// сходятся: «Омаров»/«Умаров», «Магомед»/«Магомедов Ахмед», «Алан»/«Аслан».
+func sameCashRepeatClient(a, b string) bool {
+	return sameClientMoney(a, b) || clientNamePartMoney(a, b) || sameClientNameWith(a, b, nameWordCashRepeat)
+}
+
+// nameWordCashRepeat — nameWordMoney, а в коротком слове (3–4 буквы) ещё и
+// одна пропущенная буква ВНУТРИ слова: гласная («Харн»/«Харон», «Тимр»/
+// «Тимур», «Ахмд»/«Ахмед») или удвоенная («Иса»/«Исса»). Пропущенная согласная
+// в коротком имени — другое имя («Алан»/«Аслан», «Иман»/«Имран», «Али»/«Алви»).
+// Длинные слова nameWordMoney уже прощает.
+func nameWordCashRepeat(a, b string) bool {
+	if nameWordMoney(a, b) {
+		return true
+	}
+	if isPatronymic(a) != isPatronymic(b) {
+		return false
+	}
+	ra, rb := []rune(foldYi(a)), []rune(foldYi(b))
+	if len(ra) > len(rb) {
+		ra, rb = rb, ra
+	}
+	if len(ra) < 3 || len(ra) >= 5 || len(rb) != len(ra)+1 || ra[0] != rb[0] {
+		return false
+	}
+	for k := 1; k < len(rb)-1; k++ {
+		if string(rb[:k])+string(rb[k+1:]) != string(ra) {
+			continue
+		}
+		if isVowelRu(rb[k]) || rb[k] == rb[k-1] || rb[k] == rb[k+1] {
+			return true
+		}
+	}
+	return false
+}
+
 func sameClientNameWith(a, b string, same func(a, b string) bool) bool {
 	ha, hb := hasHyphen(a), hasHyphen(b)
 	if ha == hb && sameClientNameOnce(a, b, same) {

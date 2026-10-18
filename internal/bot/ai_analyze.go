@@ -306,10 +306,13 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 
 	// Вопрос-уточнение: его задало БОЛЬШИНСТВО чтений И сообщение вообще было
 	// похоже на платёж. Последнее важно: ИИ получает и «просто сообщения с
-	// цифрой» — по такой болтовне переспрашивать в группе нельзя.
+	// цифрой» — по такой болтовне переспрашивать в группе нельзя. Чтения
+	// формулируют один и тот же вопрос своими словами — считаем, СКОЛЬКО из них
+	// спросили, а не совпадение текста (иначе «Нал 27000» без имени молча
+	// пропадал: вопроса нет, а заглушку без вопроса не пишем).
 	question := ""
 	if paymentLikely {
-		question = majorityString(clarifies, okRuns)
+		question = majorityClarify(clarifies, okRuns)
 	}
 	if disputed && question == "" {
 		question = "Не смог точно разобрать платёж — чей он и на какую сумму? Ответьте на это сообщение: ФИО клиента и сумма."
@@ -478,13 +481,6 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 // reDateLikeToken — «08.09», «8.9.26», «08.09.2026»: это дата, а не сумма.
 var reDateLikeToken = regexp.MustCompile(`^\d{1,2}\.\d{1,2}(?:\.\d{2,4})?$`)
 
-// reThousandsSuffix — суффикс тысяч/миллионов сразу после числа («31 т», «5к»,
-// «3 млн», «25 тысяч», «2 ляма», «5 косарей»). Хвосты склонений [а-яё]* — как в
-// parser.reShorthand (без них «тысяч/косарей/ляма» не распознавались). За
-// суффиксом не должна идти буква («т.е.» — не тысячи); рубли после суффикса
-// допускаем: «15тр», «15 т.р.», «15 тыс.руб».
-var reThousandsSuffix = regexp.MustCompile(`(?i)^\s*(кк|к|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:\.?\s?(?:р|руб[а-яё]*|₽))?\.?(?:$|\s|[^\p{L}\d\s](?:[^\p{L}]|$))`)
-
 // looksLikeClockToken — токен из 1–2 цифр вплотную к двоеточию (часы/минуты в
 // «12:30»). Так «12»/«30» из времени не считаются суммой, а «35.000» из
 // «наличными:35.000» (не 1–2 цифры) — считается.
@@ -552,30 +548,28 @@ func moneyTokens(text string) []float64 {
 			continue
 		}
 		// Суффикс проверяем ПЕРВЫМ: «1.5 млн» — сумма, а не дата; «22т» — тысячи.
-		suffix := reThousandsSuffix.FindStringSubmatch(text[m[1]:])
-		if suffix == nil && reDateLikeToken.MatchString(tok) {
+		// Правило суффикса — то же, что у парсера: «15000 к Адаму» — «к»
+		// предлог, а не тысячи (иначе страховка ниже делала 15 000 000).
+		v := parser.ParseMoneyValue(tok)
+		mult := parser.ThousandsMultiplier(text[m[1]:], v)
+		suffix := mult > 0
+		if !suffix && reDateLikeToken.MatchString(tok) {
 			continue // «08.09» без суффикса — дата
 		}
-		if suffix == nil && looksLikeClockToken(text, m[0], m[1], tok) {
+		if !suffix && looksLikeClockToken(text, m[0], m[1], tok) {
 			continue // «12:30» — время
 		}
-		if suffix == nil && digitCount(tok) >= 10 {
+		if !suffix && digitCount(tok) >= 10 {
 			continue // 10+ цифр — телефон/счёт/карта, а не сумма
 		}
-		if suffix == nil && precededByNonAmountMarker(text, m[0]) {
+		if !suffix && precededByNonAmountMarker(text, m[0]) {
 			continue // номер договора/счёта/телефон («договор 12345», «+7...») — не сумма
 		}
-		v := parser.ParseMoneyValue(tok)
 		if v <= 0 {
 			continue
 		}
-		if suffix != nil {
-			switch s := strings.ToLower(suffix[1]); {
-			case s == "кк" || strings.HasPrefix(s, "млн") || strings.HasPrefix(s, "лям"):
-				v *= 1_000_000
-			default: // к, т, тыс, тыщ, косар
-				v *= 1000
-			}
+		if suffix {
+			v *= mult
 		} else if v < 100 {
 			continue // мелкое число без суффикса — вряд ли сумма (номер, «за 2 месяца»)
 		}
@@ -967,18 +961,31 @@ func mostCommonKey(m map[string]int) string {
 	return best
 }
 
-// majorityString — строка, встретившаяся в БОЛЬШИНСТВЕ из total (иначе "").
-func majorityString(vals []string, total int) string {
+// majorityClarify — вопрос-уточнение, если его задало БОЛЬШИНСТВО из total
+// чтений (иначе ""). Формулировки у чтений разные («Чья это наличка 27000?» /
+// «От кого наличные 27 000 ₽?») — спросили всё равно все; задаём самую частую,
+// при равенстве — самую короткую (детерминированно).
+func majorityClarify(clarifies []string, total int) string {
+	if len(clarifies)*2 <= total {
+		return ""
+	}
 	counts := map[string]int{}
-	for _, v := range vals {
+	for _, v := range clarifies {
 		counts[v]++
 	}
+	best := ""
 	for v, c := range counts {
-		if c*2 > total {
-			return v
+		switch {
+		case best == "", c > counts[best]:
+			best = v
+		case c == counts[best]:
+			lv, lb := len([]rune(v)), len([]rune(best))
+			if lv < lb || lv == lb && v < best {
+				best = v
+			}
 		}
 	}
-	return ""
+	return best
 }
 
 type aiReceipt struct {

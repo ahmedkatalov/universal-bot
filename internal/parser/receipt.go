@@ -217,10 +217,13 @@ var fieldRules = []fieldRule{
 //	"27.06.2026 11:43:33" / "20.06.2026, 16:04" — числовой формат, с запятой перед временем или без,
 //	с секундами или без.
 var (
-	namedDateTimeRe   = regexp.MustCompile(`(?i)(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})(?:\s+(\d{1,2}):(\d{2})(?::(\d{2}))?)?`)
+	// «18 октября 2026 14:05», «… 2026 в 14:05», «… 2026, 14:05», «… 2026 г. в
+	// 14:05». Время необязательно: дата без времени читается как «только дата»
+	// (dateOnlyIn) — полночь за время операции не выдаётся.
+	namedDateTimeRe   = regexp.MustCompile(`(?i)(\d{1,2})\s+(января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(\d{4})(?:\s*(?:года|г\.?))?(?:(?:\s*,\s*(?:в\s*)?|\s+(?:в\s*)?)(\d{1,2}):(\d{2})(?::(\d{2}))?)?`)
 	numericDateTimeRe = regexp.MustCompile(`(\d{2})\.(\d{2})\.(\d{4}|\d{2})(?:,|\s+в)?\s+(\d{1,2}):(\d{2})(?::(\d{2}))?`)
 	isoDateTimeRe     = regexp.MustCompile(`(\d{4})-(\d{2})-(\d{2})[ T](\d{1,2}):(\d{2})(?::(\d{2}))?`)
-	shortMonthRe      = regexp.MustCompile(`(?i)(\d{1,2})\s+(янв|фев|мар|апр|мая|май|июн|июл|авг|сен|окт|ноя|дек)[а-я]*\.?,?\s*(\d{4})?,?\s*(?:в\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?`)
+	shortMonthRe      = regexp.MustCompile(`(?i)(\d{1,2})\s+(янв|фев|мар|апр|мая|май|июн|июл|авг|сен|окт|ноя|дек)[а-я]*\.?,?\s*(\d{4})?(?:\s*г\.)?,?\s*(?:в\s*)?(\d{1,2}):(\d{2})(?::(\d{2}))?`)
 	numericDateOnlyRe = regexp.MustCompile(`(\d{2})\.(\d{2})\.(\d{4})`)
 	timeOnlyRe        = regexp.MustCompile(`(?:^|\s)(\d{1,2}):(\d{2})(?::(\d{2}))?(?:\s|$)`)
 
@@ -335,6 +338,15 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			}
 		}
 	}
+	// 6б. Дата словом месяца без подписи и без времени («Квитанция от 18 октября
+	// 2026»): дата с чека важнее даты присылки; время — рядом или полдень.
+	for i, l := range lines {
+		if !skip[i] && namedDateTimeRe.MatchString(l) {
+			if t, ok := dateWithSeparateTime(lines, skip, i, l); ok {
+				return t, true
+			}
+		}
+	}
 	// 7. Даты операции на чеке нет вовсе — «Дата формирования» всё же ближе к
 	// операции, чем время присылки (PDF скачали сразу, прислали позже). Дата
 	// рождения/выдачи документа — никогда.
@@ -354,10 +366,17 @@ func detectTxTime(lines []string) (time.Time, bool) {
 	return time.Time{}, false
 }
 
-// dateOnlyIn — дата «дд.мм.гггг» в строке.
+// dateOnlyIn — дата «дд.мм.гггг» или «18 октября 2026» в строке.
 func dateOnlyIn(s string) (time.Time, bool) {
 	m := numericDateOnlyRe.FindStringSubmatch(s)
 	if m == nil {
+		if n := namedDateTimeRe.FindStringSubmatch(s); n != nil {
+			day, _ := strconv.Atoi(n[1])
+			year, _ := strconv.Atoi(n[3])
+			if mon, ok := monthGenitive[strings.ToLower(n[2])]; ok && day >= 1 && day <= 31 {
+				return time.Date(year, mon, day, 0, 0, 0, 0, time.Local), true
+			}
+		}
 		return time.Time{}, false
 	}
 	day, _ := strconv.Atoi(m[1])
@@ -494,19 +513,20 @@ func nextNonEmptyIndex(lines []string, from int) int {
 	return -1
 }
 
+// parseDateTimeFromLine — дата С ВРЕМЕНЕМ в строке. «18 октября 2026» без
+// времени сюда не годится (полночь — не время операции: два перевода одного
+// клиента за день слились бы в один чек) — такую дату берёт dateOnlyIn.
 func parseDateTimeFromLine(line string) (time.Time, bool) {
-	if m := namedDateTimeRe.FindStringSubmatch(line); m != nil {
+	if m := namedDateTimeRe.FindStringSubmatch(line); m != nil && m[4] != "" {
 		day, _ := strconv.Atoi(m[1])
 		month, ok := monthGenitive[strings.ToLower(m[2])]
 		if !ok {
 			return time.Time{}, false
 		}
 		year, _ := strconv.Atoi(m[3])
-		hour, min, sec := 0, 0, 0
-		if m[4] != "" {
-			hour, _ = strconv.Atoi(m[4])
-			min, _ = strconv.Atoi(m[5])
-		}
+		hour, _ := strconv.Atoi(m[4])
+		min, _ := strconv.Atoi(m[5])
+		sec := 0
 		if m[6] != "" {
 			sec, _ = strconv.Atoi(m[6])
 		}
