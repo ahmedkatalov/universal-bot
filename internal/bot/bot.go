@@ -64,6 +64,7 @@ type Bot struct {
 	aiRetryMu     sync.Mutex                                         // очередь текстов, не разобранных из-за сбоя ИИ
 	aiRetry       map[int]aiRetryItem
 	aiInFlight    map[int]aiFlight // сообщения, которые сейчас читает ИИ
+	aiDisputed    map[int]int      // сообщения, чьи чтения ИИ разошлись: сколько раз (см. noteDisputedRead)
 	chatQMu       sync.Mutex
 	chatQ         map[string]*chatQueue // очереди разбора по чатам
 	cmfHealthMu   sync.Mutex            // связь с программой рассрочек
