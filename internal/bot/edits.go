@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"whatsapp-bot/internal/db"
+	"whatsapp-bot/internal/ledger"
 	"whatsapp-bot/internal/parser"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
@@ -338,30 +339,62 @@ func corrNameMatches(query, name string) bool {
 	return true
 }
 
-// groupCorrTargets — текст и чек одного платежа (тот же клиент, перевод,
-// присланы в пределах двух суток) — одна цель поправки.
-func groupCorrTargets(ts []db.CorrTarget) [][]db.CorrTarget {
-	var groups [][]db.CorrTarget
+// corrGroup — одна цель поправки: записи одного платежа (как его считает
+// движок подсчёта) и остальные записи этого платежа, которых среди найденных
+// нет (текст-пара чека от другого сотрудника, копия чека в другой группе).
+type corrGroup struct {
+	ts    []db.CorrTarget
+	twins []db.CorrTarget
+}
+
+// groupCorrTargets — чек и его текст-пара (тот же платёж по движку подсчёта)
+// — одна цель поправки; текст, который движок считает отдельным платежом, —
+// своя цель.
+func (b *Bot) groupCorrTargets(ctx context.Context, ts []db.CorrTarget) []corrGroup {
+	var at []time.Time
 	for _, t := range ts {
+		at = append(at, t.Received)
+	}
+	x := b.loadPayIndex(ctx, at)
+	var groups []corrGroup
+	var pays []*ledger.Payment
+	for _, t := range ts {
+		p := x.payment(t.Kind, t.ID)
 		placed := false
-		for gi, g := range groups {
-			for _, o := range g {
-				d := t.Received.Sub(o.Received)
-				if d < 0 {
-					d = -d
-				}
-				if t.Kind != o.Kind && t.ContactID != 0 && t.ContactID == o.ContactID && !t.Cash && !o.Cash && d <= 48*time.Hour {
-					groups[gi] = append(groups[gi], t)
+		if p != nil {
+			for gi := range groups {
+				if pays[gi] == p {
+					groups[gi].ts = append(groups[gi].ts, t)
 					placed = true
 					break
 				}
 			}
-			if placed {
-				break
-			}
 		}
 		if !placed {
-			groups = append(groups, []db.CorrTarget{t})
+			groups = append(groups, corrGroup{ts: []db.CorrTarget{t}})
+			pays = append(pays, p)
+		}
+	}
+	for gi, p := range pays {
+		if p == nil {
+			continue
+		}
+		seen := map[string]bool{}
+		for _, t := range groups[gi].ts {
+			seen[evKey(t.Kind, t.ID)] = true
+		}
+		// Копии, пересланные ботом, повторяют сумму исходного чека сами.
+		for _, c := range x.checks(p) {
+			if k := evKey("receipt", c.ID); !seen[k] {
+				seen[k] = true
+				groups[gi].twins = append(groups[gi].twins, db.CorrTarget{Kind: "receipt", ID: c.ID, Name: c.Client, Amount: c.Amount, ContactID: c.ContactID})
+			}
+		}
+		for _, t := range x.texts(p) {
+			if k := evKey("tx", t.ID); !seen[k] {
+				seen[k] = true
+				groups[gi].twins = append(groups[gi].twins, db.CorrTarget{Kind: "tx", ID: t.ID, Name: t.Client, Amount: t.Amount, ContactID: t.ContactID, Cash: t.Cash})
+			}
 		}
 	}
 	return groups
@@ -428,7 +461,7 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 			}
 		}
 	}
-	groups := groupCorrTargets(targets)
+	groups := b.groupCorrTargets(ctx, targets)
 	switch {
 	case len(groups) == 0:
 		say(fmt.Sprintf("Не нашёл платёж на %s ₽, который нужно исправить. Ответьте свайпом на сообщение с ним.", formatMoney(c.Old)))
@@ -436,37 +469,17 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 	case len(groups) > 1:
 		var names []string
 		for _, g := range groups {
-			names = append(names, g[0].Name)
+			names = append(names, g.ts[0].Name)
 		}
+		amt := groups[0].ts[0].Amount
 		say(fmt.Sprintf("Платежей на %s ₽ несколько (%s) — какой исправить? Ответьте свайпом на нужный: «не %s а %s».",
-			formatMoney(groups[0][0].Amount), strings.Join(names, ", "), formatMoney(groups[0][0].Amount), formatMoney(c.New)))
+			formatMoney(amt), strings.Join(names, ", "), formatMoney(amt), formatMoney(c.New)))
 		return done()
 	}
-	g := groups[0]
+	// Остальные записи того же платежа (текст-пара чека, чек текста) — тоже.
+	g := append(groups[0].ts, groups[0].twins...)
 	if math.Abs(g[0].Amount-c.New) < 0.01 {
 		return done() // «правильно 5000» — подтверждение, менять нечего
-	}
-	// Копия того же платежа, присланная отдельно (текст ↔ чек), — тоже.
-	seen := map[string]bool{}
-	for _, t := range g {
-		seen[t.Kind+fmt.Sprint(t.ID)] = true
-	}
-	for _, t := range append([]db.CorrTarget(nil), g...) {
-		var twins []int
-		kind := ""
-		if t.Kind == "tx" && !t.Cash {
-			twins, _ = b.db.TxReceiptTwins(ctx, t.ID)
-			kind = "receipt"
-		} else if t.Kind == "receipt" {
-			twins, _ = b.db.ReceiptTextTwins(ctx, t.ID)
-			kind = "tx"
-		}
-		for _, id := range twins {
-			if !seen[kind+fmt.Sprint(id)] {
-				seen[kind+fmt.Sprint(id)] = true
-				g = append(g, db.CorrTarget{Kind: kind, ID: id, Amount: t.Amount, Name: t.Name})
-			}
-		}
 	}
 	was := g[0].Amount
 	changed, onlyChecks := 0, true
