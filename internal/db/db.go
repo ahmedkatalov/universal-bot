@@ -14,6 +14,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"whatsapp-bot/internal/ledger"
 )
 
 // nameKey нормализует имя для группировки в отчётах: регистр и лишние пробелы
@@ -2193,10 +2195,15 @@ type OperationRef struct {
 	GroupJID string
 	Cash     bool
 	Received time.Time // когда прислали в чат
+	// Кто прислал запись (имя из памяти номеров / WhatsApp), его номер и у кого
+	// деньги — чтобы владелец мог сказать «исключи текст Ислама».
+	Sender    string
+	Phone     string
+	Collector string
 }
 
 // FindOperations ищет операции по сумме с необязательными уточнениями:
-// имя человека (подстрока), диапазон дат, группа. Возвращает до 10 последних —
+// имя человека (подстрока), диапазон дат, группа. Возвращает до 30 последних —
 // используется ассистентом, чтобы найти операцию, которую владелец просит
 // исключить из учёта или вернуть обратно.
 func (d *DB) FindOperations(ctx context.Context, amount float64, person string, from, to *time.Time, groupJID string) ([]OperationRef, error) {
@@ -2205,28 +2212,36 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 			SELECT 'transaction' AS kind, t.id, COALESCE(c.canonical_name, t.raw_name) AS name,
 			       t.amount::float8 AS amount, t.tx_date::timestamptz AS tx_date,
 			       COALESCE(rm.wa_group_jid, '') AS group_jid, t.ignored,
-			       t.is_cash AS cash, COALESCE(rm.received_at, t.tx_date::timestamptz) AS received
+			       t.is_cash AS cash, COALESCE(rm.received_at, t.tx_date::timestamptz) AS received,
+			       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender,
+			       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
+			       COALESCE(t.collector, '') AS collector
 			FROM transactions t
 			LEFT JOIN contacts c ON c.id = t.contact_id
 			LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 			WHERE t.amount = $1 AND COALESCE(rm.deleted, false) = false
 
 			UNION ALL
 
 			SELECT 'receipt', br.id, COALESCE(c.canonical_name, br.recipient_raw, ''),
 			       br.amount::float8, br.tx_date, COALESCE(br.group_jid, ''), br.ignored,
-			       false, COALESCE(rm.received_at, br.tx_date)
+			       false, COALESCE(rm.received_at, br.tx_date),
+			       COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), ''),
+			       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1),
+			       COALESCE(br.collector, '')
 			FROM bank_receipts br
 			LEFT JOIN contacts c ON c.id = br.contact_id
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 			WHERE br.amount = $1 AND br.is_duplicate = false AND COALESCE(rm.deleted, false) = false
 		) ops
 		WHERE ($2 = '' OR ops.name ILIKE '%' || $2 || '%')
 		  AND ($3::timestamptz IS NULL OR ops.tx_date >= $3)
 		  AND ($4::timestamptz IS NULL OR ops.tx_date < $4)
 		  AND ($5 = '' OR ops.group_jid = $5)
-		ORDER BY ops.tx_date DESC
-		LIMIT 10
+		ORDER BY ops.tx_date DESC, ops.received DESC
+		LIMIT 30
 	`, amount, person, from, to, groupJID)
 	if err != nil {
 		return nil, err
@@ -2237,7 +2252,8 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 	for rows.Next() {
 		var op OperationRef
 		var groupJID string
-		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &groupJID, &op.Ignored, &op.Cash, &op.Received); err != nil {
+		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &groupJID, &op.Ignored, &op.Cash, &op.Received,
+			&op.Sender, &op.Phone, &op.Collector); err != nil {
 			return nil, err
 		}
 		op.GroupJID = groupJID
@@ -2280,6 +2296,41 @@ func (d *DB) ClearDuplicateFlagRef(ctx context.Context, amount float64, person, 
 	return true, name, txDate, waID, nil
 }
 
+// BookSpans — ОДНА книга движка подсчёта по записям нескольких несмежных
+// периодов [from, to) (с тем же запасом по краям, что у LoadBook; запись,
+// попавшая в несколько периодов, берётся один раз). Старый чек (дата операции
+// на месяц раньше присылки) и текст, присланный рядом с ним, должны оказаться в
+// одной книге: в книге «вокруг даты операции» текста нет, и чек там — платёж
+// без своей пары.
+func (d *DB) BookSpans(ctx context.Context, spans [][2]time.Time) (*ledger.Book, error) {
+	var checks []ledger.Check
+	var texts []ledger.Text
+	seenC, seenT := map[int]bool{}, map[int]bool{}
+	for _, s := range spans {
+		cs, err := d.loadLedgerChecks(ctx, s[0].Add(-ledgerPad), s[1].Add(ledgerPad), "")
+		if err != nil {
+			return nil, err
+		}
+		for _, c := range cs {
+			if !seenC[c.ID] {
+				seenC[c.ID] = true
+				checks = append(checks, c)
+			}
+		}
+		ts, err := d.loadLedgerTexts(ctx, s[0].Add(-ledgerPad), s[1].Add(ledgerPad), "")
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range ts {
+			if !seenT[t.ID] {
+				seenT[t.ID] = true
+				texts = append(texts, t)
+			}
+		}
+	}
+	return ledger.Build(checks, texts), nil
+}
+
 // SetOperationIgnored включает/выключает ручное исключение операции из учёта.
 func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignored bool) error {
 	table := ""
@@ -2304,9 +2355,10 @@ func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignor
 	return err
 }
 
-// ReceiptTextTwins — живые текстовые платежи, засчитанные как дубль этого чека
-// (тот же клиент и сумма, перевод, присланы в пределах ±2 дней).
-// Если чек исключить, они бы начали считаться — исключаем вместе с ним.
+// ReceiptTextTwins — живые текстовые платежи того же контакта и суммы, что чек
+// (перевод, присланы в пределах ±2 дней): при смене клиента чека они следуют
+// за ним. Исключение и поправка суммы берут пару чек↔текст из движка подсчёта
+// (bot.payIndex), а не отсюда: движок объединяет с чеком ровно один текст.
 func (d *DB) ReceiptTextTwins(ctx context.Context, receiptID int) ([]int, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT t.id FROM bank_receipts br
@@ -2321,35 +2373,6 @@ func (d *DB) ReceiptTextTwins(ctx context.Context, receiptID int) ([]int, error)
 		  AND COALESCE(rm.received_at, t.tx_date::timestamptz) >= COALESCE(brm.received_at, br.tx_date) - interval '2 days'
 		  AND COALESCE(rm.received_at, t.tx_date::timestamptz) <  COALESCE(brm.received_at, br.tx_date) + interval '2 days'
 		ORDER BY t.id`, receiptID)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []int
-	for rows.Next() {
-		var id int
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		out = append(out, id)
-	}
-	return out, rows.Err()
-}
-
-// TxReceiptTwins — чеки, с которыми этот текстовый платёж считается одним
-// платежом (тот же клиент и сумма, присланы в пределах ±2 дней).
-func (d *DB) TxReceiptTwins(ctx context.Context, txID int) ([]int, error) {
-	rows, err := d.pool.Query(ctx, `
-		SELECT br.id FROM transactions t
-		JOIN raw_messages rm ON rm.id = t.raw_message_id
-		JOIN bank_receipts br ON br.contact_id = t.contact_id AND br.amount = t.amount
-		LEFT JOIN raw_messages brm ON brm.id = br.raw_message_id
-		WHERE t.id = $1 AND t.is_cash = false AND t.contact_id IS NOT NULL
-		  AND br.ignored = false AND br.is_duplicate = false AND br.needs_review = false
-		  AND COALESCE(brm.deleted, false) = false
-		  AND COALESCE(brm.received_at, br.tx_date) >= COALESCE(rm.received_at, t.tx_date::timestamptz) - interval '2 days'
-		  AND COALESCE(brm.received_at, br.tx_date) <  COALESCE(rm.received_at, t.tx_date::timestamptz) + interval '2 days'
-		ORDER BY br.id`, txID)
 	if err != nil {
 		return nil, err
 	}

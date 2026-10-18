@@ -3250,7 +3250,13 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 			"('тот чек на 5000 скинули по ошибке, убери его') → action=exclude; вернуть исключённую " +
 			"('верни тот чек на 5000') → action=restore; чек ошибочно посчитан дублем и его надо засчитать " +
 			"('это не дубль, засчитай чек Миланы на 25000') → action=not_duplicate. " +
-			"Если под описание подходит несколько операций, инструмент вернёт список — уточни дату или имя.",
+			"Чек и текст про него («Магомедов Ахмед 5000» рядом с чеком) — ОДИН платёж: исключаются вместе. " +
+			"Если один платёж записан дважды (чек и отдельный такой же текст, два одинаковых текста) — исключай " +
+			"лишнюю запись, указав kind и/или sender («исключи текст Ислама» → kind=text, sender=Ислам). " +
+			"В группе исключение касается только этой группы: если тот же чек прислан и в другую группу, " +
+			"инструмент скажет об этом — спроси владельца, убрать ли и там (тогда group). " +
+			"Если под описание подходит несколько платежей, инструмент вернёт список — уточни у пользователя, " +
+			"какой (дата, имя, группа, кто прислал, чек или текст), не выбирай сам.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -3275,6 +3281,15 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 					"type":        "string",
 					"description": "Название группы, если пользователь её указал",
 				},
+				"kind": map[string]any{
+					"type":        "string",
+					"enum":        []string{"check", "text", "cash"},
+					"description": "Только если пользователь уточнил, что именно: check — чек, text — текстовая запись платежа, cash — наличка",
+				},
+				"sender": map[string]any{
+					"type":        "string",
+					"description": "Кто прислал запись (сотрудник), если пользователь уточнил: «текст Ислама» → Ислам",
+				},
 			},
 			"required": []string{"action", "amount"},
 		},
@@ -3285,6 +3300,8 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				Person string  `json:"person"`
 				Date   string  `json:"date"`
 				Group  string  `json:"group"`
+				Kind   string  `json:"kind"`
+				Sender string  `json:"sender"`
 			}
 			if err := json.Unmarshal(input, &args); err != nil {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
@@ -3340,16 +3357,33 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 
 			// Для exclude интересны ещё не исключённые, для restore — исключённые.
 			wantIgnored := args.Action == "restore"
+			sender := strings.TrimSpace(args.Sender)
 			var candidates []db.OperationRef
 			for _, op := range ops {
-				if op.Ignored == wantIgnored {
+				if op.Ignored == wantIgnored && opKindMatches(args.Kind, op) && (sender == "" || opSenderMatches(sender, op)) {
 					candidates = append(candidates, op)
 				}
 			}
-			// Чек и его текстовая копия («Магомедов Ахмед 5000» рядом с чеком) —
-			// ОДИН платёж: показываем и исключаем вместе.
-			candidates = collapseTextTwins(candidates)
+			// Каждая строка списка — один платёж, как его считает сбор (движок
+			// подсчёта): чек и его текст-пара (и копии чека в других группах) —
+			// одна строка, отдельный такой же текст — своя строка.
+			var entries []opEntry
+			var idx *payIndex
+			if args.Action == "exclude" {
+				idx = b.loadPayIndex(ctx, opTimes(candidates))
+				entries = groupOpsByPayment(candidates, idx)
+			} else {
+				for _, op := range collapseTextTwins(candidates) {
+					entries = append(entries, opEntry{op: op})
+				}
+			}
 			groups := b.joinedGroups(ctx)
+			groupName := func(g string) string {
+				if jid, err := types.ParseJID(g); err == nil {
+					return groups[jid]
+				}
+				return ""
+			}
 			opLabel := func(op db.OperationRef) string {
 				kind := "текст"
 				switch {
@@ -3364,88 +3398,71 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 						g = ", группа " + n
 					}
 				}
+				if op.Sender != "" {
+					g += ", прислал " + op.Sender
+				}
 				return fmt.Sprintf("[%s] %s, %.0f ₽, %s%s", kind, op.Name, op.Amount, op.TxDate.Format("02.01.2006 15:04"), g)
 			}
 
-			switch len(candidates) {
+			// «Исключи лишний» среди одинаковых текстов, которые владелец ничем
+			// не может различить, — исключаем лишний (отдельный платёж), а не
+			// задаём вопрос без ответа.
+			if args.Action == "exclude" {
+				if i, ok := extraTextCopy(entries); ok {
+					res, err := b.excludePayment(ctx, entries[i], idx, true, groupJID)
+					if err != nil {
+						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+					}
+					res.extra = true
+					for j, e := range entries {
+						switch {
+						case j == i:
+						case len(e.pay.Checks) > 0:
+							res.extraPaired = true
+						default:
+							res.extraLeft++
+						}
+					}
+					op := entries[i].op
+					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op, groupName), nil
+				}
+			}
+
+			switch len(entries) {
 			case 0:
 				if args.Action == "restore" {
 					return fmt.Sprintf("Исключённых операций на %.0f ₽ не нашёл.", args.Amount), nil
 				}
 				return fmt.Sprintf("Операций на %.0f ₽ в учёте не нашёл — возможно, она уже исключена или сумма другая.", args.Amount), nil
 			case 1:
-				op := candidates[0]
-				exclude := args.Action == "exclude"
-				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, exclude); err != nil {
+				op := entries[0].op
+				if args.Action == "exclude" {
+					// Владелец назвал именно эту запись (kind/sender) — только её.
+					res, err := b.excludePayment(ctx, entries[0], idx, opKind(args.Kind) != "" || sender != "", groupJID)
+					if err != nil {
+						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+					}
+					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op, groupName), nil
+				}
+				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
 					return "", fmt.Errorf("не удалось обновить операцию: %w", err)
 				}
-				twins := 0
-				if exclude && op.Kind == "receipt" {
-					// Текстовая копия этого чека иначе сразу начала бы считаться.
-					if ids, err := b.db.ReceiptTextTwins(ctx, op.ID); err == nil {
-						for _, id := range ids {
-							if b.db.SetOperationIgnored(ctx, "transaction", id, true) == nil {
-								twins++
-							}
-						}
-					}
-				}
-				verb := "исключена из учёта"
-				if args.Action == "restore" {
-					verb = "возвращена в учёт"
-				}
-				out := fmt.Sprintf("Операция %s: %s. Отчёты уже учитывают это изменение.", verb, opLabel(op))
-				if twins > 0 {
-					out += fmt.Sprintf(" Вместе с чеком исключил его текстовую запись (%d) — это был тот же платёж.", twins)
-				}
-				return out, nil
+				return fmt.Sprintf("Операция возвращена в учёт: %s. Отчёты уже учитывают это изменение.", opLabel(op)), nil
 			default:
 				var sb strings.Builder
-				sb.WriteString("Нашёл несколько подходящих операций, уточни дату, имя или группу:\n")
-				for _, op := range candidates {
-					fmt.Fprintf(&sb, "- %s\n", opLabel(op))
+				sb.WriteString("Нашёл несколько подходящих операций (каждая строка — отдельный платёж в сборе). " +
+					"Спроси, какую именно: дата, имя, группа, кто прислал (sender) или что это — чек/текст/наличка (kind):\n")
+				for i, e := range entries {
+					if i == 10 {
+						fmt.Fprintf(&sb, "…и ещё %d\n", len(entries)-10)
+						break
+					}
+					fmt.Fprintf(&sb, "- %s%s\n", opLabel(e.op), e.pairNote(idx))
 				}
 				return sb.String(), nil
 			}
 		},
 	}
-}
-
-// collapseTextTwins убирает из списка текстовые записи, которые — копия чека из
-// того же списка (тот же клиент и сумма, та же группа, ±2 дня, перевод): чек
-// останется, а его копию инструмент исключит вместе с ним.
-func collapseTextTwins(ops []db.OperationRef) []db.OperationRef {
-	var receipts []db.OperationRef
-	for _, op := range ops {
-		if op.Kind == "receipt" {
-			receipts = append(receipts, op)
-		}
-	}
-	if len(receipts) == 0 {
-		return ops
-	}
-	out := ops[:0:0]
-	for _, op := range ops {
-		if op.Kind == "transaction" && !op.Cash {
-			twin := false
-			for _, r := range receipts {
-				d := op.Received.Sub(r.Received)
-				if d < 0 {
-					d = -d
-				}
-				if math.Abs(r.Amount-op.Amount) < 1 && d <= 48*time.Hour &&
-					nameKeyBot(r.Name) == nameKeyBot(op.Name) {
-					twin = true
-					break
-				}
-			}
-			if twin {
-				continue
-			}
-		}
-		out = append(out, op)
-	}
-	return out
 }
 
 // savePendingTool сохраняет в учёт чеки, присланные владельцем в личку —
