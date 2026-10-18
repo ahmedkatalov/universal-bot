@@ -1019,6 +1019,11 @@ func (b *Bot) applyCmfWatchAnswerOpts(ctx context.Context, chat types.JID, watch
 }
 
 func (b *Bot) applyCmfWatchAnswerOpts0(ctx context.Context, chat types.JID, watchID int, text string, o answerOpts) bool {
+	// «Найди чек Каталова», «внеси в программу» на напоминание — это команда
+	// ассистенту, а не ответ «за кого платёж».
+	if isCommandText(text) {
+		return false
+	}
 	w, ok, err := b.db.CmfWatchByID(ctx, watchID)
 	if err != nil || !ok {
 		return false
@@ -1661,7 +1666,7 @@ func (b *Bot) reresolveWatchByCheck(ctx context.Context, chat types.JID, checkWa
 	}
 	if !ok {
 		// Наблюдения нет (чек без получателя, клиента назвали только сейчас) — заводим.
-		b.ensureMissingWatches(ctx)
+		b.ensureMissingWatchesAsync()
 		return false
 	}
 	w, ok, err := b.db.CmfWatchByID(ctx, wid)

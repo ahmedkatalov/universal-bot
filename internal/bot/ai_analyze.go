@@ -1112,6 +1112,7 @@ func (b *Bot) textRetryLoop() {
 	t := time.NewTicker(3 * time.Minute)
 	defer t.Stop()
 	for range t.C {
+		b.aiHealthAlert()
 		b.retryAIText(context.Background())
 	}
 }
@@ -1182,5 +1183,32 @@ func (b *Bot) retryAIText(ctx context.Context) {
 			break // ИИ всё ещё недоступен — остальные подождут следующего круга
 		}
 		b.aiRetryMu.Unlock()
+	}
+}
+
+// aiHealthAlert — ИИ-сервис подряд не отвечает (нет баланса, сбой, лимиты):
+// чеки и сообщения не читаются, пока он не вернётся. Говорим владельцу в личку
+// (не чаще раза в 6 часов) и — когда сервис вернулся.
+func (b *Bot) aiHealthAlert() {
+	if b.assistant == nil {
+		return
+	}
+	problem := b.assistant.LastProblem()
+	b.cmfHealthMu.Lock()
+	wasDown := b.aiAlerted
+	alert := problem != "" && time.Since(b.aiAlertAt) >= cmfAlertEvery
+	if alert {
+		b.aiAlertAt, b.aiAlerted = time.Now(), true
+	}
+	recovered := wasDown && problem == "" && b.assistant.Healthy()
+	if recovered {
+		b.aiAlerted = false
+	}
+	b.cmfHealthMu.Unlock()
+	switch {
+	case alert:
+		b.notifyOwners("⚠️ ИИ-сервис (OpenRouter) сейчас не отвечает: " + problem + " Чеки и непонятные сообщения я сохранил — дочитаю их сам, когда он вернётся.")
+	case recovered:
+		b.notifyOwners("✅ ИИ-сервис снова отвечает — дочитываю чеки и сообщения, которые ждали.")
 	}
 }

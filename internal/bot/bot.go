@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"math"
 	"os"
 	"path/filepath"
@@ -17,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -62,8 +64,16 @@ type Bot struct {
 	aiRetryMu     sync.Mutex                                         // очередь текстов, не разобранных из-за сбоя ИИ
 	aiRetry       map[int]aiRetryItem
 	aiInFlight    map[int]aiFlight // сообщения, которые сейчас читает ИИ
-	startedAt     time.Time        // запуск процесса (что пришло раньше — точно не в разборе)
-	cmfWritesMu   sync.Mutex       // журнал своих записей в программу (сутки)
+	chatQMu       sync.Mutex
+	chatQ         map[string]*chatQueue // очереди разбора по чатам
+	cmfHealthMu   sync.Mutex            // связь с программой рассрочек
+	cmfDownSince  time.Time
+	cmfAlertAt    time.Time
+	aiAlertAt     time.Time // когда последний раз сказали владельцу, что ИИ не отвечает
+	aiAlerted     bool
+	ensureMu      sync.Mutex // один подбор «забытых» чеков за раз
+	startedAt     time.Time  // запуск процесса (что пришло раньше — точно не в разборе)
+	cmfWritesMu   sync.Mutex // журнал своих записей в программу (сутки)
 	cmfWrites     map[string]time.Time
 	selfUser      string // только для тестов без WhatsApp: номер самого бота
 	fontDir       string
@@ -118,6 +128,8 @@ type Bot struct {
 	onDemandMu      sync.Mutex
 	onDemandUntil   time.Time
 	onDemandReplyTo types.JID
+	onDemandGot     int // сколько пачек истории пришло по запросу
+	onDemandTimer   bool
 
 	// Фото пачки наличных денег = пометка "это наличка" для соседнего платежа
 	// «ФИО+сумма». Фото может прийти ДО или ПОСЛЕ текста, поэтому запоминаем
@@ -384,13 +396,29 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// разбираем из неё чеки/платежи, чтобы вернуть данные после потери сервера.
 	if hs, ok := evt.(*events.HistorySync); ok {
 		onDemand, replyTo := b.onDemandHistoryActive()
-		if b.importHistory || onDemand {
+		// История, которую бот сам попросил («перечитай группу»), берём и если
+		// телефон ответил позже окна ожидания.
+		requested := hs.Data.GetSyncType() == waHistorySync.HistorySync_ON_DEMAND
+		if b.importHistory || onDemand || requested {
 			go func() {
 				seen, rc, pay := b.importHistorySync(hs.Data)
-				// По команде «перечитай группу» отчитываемся владельцу в личку —
-				// но только если реально что-то подтянули (чтобы не слать пустые).
-				if onDemand && !replyTo.IsEmpty() && (rc+pay) > 0 {
-					b.sendText(replyTo, fmt.Sprintf("Подтянул из истории группы: разобрал сообщений %d, новых чеков %d, платежей %d.", seen, rc, pay))
+				b.onDemandMu.Lock()
+				b.onDemandGot++
+				to := b.onDemandReplyTo
+				b.onDemandMu.Unlock()
+				if !onDemand && !requested {
+					return
+				}
+				if to.IsEmpty() {
+					to = replyTo
+				}
+				if to.IsEmpty() {
+					return
+				}
+				if rc+pay > 0 {
+					b.sendText(to, fmt.Sprintf("Подтянул из истории группы: разобрал сообщений %d, новых чеков %d, платежей %d.", seen, rc, pay))
+				} else {
+					b.sendText(to, fmt.Sprintf("История с телефона пришла: просмотрел %d сообщений — новых чеков и платежей в ней нет, всё уже было в учёте.", seen))
 				}
 			}()
 		}
@@ -425,31 +453,11 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// привязаны платежи/чеки, они выпадают из учёта, а бот подтверждает
 	// это в чате, чтобы было видно, что отчёт обновился.
 	if prot := msg.Message.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_REVOKE {
-		revokedID := prot.GetKey().GetID()
-		// Удалили фото чека, которое бот переслал сюда, — убираем копию.
-		if copyWa, ok, _ := b.db.CopyBySentID(ctx, revokedID); ok {
-			revokedID = copyWa
-		}
-		corrN, _ := b.db.CorrectionsByMessage(ctx, revokedID)
-		labeledN, _ := b.db.CountLabeledBy(ctx, revokedID)
-		txN, rcN, err := b.db.MarkMessageDeleted(ctx, revokedID)
-		if err != nil {
-			fmt.Println("Ошибка обработки удалённого сообщения:", err)
-			return
-		}
-		if txN+rcN > 0 {
-			fmt.Printf("Сообщение %s удалено — из учёта убрано платежей: %d, чеков: %d\n", revokedID, txN, rcN)
-			if !b.groupSilent(msg.Info.Chat) {
-				b.sendText(msg.Info.Chat, fmt.Sprintf(
-					"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
-			}
-		}
-		go b.ensureMissingWatches(context.Background()) // дубль мог стать основным чеком
-		if corrN > 0 && !b.groupSilent(msg.Info.Chat) {
-			b.sendText(msg.Info.Chat, "🗑 Поправку суммы удалили — вернул прежнюю сумму.")
-		}
-		if labeledN > 0 && txN+rcN == 0 && !b.groupSilent(msg.Info.Chat) {
-			b.sendText(msg.Info.Chat, "🗑 Сообщение с ФИО удалили — чек снова без клиента, спрошу, чей он.")
+		if msg.Info.IsGroup {
+			// По порядку с самим сообщением: удаление не обгонит его разбор.
+			b.enqueueChat(msg.Info.Chat.String(), func() { b.handleRevoke(context.Background(), msg, prot) })
+		} else {
+			b.handleRevoke(ctx, msg, prot)
 		}
 		return
 	}
@@ -457,7 +465,7 @@ func (b *Bot) handleEvent(evt interface{}) {
 	// Сообщение изменили («изменить» в WhatsApp) — поправляем учёт по нему.
 	if prot := msg.Message.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
 		if msg.Info.IsGroup && b.isAllowedGroup(msg.Info.Chat) {
-			go b.handleMessageEdit(context.Background(), msg, prot)
+			b.enqueueChat(msg.Info.Chat.String(), func() { b.handleMessageEdit(context.Background(), msg, prot) })
 		}
 		return
 	}
@@ -492,10 +500,205 @@ func (b *Bot) handleEvent(evt interface{}) {
 	b.handleGroupMessage(ctx, msg)
 }
 
+// handleRevoke — сообщение удалили «у всех»: убираем из учёта связанные записи.
+func (b *Bot) handleRevoke(ctx context.Context, msg *events.Message, prot *waProto.ProtocolMessage) {
+	revokedID := prot.GetKey().GetID()
+	// Удалили фото чека, которое бот переслал сюда, — убираем копию.
+	if copyWa, ok, _ := b.db.CopyBySentID(ctx, revokedID); ok {
+		revokedID = copyWa
+	}
+	corrN, _ := b.db.CorrectionsByMessage(ctx, revokedID)
+	labeledN, _ := b.db.CountLabeledBy(ctx, revokedID)
+	txN, rcN, err := b.db.MarkMessageDeleted(ctx, revokedID)
+	if err != nil {
+		fmt.Println("Ошибка обработки удалённого сообщения:", err)
+		return
+	}
+	if txN+rcN > 0 {
+		fmt.Printf("Сообщение %s удалено — из учёта убрано платежей: %d, чеков: %d\n", revokedID, txN, rcN)
+		if !b.groupSilent(msg.Info.Chat) {
+			b.sendText(msg.Info.Chat, fmt.Sprintf(
+				"🗑 Сообщение удалено — убрал из учёта связанные записи (платежей: %d, чеков: %d). Отчёты уже без них.", txN, rcN))
+		}
+	}
+	go b.ensureMissingWatches(context.Background()) // дубль мог стать основным чеком
+	if corrN > 0 && !b.groupSilent(msg.Info.Chat) {
+		b.sendText(msg.Info.Chat, "🗑 Поправку суммы удалили — вернул прежнюю сумму.")
+	}
+	if labeledN > 0 && txN+rcN == 0 && !b.groupSilent(msg.Info.Chat) {
+		b.sendText(msg.Info.Chat, "🗑 Сообщение с ФИО удалили — чек снова без клиента, спрошу, чей он.")
+	}
+	return
+}
+
 // handleGroupMessage разбирает сообщение из рабочей группы (сбор средств,
 // чеки, команда /отчет). Работает одинаково для любой группы из
 // allowedGroups (или для всех групп, если ограничение не задано).
 func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
+	// Обработчик событий WhatsApp один на все чаты: если разбирать чек (чтение
+	// зрением, ИИ, программа) прямо в нём, «Джарвис, …» и личка ждут минутами.
+	// Поэтому сообщения группы разбираем в очереди ЭТОЙ группы (порядок «имя ↔
+	// чек» внутри группы сохраняется), а обращение владельца к ассистенту —
+	// сразу, мимо очереди.
+	if b.ownerAssistantFastPath(msg) {
+		go b.processGroupMessage(context.Background(), msg)
+		return
+	}
+	b.enqueueChat(msg.Info.Chat.String(), func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
+		defer cancel()
+		b.processGroupMessage(ctx, msg)
+	})
+}
+
+// ownerAssistantFastPath — владелец пишет боту («Джарвис, …», @-упоминание)
+// текстом и не ответом на сообщение: это команда ассистенту, очереди группы
+// она не ждёт.
+func (b *Bot) ownerAssistantFastPath(msg *events.Message) bool {
+	if b.assistant == nil || msg.Message == nil || !b.isReportAdmin(msg.Info) {
+		return false
+	}
+	if msg.Message.GetImageMessage() != nil || msg.Message.GetDocumentMessage() != nil || extractQuotedStanzaID(msg) != "" {
+		return false
+	}
+	text := extractText(msg.Message)
+	if _, ok := b.stripBotName(text); ok {
+		return true
+	}
+	return b.isMentioned(msg)
+}
+
+// chatQueue — очередь сообщений одного чата (разбор по порядку).
+type chatQueue struct {
+	ch      chan func()
+	pending int64
+}
+
+// enqueueChat — выполнить fn в очереди чата key (по порядку, без блокировки
+// других чатов).
+func (b *Bot) enqueueChat(key string, fn func()) {
+	b.chatQMu.Lock()
+	if b.chatQ == nil {
+		b.chatQ = map[string]*chatQueue{}
+	}
+	q := b.chatQ[key]
+	if q == nil {
+		q = &chatQueue{ch: make(chan func(), 2000)}
+		b.chatQ[key] = q
+		go func() {
+			for f := range q.ch {
+				func() {
+					defer func() {
+						if r := recover(); r != nil {
+							fmt.Println("Очередь чата: паника при разборе сообщения:", r)
+						}
+					}()
+					start := time.Now()
+					f()
+					if d := time.Since(start); d > 20*time.Second {
+						fmt.Printf("Очередь чата %s: сообщение разбиралось %v\n", key, d.Round(time.Second))
+					}
+				}()
+				atomic.AddInt64(&q.pending, -1)
+			}
+		}()
+	}
+	atomic.AddInt64(&q.pending, 1)
+	b.chatQMu.Unlock()
+	q.ch <- fn
+}
+
+// drainQueues — дождаться, пока очереди чатов опустеют (для тестов и остановки).
+func (b *Bot) drainQueues(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		busy := false
+		b.chatQMu.Lock()
+		for _, q := range b.chatQ {
+			if atomic.LoadInt64(&q.pending) > 0 {
+				busy = true
+				break
+			}
+		}
+		b.chatQMu.Unlock()
+		if !busy {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// mediaRead — что удалось достать из фото/PDF сообщения.
+type mediaRead struct {
+	isMedia bool
+	text    string // подпись + распознанный текст (или только подпись)
+	bytes   []byte
+	path    string
+	ext     string
+	dlErr   error // фото не скачалось
+}
+
+// readMedia — скачать фото/PDF сообщения и распознать текст.
+func (b *Bot) readMedia(ctx context.Context, m *waProto.Message, waID, caption string) mediaRead {
+	var r mediaRead
+	imgMsg := m.GetImageMessage()
+	docMsg := m.GetDocumentMessage()
+	isPDF := docMsg != nil && isPDFDocument(docMsg.GetMimetype(), docMsg.GetFileName())
+	isImgDoc := docMsg != nil && !isPDF && strings.HasPrefix(strings.ToLower(docMsg.GetMimetype()), "image/")
+	if imgMsg == nil && !isPDF && !isImgDoc {
+		return r
+	}
+	r.isMedia = true
+	r.text = caption
+	var data []byte
+	var err error
+	switch {
+	case imgMsg != nil:
+		r.ext = ".jpg"
+		data, err = b.download(ctx, imgMsg)
+	case isImgDoc:
+		r.ext = ".jpg"
+		data, err = b.download(ctx, docMsg)
+	default:
+		r.ext = ".pdf"
+		data, err = b.download(ctx, docMsg)
+	}
+	if err != nil {
+		fmt.Println("Ошибка скачивания фото/файла чека:", err)
+		r.dlErr = err
+		return r
+	}
+	r.bytes = data
+	r.path = b.saveMediaFile(waID, data, r.ext)
+	var extracted string
+	if r.ext == ".pdf" {
+		extracted, err = b.extractPDFText(ctx, data)
+	} else {
+		extracted, err = b.ocr.ExtractText(ctx, data)
+	}
+	if err != nil {
+		fmt.Println("Ошибка распознавания текста фото/файла:", err)
+		return r
+	}
+	r.text = extracted
+	if caption != "" {
+		r.text = caption + "\n" + extracted
+	}
+	return r
+}
+
+// download — скачать медиа из WhatsApp (не дольше 2 минут).
+func (b *Bot) download(ctx context.Context, m whatsmeow.DownloadableMessage) ([]byte, error) {
+	if b.client == nil {
+		return nil, fmt.Errorf("WhatsApp не подключён")
+	}
+	dctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
+	return b.client.Download(dctx, m)
+}
+
+// processGroupMessage — разбор сообщения группы (в очереди группы).
+func (b *Bot) processGroupMessage(ctx context.Context, msg *events.Message) {
 	senderName := msg.Info.PushName
 	if senderName == "" {
 		senderName = senderPhoneDigits(msg.Info)
@@ -514,77 +717,9 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	// Чеки приходят фотографиями, PDF-документами (Сбер/ВТБ/РСХБ шлют PDF)
 	// и фото, отправленными "как файл" (без сжатия) — все типы скачиваем
 	// и распознаём в текст.
-	imgMsg := msg.Message.GetImageMessage()
-	docMsg := msg.Message.GetDocumentMessage()
-	isPDF := docMsg != nil && isPDFDocument(docMsg.GetMimetype(), docMsg.GetFileName())
-	isImgDoc := docMsg != nil && !isPDF && strings.HasPrefix(strings.ToLower(docMsg.GetMimetype()), "image/")
-
-	switch {
-	case isImgDoc:
-		hasMedia = true
-		mediaExt = ".jpg"
-		imgBytes, err := b.client.Download(ctx, docMsg)
-		if err != nil {
-			fmt.Println("Ошибка скачивания фото-файла:", err)
-			text = caption
-		} else {
-			mediaBytes = imgBytes
-			mediaPath = b.saveMediaFile(msg.Info.ID, imgBytes, mediaExt)
-			ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
-			if err != nil {
-				fmt.Println("Ошибка OCR фото-файла:", err)
-				text = caption
-			} else {
-				text = ocrText
-				if caption != "" {
-					text = caption + "\n" + ocrText
-				}
-			}
-		}
-	case imgMsg != nil:
-		hasMedia = true
-		mediaExt = ".jpg"
-		imgBytes, err := b.client.Download(ctx, imgMsg)
-		if err != nil {
-			fmt.Println("Ошибка скачивания фото:", err)
-			text = caption // сохраняем хотя бы подпись, если она есть
-		} else {
-			mediaBytes = imgBytes
-			mediaPath = b.saveMediaFile(msg.Info.ID, imgBytes, mediaExt)
-			ocrText, err := b.ocr.ExtractText(ctx, imgBytes)
-			if err != nil {
-				fmt.Println("Ошибка OCR:", err)
-				text = caption
-			} else {
-				// Объединяем текст с чека и подпись (если человек что-то дописал вручную)
-				text = ocrText
-				if caption != "" {
-					text = caption + "\n" + ocrText
-				}
-			}
-		}
-	case isPDF:
-		hasMedia = true
-		mediaExt = ".pdf"
-		pdfBytes, err := b.client.Download(ctx, docMsg)
-		if err != nil {
-			fmt.Println("Ошибка скачивания PDF:", err)
-			text = caption
-		} else {
-			mediaBytes = pdfBytes
-			mediaPath = b.saveMediaFile(msg.Info.ID, pdfBytes, mediaExt)
-			pdfText, err := b.extractPDFText(ctx, pdfBytes)
-			if err != nil {
-				fmt.Println("Ошибка извлечения текста из PDF:", err)
-				text = caption
-			} else {
-				text = pdfText
-				if caption != "" {
-					text = caption + "\n" + pdfText
-				}
-			}
-		}
-	default:
+	mr := b.readMedia(ctx, msg.Message, msg.Info.ID, caption)
+	text, hasMedia, mediaPath, mediaBytes, mediaExt = mr.text, mr.isMedia, mr.path, mr.bytes, mr.ext
+	if !hasMedia {
 		text = extractText(msg.Message)
 	}
 
@@ -611,6 +746,21 @@ func (b *Bot) handleGroupMessage(ctx context.Context, msg *events.Message) {
 	ctx = withAnswerRaw(ctx, rawID)
 	if q := extractQuotedStanzaID(msg); q != "" {
 		_ = b.db.SetQuotedID(ctx, rawID, q)
+	}
+	if hasMedia {
+		var keep []byte
+		if mr.dlErr != nil {
+			keep, _ = proto.Marshal(msg.Message) // перекачаем позже
+		}
+		_ = b.db.SetMediaInfo(ctx, rawID, caption, keep)
+		if mr.dlErr != nil {
+			// Фото не скачалось — не теряем молча: повторим, а в группе скажем.
+			if !b.groupSilent(msg.Info.Chat) {
+				b.sendReply(msg.Info.Chat, "📎 Не смог открыть это фото/файл чека — WhatsApp не отдал его. Попробую ещё раз сам; "+
+					"если не выйдет, перешлите его, пожалуйста, ещё раз.", msg.Info.ID, msg.Info.Sender.String())
+			}
+			return
+		}
 	}
 	answered := func() { _ = b.db.SetHandledAs(ctx, rawID, "answer") }
 	toAssistant := func(query string) {
@@ -841,6 +991,23 @@ var commandVerbs = map[string]bool{
 	"перешли": true, "перешлите": true, "удали": true, "удалите": true, "сделай": true, "посчитай": true,
 	"проверь": true, "добавь": true, "внеси": true, "найди": true, "напомни": true, "пришли": true,
 	"убери": true, "исключи": true, "верни": true, "дай": true, "скажи": true, "расскажи": true, "выведи": true,
+	"молчи": true, "помолчи": true, "замолчи": true, "перечитай": true, "пересчитай": true, "запомни": true,
+	"занеси": true, "занесите": true, "внесите": true, "запиши": true, "запишите": true, "исправь": true,
+	"поправь": true, "отметь": true, "привяжи": true, "посмотри": true, "глянь": true, "подтяни": true,
+	"обнови": true, "пересмотри": true, "сверь": true, "сверка": true, "отчёт": true, "отчет": true,
+	"сравни": true, "отмени": true, "покажешь": true, "найдёшь": true, "можешь": true, "пиши": true,
+	"говори": true, "напиши": true, "ответь": true, "объясни": true, "переведи": true, "засчитай": true,
+	"не": false,
+}
+
+// isCommandText — фраза — команда боту («перечитай группу», «найди чек
+// Каталова», «внеси в программу»), а не ответ ФИО на его вопрос.
+func isCommandText(text string) bool {
+	toks := answerTokens(cleanAnswer(text))
+	for len(toks) > 0 && (toks[0] == "джарвис" || toks[0] == "пожалуйста" || toks[0] == "а" || toks[0] == "ну" || toks[0] == "слушай") {
+		toks = toks[1:]
+	}
+	return len(toks) > 0 && commandVerbs[toks[0]]
 }
 
 // isPlainClarifyAnswer — текст владельца на вопрос бота — простой ответ на него
@@ -1273,7 +1440,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	isAdmin := b.isReportAdmin(msg.Info)
 	staticSys, dynSys := b.buildAssistantSystemPromptFor(ctx, isAdmin)
-	tools := b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, false)
+	tools, lastTool := trackTools(b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, false))
 
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
@@ -1306,6 +1473,9 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	b.persistTurns(ctx, sender, text, reply) // память переживёт рестарт
 
 	out := assistantOutgoing(reply)
+	if out == "" {
+		out = toolEcho(*lastTool) // команда выполнена — пусть будет видно
+	}
 	if out == "" {
 		fmt.Println("Ассистент решил не отвечать — ничего не отправляю")
 		return
@@ -1466,13 +1636,14 @@ func (b *Bot) assistantTools(ctx context.Context, chat types.JID, ownerJID types
 		b.sendClientReceiptTool(chat),
 		b.receiptDetailsTool(),
 		b.receiptsLedgerTool(),
+		b.findCheckTool(),
 		b.missingInGroupTool(),
 		b.setMainGroupTool(),
 		b.recordPaymentTool(),
 		b.recordExpenseTool(),
 		b.expensesReportTool(chat),
 		b.fixReceiptTool(),
-		b.recountTool(),
+		b.recountTool(chat),
 		b.phoneMemoryTool(chat),
 		b.assignReceiptTool(chat),
 	}
@@ -1652,7 +1823,7 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	}
 	userText := senderName + ": " + query + b.quotedSenderPhoneNote(ctx, msg)
 
-	tools := b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, true)
+	tools, lastTool := trackTools(b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, true))
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
 	if err != nil {
@@ -1678,9 +1849,49 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	b.historyMu.Unlock()
 	b.persistTurns(ctx, key, userText, reply) // память группового диалога переживёт рестарт
 
-	if out := assistantOutgoing(reply); out != "" {
+	out := assistantOutgoing(reply)
+	if out == "" {
+		out = toolEcho(*lastTool) // команда выполнена — владелец должен это увидеть
+	}
+	if out != "" {
 		b.sendText(chat, out)
 	}
+}
+
+// trackTools — оборачивает инструменты, запоминая результат последнего
+// выполненного: если модель после действия решила «промолчать», владелец всё
+// равно увидит, что команда выполнена.
+func trackTools(tools []ai.Tool) ([]ai.Tool, *string) {
+	last := new(string)
+	var mu sync.Mutex
+	out := make([]ai.Tool, len(tools))
+	for i, t := range tools {
+		t := t
+		h := t.Handle
+		t.Handle = func(ctx context.Context, in json.RawMessage) (string, error) {
+			r, err := h(ctx, in)
+			if err == nil && strings.TrimSpace(r) != "" {
+				mu.Lock()
+				*last = r
+				mu.Unlock()
+			}
+			return r, err
+		}
+		out[i] = t
+	}
+	return out, last
+}
+
+// toolEcho — короткий итог действия для отправки вместо «молчания».
+func toolEcho(r string) string {
+	r = strings.TrimSpace(r)
+	if r == "" {
+		return ""
+	}
+	if rs := []rune(r); len(rs) > 600 {
+		r = string(rs[:600]) + "…"
+	}
+	return r
 }
 
 // assistantOutgoing — что реально отправить: ассистент может решить промолчать
@@ -2037,11 +2248,25 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 	case len(summaries) == 0:
 		summaryText = "За текущий месяц данных пока нет."
 	default:
+		// Только крупнейшие клиенты: полный построчный список на каждый запрос
+		// раздувал промпт до десятков тысяч токенов (медленно и дорого). Цифры
+		// по конкретным людям ассистент берёт инструментами.
+		sorted := append([]db.ContactSummary(nil), summaries...)
+		sort.SliceStable(sorted, func(i, j int) bool { return sorted[i].Total > sorted[j].Total })
 		var sb strings.Builder
-		var total float64
-		for _, s := range summaries {
-			fmt.Fprintf(&sb, "- %s: %.0f ₽ (%d платежей)\n", s.CanonicalName, s.Total, s.Count)
+		var total, rest float64
+		restN := 0
+		for k, s := range sorted {
 			total += s.Total
+			if k < 20 {
+				fmt.Fprintf(&sb, "- %s: %.0f ₽ (%d платежей)\n", s.CanonicalName, s.Total, s.Count)
+			} else {
+				rest += s.Total
+				restN++
+			}
+		}
+		if restN > 0 {
+			fmt.Fprintf(&sb, "- …и ещё %d клиентов на %.0f ₽ (подробно — инструментами отчётов)\n", restN, rest)
 		}
 		fmt.Fprintf(&sb, "Итого за месяц: %.0f ₽", total)
 		summaryText = sb.String()
@@ -2059,7 +2284,11 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 
 	peopleList := "(не удалось загрузить)"
 	if contacts, err := b.db.ListContacts(ctx); err == nil && len(contacts) > 0 {
-		peopleList = strings.Join(contacts, ", ")
+		if len(contacts) > 150 {
+			peopleList = strings.Join(contacts[:150], ", ") + fmt.Sprintf(" …и ещё %d (точное имя проверяй инструментами)", len(contacts)-150)
+		} else {
+			peopleList = strings.Join(contacts, ", ")
+		}
 	}
 
 	forwardingList := "нет"
@@ -3078,7 +3307,7 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 					// Засчитанный чек сверяется с программой, как любой другой.
 					if info, ok, _ := b.db.ReceiptWatchInfoByMessage(ctx, waID); ok {
 						if gj, perr := types.ParseJID(info.GroupJID); perr == nil {
-							b.syncWatchByCheckWa(ctx, gj, waID, name)
+							b.syncWatchByCheckNow(ctx, gj, waID, name)
 						}
 					}
 				}

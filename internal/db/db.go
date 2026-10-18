@@ -512,6 +512,13 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_raw_messages_fwd_sent ON raw_messages(fwd_sent_id) WHERE fwd_sent_id IS NOT NULL`,
 		// Копию чека поправил владелец в целевой группе — исходный её больше не перезаписывает.
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS mirror_locked BOOLEAN NOT NULL DEFAULT false`,
+		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
+		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS media_proto BYTEA`,
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS media_attempts INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS media_next_at TIMESTAMPTZ`,
+		`CREATE INDEX IF NOT EXISTS idx_raw_messages_media_retry ON raw_messages(media_next_at) WHERE has_media AND NOT parsed`,
 		// Копия чека, пересланная ботом в другую группу, — зеркало исходного:
 		// исключили/удалили/поправили исходный — то же с копией.
 		`CREATE OR REPLACE FUNCTION mirror_forward_copies() RETURNS trigger AS $$
@@ -614,6 +621,240 @@ func (d *DB) OldestMessageInfo(ctx context.Context, groupJID string) (waID strin
 		return "", time.Time{}, false, err
 	}
 	return waID, ts, true, nil
+}
+
+// SetMediaInfo — подпись к фото и (если фото не скачалось) само сообщение для
+// повторной попытки.
+func (d *DB) SetMediaInfo(ctx context.Context, rawID int, caption string, proto []byte) error {
+	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET caption = NULLIF($2, ''), media_proto = $3,
+		media_next_at = CASE WHEN $3::bytea IS NULL THEN media_next_at ELSE now() + interval '2 minutes' END WHERE id = $1`,
+		rawID, caption, proto)
+	return err
+}
+
+// MediaRetry — фото/PDF из группы, которое так и не стало чеком: не скачалось
+// или не прочиталось (ИИ был недоступен).
+type MediaRetry struct {
+	RawID      int
+	WaID       string
+	GroupJID   string
+	SenderJID  string
+	SenderName string
+	Body       string
+	Caption    string
+	MediaPath  string
+	Proto      []byte
+	ReceivedAt time.Time
+	Attempts   int
+}
+
+const mediaRetryCols = `rm.id, COALESCE(rm.wa_message_id, ''), COALESCE(rm.wa_group_jid, ''), COALESCE(rm.sender_jid, ''),
+	COALESCE(rm.sender_name, ''), COALESCE(rm.body, ''), COALESCE(rm.caption, ''), COALESCE(rm.media_path, ''), rm.media_proto,
+	rm.received_at, rm.media_attempts`
+
+func scanMediaRetries(rows pgx.Rows) ([]MediaRetry, error) {
+	defer rows.Close()
+	var out []MediaRetry
+	for rows.Next() {
+		var m MediaRetry
+		if err := rows.Scan(&m.RawID, &m.WaID, &m.GroupJID, &m.SenderJID, &m.SenderName, &m.Body, &m.Caption,
+			&m.MediaPath, &m.Proto, &m.ReceivedAt, &m.Attempts); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// DueMediaRetries — фото без чека, которым пора повторить скачивание/чтение.
+func (d *DB) DueMediaRetries(ctx context.Context, limit int) ([]MediaRetry, error) {
+	rows, err := d.pool.Query(ctx, `SELECT `+mediaRetryCols+`
+		FROM raw_messages rm
+		WHERE rm.has_media AND NOT rm.parsed AND NOT COALESCE(rm.deleted, false)
+		  AND COALESCE(rm.wa_group_jid, '') LIKE '%@g.us' AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
+		  AND rm.received_at >= now() - interval '7 days' AND rm.received_at < now() - interval '3 minutes'
+		  AND (rm.media_next_at IS NULL OR rm.media_next_at <= now()) AND rm.media_attempts < 8
+		  AND (COALESCE(rm.media_path, '') <> '' OR rm.media_proto IS NOT NULL)
+		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
+		ORDER BY rm.received_at LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanMediaRetries(rows)
+}
+
+// GroupMediaToReread — для «перечитай группу»: фото/PDF группы за период без
+// засчитанного чека (не скачалось, не прочиталось, сумма не распознана).
+func (d *DB) GroupMediaToReread(ctx context.Context, groupJID string, since time.Time, limit int) ([]MediaRetry, error) {
+	rows, err := d.pool.Query(ctx, `SELECT `+mediaRetryCols+`
+		FROM raw_messages rm
+		WHERE rm.has_media AND NOT COALESCE(rm.deleted, false) AND ($1 = '' OR rm.wa_group_jid = $1)
+		  AND COALESCE(rm.wa_group_jid, '') LIKE '%@g.us' AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
+		  AND rm.received_at >= $2
+		  AND (COALESCE(rm.media_path, '') <> '' OR rm.media_proto IS NOT NULL)
+		  AND (
+		    (NOT rm.parsed AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id))
+		    OR EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id AND NOT br.ignored AND NOT br.is_duplicate
+		               AND (br.amount <= 0 OR br.recognition_status IN ('failed', 'pending')))
+		  )
+		ORDER BY rm.received_at LIMIT $3`, groupJID, since, limit)
+	if err != nil {
+		return nil, err
+	}
+	return scanMediaRetries(rows)
+}
+
+// NeedsMediaReread — фото сообщения так и не стало чеком (не скачалось/не прочиталось).
+func (d *DB) NeedsMediaReread(ctx context.Context, rawID int) bool {
+	var ok bool
+	_ = d.pool.QueryRow(ctx, `SELECT has_media AND NOT parsed AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
+		FROM raw_messages rm WHERE id = $1`, rawID).Scan(&ok)
+	return ok
+}
+
+// BumpMediaRetry — попытка не удалась: следующая позже.
+func (d *DB) BumpMediaRetry(ctx context.Context, rawID int, next time.Time) error {
+	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET media_attempts = media_attempts + 1, media_next_at = $2 WHERE id = $1`, rawID, next)
+	return err
+}
+
+// SetMediaPath — фото скачалось при повторе.
+func (d *DB) SetMediaPath(ctx context.Context, rawID int, path string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET media_path = $2 WHERE id = $1`, rawID, path)
+	return err
+}
+
+// ReceiptOfRaw — чек сообщения (если есть): id и сумма.
+func (d *DB) ReceiptOfRaw(ctx context.Context, rawID int) (id int, amount float64, ok bool, err error) {
+	err = d.pool.QueryRow(ctx, `SELECT id, amount::float8 FROM bank_receipts WHERE raw_message_id = $1 AND NOT is_duplicate ORDER BY id DESC LIMIT 1`, rawID).Scan(&id, &amount)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, 0, false, nil
+	}
+	return id, amount, err == nil, err
+}
+
+// GapAnchor — для запроса истории с телефона: первое сообщение после самого
+// большого перерыва в группе за последние days дней (бот был отключён). Нет
+// заметного перерыва — самое свежее сообщение.
+func (d *DB) GapAnchor(ctx context.Context, groupJID string, days int) (waID string, ts time.Time, gap time.Duration, ok bool, err error) {
+	var gapSec float64
+	err = d.pool.QueryRow(ctx, `
+		WITH m AS (
+			SELECT wa_message_id, received_at,
+			       received_at - lag(received_at) OVER (ORDER BY received_at) AS gap
+			FROM raw_messages
+			WHERE wa_group_jid = $1 AND COALESCE(wa_message_id, '') <> '' AND position('-fwd-' in wa_message_id) = 0
+			  AND received_at >= now() - make_interval(days => $2))
+		SELECT wa_message_id, received_at, COALESCE(extract(epoch FROM gap), 0)::float8 FROM m
+		ORDER BY CASE WHEN gap > interval '3 hours' THEN 0 ELSE 1 END, gap DESC NULLS LAST, received_at DESC
+		LIMIT 1`, groupJID, days).Scan(&waID, &ts, &gapSec)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", time.Time{}, 0, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, 0, false, err
+	}
+	gap = time.Duration(gapSec) * time.Second
+	if gap < 3*time.Hour {
+		// Перерыва нет — просим историю перед самым свежим сообщением.
+		if err := d.pool.QueryRow(ctx, `SELECT wa_message_id, received_at FROM raw_messages
+			WHERE wa_group_jid = $1 AND COALESCE(wa_message_id, '') <> '' AND position('-fwd-' in wa_message_id) = 0
+			ORDER BY received_at DESC LIMIT 1`, groupJID).Scan(&waID, &ts); err != nil {
+			return "", time.Time{}, 0, false, err
+		}
+		gap = 0
+	}
+	return waID, ts, gap, true, nil
+}
+
+// FoundCheck — найденный чек или платёж с состоянием в учёте.
+type FoundCheck struct {
+	Kind     string // чек / текст / фото
+	ID       int
+	WaID     string
+	Client   string
+	Card     string
+	Amount   float64
+	TxDate   time.Time
+	Received time.Time
+	Sender   string
+	GroupJID string
+	Status   string // засчитан / дубль / исключён / удалён / ждёт клиента / не распознан / наличка-повтор
+	DupOf    string // для дубля: когда и кем прислан первый
+}
+
+// FindChecks — поиск чека/платежа по сумме и/или имени во ВСЕХ состояниях (в
+// том числе дубли, удалённые, исключённые, непрочитанные фото), с причиной,
+// почему он не в сборе.
+func (d *DB) FindChecks(ctx context.Context, amount, tolerance float64, name, groupJID string, from, to time.Time, limit int) ([]FoundCheck, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT * FROM (
+			SELECT 'чек' AS kind, br.id, COALESCE(rm.wa_message_id, '') AS wa, COALESCE(c.canonical_name, br.recipient_raw, '') AS client,
+			       COALESCE(br.card_owner, '') AS card, br.amount::float8 AS amount, br.tx_date AS txd,
+			       COALESCE(rm.received_at, br.tx_date) AS recv, COALESCE(NULLIF(rm.sender_name, ''), rm.sender_jid, '') AS sender,
+			       COALESCE(br.group_jid, rm.wa_group_jid, '') AS grp,
+			       CASE WHEN COALESCE(rm.deleted, false) THEN 'удалён в WhatsApp'
+			            WHEN br.ignored THEN 'исключён из учёта'
+			            WHEN br.is_duplicate THEN 'повтор уже присланного чека'
+			            WHEN br.amount <= 0 THEN 'сумма не распознана'
+			            WHEN br.needs_review OR NOT br.client_confirmed THEN 'ждёт клиента («чей чек?»)'
+			            ELSE 'засчитан' END AS status,
+			       COALESCE(br.recipient_raw, '') || ' ' || COALESCE(br.card_owner, '') || ' ' || COALESCE(rm.body, '') AS hay
+			FROM bank_receipts br
+			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+			LEFT JOIN contacts c ON c.id = br.contact_id
+			UNION ALL
+			SELECT CASE WHEN t.is_cash THEN 'наличка' ELSE 'текст' END, t.id, COALESCE(rm.wa_message_id, ''),
+			       COALESCE(c.canonical_name, t.raw_name, ''), '', t.amount::float8, t.tx_date::timestamptz,
+			       COALESCE(rm.received_at, t.tx_date::timestamptz), COALESCE(NULLIF(rm.sender_name, ''), rm.sender_jid, ''),
+			       COALESCE(rm.wa_group_jid, ''),
+			       CASE WHEN COALESCE(rm.deleted, false) THEN 'удалён в WhatsApp'
+			            WHEN t.ignored THEN 'исключён из учёта'
+			            WHEN t.dup_pending THEN 'придержан как возможный повтор налички'
+			            ELSE 'записан' END,
+			       COALESCE(t.raw_name, '') || ' ' || COALESCE(rm.body, '')
+			FROM transactions t
+			LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+			LEFT JOIN contacts c ON c.id = t.contact_id
+			UNION ALL
+			SELECT 'фото', rm.id, COALESCE(rm.wa_message_id, ''), '', '', 0, rm.received_at, rm.received_at,
+			       COALESCE(NULLIF(rm.sender_name, ''), rm.sender_jid, ''), COALESCE(rm.wa_group_jid, ''),
+			       CASE WHEN COALESCE(rm.media_path, '') = '' THEN 'фото не скачалось' ELSE 'фото не прочитано как чек' END,
+			       COALESCE(rm.body, '') || ' ' || COALESCE(rm.caption, '')
+			FROM raw_messages rm
+			WHERE rm.has_media AND NOT COALESCE(rm.deleted, false) AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
+			  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
+			  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id)
+		) x
+		WHERE x.recv >= $4 AND x.recv < $5
+		  AND ($3 = '' OR x.grp = $3)
+		  AND ($1::float8 <= 0 OR abs(x.amount - $1) <= $2 OR (x.kind = 'фото' AND position((round($1)::bigint)::text in replace(x.hay, ' ', '')) > 0))
+		ORDER BY x.recv DESC LIMIT 2000`, amount, tolerance, groupJID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	// Имя сравниваем здесь, а не в SQL: ILIKE с кириллицей зависит от локали базы.
+	q := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(name), "ё", "е"))
+	var out []FoundCheck
+	for rows.Next() {
+		var f FoundCheck
+		var hay string
+		if err := rows.Scan(&f.Kind, &f.ID, &f.WaID, &f.Client, &f.Card, &f.Amount, &f.TxDate, &f.Received, &f.Sender, &f.GroupJID, &f.Status, &hay); err != nil {
+			return nil, err
+		}
+		if q != "" {
+			h := strings.ToLower(strings.ReplaceAll(hay+" "+f.Client+" "+f.Card, "ё", "е"))
+			if !strings.Contains(h, q) {
+				continue
+			}
+		}
+		out = append(out, f)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, rows.Err()
 }
 
 func (d *DB) MarkMessageParsed(ctx context.Context, rawMessageID int) error {
@@ -1204,6 +1445,15 @@ type ClarifyReceipt struct {
 // импорт) — вызывающий код может не спрашивать. rawMessageID нужен, чтобы
 // потом привязать ответ к чеку по wa_message_id.
 func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]ClarifyReceipt, error) {
+	return d.UnconfirmedReceiptsOrdered(ctx, groupJID, olderThan, limit, false)
+}
+
+// UnconfirmedReceiptsOrdered — newest=true: сначала самые свежие (когда чеков без ответа много).
+func (d *DB) UnconfirmedReceiptsOrdered(ctx context.Context, groupJID string, olderThan time.Time, limit int, newest bool) ([]ClarifyReceipt, error) {
+	order := "br.created_at"
+	if newest {
+		order = "br.created_at DESC"
+	}
 	rows, err := d.pool.Query(ctx, `
 		SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''),
 		       COALESCE(br.card_owner, br.recipient_raw, ''), br.amount::float8, br.tx_date
@@ -1216,7 +1466,7 @@ func (d *DB) UnconfirmedReceipts(ctx context.Context, groupJID string, olderThan
 		  `+notGroupForwardCopy+`
 		  AND br.amount > 0
 		  AND br.created_at < $2
-		ORDER BY br.created_at
+		ORDER BY `+order+`
 		LIMIT $3
 	`, groupJID, olderThan, limit)
 	if err != nil {
@@ -1270,6 +1520,15 @@ func (d *DB) RecentSenderTexts(ctx context.Context, groupJID, senderJID string, 
 // (amount <= 0), по которым ещё не спрашивал. Это фото/PDF, где ни OCR, ни ИИ,
 // ни зрение не вытащили сумму — бот спросит в группе, что на чеке.
 func (d *DB) UnrecognizedReceipts(ctx context.Context, groupJID string, olderThan time.Time, limit int) ([]ClarifyReceipt, error) {
+	return d.UnrecognizedReceiptsOrdered(ctx, groupJID, olderThan, limit, false)
+}
+
+// UnrecognizedReceiptsOrdered — newest=true: сначала самые свежие (когда чеков без ответа много).
+func (d *DB) UnrecognizedReceiptsOrdered(ctx context.Context, groupJID string, olderThan time.Time, limit int, newest bool) ([]ClarifyReceipt, error) {
+	order := "br.created_at"
+	if newest {
+		order = "br.created_at DESC"
+	}
 	rows, err := d.pool.Query(ctx, `
 		SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(rm.sender_jid, ''),
 		       COALESCE(br.card_owner, br.recipient_raw, ''), br.amount::float8, br.tx_date
@@ -1282,7 +1541,7 @@ func (d *DB) UnrecognizedReceipts(ctx context.Context, groupJID string, olderTha
 		  `+notGroupForwardCopy+`
 		  AND br.amount <= 0
 		  AND br.created_at < $2
-		ORDER BY br.created_at
+		ORDER BY `+order+`
 		LIMIT $3
 	`, groupJID, olderThan, limit)
 	if err != nil {
@@ -2067,7 +2326,9 @@ func (d *DB) UnclearItems(ctx context.Context, groupJID string, from, to *time.T
 		        COALESCE(NULLIF(rm.sender_name, ''), split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1))
 		FROM raw_messages rm
 		WHERE rm.has_media = true AND rm.deleted = false AND rm.parsed = false
-		  AND rm.media_path IS NOT NULL AND rm.media_path <> ''
+		  -- и фото, которое не скачалось (его сообщение сохранено для повтора)
+		  AND ((rm.media_path IS NOT NULL AND rm.media_path <> '') OR rm.media_proto IS NOT NULL)
+		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
 		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
 		  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id)
 		  AND ($1 = '' OR rm.wa_group_jid = $1)
@@ -4185,6 +4446,46 @@ func (d *DB) ListCmfWatches(ctx context.Context, statuses []string, limit int) (
 	return out, rows.Err()
 }
 
+// TouchCmfWatch — наблюдение проверяли (даже если программа ответила ошибкой).
+func (d *DB) TouchCmfWatch(ctx context.Context, id int) error {
+	_, err := d.pool.Exec(ctx, `UPDATE cmf_watch SET checked_at = now() WHERE id = $1`, id)
+	return err
+}
+
+// LookupWatchesForRetry — чеки, по которым поиск клиента в программе не
+// удался, — давно не проверявшиеся первыми.
+func (d *DB) LookupWatchesForRetry(ctx context.Context, limit int) ([]CmfWatch, error) {
+	return d.cmfWatchesByStatus(ctx, "lookup", time.Now().Add(-10*time.Minute), time.Now().AddDate(0, 0, -30), limit)
+}
+
+// NonameWatchesWithClient — сверка «без клиента», а у чека клиент уже назван.
+func (d *DB) NonameWatchesWithClient(ctx context.Context, limit int) ([]CmfWatch, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT cw.id, cw.group_jid, COALESCE(cw.sender_jid,''), COALESCE(c.canonical_name, br.recipient_raw, ''),
+		       cw.amount::float8, cw.tx_date, cw.created_at
+		FROM cmf_watch cw
+		JOIN bank_receipts br ON br.raw_message_id = cw.raw_message_id
+		JOIN raw_messages rm ON rm.id = cw.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE cw.status = 'noname' AND cw.created_at >= now() - interval '30 days'
+		  AND br.client_confirmed AND NOT br.needs_review AND NOT br.ignored AND NOT br.is_duplicate
+		  AND NOT COALESCE(rm.deleted, false) AND COALESCE(c.canonical_name, br.recipient_raw, '') <> ''
+		ORDER BY cw.created_at LIMIT $1`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CmfWatch
+	for rows.Next() {
+		var w CmfWatch
+		if err := rows.Scan(&w.ID, &w.GroupJID, &w.SenderJID, &w.ClientText, &w.Amount, &w.TxDate, &w.CreatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, w)
+	}
+	return out, rows.Err()
+}
+
 // DueCmfWatches — наблюдения со статусом watch, созданные раньше cutoff:
 // пора проверить, внесён ли платёж в программу.
 func (d *DB) DueCmfWatches(ctx context.Context, cutoff time.Time, limit int) ([]CmfWatch, error) {
@@ -4209,7 +4510,9 @@ func (d *DB) cmfWatchesByStatus(ctx context.Context, status string, cutoff, sinc
 		  -- Чек исключили из учёта («скинули по ошибке») или это дубль — не напоминаем.
 		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = cw.raw_message_id
 		                  AND (br.ignored OR br.is_duplicate))
-		ORDER BY cw.created_at
+		-- Давно не проверявшиеся — первыми: чек, по которому программа отвечает
+		-- ошибкой, не загораживает очередь остальным.
+		ORDER BY cw.checked_at NULLS FIRST, cw.created_at
 		LIMIT $2
 	`, cutoff, limit, status, since)
 	if err != nil {
@@ -4448,7 +4751,7 @@ func (d *DB) ReceiptsWithoutWatch(ctx context.Context, since time.Time, limit in
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
-		WHERE br.created_at >= $1 AND br.amount > 0 AND br.client_confirmed AND NOT br.needs_review
+		WHERE br.created_at >= $1 AND br.tx_date >= now() - interval '30 days' AND br.amount > 0 AND br.client_confirmed AND NOT br.needs_review
 		  AND NOT br.is_duplicate AND NOT br.ignored AND NOT COALESCE(rm.deleted, false)
 		  AND NOT EXISTS (SELECT 1 FROM cmf_watch cw WHERE cw.raw_message_id = br.raw_message_id)
 		  `+notGroupForwardCopy+`

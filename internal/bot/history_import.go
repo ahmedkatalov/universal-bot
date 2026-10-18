@@ -36,20 +36,21 @@ func (b *Bot) onDemandHistoryActive() (bool, types.JID) {
 	return false, types.JID{}
 }
 
-// requestGroupHistory просит ТЕЛЕФОН прислать более старые сообщения группы
-// (on-demand history sync). Ответ придёт асинхронно событием HistorySync и
-// разберётся обычным путём; итог уйдёт владельцу (replyTo). Best-effort: если
-// телефон офлайн или истории больше нет — просто ничего не придёт.
-func (b *Bot) requestGroupHistory(ctx context.Context, groupJID, replyTo types.JID, count int) error {
+// requestGroupHistory просит ТЕЛЕФОН прислать сообщения группы, которых у
+// бота нет: перед первым сообщением после самого большого перерыва за 2
+// недели (бот был отключён), а если перерыва нет — перед самым свежим. Ответ
+// придёт асинхронно событием HistorySync и разберётся обычным путём; итог
+// (даже «ничего не пришло») уйдёт владельцу (replyTo), когда окно закроется.
+func (b *Bot) requestGroupHistory(ctx context.Context, groupJID, replyTo types.JID, count int) (string, error) {
 	if b.client == nil || b.client.Store.ID == nil {
-		return fmt.Errorf("WhatsApp не подключён")
+		return "", fmt.Errorf("WhatsApp не подключён — историю попросить не у кого")
 	}
-	waID, ts, ok, err := b.db.OldestMessageInfo(ctx, groupJID.String())
+	waID, ts, gap, ok, err := b.db.GapAnchor(ctx, groupJID.String(), 14)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if !ok {
-		return fmt.Errorf("по этой группе у меня ещё нет сохранённых сообщений — не от чего отталкиваться")
+		return "", fmt.Errorf("по этой группе у меня ещё нет сохранённых сообщений — не от чего отталкиваться")
 	}
 	anchor := &types.MessageInfo{
 		MessageSource: types.MessageSource{Chat: groupJID, IsFromMe: false},
@@ -58,13 +59,50 @@ func (b *Bot) requestGroupHistory(ctx context.Context, groupJID, replyTo types.J
 	}
 	// Окно приёма открываем ДО отправки, чтобы не упустить быстрый ответ телефона.
 	b.onDemandMu.Lock()
-	b.onDemandUntil = time.Now().Add(3 * time.Minute)
+	b.onDemandUntil = time.Now().Add(15 * time.Minute)
 	b.onDemandReplyTo = replyTo
+	startTimer := !b.onDemandTimer
+	if startTimer {
+		b.onDemandTimer = true
+		b.onDemandGot = 0
+	}
 	b.onDemandMu.Unlock()
+	if startTimer {
+		go b.onDemandReport()
+	}
 
 	req := b.client.BuildHistorySyncRequest(anchor, count)
-	_, err = b.client.SendMessage(ctx, b.client.Store.ID.ToNonAD(), req, whatsmeow.SendRequestExtra{Peer: true})
-	return err
+	if _, err = b.client.SendMessage(ctx, b.client.Store.ID.ToNonAD(), req, whatsmeow.SendRequestExtra{Peer: true}); err != nil {
+		fmt.Println("История с телефона: запрос не ушёл:", err)
+		return "", fmt.Errorf("запрос телефону не ушёл: %v", err)
+	}
+	if gap > 0 {
+		return fmt.Sprintf("попросил телефон прислать сообщения до %s (перед перерывом %s — бот, похоже, был отключён)",
+			ts.In(time.Local).Format("02.01 15:04"), gap.Round(time.Hour)), nil
+	}
+	return "попросил телефон прислать последние сообщения, которых у меня нет", nil
+}
+
+// onDemandReport — когда окно приёма истории закрылось, сказать владельцу итог.
+func (b *Bot) onDemandReport() {
+	for {
+		b.onDemandMu.Lock()
+		until := b.onDemandUntil
+		b.onDemandMu.Unlock()
+		if d := time.Until(until); d > 0 {
+			time.Sleep(d)
+			continue
+		}
+		break
+	}
+	b.onDemandMu.Lock()
+	got, to := b.onDemandGot, b.onDemandReplyTo
+	b.onDemandTimer = false
+	b.onDemandMu.Unlock()
+	// Пришедшие пачки уже отчитаны сразу; молчим только если не пришло ничего.
+	if got == 0 && !to.IsEmpty() {
+		b.sendText(to, "История с телефона так и не пришла (телефон с WhatsApp бота должен быть онлайн). Можно повторить «перечитай группу» позже.")
+	}
 }
 
 func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receiptsN, paymentsN int) {
@@ -150,6 +188,18 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 				senderPhone = sender.ToNonAD().String()
 			}
 			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), senderPhone, sender.User, text, img != nil || isPDFDoc, mediaPath, ts)
+			if err == nil && existed && mediaBytes != nil {
+				// Это сообщение уже было, но фото тогда не скачалось / не прочиталось —
+				// сейчас телефон прислал его снова: разбираем.
+				if b.db.NeedsMediaReread(ctx, rawID) {
+					_ = b.db.SetMediaPath(ctx, rawID, mediaPath)
+					if b.importReceiptSilent(ctx, chat, rawID, ts, mediaBytes, ext) {
+						receipts++
+					}
+					_ = b.db.MarkMessageParsed(ctx, rawID)
+				}
+				continue
+			}
 			if err != nil || existed {
 				continue // уже было (идемпотентно) или ошибка — не дублируем
 			}

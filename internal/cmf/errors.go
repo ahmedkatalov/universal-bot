@@ -68,3 +68,16 @@ func IsTransient(err error) bool {
 	var ae *APIError
 	return errors.As(err, &ae) && ae.Transient()
 }
+
+// IsOutage — сбой всей программы для бота, а не одного клиента: сеть, вход,
+// нет доступа, перегрузка или ошибка на её стороне, истёк срок ожидания.
+func IsOutage(err error) bool {
+	if err == nil {
+		return false
+	}
+	var ae *APIError
+	if !errors.As(err, &ae) {
+		return true // таймаут контекста и прочие — до программы не достучались
+	}
+	return ae.Status == 0 || ae.Op == "вход" || ae.Status == 401 || ae.Status == 403 || ae.Status == 429 || ae.Status >= 500
+}

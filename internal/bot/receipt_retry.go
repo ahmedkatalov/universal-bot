@@ -15,6 +15,10 @@ import (
 
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/parser"
+
+	waProto "go.mau.fi/whatsmeow/binary/proto"
+	"go.mau.fi/whatsmeow/types"
+	"google.golang.org/protobuf/proto"
 )
 
 // maxReceiptRetries — сколько раз перечитываем чек, прежде чем сдаться и оставить
@@ -56,6 +60,7 @@ func (b *Bot) receiptRetryLoop() {
 func (b *Bot) retryDueReceipts() {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Minute)
 	defer cancel()
+	b.retryDueMedia(ctx)
 	items, err := b.db.DueReceiptRetries(ctx, time.Now(), maxReceiptRetries(), 10)
 	if err != nil {
 		fmt.Println("Повтор чеков: ошибка выборки:", err)
@@ -109,4 +114,73 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 		return
 	}
 	fmt.Printf("Повтор чека #%d: распознан (сумма %.0f ₽, получатель %q)\n", it.ID, rd.Amount, rd.Recipient)
+}
+
+// retryDueMedia — фото/PDF чеков, которые так и не стали чеком (не скачались
+// или ИИ не смог их прочитать), пробуем снова — по очереди своей группы.
+func (b *Bot) retryDueMedia(ctx context.Context) {
+	if b.assistant != nil && b.assistant.Degraded() {
+		return // ИИ всё ещё не отвечает — подождём
+	}
+	items, err := b.db.DueMediaRetries(ctx, 5)
+	if err != nil {
+		fmt.Println("Повтор фото: ошибка выборки:", err)
+		return
+	}
+	for _, it := range items {
+		it := it
+		done := make(chan struct{})
+		b.enqueueChat(it.GroupJID, func() {
+			defer close(done)
+			b.rereadMedia(ctx, it)
+		})
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+// rereadMedia — заново скачать (если нужно) и разобрать фото чека так же, как
+// при получении. Возвращает, стало ли фото чеком.
+func (b *Bot) rereadMedia(ctx context.Context, it db.MediaRetry) bool {
+	chat, err := types.ParseJID(it.GroupJID)
+	if err != nil {
+		return false
+	}
+	text, ext := it.Body, filepath.Ext(it.MediaPath)
+	var data []byte
+	if it.MediaPath != "" {
+		data, err = os.ReadFile(it.MediaPath)
+	}
+	if it.MediaPath == "" || err != nil {
+		if len(it.Proto) == 0 {
+			_ = b.db.BumpMediaRetry(ctx, it.RawID, time.Now().Add(retryBackoff(it.Attempts)))
+			return false
+		}
+		var m waProto.Message
+		if uerr := proto.Unmarshal(it.Proto, &m); uerr != nil {
+			_ = b.db.BumpMediaRetry(ctx, it.RawID, time.Now().Add(24*time.Hour))
+			return false
+		}
+		mr := b.readMedia(ctx, &m, it.WaID, it.Caption)
+		if mr.dlErr != nil || mr.bytes == nil {
+			_ = b.db.BumpMediaRetry(ctx, it.RawID, time.Now().Add(retryBackoff(it.Attempts)))
+			return false
+		}
+		_ = b.db.SetMediaPath(ctx, it.RawID, mr.path)
+		data, text, ext = mr.bytes, mr.text, mr.ext
+		_ = b.db.SetMessageBody(ctx, it.RawID, text)
+	}
+	if ext == "" {
+		ext = ".jpg"
+	}
+	payer, payerAmount := b.payerFromCaption(ctx, it.Caption)
+	b.handleBankReceipt(ctx, chat, it.SenderJID, it.WaID, text, it.RawID, it.ReceivedAt, data, ext, payer, payerAmount)
+	if _, _, ok, _ := b.db.ReceiptOfRaw(ctx, it.RawID); ok {
+		return true
+	}
+	_ = b.db.BumpMediaRetry(ctx, it.RawID, time.Now().Add(retryBackoff(it.Attempts)))
+	return false
 }

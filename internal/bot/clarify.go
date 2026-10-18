@@ -194,8 +194,17 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			continue // владелец попросил молчать в этой группе — вопросов не задаём
 		}
 		// 1. Чеки без имени клиента — «чей это чек?».
-		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); withAI && err == nil && n > 0 && n <= clarifyMaxAsk {
-			items, err := b.db.UnconfirmedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
+		// Много чеков без ответа (сотрудник скинул пачку) — не замолкаем совсем:
+		// спрашиваем про самые свежие по одному за цикл, остальные видны в
+		// «нераспознанных» и в разделе «НЕ вошло».
+		if n, err := b.db.CountUnconfirmed(ctx, jid.String(), before); withAI && err == nil && n > 0 {
+			mass := n > clarifyMaxAsk
+			limit := clarifyPerCycle - asked
+			if mass {
+				limit = 1
+				fmt.Printf("Чей чек: %d чеков без ФИО в группе %s — спрашиваю по одному, свежие первыми\n", n, jid)
+			}
+			items, err := b.db.UnconfirmedReceiptsOrdered(ctx, jid.String(), before, limit, mass)
 			if err == nil {
 				for _, it := range items {
 					// Прежде чем спрашивать — анализируем недавние сообщения этого
@@ -281,8 +290,13 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 			break
 		}
 		// 2. Чеки, у которых не прочиталась сумма — «не смог разобрать, что на чеке?».
-		if n, err := b.db.CountUnrecognized(ctx, jid.String(), before); withAI && err == nil && n > 0 && n <= clarifyMaxAsk {
-			items, err := b.db.UnrecognizedReceipts(ctx, jid.String(), before, clarifyPerCycle-asked)
+		if n, err := b.db.CountUnrecognized(ctx, jid.String(), before); withAI && err == nil && n > 0 {
+			mass := n > clarifyMaxAsk
+			limit := clarifyPerCycle - asked
+			if mass {
+				limit = 1
+			}
+			items, err := b.db.UnrecognizedReceiptsOrdered(ctx, jid.String(), before, limit, mass)
 			if err == nil {
 				for _, it := range items {
 					text := "🤔 Не смог разобрать этот чек (не прочитал сумму). Напишите сумму " +
@@ -538,6 +552,10 @@ func isUnknownReply(lower string) bool {
 // fix_receipt). Так вопрос владельца перестаёт превращаться в ФИО клиента.
 func clarifyNameFromReply(text string) (name string, amount float64, deferToAI bool) {
 	amount = parser.ExtractAmount(text)
+	// «Молчи в группе», «перечитай группу», «найди чек Каталова» — команда, не имя.
+	if isCommandText(text) {
+		return "", amount, true
+	}
 	// Вопрос («…?») — это не имя. Отдаём ассистенту.
 	if strings.Contains(text, "?") {
 		return "", amount, true

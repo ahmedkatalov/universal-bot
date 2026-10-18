@@ -5,6 +5,7 @@
 package bot
 
 import (
+	"sync"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -729,7 +730,7 @@ func (b *Bot) fixReceiptTool() ai.Tool {
 			if kind == "receipt" && canonical != "" {
 				if _, wa, g, err := b.db.ReceiptRef(ctx, id); err == nil {
 					if gj, err := types.ParseJID(g); err == nil {
-						b.syncWatchByCheckWa(ctx, gj, wa, canonical)
+						b.syncWatchByCheckNow(ctx, gj, wa, canonical)
 					}
 				}
 			}
@@ -768,22 +769,22 @@ func (b *Bot) rereadGroupTool(chat types.JID) ai.Tool {
 			"type": "object",
 			"properties": map[string]any{
 				"group": map[string]any{"type": "string", "description": "Название группы (пусто = эта группа; в личке без указания — все группы)"},
+				"days":  map[string]any{"type": "integer", "description": "За сколько дней перечитать (по умолчанию 7)"},
 			},
 			"required": []string{},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
 				Group string `json:"group"`
+				Days  int    `json:"days"`
 			}
 			_ = json.Unmarshal(input, &args)
-
-			// 1) Надёжная часть: заново разобрать сохранённые сообщения.
-			recountMsg, err := b.recountEverything(ctx)
-			if err != nil {
-				return "", err
+			if args.Days <= 0 || args.Days > 60 {
+				args.Days = 7
 			}
+			since := time.Now().AddDate(0, 0, -args.Days)
 
-			// 2) Определяем, у каких групп просить более старую историю с телефона.
+			// Какие группы перечитываем.
 			var targets []types.JID
 			if strings.TrimSpace(args.Group) != "" {
 				jids, _, gerr := b.resolveGroups(ctx, args.Group)
@@ -804,26 +805,50 @@ func (b *Bot) rereadGroupTool(chat types.JID) ai.Tool {
 					}
 				}
 			}
+			b.sendText(chat, fmt.Sprintf("🔄 Перечитываю группу за %d дн.: фото чеков, которые не прочитались, и непонятые сообщения. Это займёт до пары минут — напишу итог.", args.Days))
 
-			requested := 0
+			// 1) Фото/PDF чеков, которые так и не стали засчитанным чеком.
+			if b.assistant != nil {
+				b.assistant.ResetBreaker() // владелец явно просит — пробуем ИИ сразу
+			}
+			tried, recognized := 0, 0
 			for _, jid := range targets {
-				if err := b.requestGroupHistory(ctx, jid, chat, 200); err == nil {
-					requested++
+				t, r := b.rereadGroupMedia(ctx, jid.String(), since)
+				tried, recognized = tried+t, recognized+r
+			}
+
+			// 2) Тексты и сопоставление имён.
+			recountMsg, err := b.recountEverythingFor(ctx, chat)
+			if err != nil {
+				return "", err
+			}
+
+			// 3) С телефона — пропущенное, пока бот был отключён (перерыв в
+			// сообщениях группы), или перед самым свежим сообщением.
+			var hist []string
+			for _, jid := range targets {
+				if note, err := b.requestGroupHistory(ctx, jid, chat, 300); err != nil {
+					hist = append(hist, b.groupLabel(ctx, jid)+": "+err.Error())
+				} else if note != "" {
+					hist = append(hist, b.groupLabel(ctx, jid)+": "+note)
 				}
 			}
 
-			out := recountMsg
-			if requested > 0 {
-				out += "\n\nТакже попросил телефон прислать более старую историю " +
-					fmt.Sprintf("(%d групп(ы))", requested) +
-					" — если там есть ещё чеки и телефон онлайн, подтяну в фоне и напишу, сколько нашёл."
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Фото чеков перечитал: %d, из них стали чеками: %d.\n", tried, recognized)
+			if tried > recognized {
+				sb.WriteString("Не прочитались — посмотреть их: «скинь нераспознанные чеки».\n")
 			}
-			return out, nil
+			sb.WriteString(recountMsg)
+			if len(hist) > 0 {
+				sb.WriteString("\n\nИстория с телефона:\n- " + strings.Join(hist, "\n- "))
+			}
+			return sb.String(), nil
 		},
 	}
 }
 
-func (b *Bot) recountTool() ai.Tool {
+func (b *Bot) recountTool(chat types.JID) ai.Tool {
 	return ai.Tool{
 		Name: "recount_everything",
 		Description: "Полный пересчёт учёта заново: повторно сопоставляет непонятые чеки с известными именами " +
@@ -836,13 +861,23 @@ func (b *Bot) recountTool() ai.Tool {
 			"required":   []string{},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
-			return b.recountEverything(ctx)
+			return b.recountEverythingFor(ctx, chat)
 		},
 	}
 }
 
-// recountEverything — реализация пересчёта.
+// recountEverything — реализация пересчёта (всё сразу, итог в ответе).
 func (b *Bot) recountEverything(ctx context.Context) (string, error) {
+	return b.recountEverythingFor(ctx, types.JID{})
+}
+
+// recountEverythingFor — пересчёт; если report задан, доразбор ИИ идёт в фоне
+// (ответ владельцу не ждёт десятки чтений ИИ), а его итог придёт отдельным
+// сообщением в report.
+func (b *Bot) recountEverythingFor(ctx context.Context, report types.JID) (string, error) {
+	if b.assistant != nil {
+		b.assistant.ResetBreaker() // владелец явно просит — пробуем ИИ сразу
+	}
 	var sb strings.Builder
 
 	// 1. Повторное сопоставление чеков с ручной проверки (алиасы могли
@@ -866,44 +901,27 @@ func (b *Bot) recountEverything(ctx context.Context) (string, error) {
 		fmt.Fprintf(&sb, "(не удалось перечитать чеки на проверке: %v)\n", err)
 	}
 
-	// 2. Повторный разбор текстовых сообщений, не давших ни одной операции.
+	// 2. Повторный разбор текстовых сообщений, не давших ни одной операции, —
+	// тем же путём, что вживую (ИИ понимает, платёж ли это; планы и вопросы —
+	// не платежи). ИИ недоступен — только явные платежи известным клиентам,
+	// остальное дочитается, когда ИИ вернётся.
 	reParsed := 0
-	aiCalls := 0
+	type aiJob struct {
+		m   db.UnparsedMessage
+		jid types.JID
+	}
+	var jobs []aiJob
 	if msgs, err := b.db.UnparsedTextMessages(ctx, 100); err == nil {
+		aiOK := b.assistant != nil && !b.assistant.Degraded()
 		for _, m := range msgs {
-			result := parser.ParseMessage(m.Body)
-			saved := 0
-			for _, tr := range result.Transactions {
-				canonical, _ := b.aliases.ResolveName(tr.RawName)
-				contactID, err := b.db.GetOrCreateContact(ctx, canonical)
-				if err != nil {
-					continue
-				}
-				if err := b.db.InsertTransaction(ctx, dbTransactionFromParsed(tr, contactID, m.ID, m.ReceivedAt)); err == nil {
-					saved++
-				}
+			jid, jerr := types.ParseJID(m.GroupJID)
+			if aiOK && len(jobs) < 30 && jerr == nil && mightBePayment(m.Body) {
+				jobs = append(jobs, aiJob{m, jid})
+				continue
 			}
-			// Строки с цифрами, которые не взял парсер, — через ИИ (не больше
-			// 15 обращений за пересчёт, чтобы не жечь токены на старой болтовне).
-			// Отметку «разобрано» в этом случае ставит сам aiRescueUnparsed —
-			// и НЕ ставит, если платёж нашёлся, но не записался (чтобы следующий
-			// пересчёт вернулся к нему).
-			delegated := false
-			if saved == 0 && len(result.Unparsed) > 0 && containsDigit(result.Unparsed) && b.assistant != nil && aiCalls < 15 {
-				aiCalls++
-				jid, err := types.ParseJID(m.GroupJID)
-				if err == nil {
-					delegated = true
-					// paymentLikely=false: при ПЕРЕСЧЁТЕ старых сообщений публичный
-					// «❓» не задаём — иначе бот задним числом засыпал бы группы
-					// вопросами по давним сообщениям. Платёж, если он есть, ИИ запишет.
-					b.aiRescueUnparsed(ctx, jid, m.SenderName, result.Unparsed, m.ID, m.ReceivedAt, false, false)
-				}
-			}
-			if saved > 0 {
-				reParsed += saved
-			}
-			if !delegated {
+			n, _ := b.recordDeterministicPaymentsMode(ctx, m.Body, m.ID, m.ReceivedAt, false, detKnown)
+			reParsed += n
+			if n > 0 || !mightBePayment(m.Body) {
 				_ = b.db.MarkMessageParsed(ctx, m.ID)
 			}
 		}
@@ -911,11 +929,104 @@ func (b *Bot) recountEverything(ctx context.Context) (string, error) {
 		fmt.Fprintf(&sb, "(не удалось перечитать сообщения: %v)\n", err)
 	}
 
+	// Доразбор ИИ: параллельно (по 4); при report — в фоне, итог отдельным сообщением.
+	runAI := func(ctx context.Context) int {
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 4)
+		got := 0
+		for _, j := range jobs {
+			j := j
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				before, _ := b.db.TxIDsByRawID(ctx, j.m.ID)
+				// paymentLikely=false: при ПЕРЕСЧЁТЕ старых сообщений публичный
+				// «❓» не задаём — бот не засыпает группы вопросами задним числом.
+				b.aiRescueUnparsed(ctx, j.jid, j.m.SenderName, []string{j.m.Body}, j.m.ID, j.m.ReceivedAt, false, false)
+				after, _ := b.db.TxIDsByRawID(ctx, j.m.ID)
+				mu.Lock()
+				got += len(after) - len(before)
+				mu.Unlock()
+			}()
+		}
+		wg.Wait()
+		return got
+	}
+	aiNote := ""
+	if len(jobs) > 0 {
+		if !report.IsEmpty() {
+			go func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+				defer cancel()
+				n := runAI(ctx)
+				b.sendText(report, fmt.Sprintf("Доразбор ИИ закончил: перечитал %d сообщений, нашёл платежей: %d.", len(jobs), n))
+			}()
+			aiNote = fmt.Sprintf(" (ещё %d непонятных сообщений ИИ дочитывает — итог пришлю отдельно)", len(jobs))
+		} else {
+			reParsed += runAI(ctx)
+			aiNote = fmt.Sprintf(" (ИИ перечитал %d сообщений)", len(jobs))
+		}
+	}
+
 	fmt.Fprintf(&sb, "Пересчёт завершён:\n")
 	fmt.Fprintf(&sb, "- чеков возвращено в учёт после повторного сопоставления имён: %d\n", reResolved)
-	fmt.Fprintf(&sb, "- платежей извлечено из ранее нераспознанных сообщений: %d (плюс доразбор ИИ в фоне: %d сообщений)\n", reParsed, aiCalls)
+	fmt.Fprintf(&sb, "- платежей извлечено из ранее нераспознанных сообщений: %d%s\n", reParsed, aiNote)
+	if b.assistant != nil && b.assistant.Degraded() {
+		sb.WriteString("- ИИ сейчас не отвечает: непонятные сообщения дочитаю сам, когда он вернётся\n")
+	}
 	sb.WriteString("Все отчёты теперь строятся по обновлённым данным.")
 	return sb.String(), nil
+}
+
+// rereadGroupMedia — «перечитай группу»: заново читает фото/PDF чеков группы
+// за период, которые не стали засчитанным чеком (не скачались, ИИ не смог
+// прочитать, сумма не распознана). Возвращает: сколько перечитал, сколько
+// стали чеками.
+// groupLabel — название группы для ответов.
+func (b *Bot) groupLabel(ctx context.Context, jid types.JID) string {
+	if n := b.joinedGroups(ctx)[jid]; n != "" {
+		return "«" + n + "»"
+	}
+	return jid.User
+}
+
+func (b *Bot) rereadGroupMedia(ctx context.Context, groupJID string, since time.Time) (tried, recognized int) {
+	items, err := b.db.GroupMediaToReread(ctx, groupJID, since, 40)
+	if err != nil {
+		fmt.Println("Перечитать фото: ошибка выборки:", err)
+		return 0, 0
+	}
+	for _, it := range items {
+		if ctx.Err() != nil {
+			break
+		}
+		it := it
+		tried++
+		done := make(chan bool, 1)
+		b.enqueueChat(it.GroupJID, func() {
+			if rid, amt, ok, _ := b.db.ReceiptOfRaw(ctx, it.RawID); ok {
+				// Чек есть, но сумма не прочиталась / повторы кончились — читаем ещё раз.
+				if it.MediaPath != "" {
+					b.retryOneReceipt(ctx, db.ReceiptRetry{ID: rid, MediaPath: it.MediaPath, GroupJID: it.GroupJID})
+				}
+				_, amt2, _, _ := b.db.ReceiptOfRaw(ctx, it.RawID)
+				done <- amt <= 0 && amt2 > 0
+				return
+			}
+			done <- b.rereadMedia(ctx, it)
+		})
+		select {
+		case ok := <-done:
+			if ok {
+				recognized++
+			}
+		case <-ctx.Done():
+		}
+	}
+	return tried, recognized
 }
 
 // parseUnclearCode разбирает код элемента вида "receipt:12" / "message:34".
@@ -933,4 +1044,111 @@ func parseUnclearCode(code string) (string, int, error) {
 		return "", 0, fmt.Errorf("неверный id в коде %q", code)
 	}
 	return kind, id, nil
+}
+
+// findCheckTool — найти конкретный чек/платёж по сумме и/или имени во ВСЕХ
+// состояниях и сказать, почему его нет в сборе (дубль, удалён, исключён, ждёт
+// клиента, фото не прочиталось/не скачалось).
+func (b *Bot) findCheckTool() ai.Tool {
+	return ai.Tool{
+		Name: "find_check",
+		Description: "Ищет КОНКРЕТНЫЙ чек или платёж по сумме и/или имени (клиент, получатель на чеке, подпись, текст чека) " +
+			"во всех состояниях: засчитан, повтор уже присланного чека, удалён в WhatsApp, исключён, ждёт «чей чек?», " +
+			"сумма не распознана, фото не прочитано/не скачалось. Вызывай на «найди чек Исаева на 15000», «Расул говорит, " +
+			"скинул чек Каталова — где он?», «почему чек на 5000 не в сборе». Если чек нашёлся непрочитанным — предложи " +
+			"«перечитай группу» или продиктовать сумму и ФИО (fix_receipt).",
+		InputSchema: map[string]any{
+			"type": "object",
+			"properties": map[string]any{
+				"amount":    map[string]any{"type": "number", "description": "Сумма (необязательно)"},
+				"name":      map[string]any{"type": "string", "description": "Имя/фамилия клиента или получателя (необязательно)"},
+				"group":     map[string]any{"type": "string", "description": "Группа (пусто = все)"},
+				"from_date": map[string]any{"type": "string", "description": "С какой даты YYYY-MM-DD (пусто = 30 дней назад)"},
+				"to_date":   map[string]any{"type": "string", "description": "По какую дату YYYY-MM-DD (пусто = сегодня)"},
+			},
+			"required": []string{},
+		},
+		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
+			var args struct {
+				Amount   float64 `json:"amount"`
+				Name     string  `json:"name"`
+				Group    string  `json:"group"`
+				FromDate string  `json:"from_date"`
+				ToDate   string  `json:"to_date"`
+			}
+			_ = json.Unmarshal(input, &args)
+			name := strings.TrimSpace(args.Name)
+			if args.Amount <= 0 && name == "" {
+				return "", fmt.Errorf("укажи сумму или имя")
+			}
+			now := time.Now()
+			from := now.AddDate(0, 0, -30)
+			to := now.Add(24 * time.Hour)
+			if t, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local); err == nil {
+				from = t
+			}
+			if t, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local); err == nil {
+				to = t.AddDate(0, 0, 1)
+			}
+			groupJID := ""
+			if strings.TrimSpace(args.Group) != "" {
+				jid, _, err := b.resolveGroup(ctx, args.Group)
+				if err != nil {
+					return "", err
+				}
+				groupJID = jid.String()
+			}
+			// Имя ищем по основе фамилии: «Исаева» найдёт «Исаев Харон».
+			q := name
+			if ws := normWords(name); len(ws) > 0 {
+				q = ws[0]
+				if r := []rune(q); len(r) > 5 {
+					q = string(r[:len(r)-2])
+				}
+			}
+			found, err := b.db.FindChecks(ctx, args.Amount, 1, q, groupJID, from, to, 15)
+			if err != nil {
+				return "", err
+			}
+			if len(found) == 0 {
+				return fmt.Sprintf("Ни чека, ни платежа%s%s с %s по %s не нашёл — ни засчитанного, ни отброшенного. "+
+					"Если его присылали, когда бот был отключён, — «перечитай группу» попросит историю у телефона.",
+					func() string {
+						if args.Amount > 0 {
+							return fmt.Sprintf(" на %s ₽", formatMoney(args.Amount))
+						}
+						return ""
+					}(), func() string {
+						if name != "" {
+							return " по «" + name + "»"
+						}
+						return ""
+					}(), from.Format("02.01"), to.AddDate(0, 0, -1).Format("02.01")), nil
+			}
+			groups := b.joinedGroups(ctx)
+			var sb strings.Builder
+			fmt.Fprintf(&sb, "Нашёл %d:\n", len(found))
+			for _, f := range found {
+				g := f.GroupJID
+				if jid, err := types.ParseJID(f.GroupJID); err == nil && groups[jid] != "" {
+					g = groups[jid]
+				}
+				who := f.Client
+				if who == "" {
+					who = "клиент не указан"
+				}
+				card := ""
+				if f.Card != "" && f.Card != f.Client {
+					card = ", получатель на чеке " + f.Card
+				}
+				amt := ""
+				if f.Amount > 0 {
+					amt = formatMoney(f.Amount) + " ₽, "
+				}
+				fmt.Fprintf(&sb, "• [%s] %s%s%s, прислан %s (%s), группа «%s» — %s\n",
+					f.Kind, amt, who, card, f.Received.In(time.Local).Format("02.01 15:04"), f.Sender, g, f.Status)
+			}
+			return strings.TrimRight(sb.String(), "\n"), nil
+		},
+	}
 }

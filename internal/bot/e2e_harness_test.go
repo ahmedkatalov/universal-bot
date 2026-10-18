@@ -347,7 +347,11 @@ func (e *e2eBot) sentSince(n int) []e2eSent {
 }
 
 // waitIdle — подождать фоновые горутины (ассистент, ИИ-разбор, сверка).
-func (e *e2eBot) waitIdle() { time.Sleep(400 * time.Millisecond) }
+func (e *e2eBot) waitIdle() {
+	e.drainQueues(2 * time.Minute)
+	time.Sleep(400 * time.Millisecond)
+	e.drainQueues(2 * time.Minute)
+}
 
 var e2eSeq int
 

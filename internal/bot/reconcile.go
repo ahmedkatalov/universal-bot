@@ -9,6 +9,7 @@ import (
 	"math"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -130,12 +131,19 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 
 	var out []reconRec
 	var members [][]db.ReconReceipt
+	var spanFrom, spanTo []time.Time // даты чеков группы копий (быстрый отсев)
 	byWa := map[string]int{}
 	merge := func(k int, r db.ReconReceipt) {
 		for _, g := range own(r) {
 			out[k].groups[g] = true
 		}
 		members[k] = append(members[k], r)
+		if r.TxDate.Before(spanFrom[k]) {
+			spanFrom[k] = r.TxDate
+		}
+		if r.TxDate.After(spanTo[k]) {
+			spanTo[k] = r.TxDate
+		}
 		if out[k].NeedsReview && !r.NeedsReview { // предпочитаем копию с подтверждённым клиентом
 			g, doc := out[k].groups, out[k].DocNumber
 			out[k].ReconReceipt = r
@@ -149,9 +157,14 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 	}
 	findCopy := func(r db.ReconReceipt) int {
 		rd := normDoc(r.DocNumber)
+		rg := own(r)
 	next:
 		for k := range out {
-			for _, g := range own(r) {
+			// Копии одного чека — в пределах суток друг от друга.
+			if r.TxDate.Sub(spanTo[k]) > 50*time.Hour || spanFrom[k].Sub(r.TxDate) > 50*time.Hour {
+				continue
+			}
+			for _, g := range rg {
 				if out[k].groups[g] {
 					continue next
 				}
@@ -184,6 +197,7 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 		}
 		out = append(out, reconRec{ReconReceipt: r, groups: groups})
 		members = append(members, []db.ReconReceipt{r})
+		spanFrom, spanTo = append(spanFrom, r.TxDate), append(spanTo, r.TxDate)
 		return len(out) - 1
 	}
 	var fwd []db.ReconReceipt
@@ -213,6 +227,31 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 // «Хаджи Мурат» = «Хаджимурат»). Однословные имена — только точное совпадение,
 // чтобы «Ахмед» не прилип ко всем Ахмедам; разные имена (Рустам/Руслан,
 // Мадина/Марина, Магомед/Магомед-Расул) — разные.
+// sameNameMemo — sameClientName с запоминанием: в сверке одни и те же имена
+// сравниваются тысячи раз (каждый клиент со всеми чеками за полтора месяца).
+var (
+	sameNameMu    sync.Mutex
+	sameNameCache = map[string]bool{}
+)
+
+func sameNameMemo(a, b string) bool {
+	k := a + "\x00" + b
+	sameNameMu.Lock()
+	v, ok := sameNameCache[k]
+	sameNameMu.Unlock()
+	if ok {
+		return v
+	}
+	r := sameClientName(a, b)
+	sameNameMu.Lock()
+	if len(sameNameCache) > 300000 {
+		sameNameCache = map[string]bool{}
+	}
+	sameNameCache[k] = r
+	sameNameMu.Unlock()
+	return r
+}
+
 func sameClientName(a, b string) bool {
 	ha, hb := hasHyphen(a), hasHyphen(b)
 	if ha == hb && sameClientNameOnce(a, b) {
@@ -586,6 +625,15 @@ type reconBucket struct {
 
 // cmfReconcile — живая сверка учёта за период [from, to) с программой.
 func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID string) (string, error) {
+	return b.cmfReconcileFor(ctx, from, to, groupJID, "")
+}
+
+// cmfReconcileFor — сверка, при client != "" — только чеки этого клиента
+// («внесён ли чек Каталова?» — без сверки всех клиентов за период).
+func (b *Bot) cmfReconcileFor(ctx context.Context, from, to time.Time, groupJID, client string) (string, error) {
+	// Сверка не дольше 2 минут: висящая программа не держит ответ владельцу вечно.
+	ctx, cancel := context.WithTimeout(ctx, 2*time.Minute)
+	defer cancel()
 	ctxFrom := from.AddDate(0, 0, -reconContextDays)
 	ctxTo := to.AddDate(0, 0, reconContextDays)
 
@@ -658,8 +706,46 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		nCash++
 		addReported(c.Name, reconItem{ID: -c.ID, Kind: "cash", Amount: c.Amount, Date: c.TxDate, Report: true})
 	}
+	if c := strings.TrimSpace(client); c != "" {
+		var keep []string
+		for _, key := range order {
+			d := buckets[key].display
+			if sameClientName(d, c) || nameCovers(c, d) || nameCovers(d, c) {
+				keep = append(keep, key)
+			}
+		}
+		if len(keep) == 0 {
+			return fmt.Sprintf("За %s чеков и налички клиента «%s» в учёте не нашёл.", periodLabel, c), nil
+		}
+		order, unconfirmed, unconfirmedSum, notInProgram = keep, 0, 0, nil
+	}
 	if len(order) == 0 && unconfirmed == 0 && len(notInProgram) == 0 {
 		return "За " + periodLabel + " чеков и налички в учёте нет.", nil
+	}
+	// Поиск клиентов в программе — параллельно (по 6): по одному он шёл минутами.
+	type lookupRes struct {
+		clients []cmf.ClientInfo
+		kind    cmfMatchKind
+		err     error
+	}
+	lookups := make(map[string]lookupRes, len(order))
+	{
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 6)
+		for _, key := range order {
+			wg.Add(1)
+			go func(key string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				cl, kind, err := b.cmfLookupWithTypos(ctx, buckets[key].display)
+				mu.Lock()
+				lookups[key] = lookupRes{cl, kind, err}
+				mu.Unlock()
+			}(key)
+		}
+		wg.Wait()
 	}
 
 	// Имя → клиент программы; один клиент под разными написаниями сводится по ID.
@@ -677,7 +763,8 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 	pinged := false
 	for _, key := range order {
 		bk := buckets[key]
-		clients, kind, err := b.cmfLookupWithTypos(ctx, bk.display)
+		lr := lookups[key]
+		clients, kind, err := lr.clients, lr.kind, lr.err
 		if err == nil && kind != cmfExact && kind != cmfStrong {
 			// Плательщик, за которого в группе уже ответили «это оплата за X».
 			if pc, ok := b.payerFor(ctx, bk.display, clients); ok {
@@ -741,17 +828,41 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 		items []reconItem
 		pays  []cmf.Payment
 	}
+	// Оплаты клиентов из программы — параллельно (по 6).
+	type payRes struct {
+		pays []cmf.Payment
+		err  error
+	}
+	payments := make(map[string]payRes, len(cidOrder))
+	{
+		var mu sync.Mutex
+		var wg sync.WaitGroup
+		sem := make(chan struct{}, 6)
+		for _, cid := range cidOrder {
+			wg.Add(1)
+			go func(cid string) {
+				defer wg.Done()
+				sem <- struct{}{}
+				defer func() { <-sem }()
+				p, err := b.cmf.PaymentsBetween(ctx, cid, ctxFrom.AddDate(0, 0, -10), ctxTo.AddDate(0, 0, 20))
+				mu.Lock()
+				payments[cid] = payRes{p, err}
+				mu.Unlock()
+			}(cid)
+		}
+		wg.Wait()
+	}
 	var cases []clientCase
 	for _, cid := range cidOrder {
 		g := groupsByCID[cid]
 		// Контекст: остальные чеки/наличка ЭТОГО клиента вокруг периода и из других
 		// групп — они «забирают» свои оплаты, в ответ не выводятся.
 		isHis := func(name string) bool {
-			if sameClientName(name, g.client.FullName) {
+			if sameNameMemo(name, g.client.FullName) {
 				return true
 			}
 			for _, n := range g.names {
-				if sameClientName(name, n) {
+				if sameNameMemo(name, n) {
 					return true
 				}
 			}
@@ -774,7 +885,7 @@ func (b *Bot) cmfReconcile(ctx context.Context, from, to time.Time, groupJID str
 			}
 			items = append(items, reconItem{ID: -c.ID, Kind: "cash", Amount: c.Amount, Date: c.TxDate})
 		}
-		pays, perr := b.cmf.PaymentsBetween(ctx, cid, ctxFrom.AddDate(0, 0, -10), ctxTo.AddDate(0, 0, 20))
+		pays, perr := payments[cid].pays, payments[cid].err
 		if perr != nil {
 			fmt.Printf("cmf: ошибка платежей клиента %q: %v\n", g.client.FullName, perr)
 			attention = append(attention, fmt.Sprintf("%s — не смог получить его оплаты: %s (%s)", g.client.FullName, cmf.Human(perr), itemsBrief(g.items)))

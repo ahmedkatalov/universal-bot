@@ -151,14 +151,8 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 		return name, amount
 	}
 	// 1. Подпись к чеку.
-	if strings.TrimSpace(caption) != "" {
-		if name := b.cmfExtractClientName(ctx, caption); name != "" {
-			return found(name, parser.ExtractAmount(caption))
-		}
-		// ИИ не выделил, но подпись сама похожа на ФИО ("цихаев саляхь").
-		if name, ok := looksLikeName(caption); ok {
-			return found(name, parser.ExtractAmount(caption))
-		}
+	if name, amount := b.payerFromCaption(ctx, caption); name != "" {
+		return found(name, amount)
 	}
 	// 2. Чек — это ответ (свайп) на сообщение с именем.
 	if quoted := extractQuotedText(msg); strings.TrimSpace(quoted) != "" {
@@ -172,6 +166,25 @@ func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, capt
 	// 3. Имя из очереди «написали перед чеком» берётся уже при разборе чека
 	// (takeQueuedPayer), когда известна его сумма: «Ахмед 15000» не достанется
 	// чеку на 20000.
+	return "", 0
+}
+
+// payerFromCaption — ФИО клиента из подписи к фото чека. Подпись-команда боту
+// («Джарвис, внеси в программу») — не ФИО клиента.
+func (b *Bot) payerFromCaption(ctx context.Context, caption string) (string, float64) {
+	if stripped, addressed := b.stripBotName(caption); addressed {
+		caption = strings.TrimSpace(strings.TrimLeft(strings.TrimPrefix(strings.TrimPrefix(stripped, "это"), "Это"), " ,:-—"))
+	}
+	if isCommandText(caption) || strings.TrimSpace(caption) == "" {
+		return "", 0
+	}
+	if name := b.cmfExtractClientName(ctx, caption); name != "" {
+		return name, parser.ExtractAmount(caption)
+	}
+	// ИИ не выделил, но подпись сама похожа на ФИО ("цихаев саляхь").
+	if name, ok := looksLikeName(caption); ok {
+		return name, parser.ExtractAmount(caption)
+	}
 	return "", 0
 }
 
@@ -417,7 +430,7 @@ func (b *Bot) syncWatchAfterLabel(ctx context.Context, chat types.JID, checkRawI
 		return
 	}
 	if !ok {
-		b.ensureMissingWatches(ctx) // чек стал засчитанным только сейчас
+		b.ensureMissingWatchesAsync() // чек стал засчитанным только сейчас
 		return
 	}
 	w, ok, err := b.db.CmfWatchByID(ctx, wid)
@@ -433,6 +446,10 @@ func (b *Bot) ensureMissingWatches(ctx context.Context) {
 	if b.cmf == nil || b.db == nil {
 		return
 	}
+	if !b.ensureMu.TryLock() {
+		return // уже идёт
+	}
+	defer b.ensureMu.Unlock()
 	ms, err := b.db.ReceiptsWithoutWatch(ctx, time.Now().AddDate(0, 0, -3), 50)
 	if err != nil {
 		return
@@ -446,10 +463,52 @@ func (b *Bot) ensureMissingWatches(ctx context.Context) {
 	}
 }
 
+// ensureMissingWatchesAsync — то же в фоне (из разбора сообщения не ждём программу).
+func (b *Bot) ensureMissingWatchesAsync() {
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+		defer cancel()
+		b.ensureMissingWatches(ctx)
+	}()
+}
+
+// repairNonameWatches — сверка «без клиента», хотя клиента чека уже назвали
+// (ответ на «чей чек?» до этого обновления не доходил до сверки): узнаём клиента.
+func (b *Bot) repairNonameWatches(ctx context.Context) {
+	ws, err := b.db.NonameWatchesWithClient(ctx, 30)
+	if err != nil {
+		return
+	}
+	for _, w := range ws {
+		if ctx.Err() != nil {
+			return
+		}
+		jid, err := types.ParseJID(w.GroupJID)
+		if err != nil {
+			continue
+		}
+		_ = b.db.UpdateCmfWatch(ctx, w.ID, w.ClientText, "", "", "", "lookup")
+		b.cmfResolveWatch(ctx, w.ID, jid, w.ClientText, w.Amount)
+		if b.cmfDown() {
+			return
+		}
+	}
+}
+
 // syncWatchByCheckWa — клиента чека назвали ответом на «чей чек?» или правкой:
 // сверка по этому чеку ищет его в программе (раньше оставалась «без имени»
 // навсегда и не напоминала).
 func (b *Bot) syncWatchByCheckWa(ctx context.Context, chat types.JID, checkWa, canonical string) {
+	b.syncWatchByCheck(ctx, chat, checkWa, canonical, true)
+}
+
+// syncWatchByCheckNow — то же, но наблюдение заводится сразу (для команд
+// ассистента: ответ владельцу и так идёт после них).
+func (b *Bot) syncWatchByCheckNow(ctx context.Context, chat types.JID, checkWa, canonical string) {
+	b.syncWatchByCheck(ctx, chat, checkWa, canonical, false)
+}
+
+func (b *Bot) syncWatchByCheck(ctx context.Context, chat types.JID, checkWa, canonical string, async bool) {
 	if b.cmf == nil || checkWa == "" || canonical == "" {
 		return
 	}
@@ -457,7 +516,16 @@ func (b *Bot) syncWatchByCheckWa(ctx context.Context, chat types.JID, checkWa, c
 	// «это не дубль») — наблюдения за ним ещё нет: заводим.
 	if info, ok, err := b.db.ReceiptWatchInfoByMessage(ctx, checkWa); err == nil && ok && !info.HasWatch && info.Countable {
 		if copyOf, _ := b.db.IsGroupForwardCopy(ctx, info.RawID); !copyOf {
-			b.cmfWatchReceipt(ctx, chat, info.SenderJID, canonical, info.Amount, info.TxDate, info.RawID)
+			run := func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+				defer cancel()
+				b.cmfWatchReceipt(ctx, chat, info.SenderJID, canonical, info.Amount, info.TxDate, info.RawID)
+			}
+			if async {
+				go run() // поиск в программе — в фоне, разбор сообщений его не ждёт
+			} else {
+				run()
+			}
 			return
 		}
 	}
@@ -554,10 +622,15 @@ func extractQuotedText(msg *events.Message) string {
 // того клиента (тёзку/однофамильца): спрашиваем в группе ответом на сам чек
 // («за кого этот платёж?»), ответ понимает applyCmfWatchAnswer.
 func (b *Bot) cmfResolveWatch(ctx context.Context, watchID int, chat types.JID, clientText string, amount float64) {
-	clients, kind, err := b.cmfLookupWithTypos(ctx, clientText)
+	// Поиск в программе — не дольше минуты (программа может висеть).
+	lctx, cancel := context.WithTimeout(ctx, time.Minute)
+	clients, kind, err := b.cmfLookupWithTypos(lctx, clientText)
+	cancel()
+	b.cmfNoteResult(err, chat)
 	if err != nil {
 		// Программа не ответила — оставляем «lookup»: фоновая проверка повторит.
 		fmt.Println("cmf lookup:", err)
+		_ = b.db.TouchCmfWatch(context.Background(), watchID)
 		return
 	}
 	if kind == cmfExact || kind == cmfStrong {
@@ -607,24 +680,38 @@ func (b *Bot) cmfWatcherLoop() {
 	if b.cmf == nil {
 		return
 	}
+	run := func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+		defer cancel()
+		b.cmfCheckDue(ctx)
+	}
+	time.Sleep(2 * time.Minute) // после запуска не ждём полчаса
+	run()
 	ticker := time.NewTicker(30 * time.Minute)
 	defer ticker.Stop()
 	for range ticker.C {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-		b.cmfCheckDue(ctx)
-		cancel()
+		run()
 	}
 }
 
 // cmfRetryLookups — чеки, по которым программа не ответила при поиске клиента
-// (статус lookup, старше 10 минут), ищем ещё раз.
-func (b *Bot) cmfRetryLookups(ctx context.Context) {
-	ws, err := b.db.ListCmfWatches(ctx, []string{"lookup"}, 20)
+// (статус lookup, старше 10 минут), ищем ещё раз: самые давно проверенные
+// первыми, до 30 дней (раньше через 3 суток чек бросался навсегда).
+func (b *Bot) cmfRetryLookups(ctx context.Context) { b.cmfRetryLookupsN(ctx, 20) }
+
+// cmfRetryLookupsAll — связь вернулась: перепроверить все отложенные.
+func (b *Bot) cmfRetryLookupsAll(ctx context.Context) { b.cmfRetryLookupsN(ctx, 300) }
+
+func (b *Bot) cmfRetryLookupsN(ctx context.Context, limit int) {
+	ws, err := b.db.LookupWatchesForRetry(ctx, limit)
 	if err != nil {
 		return
 	}
 	for _, w := range ws {
-		if w.ClientText == "" || time.Since(w.CreatedAt) < 10*time.Minute || time.Since(w.CreatedAt) > 72*time.Hour {
+		if ctx.Err() != nil {
+			return
+		}
+		if w.ClientText == "" || time.Since(w.CreatedAt) < 10*time.Minute || time.Since(w.CreatedAt) > 30*24*time.Hour {
 			continue
 		}
 		jid, err := types.ParseJID(w.GroupJID)
@@ -632,17 +719,25 @@ func (b *Bot) cmfRetryLookups(ctx context.Context) {
 			continue
 		}
 		b.cmfResolveWatch(ctx, w.ID, jid, w.ClientText, w.Amount)
+		if b.cmfDown() {
+			return // программа всё ещё не отвечает — остальные подождут
+		}
 	}
 }
 
 func (b *Bot) cmfCheckDue(ctx context.Context) {
 	b.ensureMissingWatches(ctx)
+	b.repairNonameWatches(ctx)
 	b.cmfRetryLookups(ctx)
 	due, err := b.db.DueCmfWatches(ctx, time.Now().Add(-cmfRemindAfter()), 30)
 	if err != nil {
 		fmt.Println("cmf: ошибка выборки наблюдений:", err)
 		return
 	}
+	// Записи после обращений к программе — со своим сроком: если общий срок
+	// прохода истёк, отправленное напоминание всё равно должно запомниться.
+	wctx, wcancel := context.WithTimeout(context.Background(), time.Minute)
+	defer wcancel()
 	// Собираем неотмеченные по ГРУППЕ, чтобы послать ОДНО напоминание со списком
 	// клиентов, а не по сообщению на каждый чек (меньше шума, как просил владелец).
 	type rem struct {
@@ -650,21 +745,13 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		client string
 		amount float64
 		date   time.Time
-		check  bool // похожая оплата есть, но сверка не уверена — «проверьте»
+		check  bool   // похожая оплата есть, но сверка не уверена — «проверьте»
+		group  string // группа чека (для напоминания владельцу в личку)
 	}
 	byGroup := map[string][]rem{}
 	var order []string
-	// Судим чеки клиента вместе, как сверка: одна оплата — один чек. Уже
-	// напомненные — тоже: внесли с тех пор — закрываем (иначе «внеси в
-	// программу» потом брал бы их дату).
-	reminded, _ := b.db.RemindedCmfWatches(ctx, time.Now().AddDate(0, 0, -60), 100)
-	all := append(append([]db.CmfWatch(nil), due...), reminded...)
-	verdicts := b.judgeClientWatches(ctx, all)
-	for _, w := range reminded {
-		if v, ok := verdicts[w.ID]; ok && v.v.entered() {
-			_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "found")
-		}
-	}
+	// Судим чеки клиента вместе, как сверка: одна оплата — один чек.
+	verdicts := b.judgeClientWatches(ctx, due)
 	// Копии одного чека (в группе СБ и в основной) — одно напоминание.
 	type itemKey struct {
 		client string
@@ -674,7 +761,7 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 	// напоминание не «съедает»).
 	primary := map[itemKey]int{}
 	primarySilent := map[itemKey]bool{}
-	for _, w := range all {
+	for _, w := range due {
 		v, ok := verdicts[w.ID]
 		if !ok {
 			continue
@@ -689,36 +776,41 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 			primary[k], primarySilent[k] = w.ID, silent
 		}
 	}
+	var copies []int // копии напомненного чека — помечаем вместе с ним
 	for _, w := range due {
 		needCheck := false
 		if v, ok := verdicts[w.ID]; ok {
 			if v.v.entered() {
-				_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "found")
+				_ = b.db.UpdateCmfWatch(wctx, w.ID, "", "", "", "", "found")
 				fmt.Printf("cmf: платёж %s на %.0f ₽ найден в программе\n", w.ClientName, w.Amount)
 				continue
 			}
 			needCheck = v.v.needsCheck()
 			if primary[itemKey{w.ClientID, v.item}] != w.ID {
-				// Тот же чек, присланный в другую группу: напоминание идёт по первому.
-				_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "reminded")
+				copies = append(copies, w.ID) // тот же чек в другой группе: напоминание по первому
 				continue
 			}
 		} else {
+			gj, _ := types.ParseJID(w.GroupJID)
 			found, err := b.cmf.HasPaymentAround(ctx, w.ClientID, w.Amount, w.TxDate, 5)
+			b.cmfNoteResult(err, gj)
 			if err != nil {
 				fmt.Println("cmf: ошибка проверки платежа:", err)
+				// Отметка «проверяли»: очередь идёт дальше, не застревая на нём.
+				_ = b.db.TouchCmfWatch(wctx, w.ID)
 				continue
 			}
 			if found {
-				_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "found")
+				_ = b.db.UpdateCmfWatch(wctx, w.ID, "", "", "", "", "found")
 				fmt.Printf("cmf: платёж %s на %.0f ₽ найден в программе\n", w.ClientName, w.Amount)
 				continue
 			}
 		}
-		_ = b.db.UpdateCmfWatch(ctx, w.ID, "", "", "", "", "reminded")
-		// Группа чека заглушена, а его копия переслана в другую — напоминаем там.
+		// Группа чека заглушена — напоминаем в группе копии, а если её нет —
+		// владельцу в личку (иначе напоминание пропало бы навсегда).
 		target := w.GroupJID
 		if jid, err := types.ParseJID(target); err == nil && b.groupSilent(jid) {
+			target = "dm"
 			if gs, err := b.db.ForwardCopyGroups(ctx, w.WaMessageID); err == nil {
 				for _, g := range gs {
 					if gj, err := types.ParseJID(g); err == nil && !b.groupSilent(gj) {
@@ -731,18 +823,45 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 		if _, ok := byGroup[target]; !ok {
 			order = append(order, target)
 		}
-		byGroup[target] = append(byGroup[target], rem{w.ID, w.ClientName, w.Amount, w.TxDate, needCheck})
+		byGroup[target] = append(byGroup[target], rem{w.ID, w.ClientName, w.Amount, w.TxDate, needCheck, w.GroupJID})
+	}
+	for _, id := range copies {
+		_ = b.db.UpdateCmfWatch(wctx, id, "", "", "", "", "reminded")
 	}
 
+	groupNames := map[types.JID]string{}
+	if len(byGroup["dm"]) > 0 {
+		groupNames = b.joinedGroups(ctx)
+	}
 	for _, gj := range order {
+		items := byGroup[gj]
+		markAll := func(askID string) {
+			for _, it := range items {
+				_ = b.db.UpdateCmfWatch(wctx, it.id, "", "", "", "", "reminded")
+				if askID != "" {
+					_ = b.db.SetCmfWatchAsk(wctx, it.id, askID, "")
+				}
+			}
+		}
+		if gj == "dm" {
+			var sb strings.Builder
+			sb.WriteString("⏰ В программе пока НЕ отмечены (в группе я молчу, поэтому пишу вам):")
+			for _, it := range items {
+				g := ""
+				if jid, err := types.ParseJID(it.group); err == nil && groupNames[jid] != "" {
+					g = " — группа «" + groupNames[jid] + "»"
+				}
+				fmt.Fprintf(&sb, "\n• %s — %.0f ₽ (чек %s)%s", it.client, it.amount, it.date.Format("02.01"), g)
+			}
+			if b.notifyOwners(sb.String()) {
+				markAll("")
+			} // владельца нет — чек ждёт, пока в группе снова можно писать
+			continue
+		}
 		jid, err := types.ParseJID(gj)
 		if err != nil {
 			continue
 		}
-		if b.groupSilent(jid) {
-			continue // в этой группе бот молчит — напоминания не шлём
-		}
-		items := byGroup[gj]
 		var sb strings.Builder
 		if len(items) == 1 {
 			it := items[0]
@@ -754,8 +873,9 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 					it.date.Format("02.01"), it.amount, it.client)
 			}
 			// Ответом на сам чек и со связью: поправку («это не он») поймём по этому чеку.
-			if w, ok, err := b.db.CmfWatchByID(ctx, it.id); err == nil && ok && w.GroupJID == gj {
-				b.cmfSay(ctx, jid, w, sb.String())
+			if w, ok, err := b.db.CmfWatchByID(wctx, it.id); err == nil && ok && w.GroupJID == gj {
+				markAll("")
+				b.cmfSay(wctx, jid, w, sb.String())
 				continue
 			}
 		} else {
@@ -768,10 +888,18 @@ func (b *Bot) cmfCheckDue(ctx context.Context) {
 				fmt.Fprintf(&sb, "\n• %s — %.0f ₽ (чек %s)%s", it.client, it.amount, it.date.Format("02.01"), note)
 			}
 		}
-		id := b.sendTextReturnID(jid, sb.String())
-		if id != "" {
-			for _, it := range items {
-				_ = b.db.SetCmfWatchAsk(ctx, it.id, id, "")
+		markAll(b.sendTextReturnID(jid, sb.String()))
+	}
+
+	// Уже напомненные: внесли с тех пор — закрываем (иначе «внеси в программу»
+	// потом брал бы их дату). Понемногу за проход, самые давно проверенные.
+	if reminded, err := b.db.RemindedCmfWatches(ctx, time.Now().AddDate(0, 0, -14), 10); err == nil && len(reminded) > 0 {
+		vs := b.judgeClientWatches(ctx, reminded)
+		for _, w := range reminded {
+			if v, ok := vs[w.ID]; ok && v.v.entered() {
+				_ = b.db.UpdateCmfWatch(wctx, w.ID, "", "", "", "", "found")
+			} else {
+				_ = b.db.TouchCmfWatch(wctx, w.ID)
 			}
 		}
 	}
@@ -844,13 +972,14 @@ func (b *Bot) cmfStatusTool() ai.Tool {
 			"(по умолчанию сегодня) и проверяет по каждому, внесён ли платёж в программу. Показывает: внесённые, " +
 			"НЕ внесённые (их надо добавить), и чеки, клиента которых нет в программе. Вызывай ВСЕГДА при вопросах " +
 			"'какие чеки не внесены', 'какие сегодняшние чеки добавлены', 'чеки каких клиентов внесены', " +
-			"'проверь сверку'. Не отвечай про сверку по памяти — всегда вызывай этот инструмент.",
+			"'проверь сверку', 'внесён ли чек Каталова' (тогда укажи client). Не отвечай про сверку по памяти — всегда вызывай этот инструмент.",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
 				"from_date": map[string]any{"type": "string", "description": "Начало периода YYYY-MM-DD (пусто = сегодня)"},
 				"to_date":   map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD (пусто = сегодня)"},
 				"group":     map[string]any{"type": "string", "description": "Название группы (пусто = все)"},
+				"client":    map[string]any{"type": "string", "description": "ФИО клиента, если спрашивают про его чек («внесён ли чек Каталова?») — проверю только его"},
 			},
 			"required": []string{},
 		},
@@ -859,6 +988,7 @@ func (b *Bot) cmfStatusTool() ai.Tool {
 				FromDate string `json:"from_date"`
 				ToDate   string `json:"to_date"`
 				Group    string `json:"group"`
+				Client   string `json:"client"`
 			}
 			_ = json.Unmarshal(input, &args)
 			now := time.Now()
@@ -882,7 +1012,10 @@ func (b *Bot) cmfStatusTool() ai.Tool {
 				}
 				groupJID = jid.String()
 			}
-			return b.cmfReconcile(ctx, from, to, groupJID)
+			if strings.TrimSpace(args.Client) != "" && args.FromDate == "" {
+				from = from.AddDate(0, 0, -30) // про чек клиента — за последний месяц
+			}
+			return b.cmfReconcileFor(ctx, from, to, groupJID, args.Client)
 		},
 	}
 }

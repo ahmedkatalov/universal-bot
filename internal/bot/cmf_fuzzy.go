@@ -8,8 +8,10 @@ package bot
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"unicode"
 
 	"whatsapp-bot/internal/cmf"
@@ -205,34 +207,63 @@ func cmfQueryVariants(words []string) []string {
 // числу совпавших по буквам слов. strong=true — ровно один кандидат совпал по
 // ВСЕМ значимым словам запроса (уверенно считаем, что это он).
 func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.ClientInfo, strong bool) {
+	clients, strong, _ = b.cmfFuzzyByWordsErr(ctx, name)
+	return clients, strong
+}
+
+// cmfFuzzyByWordsErr — то же, плюс ошибка программы: если часть запросов не
+// прошла и никого не нашли, это НЕ «такого клиента нет» — сверка повторит.
+func (b *Bot) cmfFuzzyByWordsErr(ctx context.Context, name string) (clients []cmf.ClientInfo, strong bool, lookupErr error) {
 	if b.cmf == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	qWords := normWords(name)
 	if len(qWords) == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 
 	byID := map[string]cmf.ClientInfo{}
 	queries := cmfQueryVariants(qWords)
 	const maxQueries = 6 // меньше запросов на имя: не забиваем программу (в сверке десятки имён)
+	if len(queries) > maxQueries {
+		queries = queries[:maxQueries]
+	}
+	// Запросы — параллельно (каждый ждал бы по очереди до 30 с).
+	type res struct {
+		found []cmf.ClientInfo
+		err   error
+	}
+	out := make([]res, len(queries))
+	var wg sync.WaitGroup
 	for i, q := range queries {
-		if i >= maxQueries {
-			break
-		}
-		found, err := b.cmf.LookupClients(ctx, q)
-		if err != nil {
+		wg.Add(1)
+		go func(i int, q string) {
+			defer wg.Done()
+			f, err := b.cmf.LookupClients(ctx, q)
+			out[i] = res{f, err}
+		}(i, q)
+	}
+	wg.Wait()
+	for _, r := range out {
+		if r.err != nil {
+			if lookupErr == nil {
+				lookupErr = r.err
+			}
 			continue
 		}
-		for _, c := range found {
+		for _, c := range r.found {
 			if c.ID != "" {
 				byID[c.ID] = c
 			}
 		}
 	}
-	if len(byID) == 0 {
-		return nil, false
+	if lookupErr != nil {
+		fmt.Printf("cmf: поиск похожих на %q — часть запросов не прошла: %v\n", name, lookupErr)
 	}
+	if len(byID) == 0 {
+		return nil, false, lookupErr
+	}
+	lookupErr = nil
 
 	type scored struct {
 		c cmf.ClientInfo
@@ -259,7 +290,7 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 		}
 	}
 	if best == 0 {
-		return nil, false
+		return nil, false, nil
 	}
 	// Все похожие, правдоподобные — первыми: покрывающие имя, затем с той же
 	// фамилией (родственник не должен теряться за десятком тёзок), затем по
@@ -316,7 +347,7 @@ func (b *Bot) cmfFuzzyByWords(ctx context.Context, name string) (clients []cmf.C
 	// Уверенно — когда ровно ОДИН кандидат действительно покрывает имя: каждое
 	// слово совпало строго (склонение, гласная, пропущенная буква — да; другое
 	// имя/фамилия — нет), отчество не принято за фамилию, инициалы не спорят.
-	return clients, coveringUnique(name, clients) >= 0
+	return clients, coveringUnique(name, clients) >= 0, nil
 }
 
 // coveringUnique — индекс единственного кандидата, покрывающего имя (−1 — нет
@@ -370,7 +401,10 @@ func (b *Bot) cmfLookupWithTypos(ctx context.Context, name string) ([]cmf.Client
 	if k := coveringUnique(name, direct); k >= 0 {
 		return []cmf.ClientInfo{direct[k]}, cmfExact, nil
 	}
-	cands, strong := b.cmfFuzzyByWords(ctx, name)
+	cands, strong, ferr := b.cmfFuzzyByWordsErr(ctx, name)
+	if ferr != nil && len(cands) == 0 && len(direct) == 0 {
+		return nil, cmfNoMatch, ferr // программа не ответила — это не «нет такого клиента»
+	}
 	for _, d := range direct { // прямые находки — тоже кандидаты
 		dup := false
 		for _, c := range cands {

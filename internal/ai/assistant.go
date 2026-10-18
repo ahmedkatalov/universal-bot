@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -164,7 +165,113 @@ type Assistant struct {
 	// Лимит токенов ответа по типу запроса (OPENROUTER_MAX_TOKENS / _VISION_MAX_TOKENS).
 	chatMaxTokens   int
 	visionMaxTokens int
+
+	// Предохранитель: ИИ-сервис подряд не отвечает (таймауты, 5xx, 429, нет
+	// баланса) — на короткое время отвечаем ошибкой сразу, не заставляя каждое
+	// сообщение ждать минутами. Вызывающие при ошибке откатываются на запасной
+	// разбор и очередь повторов.
+	brMu       sync.Mutex
+	brFails    int
+	brOpenTill time.Time
+	brLastErr  error
 }
+
+// Общие сроки на один запрос (вместе с повторами и резервными моделями), если
+// вызывающий не задал свой: разбор текста, чтение чека, диалог с инструментами.
+var (
+	completeBudget = envDuration("OPENROUTER_COMPLETE_TIMEOUT", 40*time.Second)
+	visionBudget   = envDuration("OPENROUTER_VISION_TIMEOUT", 60*time.Second)
+	replyBudget    = envDuration("OPENROUTER_REPLY_TIMEOUT", 4*time.Minute)
+)
+
+const (
+	breakerThreshold = 3                // подряд неудач до «размыкания»
+	breakerCooldown  = 90 * time.Second // сколько отвечаем ошибкой сразу
+)
+
+func envDuration(key string, def time.Duration) time.Duration {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return def
+}
+
+// withBudget — ctx со сроком не дольше d (если у вызывающего срок короче — его).
+func withBudget(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, d)
+}
+
+// breakerCheck — сервис недавно подряд не отвечал: ошибка сразу.
+func (a *Assistant) breakerCheck() error {
+	a.brMu.Lock()
+	defer a.brMu.Unlock()
+	if time.Now().Before(a.brOpenTill) {
+		if a.brLastErr != nil {
+			return a.brLastErr
+		}
+		return &ProviderError{"timeout", "ИИ-сервис сейчас не отвечает. Попробуй через минуту.", "breaker open"}
+	}
+	return nil
+}
+
+// breakerNote — учесть результат запроса к сервису.
+func (a *Assistant) breakerNote(err error) {
+	a.brMu.Lock()
+	defer a.brMu.Unlock()
+	if err == nil {
+		a.brFails, a.brOpenTill, a.brLastErr = 0, time.Time{}, nil
+		return
+	}
+	var pe *ProviderError
+	if !errors.As(err, &pe) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			pe = &ProviderError{"timeout", "ИИ-сервис отвечает слишком долго. Попробуй через минуту.", err.Error()}
+		} else {
+			return
+		}
+	}
+	switch pe.Category {
+	case "timeout", "server", "rate_limit", "credits", "model":
+	default:
+		return // ошибка запроса (длинный контекст, непонятный ответ) — сервис жив
+	}
+	a.brFails++
+	a.brLastErr = pe
+	if a.brFails >= breakerThreshold {
+		a.brOpenTill = time.Now().Add(breakerCooldown)
+		fmt.Printf("ИИ: %d неудачных запросов подряд (%s) — %v отвечаю ошибкой сразу\n", a.brFails, pe.Category, breakerCooldown)
+	}
+}
+
+// LastProblem — короткое объяснение для владельца, почему ИИ сейчас не отвечает
+// ("" — всё в порядке).
+func (a *Assistant) LastProblem() string {
+	a.brMu.Lock()
+	defer a.brMu.Unlock()
+	if a.brLastErr == nil || !time.Now().Before(a.brOpenTill) {
+		return ""
+	}
+	return UserMessage(a.brLastErr)
+}
+
+// Healthy — последний запрос к ИИ-сервису прошёл успешно.
+func (a *Assistant) Healthy() bool {
+	a.brMu.Lock()
+	defer a.brMu.Unlock()
+	return a.brFails == 0
+}
+
+// ResetBreaker — владелец явно просит повторить («перечитай»): пробуем сразу.
+func (a *Assistant) ResetBreaker() {
+	a.brMu.Lock()
+	a.brFails, a.brOpenTill = 0, time.Time{}
+	a.brMu.Unlock()
+}
+
+// Degraded — ИИ-сервис сейчас считается недоступным (предохранитель разомкнут).
+func (a *Assistant) Degraded() bool { return a.breakerCheck() != nil }
 
 // New создаёт клиента OpenRouter. apiKey — значение OPENROUTER_API_KEY.
 // model — id модели в каталоге OpenRouter (например, "anthropic/claude-sonnet-4.6");
@@ -189,7 +296,7 @@ func New(apiKey, model, visionModel, baseURL string) *Assistant {
 		model:                model,
 		visionModel:          visionModel,
 		baseURL:              strings.TrimRight(baseURL, "/"),
-		http:                 &http.Client{Timeout: 90 * time.Second},
+		http:                 &http.Client{Timeout: envDuration("OPENROUTER_HTTP_TIMEOUT", 60*time.Second)},
 		fallbackModels:       splitModels(os.Getenv("OPENROUTER_FALLBACK_MODELS")),
 		visionFallbackModels: splitModels(os.Getenv("OPENROUTER_VISION_FALLBACK_MODELS")),
 		chatMaxTokens:        envInt("OPENROUTER_MAX_TOKENS", defaultChatMaxTokens),
@@ -281,6 +388,8 @@ type chatResponse struct {
 // инструмент, Reply выполняет его через tool.Handle и отдаёт результат
 // обратно модели, пока не получит финальный текстовый ответ.
 func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem string, tools []Tool, history []Turn, userText string) (string, error) {
+	ctx, cancel := withBudget(ctx, replyBudget)
+	defer cancel()
 	messages := make([]chatMessage, 0, len(history)+2)
 	messages = append(messages, systemWithCache(staticSystem, dynamicSystem))
 	for _, t := range history {
@@ -391,6 +500,8 @@ func toolCallNames(calls []toolCall) string {
 // плюс один пользовательский текст -> текст ответа. Используется внутренними
 // модулями бота (доразбор нераспознанных сообщений и чеков), а не для диалога.
 func (a *Assistant) Complete(ctx context.Context, systemPrompt, userText string) (string, error) {
+	ctx, cancel := withBudget(ctx, completeBudget)
+	defer cancel()
 	msg, _, err := a.chat(ctx, []chatMessage{
 		{Role: "system", Content: systemPrompt},
 		{Role: "user", Content: userText},
@@ -427,6 +538,11 @@ type visionRequest struct {
 // изображение (фото чека) и отвечает по нему. mimeType — "image/jpeg"
 // или "image/png".
 func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userText string, image []byte, mimeType string) (string, error) {
+	ctx, cancel := withBudget(ctx, visionBudget)
+	defer cancel()
+	if err := a.breakerCheck(); err != nil {
+		return "", err
+	}
 	dataURL := "data:" + mimeType + ";base64," + base64.StdEncoding.EncodeToString(image)
 	models := append([]string{a.visionModel}, a.visionFallbackModels...)
 	var lastErr error
@@ -447,10 +563,14 @@ func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userTex
 		}
 		body, status, terr := a.postCompletions(ctx, payload)
 		msg, cerr := interpretText(body, status, terr)
+		a.breakerNote(cerr)
 		if cerr == nil {
 			return msg, nil
 		}
 		lastErr = cerr
+		if ctx.Err() != nil {
+			return "", cerr // срок вышел — резервные модели не пробуем
+		}
 		var pe *ProviderError
 		if errors.As(cerr, &pe) && shouldFallback(pe.Category) {
 			continue // пробуем следующую vision-модель
@@ -483,6 +603,9 @@ func (a *Assistant) PingVision(ctx context.Context) error {
 }
 
 func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []toolDef) (chatMessage, string, error) {
+	if err := a.breakerCheck(); err != nil {
+		return chatMessage{}, "", err
+	}
 	models := append([]string{a.model}, a.fallbackModels...)
 	var lastErr error
 	for _, model := range models {
@@ -497,10 +620,14 @@ func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []to
 		}
 		body, status, terr := a.postCompletions(ctx, payload)
 		msg, finish, cerr := interpretChat(body, status, terr)
+		a.breakerNote(cerr)
 		if cerr == nil {
 			return msg, finish, nil
 		}
 		lastErr = cerr
+		if ctx.Err() != nil {
+			return chatMessage{}, "", cerr // срок вышел — резервные модели не пробуем
+		}
 		var pe *ProviderError
 		if errors.As(cerr, &pe) && shouldFallback(pe.Category) {
 			continue // основная модель недоступна/перегружена — пробуем резервную
@@ -574,6 +701,10 @@ func (a *Assistant) postCompletions(ctx context.Context, payload []byte) (body [
 			lastErr = err
 			if ctx.Err() != nil {
 				return nil, 0, ctx.Err()
+			}
+			var ne interface{ Timeout() bool }
+			if errors.As(err, &ne) && ne.Timeout() {
+				return nil, 0, err // ждали целую минуту — повтор только затянет ответ
 			}
 			continue // сетевой сбой — если контекст жив, пробуем снова
 		}

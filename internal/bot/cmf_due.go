@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	"whatsapp-bot/internal/db"
@@ -64,7 +65,7 @@ func (b *Bot) judgeDueWatches(ctx context.Context, l *dueLedger, clientID string
 	}
 	isHis := func(name string) bool {
 		for _, n := range names {
-			if n != "" && sameClientName(name, n) {
+			if n != "" && sameNameMemo(name, n) {
 				return true
 			}
 		}
@@ -155,15 +156,41 @@ func (b *Bot) judgeClientWatches(ctx context.Context, ws []db.CmfWatch) map[int]
 			byClient[w.ClientID] = append(byClient[w.ClientID], w)
 		}
 	}
-	for cid, cws := range byClient {
-		vs, err := b.judgeDueWatches(ctx, ledger, cid, cws)
-		if err != nil {
-			fmt.Println("cmf: сверка клиента для напоминания не удалась:", err)
-			continue
-		}
-		for id, v := range vs {
-			out[id] = v
-		}
+	// Клиентов проверяем параллельно (по 4): каждый — несколько запросов к
+	// программе, по очереди проход по десяткам клиентов шёл минутами.
+	type job struct {
+		cid string
+		ws  []db.CmfWatch
 	}
+	jobs := make(chan job)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for k := 0; k < 4; k++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				vs, err := b.judgeDueWatches(ctx, ledger, j.cid, j.ws)
+				b.cmfNoteResult(err)
+				if err != nil {
+					fmt.Println("cmf: сверка клиента для напоминания не удалась:", err)
+					continue
+				}
+				mu.Lock()
+				for id, v := range vs {
+					out[id] = v
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+	for cid, cws := range byClient {
+		if ctx.Err() != nil {
+			break
+		}
+		jobs <- job{cid, cws}
+	}
+	close(jobs)
+	wg.Wait()
 	return out
 }
