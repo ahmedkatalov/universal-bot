@@ -95,6 +95,27 @@ func firstMoneyNumber(s string) string {
 // а «22 т.е.» и «15 тренировок» — нет.
 var amountSuffixRe = regexp.MustCompile(`(?i)^(\s*)(кк|к|k|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:\.?\s?(?:р|руб[а-яё]*|₽))?\.?(?:$|\s|[^\p{L}\d\s](?:[^\p{L}]|$))`)
 
+// ThousandsMultiplier — множитель суффикса тысяч/миллионов сразу после числа
+// base (rest — текст после числа): 1000 («22т», «5к», «25 тыщ», «15 т.р.»),
+// 1 000 000 («3 млн», «2 ляма», «1кк») или 0 — суффикса нет. Одна буква
+// «к/k/т» через пробел после числа от 1000 — не тысячи: «Отдал 15000 к Адаму» —
+// «к» тут предлог. Одно правило и для разбора сообщений, и для подсказки/
+// страховки суммы ИИ (иначе ИИ-страховка делала из 15000 — 15 000 000).
+func ThousandsMultiplier(rest string, base float64) float64 {
+	m := amountSuffixRe.FindStringSubmatch(rest)
+	if m == nil || base <= 0 {
+		return 0
+	}
+	mult := strings.ToLower(m[2])
+	if single := mult == "к" || mult == "k" || mult == "т"; single && m[1] != "" && base >= 1000 {
+		return 0
+	}
+	if mult == "кк" || strings.HasPrefix(mult, "млн") || strings.HasPrefix(mult, "лям") {
+		return 1_000_000
+	}
+	return 1000 // к, т, тыс, тыщ, косарь
+}
+
 // dateTokenRe — «18.10», «18.10.26», «18.10.2026»: дата, а не сумма.
 var dateTokenRe = regexp.MustCompile(`^(\d{1,2})\.(\d{1,2})(?:\.(\d{2}|\d{4}))?$`)
 
@@ -128,19 +149,10 @@ func amountHits(text string) []amountHit {
 	for _, sp := range moneyNumberSpans(text) {
 		tok := text[sp[0]:sp[1]]
 		base := moneyValue(tok)
-		if m := amountSuffixRe.FindStringSubmatch(text[sp[1]:]); m != nil {
-			mult := strings.ToLower(m[2])
-			// «Отдал 15000 к Адаму» — «к» тут предлог, а не тысячи.
-			single := mult == "к" || mult == "k" || mult == "т"
-			if !(single && m[1] != "" && base >= 1000) && base > 0 {
-				switch {
-				case mult == "кк" || strings.HasPrefix(mult, "млн") || strings.HasPrefix(mult, "лям"):
-					out = append(out, amountHit{v: base * 1_000_000, start: sp[0], end: sp[1], real: true})
-				default: // к, т, тыс, тыщ, косарь
-					out = append(out, amountHit{v: base * 1000, start: sp[0], end: sp[1], real: true})
-				}
-				continue
-			}
+		// «Отдал 15000 к Адаму» — «к» тут предлог, а не тысячи (ThousandsMultiplier).
+		if k := ThousandsMultiplier(text[sp[1]:], base); k > 0 {
+			out = append(out, amountHit{v: base * k, start: sp[0], end: sp[1], real: true})
+			continue
 		}
 		if isDateToken(tok) || isClockToken(text, sp[0], sp[1]) {
 			continue
