@@ -530,6 +530,9 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// другого клиента на вопрос по экрану возвращает экран в учёт, удалят
 		// полный чек — экран снова в работе.
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS superseded_by_raw INT`,
+		// Человек ответил «другой» на «похоже, это тот же чек» — назовут клиента,
+		// бот не переспрашивает «тот же?» по слабому совпадению.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_denied BOOLEAN NOT NULL DEFAULT false`,
 		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
 		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,

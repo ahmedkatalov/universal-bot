@@ -40,6 +40,7 @@ type completedReceipt struct {
 	client               string
 	p                    PrintedReceipt
 	guessed, collapsed   bool
+	denied               bool // человек уже ответил «другой» на «похоже, тот же чек»
 }
 
 func (d *DB) loadCompletedReceipt(ctx context.Context, id int) (completedReceipt, bool, error) {
@@ -52,14 +53,14 @@ func (d *DB) loadCompletedReceipt(ctx context.Context, id int) (completedReceipt
 		       COALESCE(c.canonical_name, br.recipient_raw, ''),
 		       `+printedRecipientOf("br")+`, COALESCE(br.sender_raw, ''), COALESCE(br.bank, ''),
 		       COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''), COALESCE(br.amount, 0)::float8, br.tx_date,
-		       br.tx_time_guessed, br.collapsed
+		       br.tx_time_guessed, br.collapsed, br.same_check_denied
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE br.id = $1`, id).
 		Scan(&r.groupJID, &r.sender, &r.wa, &r.received, &r.live, &r.named, &r.contactID, &r.client,
 			&r.p.Recipient, &r.p.Sender, &r.p.Bank, &r.p.DocNumber, &r.p.AuthCode, &r.p.Amount, &r.p.TxDate,
-			&r.guessed, &r.collapsed)
+			&r.guessed, &r.collapsed, &r.denied)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, false, nil
 	}
@@ -194,7 +195,8 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 	// клиент, сумма, карта, и чек сделан не позже, чем прислали этот. И когда
 	// дочитали сумму, и когда назвали клиента (экран «Перевод выполнен» без
 	// даты, названный в ответ на вопрос бота, при уже засчитанном полном чеке).
-	if allowTentative && r.named && r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
+	// Человек уже сказал про этот чек «другой» — это слабое совпадение не ищем.
+	if allowTentative && !r.denied && r.named && r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
 		ownerNorm := printedNorm("$6::text")
 		senderNorm := printedNorm("$7::text")
 		err = d.pool.QueryRow(ctx, `
@@ -230,11 +232,12 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 }
 
 // UndoReceiptDuplicate — человек сказал, что чек сообщения waID не повтор, а
-// отдельный платёж: снова учитываем его. needsReview — клиент у него ещё не
+// отдельный платёж: снова учитываем его (и запоминаем ответ — «тот же?» по
+// слабому совпадению больше не спрашиваем). needsReview — клиент у него ещё не
 // назван (спросить «чей чек?»).
 func (d *DB) UndoReceiptDuplicate(ctx context.Context, waID string) (found bool, amount float64, client string, needsReview bool, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts br SET is_duplicate = false, superseded_by_raw = NULL
+		UPDATE bank_receipts br SET is_duplicate = false, superseded_by_raw = NULL, same_check_denied = true
 		WHERE br.id = (
 			SELECT b2.id FROM bank_receipts b2 JOIN raw_messages rm ON rm.id = b2.raw_message_id
 			WHERE rm.wa_message_id = $1 AND COALESCE(rm.deleted, false) = false

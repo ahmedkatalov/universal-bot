@@ -4301,11 +4301,11 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			same, e := b.db.DedupeCompletedReceipt(ctx, rid, false, true)
 			if e != nil {
 				fmt.Println("Ошибка проверки повтора чека без времени операции:", e)
-			} else if same.Found && same.VictimIsThis {
-				b.reportSameCheck(ctx, chat, waMsgID, senderJID, same, false)
-				return
 			} else if same.Found {
 				b.reportSameCheck(ctx, chat, waMsgID, senderJID, same, false)
+				if same.VictimIsThis {
+					return // в сбор не идёт, пока не ответят «другой»
+				}
 			}
 		}
 	}

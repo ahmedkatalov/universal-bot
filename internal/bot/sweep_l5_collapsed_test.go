@@ -312,6 +312,22 @@ func TestL5collapsed_11_ScreenAfterCheckAnswers(t *testing.T) {
 		t.Errorf("экран другого перевода после «другой» и ФИО: сбор %v, ожидали Исаев Харон 5000 + Магомедов Ахмед 5000", got)
 	}
 
+	// «другой», а потом ТОТ ЖЕ клиент (заплатил дважды по 5000): работник уже
+	// сказал, что это другой платёж, — бот не переспрашивает «тот же?».
+	e = newE2E(t, e2eOpts{WithAI: true})
+	e.ai = l5collapsedVision(op)
+	grp, emp = e2eGroup("scr6"), user("79001115934")
+	l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", op.Format("15:04:05")), "Исаев Харон", "")
+	l4intakePhoto(e, grp, emp, "Сафаи", "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", "")
+	q = e.lastWith("НЕПОЛНЫМ")
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "другой", q.ID, e.botJID(), q.Text))
+	a = e.lastWith("Чей он")
+	n := len(e.sent())
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаев Харон", a.ID, e.botJID(), a.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+		t.Errorf("«другой» и тот же клиент: сбор %v, ожидали Исаев Харон 10000 (бот: %v)", got, e.sentSince(n))
+	}
+
 	// Два засчитанных полных чека на ту же сумму — какой из них, не угадываем.
 	e = newE2E(t, e2eOpts{WithAI: true})
 	e.ai = l5collapsedVision(op)
