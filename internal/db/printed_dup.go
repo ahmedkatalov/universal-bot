@@ -47,6 +47,29 @@ type PrintedTwin struct {
 // времени молча не решаем — спрашиваем человека.
 func MinutePrecision(t time.Time) bool { return t.Second() == 0 && t.Nanosecond() == 0 }
 
+// sameOpTimeSQL — время операции двух чеков (a и b; *Guessed — время не с
+// чека, а по сообщению) не мешает считать их одним и тем же чеком. Если оба
+// времени НАПЕЧАТАНЫ на чеках, то копия того же чека печатает то же время: до
+// секунды, а если хоть один чек печатает только минуты (ВТБ, РСХБ) — та же
+// минута. Разное напечатанное время — разные операции (крупный платёж, разбитый
+// по лимиту банка на переводы с разницей в минуты). Окно DuplicateWindow — только
+// когда время хоть одного чека угадано.
+func sameOpTimeSQL(aTx, aGuessed, bTx, bGuessed string) string {
+	return fmt.Sprintf(`(CASE WHEN %[2]s OR %[4]s
+		THEN abs(extract(epoch FROM %[1]s - %[3]s)) <= %[5]d
+		ELSE (%[1]s = %[3]s
+		      OR ((extract(second FROM %[1]s) = 0 OR extract(second FROM %[3]s) = 0)
+		          AND date_trunc('minute', %[1]s) = date_trunc('minute', %[3]s))) END)`,
+		aTx, aGuessed, bTx, bGuessed, int(DuplicateWindow/time.Second))
+}
+
+// sameStrongIDSQL — у чеков a и b общий номер операции или код авторизации
+// (NULL-безопасно: номер хранится NULL, если его нет на чеке).
+func sameStrongIDSQL(aDoc, aAuth, bDoc, bAuth string) string {
+	return fmt.Sprintf(`COALESCE((NULLIF(%[1]s, '') IS NOT NULL AND %[1]s = %[3]s)
+		OR (NULLIF(%[2]s, '') IS NOT NULL AND %[2]s = %[4]s), false)`, aDoc, aAuth, bDoc, bAuth)
+}
+
 // printedNorm — сравнение печатных строк без пробелов, знаков и «ё».
 func printedNorm(expr string) string {
 	return `regexp_replace(lower(translate(COALESCE(` + expr + `, ''), 'ёЁ', 'еЕ')), '[[:space:][:punct:]]+', '', 'g')`

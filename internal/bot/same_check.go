@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 
 	"whatsapp-bot/internal/db"
@@ -222,4 +223,142 @@ func (b *Bot) answerForRepeatedCheck(ctx context.Context, chat types.JID, waID, 
 		b.registerSameCheckAsk(id, sameCheckAsk{checkWa: waID})
 	}
 	return true, true
+}
+
+// crossClientAsk — «этот чек уже прислан в другой группе как otherClient, а
+// здесь подписан thisClient — чей он?».
+type crossClientAsk struct {
+	thisWa, otherWa         string // копия чека в этой группе и в другой
+	otherGroup              string // JID другой группы
+	thisClient, otherClient string
+}
+
+func (b *Bot) registerCrossClientAsk(botMsgID string, a crossClientAsk) {
+	if botMsgID == "" || a.thisWa == "" {
+		return
+	}
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if len(b.clarify.crossAsks) >= clarifyMapCap {
+		for k := range b.clarify.crossAsks {
+			delete(b.clarify.crossAsks, k)
+			break
+		}
+	}
+	b.clarify.crossAsks[botMsgID] = a
+}
+
+// askCrossGroupClient — чек, подписанный здесь клиентом client, с тем же
+// номером операции уже засчитан в ДРУГОЙ группе на другого клиента: один из
+// работников ошибся. Платёж один (отчёт склеивает копии), но клиент чека — ФИО
+// рядом с ним, а рядом с ним два разных ФИО: молча по первой подписи не решаем,
+// спрашиваем в этой группе.
+func (b *Bot) askCrossGroupClient(ctx context.Context, chat types.JID, rawID int, waMsgID, senderJID, client string, cid *int, docNumber, authCode string, amount float64, txDate time.Time) {
+	if waMsgID == "" || client == "" || b.groupSilent(chat) {
+		return
+	}
+	copies, err := b.db.NamedCopiesInOtherGroups(ctx, chat.String(), rawID, docNumber, authCode, amount, txDate, cid)
+	if err != nil {
+		fmt.Println("Проверка чека в других группах не удалась:", err)
+		return
+	}
+	for _, o := range copies {
+		if sameClientMoney(o.Client, client) || clientNamePartMoney(o.Client, client) {
+			// Тот же клиент, записанный иначе («Харон» и «Исаев Харон»), — у чека
+			// один номер операции, спорить не о чем.
+			continue
+		}
+		where := o.GroupJID
+		if j, err := types.ParseJID(o.GroupJID); err == nil {
+			where = b.groupLabel(ctx, j)
+		}
+		id := b.sendReply(chat, fmt.Sprintf(
+			"🤔 Этот чек уже прислан в %s как %s, а здесь подписан %s. Чей он — %s или %s? "+
+				"Ответьте на это сообщение ФИО клиента — поправлю чек в обеих группах.",
+			where, o.Client, client, o.Client, client), waMsgID, senderJID)
+		fmt.Printf("Чек %s: тот же чек в %s записан на %s, здесь — на %s: спросил, чей он\n", waMsgID, o.GroupJID, o.Client, client)
+		b.registerCrossClientAsk(id, crossClientAsk{
+			thisWa: waMsgID, otherWa: o.WaMessage, otherGroup: o.GroupJID,
+			thisClient: client, otherClient: o.Client,
+		})
+		return
+	}
+}
+
+// crossKeepWords — «оставь как есть»: ответ не меняет ни одну копию.
+var crossKeepWords = []string{"оставь", "оставьте", "как было", "как есть", "не трогай"}
+
+// applyCrossClientAnswer — ответ на «этот чек уже прислан в другой группе как
+// X — чей он?»: названный клиент становится клиентом ОБЕИХ копий чека.
+func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID string, a crossClientAsk, text string) bool {
+	done := func() {
+		b.clarify.mu.Lock()
+		delete(b.clarify.crossAsks, askID)
+		b.clarify.mu.Unlock()
+	}
+	low := cleanAnswer(text)
+	for _, w := range crossKeepWords {
+		if strings.Contains(low, w) {
+			done()
+			b.sendText(chat, "Ок, оставил как было.")
+			return true
+		}
+	}
+	rest := withoutSameCheckWords(text)
+	if rest == "" {
+		return false
+	}
+	is := func(name string) bool { return sameClientMoney(rest, name) || clientNamePartMoney(rest, name) }
+	name := ""
+	switch this, other := is(a.thisClient), is(a.otherClient); {
+	case this && other:
+		b.sendText(chat, fmt.Sprintf("Не понял, чей чек. Ответьте на вопрос одним ФИО: %s или %s.", a.otherClient, a.thisClient))
+		return true
+	case this:
+		name = a.thisClient
+	case other:
+		name = a.otherClient
+	default:
+		// Назвали третьего клиента — ему и принадлежит чек.
+		c, ok := b.confirmClientName(ctx, rest)
+		if !ok {
+			return false
+		}
+		name = c
+	}
+	canonical, _ := b.aliases.ResolveName(name)
+	var cid *int
+	if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+		cid = &id
+	}
+	fixed := 0
+	for _, cp := range []struct{ wa, group string }{{a.thisWa, chat.String()}, {a.otherWa, a.otherGroup}} {
+		if cp.wa == "" {
+			continue
+		}
+		found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, cp.wa, canonical, cid, 0)
+		if err != nil {
+			fmt.Println("Поправка клиента чека не удалась:", err)
+			continue
+		}
+		if !found {
+			continue
+		}
+		fixed++
+		if g, err := types.ParseJID(cp.group); err == nil {
+			b.reresolveWatchByCheck(ctx, g, cp.wa, canonical)
+		}
+	}
+	done()
+	if fixed == 0 {
+		b.sendText(chat, "Этот чек уже не найден (удалён или исключён) — ничего не менял.")
+		return true
+	}
+	where := a.otherGroup
+	if j, err := types.ParseJID(a.otherGroup); err == nil {
+		where = b.groupLabel(ctx, j)
+	}
+	fmt.Printf("Чек %s: клиент %s — поправил и копию в %s\n", a.thisWa, canonical, a.otherGroup)
+	b.sendText(chat, fmt.Sprintf("Поправил: чек на клиента %s — и здесь, и в %s.", canonical, where))
+	return true
 }
