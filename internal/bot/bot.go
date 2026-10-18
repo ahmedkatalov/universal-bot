@@ -3251,6 +3251,8 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 			"('верни тот чек на 5000') → action=restore; чек ошибочно посчитан дублем и его надо засчитать " +
 			"('это не дубль, засчитай чек Миланы на 25000') → action=not_duplicate. " +
 			"Чек и текст про него («Магомедов Ахмед 5000» рядом с чеком) — ОДИН платёж: исключаются вместе. " +
+			"Текст-итог платежа частями («Магомедов Ахмед 15000» про чеки 10000 + 5000) — тоже один платёж со всеми " +
+			"своими чеками: без kind исключается весь платёж, с kind=text — только текст (чеки остаются в сборе). " +
 			"Если один платёж записан дважды (чек и отдельный такой же текст, два одинаковых текста) — исключай " +
 			"лишнюю запись, указав kind и/или sender («исключи текст Ислама» → kind=text, sender=Ислам). " +
 			"В группе исключение касается только этой группы: если тот же чек прислан и в другую группу, " +
@@ -3417,7 +3419,7 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 					for j, e := range entries {
 						switch {
 						case j == i:
-						case len(e.pay.Checks) > 0:
+						case e.withChecks():
 							res.extraPaired = true
 						default:
 							res.extraLeft++
@@ -3438,7 +3440,13 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				op := entries[0].op
 				if args.Action == "exclude" {
 					// Владелец назвал именно эту запись (kind/sender) — только её.
-					res, err := b.excludePayment(ctx, entries[0], idx, opKind(args.Kind) != "" || sender != "", groupJID)
+					// Итог платежа частями — только если сказал «текст» (kind):
+					// иначе «убери платёж на 15000» — весь платёж со всеми чеками.
+					only := opKind(args.Kind) != "" || sender != ""
+					if entries[0].split != nil {
+						only = opKind(args.Kind) != ""
+					}
+					res, err := b.excludePayment(ctx, entries[0], idx, only, groupJID)
 					if err != nil {
 						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
 					}
