@@ -506,7 +506,9 @@ func parseCmfAnswer(text, caption string, cands []cmf.ClientInfo) (ans cmfAnswer
 		}
 	}
 	name, amount, deferToAI := clarifyNameFromReply(text)
-	if deferToAI || amount > 0 || name == "" {
+	// Сумма в ответе (даже неясная: «Исаев 15000 20000») — это не выбор клиента.
+	_, ambiguous := parser.ExtractSingleAmount(text)
+	if deferToAI || amount > 0 || ambiguous || name == "" {
 		return cmfAnswer{Kind: ansOther}, false
 	}
 	if caption != "" && nameCovers(stripFillers(strings.ToLower(name)), caption) {

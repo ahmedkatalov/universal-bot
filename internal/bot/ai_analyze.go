@@ -382,17 +382,15 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 }
 
-// reMoneyToken — числовые токены в тексте: «10.000», «72,600», «30 000», «31».
-var reMoneyToken = regexp.MustCompile(`\d[\d.,]*(?:[ \x{00a0}]\d{3})*`)
-
 // reDateLikeToken — «08.09», «8.9.26», «08.09.2026»: это дата, а не сумма.
 var reDateLikeToken = regexp.MustCompile(`^\d{1,2}\.\d{1,2}(?:\.\d{2,4})?$`)
 
 // reThousandsSuffix — суффикс тысяч/миллионов сразу после числа («31 т», «5к»,
 // «3 млн», «25 тысяч», «2 ляма», «5 косарей»). Хвосты склонений [а-яё]* — как в
 // parser.reShorthand (без них «тысяч/косарей/ляма» не распознавались). За
-// суффиксом не должна идти буква («т.е.» — не тысячи).
-var reThousandsSuffix = regexp.MustCompile(`(?i)^\s*(кк|к|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:$|\s|[^\p{L}\d\s](?:[^\p{L}]|$))`)
+// суффиксом не должна идти буква («т.е.» — не тысячи); рубли после суффикса
+// допускаем: «15тр», «15 т.р.», «15 тыс.руб».
+var reThousandsSuffix = regexp.MustCompile(`(?i)^\s*(кк|к|тыщ[а-яё]*|тыс[а-яё]*|т|млн|лям[а-яё]*|косар[а-яё]*)(?:\.?\s?(?:р|руб[а-яё]*|₽))?\.?(?:$|\s|[^\p{L}\d\s](?:[^\p{L}]|$))`)
 
 // looksLikeClockToken — токен из 1–2 цифр вплотную к двоеточию (часы/минуты в
 // «12:30»). Так «12»/«30» из времени не считаются суммой, а «35.000» из
@@ -453,7 +451,9 @@ func precededByNonAmountMarker(text string, start int) bool {
 
 func moneyTokens(text string) []float64 {
 	var out []float64
-	for _, m := range reMoneyToken.FindAllStringIndex(text, -1) {
+	// Числа — как их читает парсер: «30 000» — одно число, а «15000 200» и
+	// «15000\n20000» — два (раньше склеивались в одну огромную сумму).
+	for _, m := range parser.MoneyNumberSpans(text) {
 		tok := strings.Trim(text[m[0]:m[1]], ".,")
 		if tok == "" {
 			continue

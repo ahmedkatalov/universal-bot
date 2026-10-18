@@ -211,8 +211,6 @@ var fieldRules = []fieldRule{
 	{"status", regexp.MustCompile(`(?i)^статус\s*:?\s*(.*)$`)},
 }
 
-var moneyRe = regexp.MustCompile(`\d[\d\s.,]*\d|\d`)
-
 // Дата/время операции на чеке — два реальных формата:
 //
 //	"26 июня 2026 22:58:35 (МСК)"   — день + название месяца (родительный падеж) + год + время
@@ -240,61 +238,215 @@ var (
 	}
 )
 
-// detectTxTime ищет дату/время операции построчно. Строки с явным словом
-// "дата" проверяются в первую очередь — это надёжнее, чем случайное первое
-// совпадение шаблона где-то ещё на чеке.
+// notOperationDateRe — даты на чеке, которые НЕ дата операции: когда квитанцию
+// сформировали/распечатали/выдали (у PDF это обычно момент скачивания — утром
+// следующего дня), дата рождения.
+var notOperationDateRe = regexp.MustCompile(`(?i)формир|печат|выдач|выдан|рожд`)
+
+// operationDateLabelRe — подпись именно даты/времени операции.
+var operationDateLabelRe = regexp.MustCompile(`(?i)операци|перевод|платеж|платёж|оплат|списани`)
+
+// detectTxTime ищет дату/время ОПЕРАЦИИ построчно (по ней чек идёт в отчёт).
+// «Дата формирования/печати» не годится ни в одном из проходов — ни сама
+// строка, ни значение под такой подписью. Порядок: явная «дата операции» с
+// временем; «дата операции» без времени + «Время операции»; любая строка
+// «дата» с временем; любая дата с временем; любая «дата» без времени; и лишь
+// когда даты операции нет совсем — дата формирования/печати.
 func detectTxTime(lines []string) (time.Time, bool) {
-	for _, l := range lines {
-		if strings.Contains(strings.ToLower(l), "дата") {
-			if t, ok := parseDateTimeFromLine(l); ok {
+	skip := make([]bool, len(lines))
+	for i, l := range lines {
+		if !notOperationDateRe.MatchString(l) {
+			continue
+		}
+		skip[i] = true
+		// «Дата формирования» без значения — значение строкой ниже.
+		if j := dateValueBelow(lines, i); j >= 0 {
+			skip[j] = true
+		}
+	}
+	// valueLine — строка со значением подписи i: она сама или (если в ней нет
+	// даты) следующая строка с датой («Дата операции\n17.10.2026 23:40»).
+	valueLine := func(i int) string {
+		if j := dateValueBelow(lines, i); j >= 0 && !skip[j] {
+			return lines[j]
+		}
+		return lines[i]
+	}
+	isOpLabel := func(i int) bool {
+		low := strings.ToLower(lines[i])
+		return !skip[i] && (strings.Contains(low, "дата") || strings.Contains(low, "врем")) && operationDateLabelRe.MatchString(low)
+	}
+	// 1. «Дата (и время) операции/перевода/платежа» с временем.
+	for i := range lines {
+		if isOpLabel(i) {
+			if t, ok := parseDateTimeFromLine(valueLine(i)); ok {
 				return t, true
 			}
 		}
 	}
-	for _, l := range lines {
+	// 2. «Дата операции: 17.10.2026» и время отдельно («Время операции: 23:40»).
+	for i := range lines {
+		if isOpLabel(i) && strings.Contains(strings.ToLower(lines[i]), "дата") {
+			if t, ok := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
+				return t, true
+			}
+		}
+	}
+	// 3. Любая строка «дата» с временем.
+	for i, l := range lines {
+		if !skip[i] && strings.Contains(strings.ToLower(l), "дата") {
+			if t, ok := parseDateTimeFromLine(valueLine(i)); ok {
+				return t, true
+			}
+		}
+	}
+	// 4. Любая дата с временем.
+	for i, l := range lines {
+		if skip[i] {
+			continue
+		}
 		if t, ok := parseDateTimeFromLine(l); ok {
 			return t, true
 		}
 	}
-	// «Дата операции: 30.09.2026» и время отдельной строкой («Время операции:
-	// 23:40») — или вовсе без времени: дата с чека важнее даты присылки.
+	// 5. «Дата: 30.09.2026» без времени (или время отдельной строкой): дата с
+	// чека важнее даты присылки.
+	for i, l := range lines {
+		if !skip[i] && strings.Contains(strings.ToLower(l), "дата") {
+			if t, ok := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
+				return t, true
+			}
+		}
+	}
+	// 6. Даты операции на чеке нет вовсе — «Дата формирования» всё же ближе к
+	// операции, чем время присылки (PDF скачали сразу, прислали позже). Дата
+	// рождения/выдачи документа — никогда.
 	for i, l := range lines {
 		low := strings.ToLower(l)
-		if !strings.Contains(low, "дата") || strings.Contains(low, "рожд") || strings.Contains(low, "формир") {
+		if !skip[i] || strings.Contains(low, "рожд") || strings.Contains(low, "выда") || !notOperationDateRe.MatchString(l) {
 			continue
 		}
-		m := numericDateOnlyRe.FindStringSubmatch(l)
-		if m == nil {
-			if v := strings.TrimSpace(nextNonEmptyLine(lines, i+1)); v != "" {
-				m = numericDateOnlyRe.FindStringSubmatch(v)
-			}
+		v := l
+		if j := dateValueBelow(lines, i); j >= 0 {
+			v = lines[j]
 		}
-		if m == nil {
-			continue
+		if t, ok := parseDateTimeFromLine(v); ok {
+			return t, true
 		}
-		day, _ := strconv.Atoi(m[1])
-		mon, _ := strconv.Atoi(m[2])
-		year, _ := strconv.Atoi(m[3])
-		if mon < 1 || mon > 12 || day < 1 || day > 31 {
-			continue
-		}
-		hour, min, sec := 12, 0, 0
-		for k := i; k < len(lines) && k <= i+3; k++ {
-			if tm := timeOnlyRe.FindStringSubmatch(lines[k]); tm != nil {
-				hour, _ = strconv.Atoi(tm[1])
-				min, _ = strconv.Atoi(tm[2])
-				if tm[3] != "" {
-					sec, _ = strconv.Atoi(tm[3])
-				}
-				break
-			}
-		}
-		if hour > 23 || min > 59 {
-			hour, min, sec = 12, 0, 0
-		}
-		return time.Date(year, time.Month(mon), day, hour, min, sec, 0, time.Local), true
 	}
 	return time.Time{}, false
+}
+
+// dateOnlyIn — дата «дд.мм.гггг» в строке.
+func dateOnlyIn(s string) (time.Time, bool) {
+	m := numericDateOnlyRe.FindStringSubmatch(s)
+	if m == nil {
+		return time.Time{}, false
+	}
+	day, _ := strconv.Atoi(m[1])
+	mon, _ := strconv.Atoi(m[2])
+	year, _ := strconv.Atoi(m[3])
+	if mon < 1 || mon > 12 || day < 1 || day > 31 {
+		return time.Time{}, false
+	}
+	return time.Date(year, time.Month(mon), day, 0, 0, 0, 0, time.Local), true
+}
+
+// dateWithSeparateTime — дата из value (подпись в строке i) и время к ней:
+// строка «Время операции/перевода» где угодно на чеке, иначе время в ближайших
+// строках под датой, иначе время любой даты-со-временем ТОГО ЖЕ дня, иначе
+// полдень. Строки формирования/печати (skip) не смотрим.
+func dateWithSeparateTime(lines []string, skip []bool, i int, value string) (time.Time, bool) {
+	d, ok := dateOnlyIn(value)
+	if !ok {
+		return time.Time{}, false
+	}
+	at := func(tm []string) (time.Time, bool) {
+		hour, _ := strconv.Atoi(tm[1])
+		min, _ := strconv.Atoi(tm[2])
+		sec := 0
+		if tm[3] != "" {
+			sec, _ = strconv.Atoi(tm[3])
+		}
+		if hour > 23 || min > 59 || sec > 59 {
+			return time.Time{}, false
+		}
+		return time.Date(d.Year(), d.Month(), d.Day(), hour, min, sec, 0, time.Local), true
+	}
+	for k, l := range lines {
+		low := strings.ToLower(l)
+		if skip[k] || !strings.Contains(low, "врем") || !operationDateLabelRe.MatchString(low) {
+			continue
+		}
+		v := l
+		if timeOnlyRe.FindStringSubmatch(v) == nil {
+			if j := nextNonEmptyIndex(lines, k+1); j >= 0 && !skip[j] {
+				v = lines[j]
+			}
+		}
+		if tm := timeOnlyRe.FindStringSubmatch(v); tm != nil {
+			if t, ok := at(tm); ok {
+				return t, true
+			}
+		}
+	}
+	for k := i; k < len(lines) && k <= i+3; k++ {
+		if skip[k] {
+			continue
+		}
+		if tm := timeOnlyRe.FindStringSubmatch(lines[k]); tm != nil {
+			if t, ok := at(tm); ok {
+				return t, true
+			}
+		}
+	}
+	for k, l := range lines {
+		if skip[k] {
+			continue
+		}
+		if t, ok := parseDateTimeFromLine(l); ok && t.Year() == d.Year() && t.YearDay() == d.YearDay() {
+			return t, true
+		}
+	}
+	return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, time.Local), true
+}
+
+// lineHasDate — в строке есть дата (числом или словом месяца).
+func lineHasDate(s string) bool {
+	if _, ok := dateOnlyIn(s); ok {
+		return true
+	}
+	if _, ok := parseDateTimeFromLine(s); ok {
+		return true
+	}
+	return namedDateTimeRe.MatchString(s)
+}
+
+// dateValueBelow — у подписи i без даты («Дата операции») значение — следующая
+// непустая строка с датой, которая сама не подпись. −1 — нет такой.
+func dateValueBelow(lines []string, i int) int {
+	if lineHasDate(lines[i]) {
+		return -1
+	}
+	j := nextNonEmptyIndex(lines, i+1)
+	if j < 0 || !lineHasDate(lines[j]) {
+		return -1
+	}
+	low := strings.ToLower(lines[j])
+	if strings.Contains(low, "дата") || strings.Contains(low, "врем") {
+		return -1
+	}
+	return j
+}
+
+// nextNonEmptyIndex — номер следующей непустой строки (−1 — нет).
+func nextNonEmptyIndex(lines []string, from int) int {
+	for i := from; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != "" {
+			return i
+		}
+	}
+	return -1
 }
 
 func parseDateTimeFromLine(line string) (time.Time, bool) {
@@ -671,38 +823,12 @@ func isFieldLabel(s string) bool {
 //	"35.000"       -> 35000    (точка + РОВНО 3 цифры — разделитель тысяч!)
 //	"20.000р"      -> 20000
 //	"844,03"       -> 844.03
+//
+// Берётся ПЕРВОЕ число строки. Пробел склеивает цифры только как разделитель
+// тысяч («15 000», «1 500 000,00»): «15000 18.10» -> 15000, а не 1500018.10, и
+// перенос строки числа не склеивает.
 func ParseMoneyValue(s string) float64 {
-	m := moneyRe.FindString(s)
-	if m == "" {
-		return 0
-	}
-	cleaned := strings.TrimSpace(m)
-	cleaned = strings.ReplaceAll(cleaned, " ", "")
-	cleaned = strings.ReplaceAll(cleaned, "\u00a0", "")
-
-	// Если и точка и запятая: точка — тысячи, запятая — десятичные ("1.234,56")
-	if strings.Contains(cleaned, ".") && strings.Contains(cleaned, ",") {
-		cleaned = strings.ReplaceAll(cleaned, ".", "")
-		cleaned = strings.ReplaceAll(cleaned, ",", ".")
-	} else {
-		// Разделители тысяч: одна или несколько групп ровно по 3 цифры
-		// ("35.000", "1,500", "2.500.000", "1,234,567") — убираем их. Иначе
-		// единственный разделитель с 1-2 цифрами после — десятичная часть
-		// ("844,03", "10000.00").
-		thousandsRe := regexp.MustCompile(`^\d{1,3}([.,]\d{3})+$`)
-		if thousandsRe.MatchString(cleaned) {
-			cleaned = strings.ReplaceAll(cleaned, ".", "")
-			cleaned = strings.ReplaceAll(cleaned, ",", "")
-		} else {
-			cleaned = strings.ReplaceAll(cleaned, ",", ".")
-		}
-	}
-
-	val, err := strconv.ParseFloat(cleaned, 64)
-	if err != nil {
-		return 0
-	}
-	return val
+	return moneyValue(firstMoneyNumber(s))
 }
 
 func nextNonEmptyLine(lines []string, from int) string {

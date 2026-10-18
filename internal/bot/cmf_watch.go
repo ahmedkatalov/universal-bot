@@ -101,9 +101,18 @@ func looksLikeName(text string) (string, bool) {
 		return "", false
 	}
 	var nameWords []string
+	prevNum := false
 	for _, w := range strings.Fields(name) {
 		// слова с цифрами (суммы "25.000", "20т") в имя не берём
 		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+			prevNum = true
+			continue
+		}
+		// хвост суммы «15 т.р.», «15 тыс.руб», «15000 руб.» — не часть ФИО
+		afterNum := prevNum
+		prevNum = false
+		if parser.IsMoneyWord(w, afterNum) {
+			prevNum = afterNum // «15 тыс. руб.» — хвост из нескольких слов
 			continue
 		}
 		// Обрезаем НЕбуквенные края слова: эмодзи/знаки, прилипшие к имени
