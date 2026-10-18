@@ -522,6 +522,9 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE INDEX IF NOT EXISTS idx_raw_messages_fwd_sent ON raw_messages(fwd_sent_id) WHERE fwd_sent_id IS NOT NULL`,
 		// Копию чека поправил владелец в целевой группе — исходный её больше не перезаписывает.
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS mirror_locked BOOLEAN NOT NULL DEFAULT false`,
+		// Время операции на чеке НЕ прочиталось — в tx_date время сообщения
+		// (по нему нельзя сравнивать «тот же чек» с точным временем другого).
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS tx_time_guessed BOOLEAN NOT NULL DEFAULT false`,
 		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
 		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,
@@ -1465,6 +1468,7 @@ type BankReceiptInput struct {
 	TxDate            time.Time // время ОПЕРАЦИИ (с чека, если распозналось), не время получения сообщения
 	Collapsed         bool      // свёрнутый экран банка (без даты/номера/получателя) — ждёт полного чека
 	Ignored           bool      // в сбор не идёт (например, перевод отклонён банком)
+	TxTimeGuessed     bool      // время операции с чека не прочиталось — TxDate это время сообщения
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
@@ -1472,12 +1476,12 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 		INSERT INTO bank_receipts
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
 			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
-			 client_confirmed, group_jid, submitted_by, tx_date, collapsed, ignored, client_source_raw_id)
-		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NULLIF($24, 0))
+			 client_confirmed, group_jid, submitted_by, tx_date, collapsed, ignored, client_source_raw_id, tx_time_guessed)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NULLIF($24, 0), $25)
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
 		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
 		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
-		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed, r.Ignored, r.ClientSourceRawID)
+		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed, r.Ignored, r.ClientSourceRawID, r.TxTimeGuessed)
 	return err
 }
 
@@ -1509,40 +1513,78 @@ type SupersededCollapsed struct {
 //
 // Возвращает атрибуцию заменённого свёрнутого чека: если он был привязан к
 // клиенту, вызывающий переносит клиента на полный чек (иначе платёж выпал бы).
-func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID string, amount float64, before time.Time) (SupersededCollapsed, error) {
+//
+// rank решает, ТОТ ЛИ это платёж и насколько вероятно (nil — любой свёрнутый,
+// самый свежий): 0 — точно не тот (свёрнутый, уже записанный на клиента А, — не
+// тот же платёж, что полный чек, подписанный клиентом Б, даже на ту же сумму;
+// его не трогаем, иначе платёж А молча пропал бы). Из подходящих берём с самым
+// высоким рангом (свёрнутый ТОГО ЖЕ клиента важнее ничьего), при равенстве —
+// самый свежий.
+func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID string, amount float64, before time.Time, rank func(SupersededCollapsed) int) (SupersededCollapsed, error) {
 	var res SupersededCollapsed
 	if amount <= 0 || groupJID == "" || senderJID == "" {
 		return res, nil
 	}
-	var contactID *int
-	var recipientRaw string
-	var clientConfirmed bool
-	err := d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts SET is_duplicate = true
-		WHERE id = (
-			SELECT br.id FROM bank_receipts br
-			JOIN raw_messages rm ON rm.id = br.raw_message_id
-			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-			  AND rm.sender_jid = $2
-			  AND br.amount = $3::numeric
-			  AND br.collapsed = true
-			  AND br.is_duplicate = false AND br.ignored = false
-			  AND rm.received_at >= $4::timestamptz - interval '3 days' AND rm.received_at <= $4::timestamptz
-			ORDER BY rm.received_at DESC LIMIT 1
-		)
-		RETURNING contact_id, COALESCE(recipient_raw, ''), client_confirmed
-	`, groupJID, senderJID, amount, before).Scan(&contactID, &recipientRaw, &clientConfirmed)
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.id, br.contact_id, COALESCE(br.recipient_raw, ''), br.client_confirmed
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.amount = $3::numeric
+		  AND br.collapsed = true
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND rm.received_at >= $4::timestamptz - interval '3 days' AND rm.received_at <= $4::timestamptz
+		ORDER BY rm.received_at DESC LIMIT 20
+	`, groupJID, senderJID, amount, before)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return res, nil
-		}
 		return res, err
 	}
-	res.Found = true
-	res.ContactID = contactID
-	res.RecipientRaw = recipientRaw
-	res.ClientConfirmed = clientConfirmed
-	return res, nil
+	type cand struct {
+		id int
+		c  SupersededCollapsed
+	}
+	var cands []cand
+	for rows.Next() {
+		var x cand
+		if err := rows.Scan(&x.id, &x.c.ContactID, &x.c.RecipientRaw, &x.c.ClientConfirmed); err != nil {
+			rows.Close()
+			return res, err
+		}
+		x.c.Found = true
+		cands = append(cands, x)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return res, err
+	}
+	ranks := make([]int, len(cands))
+	for i, x := range cands {
+		ranks[i] = 1
+		if rank != nil {
+			ranks[i] = rank(x.c)
+		}
+	}
+	for {
+		best := -1
+		for i := range cands {
+			if ranks[i] > 0 && (best < 0 || ranks[i] > ranks[best]) {
+				best = i // кандидаты идут от свежих к старым: при равном ранге — свежий
+			}
+		}
+		if best < 0 {
+			return res, nil
+		}
+		tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true
+			WHERE id = $1 AND is_duplicate = false AND collapsed = true`, cands[best].id)
+		if err != nil {
+			return res, err
+		}
+		if tag.RowsAffected() == 1 {
+			return cands[best].c, nil
+		}
+		ranks[best] = 0 // его уже кто-то заменил — берём следующий
+	}
 }
 
 // ClarifyReceipt — чек, по которому бот не уверен, чей это клиент, и хочет
@@ -1699,10 +1741,31 @@ func (d *DB) CountUnrecognized(ctx context.Context, groupJID string, olderThan t
 //   - пустой ответ (только «да/верно») просто снимает флаги (подтверждение).
 //
 // Возвращает итоговую сумму чека.
+//
+// Тот же чек, уже учтённый в группе, ищет DedupeCompletedReceipt (без вопроса в
+// группе, поэтому самое слабое совпадение — у чека не прочиталось время — не
+// ищет). Кто может спросить «тот же чек или другой?», вызывает
+// FillReceiptByMessageID и DedupeCompletedReceipt сам.
 func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (found bool, amount_ float64, needsReview bool, err error) {
+	rid, found, got, nr, err := d.FillReceiptByMessageID(ctx, waMessageID, name, contactID, amount)
+	if err != nil || !found {
+		return found, got, nr, err
+	}
+	if name != "" || amount > 0 {
+		// Чек стал «чьим» (или полным) — тот же чек, присланный ещё раз, больше не
+		// считаем вторым платежом.
+		if _, e := d.DedupeCompletedReceipt(ctx, rid, amount > 0, false); e != nil {
+			fmt.Println("Проверка повтора чека после ответа не удалась:", e)
+		}
+	}
+	return true, got, nr, nil
+}
+
+// FillReceiptByMessageID — FillReceiptByMessage без поиска повтора; возвращает
+// и id заполненного чека.
+func (d *DB) FillReceiptByMessageID(ctx context.Context, waMessageID, name string, contactID *int, amount float64) (rid int, found bool, amount_ float64, needsReview bool, err error) {
 	var got float64
 	var nr bool
-	var rid int
 	err = d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
 			card_owner    = CASE WHEN $2 = '' THEN card_owner ELSE COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')) END,
@@ -1732,15 +1795,15 @@ func (d *DB) FillReceiptByMessage(ctx context.Context, waMessageID, name string,
 		RETURNING id, amount::float8, needs_review
 	`, waMessageID, name, contactID, amount).Scan(&rid, &got, &nr)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, false, nil
+		return 0, false, 0, false, nil
 	}
 	if err != nil {
-		return false, 0, false, err
+		return 0, false, 0, false, err
 	}
 	if amount > 0 {
 		_ = d.SyncWatchWithReceipt(ctx, rid)
 	}
-	return true, got, nr, nil
+	return rid, true, got, nr, nil
 }
 
 // CountUnconfirmed — сколько чеков без подтверждённого клиента в группе старше
@@ -2027,9 +2090,14 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 	// той же группе — повышаем ОДНУ живую копию до оригинала. Иначе платёж исчез
 	// бы совсем: оригинал удалён, копия скрыта как дубль. Ровно одну (свежую) на
 	// каждый удалённый оригинал — чтобы не задвоить, если копий несколько.
+	// Копия без ФИО (клиентом у неё записан владелец карты), повышенная после
+	// удаления оригинала, снова ждёт ответа «чей чек?», а не уходит в сбор на
+	// владельца карты — подписан был оригинал или нет (копию-повтор вставляют
+	// без needs_review: клиента у оригинала не спрашивали дважды).
 	if _, e := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET is_duplicate = false
-		WHERE id IN (
+		UPDATE bank_receipts u SET is_duplicate = false,
+			needs_review = u.needs_review OR NOT u.client_confirmed
+		FROM (
 			SELECT DISTINCT ON (orig.id) dd.id
 			FROM bank_receipts orig
 			JOIN bank_receipts dd ON dd.id <> orig.id AND dd.is_duplicate = true AND dd.ignored = false
@@ -2038,12 +2106,21 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 					(NULLIF(orig.doc_number, '') IS NOT NULL AND dd.doc_number = orig.doc_number) OR
 					(NULLIF(orig.auth_code, '') IS NOT NULL AND dd.auth_code = orig.auth_code) OR
 					(dd.contact_id = orig.contact_id AND dd.amount = orig.amount
-					 AND abs(extract(epoch FROM dd.tx_date - orig.tx_date)) <= 300)
+					 AND abs(extract(epoch FROM dd.tx_date - orig.tx_date)) <= 300) OR
+					-- Тот же напечатанный чек (копия без ФИО при подписанном оригинале).
+					`+printedMatchSQL("dd", "orig")+` OR
+					-- Копия без прочитанного времени, признанная «похоже, тот же»
+					-- (DedupeCompletedReceipt): тот же клиент и сумма.
+					(dd.tx_time_guessed AND dd.client_confirmed AND orig.client_confirmed
+					 AND dd.contact_id = orig.contact_id AND dd.amount = orig.amount
+					 AND orig.tx_date <= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '2 minutes'
+					 AND orig.tx_date >= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '3 days')
 				)
 			JOIN raw_messages drm ON drm.id = dd.raw_message_id AND COALESCE(drm.deleted, false) = false
 			WHERE orig.raw_message_id = $1 AND orig.is_duplicate = false AND orig.ignored = false
 			ORDER BY orig.id, dd.created_at DESC
-		)
+		) sel
+		WHERE u.id = sel.id
 	`, rawID); e != nil {
 		fmt.Println("Промоут дубля после удаления оригинала не удался:", e)
 	}
@@ -4202,6 +4279,7 @@ func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name 
 // ReattributeReceiptByMessageFrom — то же, с запоминанием сообщения, которое
 // назвало клиента (удалят — привязка откатится).
 func (d *DB) ReattributeReceiptByMessageFrom(ctx context.Context, waMessageID, name string, contactID *int, sourceRawID int) (found bool, amount float64, err error) {
+	var rid int
 	var src any
 	if sourceRawID > 0 {
 		src = sourceRawID
@@ -4217,13 +4295,18 @@ func (d *DB) ReattributeReceiptByMessageFrom(ctx context.Context, waMessageID, n
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false
 			ORDER BY br.id DESC LIMIT 1
 		)
-		RETURNING amount::float8
-	`, waMessageID, name, contactID, src).Scan(&amount)
+		RETURNING id, amount::float8
+	`, waMessageID, name, contactID, src).Scan(&rid, &amount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return false, 0, nil
 	}
 	if err != nil {
 		return false, 0, err
+	}
+	// Чек получил клиента — тот же чек, присланный ещё раз, не считаем вторым
+	// платежом.
+	if _, e := d.DedupeCompletedReceipt(ctx, rid, false, false); e != nil {
+		fmt.Println("Проверка повтора чека после привязки клиента не удалась:", e)
 	}
 	return true, amount, nil
 }

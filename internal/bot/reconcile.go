@@ -270,6 +270,27 @@ func sameClientName(a, b string) bool { return sameClientNameWith(a, b, nameWord
 // («Магомедов» ≠ «Магометов»). Падежи, порядок слов, инициалы — как в сверке.
 func sameClientMoney(a, b string) bool { return sameClientNameWith(a, b, nameWordMoney) }
 
+// clientNamePartMoney — одно имя целиком входит в другое («Харон» и «Исаев
+// Харон», «Исаев» и «Исаев Харон Магомедович»): все полные слова короткого есть
+// в длинном (сравнение слов — как для денег), инициалы не спорят. Это не «тот же
+// клиент» вообще (Харонов много), а «совместимое» имя — годится там, где всё
+// остальное уже совпало (тот же работник, сумма, свёрнутый экран и полный чек).
+func clientNamePartMoney(a, b string) bool {
+	fa, ia := nameParts(a)
+	fb, ib := nameParts(b)
+	if len(fa) == 0 || len(fb) == 0 {
+		return false
+	}
+	if len(fa) > len(fb) {
+		fa, fb, ia, ib = fb, fa, ib, ia
+	}
+	score, ua, ub := matchNameWordsWith(fa, fb, nameWordMoney)
+	if score < len(fa) {
+		return false
+	}
+	return initialsAgree(ia, leftovers(fb, ub, ib)) && initialsAgree(ib, leftovers(fa, ua, ia))
+}
+
 func sameClientNameWith(a, b string, same func(a, b string) bool) bool {
 	ha, hb := hasHyphen(a), hasHyphen(b)
 	if ha == hb && sameClientNameOnce(a, b, same) {

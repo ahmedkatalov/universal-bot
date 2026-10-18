@@ -72,12 +72,14 @@ type RecognizedReceipt struct {
 	Commission float64
 	TxDate     time.Time
 	HasTxDate  bool
+	Declined   bool // банк перевод отклонил — денег нет, в сбор не идёт
 }
 
 // FillReceiptFromRetry заполняет чек данными, распознанными на повторе, и снимает
 // его с очереди. Клиента, уже подтверждённого владельцем (client_confirmed), НЕ
 // затираем — обновляем только банковские поля и сумму. needs_review снимаем лишь
-// если есть и сумма, и подтверждённый клиент.
+// если есть и сумма, и подтверждённый клиент. Отклонённый банком перевод
+// (Declined) в учёт не идёт: ignored, как при приёме чека.
 func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedReceipt) error {
 	_, err := d.pool.Exec(ctx, `
 		UPDATE bank_receipts SET
@@ -95,15 +97,18 @@ func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedRecei
 			commission    = CASE WHEN commission > 0 THEN commission
 			                     WHEN $9::numeric > 0 THEN $9::numeric ELSE commission END,
 			tx_date       = CASE WHEN $11 THEN $10::timestamptz ELSE tx_date END,
+			tx_time_guessed = CASE WHEN $11 THEN false ELSE tx_time_guessed END,
 			collapsed     = false,
 			recognition_status = 'ok',
 			next_retry_at      = NULL,
-			needs_review  = CASE WHEN (CASE WHEN $8::numeric > 0 THEN $8::numeric ELSE amount END) > 0
+			ignored       = ignored OR $12,
+			needs_review  = CASE WHEN $12 THEN false
+			                     WHEN (CASE WHEN $8::numeric > 0 THEN $8::numeric ELSE amount END) > 0
 			                          AND client_confirmed AND contact_id IS NOT NULL
 			                     THEN false ELSE true END
 		WHERE id = $1
 	`, id, r.Bank, r.Recipient, r.Sender, r.DocNumber, r.AuthCode, r.Status,
-		r.Amount, r.Commission, r.TxDate, r.HasTxDate)
+		r.Amount, r.Commission, r.TxDate, r.HasTxDate, r.Declined)
 	return err
 }
 

@@ -3550,20 +3550,21 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 		}
 
 		err = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
-			RawMessageID: pr.rawID,
-			Bank:         rd.Bank,
-			RecipientRaw: rd.Recipient,
-			SenderRaw:    rd.Sender,
-			ContactID:    contactIDPtr,
-			Amount:       rd.Amount,
-			Commission:   rd.Commission,
-			DocNumber:    rd.DocNumber,
-			AuthCode:     rd.AuthCode,
-			Status:       rd.Status,
-			NeedsReview:  !matched,
-			GroupJID:     groupJID.String(),
-			SubmittedBy:  sender,
-			TxDate:       txDate,
+			RawMessageID:  pr.rawID,
+			Bank:          rd.Bank,
+			RecipientRaw:  rd.Recipient,
+			SenderRaw:     rd.Sender,
+			ContactID:     contactIDPtr,
+			Amount:        rd.Amount,
+			Commission:    rd.Commission,
+			DocNumber:     rd.DocNumber,
+			AuthCode:      rd.AuthCode,
+			Status:        rd.Status,
+			NeedsReview:   !matched,
+			GroupJID:      groupJID.String(),
+			SubmittedBy:   sender,
+			TxDate:        txDate,
+			TxTimeGuessed: !rd.HasTxTime,
 		})
 		if err != nil {
 			fmt.Fprintf(&sb, "- ОШИБКА сохранения: %s, %.0f ₽ (%v)\n", canonical, rd.Amount, err)
@@ -3979,7 +3980,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			ClientSourceRawID: payerSrc,
 			RawMessageID:      rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
 			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
-			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true,
+			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true, TxTimeGuessed: !rd.HasTxTime,
 		}); err != nil {
 			fmt.Println("Ошибка сохранения неполного чека:", err)
 		}
@@ -4029,7 +4030,12 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			return
 		}
 		fmt.Printf("Чек (сообщение %d): не удалось распознать сумму/получателя, нужна ручная проверка\n", rawID)
-		_ = b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
+		// Клиента назвали рядом с чеком (подпись/имя перед ним) — записываем его
+		// сразу как подтверждённого, хоть сумма и не прочиталась. Иначе автоповтор
+		// распознавания заменил бы его владельцем карты с чека, а ответ одной
+		// суммой не засчитал бы чек и бот переспросил бы клиента, которого уже
+		// назвали.
+		in := db.BankReceiptInput{
 			ClientSourceRawID: payerSrc,
 			RawMessageID:      rawID,
 			Bank:              rd.Bank,
@@ -4043,7 +4049,19 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			NeedsReview:       true,
 			GroupJID:          chat.String(),
 			TxDate:            txDate,
-		})
+			TxTimeGuessed:     !rd.HasTxTime,
+		}
+		if payerOverride != "" {
+			canonical, _ := b.aliases.ResolveName(payerOverride)
+			if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+				in.ContactID = &cid
+				in.ClientConfirmed = true
+				in.CardOwner = cardOwner // получатель, как он напечатан на чеке
+			} else {
+				fmt.Println("Ошибка получения контакта для чека:", err)
+			}
+		}
+		_ = b.db.InsertBankReceipt(ctx, in)
 		if visionUnavailable {
 			// Зрение было недоступно — ставим на автоповтор распознавания.
 			_ = b.db.MarkReceiptForRetry(ctx, rawID, "vision unavailable", time.Now().Add(retryBackoff(0)))
@@ -4114,6 +4132,49 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if err != nil {
 		fmt.Println("Ошибка проверки дубля чека:", err)
 	}
+	// Чек без номера операции, присланный ещё раз (сначала без ФИО, потом с ФИО
+	// — или наоборот): «тот же клиент» тут не помогает — у неподписанной копии
+	// клиентом записан владелец карты. Сверяем то, что НАПЕЧАТАНО: получатель,
+	// сумма, точное время, плательщик, банк. Подписанная копия остаётся в учёте,
+	// неподписанная — повтор. Подписанные разными клиентами — не склеиваем.
+	twinAskedNote := ""
+	if !dupMatch.Found && !declined && senderJID != "" && rd.HasTxTime && rd.Amount > 0 && receiptRecipient != "" {
+		tw, err := b.db.FindPrintedTwin(ctx, chat.String(), 0, db.PrintedReceipt{
+			Recipient: receiptRecipient, Sender: rd.Sender, Bank: rd.Bank,
+			DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Amount: rd.Amount, TxDate: txDate,
+		})
+		if err != nil {
+			fmt.Println("Ошибка проверки повтора чека по напечатанному:", err)
+		} else if tw.Found {
+			sameNamed := tw.Named && ((contactIDPtr != nil && tw.ContactID != nil && *tw.ContactID == *contactIDPtr) ||
+				sameClientMoney(tw.Client, payerOverride))
+			// Время на чеке только до минуты (ВТБ): два разных перевода в одну
+			// минуту бывают — подписанный и неподписанный молча не склеиваем, у
+			// неподписанного спросим «чей чек?» (ответ тем же клиентом склеит их).
+			minute := db.MinutePrecision(txDate)
+			switch {
+			case payerOverride != "" && !tw.Named && minute:
+			case payerOverride != "" && !tw.Named:
+				// Раньше прислали этот же чек без ФИО — теперь подписали: считаем
+				// подписанный, неподписанный — повтор (и про него не спрашиваем).
+				if ok, err := b.db.MarkReceiptDuplicate(ctx, tw.ID); err != nil {
+					fmt.Println("Ошибка пометки повтора чека:", err)
+				} else if ok {
+					fmt.Printf("Чек (сообщение %d): тот же чек раньше прислали без ФИО (%s) — тот считаю повтором\n", rawID, tw.WaMessage)
+					b.dropReceiptAsk(chat.String(), tw.WaMessage)
+					if tw.Asked {
+						twinAskedNote = fmt.Sprintf("Это тот же чек, что раньше прислали без подписи (я спрашивал, чей он): считаю его один раз — на %s.", payerOverride)
+					}
+				}
+			case payerOverride != "" && !sameNamed:
+				// Тот же печатный чек подписан другим клиентом — разных клиентов не
+				// склеиваем: оба остаются, как и раньше.
+			case payerOverride == "" && tw.Named && minute:
+			default:
+				dupMatch = db.DuplicateMatch{Found: true, TxDate: tw.TxDate, Client: tw.Client, WaMessage: tw.WaMessage}
+			}
+		}
+	}
 	isDuplicate, dupTxDate := dupMatch.Found, dupMatch.TxDate
 	if isDuplicate {
 		// Повтор того же чека — клиента не спрашиваем (он уже есть у оригинала).
@@ -4125,7 +4186,25 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// дублем, чтобы он не висел в «не вошло» и не задваивал «Максимум».
 	clientConfirmed := payerOverride != ""
 	if !isDuplicate {
-		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt); err != nil {
+		// Свёрнутый, уже записанный на ДРУГОГО клиента, — другой платёж (у
+		// работника много чеков на круглые суммы): его не заменяем, иначе платёж
+		// того клиента молча пропал бы из сбора. Свёрнутый ТОГО ЖЕ клиента (в
+		// т.ч. названный коротко: «Харон» / «Исаев» при подписи «Исаев Харон»)
+		// заменяем раньше ничьего — ничей может быть платежом другого клиента.
+		rankCollapsed := func(c db.SupersededCollapsed) int {
+			if payerOverride == "" {
+				return 1 // у полного чека клиента нет — берём клиента свёрнутого
+			}
+			if !c.ClientConfirmed || c.ContactID == nil || strings.TrimSpace(c.RecipientRaw) == "" {
+				return 1 // свёрнутый ещё ничей
+			}
+			if (contactIDPtr != nil && *c.ContactID == *contactIDPtr) ||
+				sameClientMoney(c.RecipientRaw, payerOverride) || clientNamePartMoney(c.RecipientRaw, payerOverride) {
+				return 2
+			}
+			return 0
+		}
+		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, rankCollapsed); err != nil {
 			fmt.Println("Ошибка замены свёрнутого чека:", err)
 		} else if sup.Found {
 			fmt.Printf("Чек (сообщение %d): полный чек заменил ранее присланный свёрнутый на %.0f ₽\n", rawID, rd.Amount)
@@ -4165,6 +4244,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		ClientConfirmed:   clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
 		GroupJID:          chat.String(),
 		TxDate:            txDate,
+		TxTimeGuessed:     !rd.HasTxTime,
 		Ignored:           declined,
 	})
 	if err != nil {
@@ -4195,14 +4275,26 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 				dupMatch.Client, payerOverride, payerOverride)
 		}
 		if !b.groupSilent(chat) {
+			undo := ""
+			if extra == "" && !dupMatch.StrongID && waMsgID != "" {
+				// Номера операции нет — совпало по клиенту, времени, напечатанному:
+				// это может быть и второй перевод. Путь назад — ответ «другой».
+				undo = " Если это ДРУГОЙ платёж — ответьте на это сообщение «другой», и я засчитаю его отдельно."
+			}
 			id := b.sendReply(chat, fmt.Sprintf(
-				"⚠️ Этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.%s",
-				shown, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), extra),
+				"⚠️ Этот чек уже присылали в эту группу: %s, %.0f ₽, чек от %s. Второй раз не учитываю в сумме сбора.%s%s",
+				shown, rd.Amount, dupTxDate.Format("02.01.2006 15:04"), extra, undo),
 				waMsgID, senderJID)
 			if extra != "" {
 				b.registerDupFixAsk(id, dupFixAsk{checkWa: dupMatch.WaMessage, name: payerOverride})
+			} else if undo != "" {
+				b.registerSameCheckAsk(id, sameCheckAsk{checkWa: waMsgID})
 			}
 		}
+	}
+
+	if twinAskedNote != "" && !b.groupSilent(chat) {
+		b.sendReply(chat, twinAskedNote, waMsgID, senderJID)
 	}
 
 	// Подозрительно большая сумма (вероятно, лишний ноль при распознавании) —

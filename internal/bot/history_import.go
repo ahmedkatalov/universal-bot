@@ -317,7 +317,7 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 		RecipientPhone: rd.RecipientPhone, SenderRaw: rd.Sender, SenderBank: rd.SenderBank, SenderAccount: rd.SenderAccount,
 		ContactID: contactIDPtr, Amount: rd.Amount, Commission: rd.Commission, DocNumber: rd.DocNumber, AuthCode: rd.AuthCode,
 		Status: rd.Status, NeedsReview: needsReview, IsDuplicate: isDup, GroupJID: chat.String(), TxDate: txDate,
-		ClientConfirmed: client != "", SubmittedBy: sender,
+		ClientConfirmed: client != "", SubmittedBy: sender, TxTimeGuessed: !rd.HasTxTime,
 	}); err != nil {
 		fmt.Println("Импорт истории: ошибка сохранения чека:", err)
 		return false
