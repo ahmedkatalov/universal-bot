@@ -323,7 +323,22 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 	if err != nil {
 		return false
 	}
+	// Платёж «ФИО сумма» называет только чек на ТУ ЖЕ сумму (как в
+	// handleNameMessage и очереди имён): «Магомедов Ахмед 20000» — не клиент чека
+	// на 15000, «… нал» — вообще другой платёж, в списке подходит только строка
+	// с суммой чека. Сначала — сообщения с суммой чека, потом — просто ФИО.
+	var exact, loose []string
 	for _, t := range texts {
+		src, same, ok := checkNameSource(t, it.Amount)
+		switch {
+		case !ok:
+		case same:
+			exact = append(exact, src)
+		default:
+			loose = append(loose, src)
+		}
+	}
+	for _, t := range append(exact, loose...) {
 		name, ok := looksLikeName(t)
 		if !ok {
 			name, ok = firstNameLine(t)

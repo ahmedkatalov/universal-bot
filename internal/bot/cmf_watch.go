@@ -266,8 +266,11 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	// Наличка («Исаев Ислам нал 5000», «Ахмед 10000 у Дени») и список из
 	// нескольких платежей — это платежи, а не подпись к чеку. Если рядом ждёт чек,
 	// подпишем его строкой с ТОЙ ЖЕ суммой, остальное запишется как платежи.
-	if amount > 0 && (parser.IsCash(text) || amountLines > 1) {
-		if hasUnconfirmed && quotedID == "" && amountLines > 1 {
+	// Решаем по строкам с суммой, а не по сумме всего текста: у «Исаев Харон\n
+	// 10000\n5000» общая сумма не читается (числа на разных строках), а это всё
+	// равно два платежа — подписью к чеку его не съедаем.
+	if amountLines > 1 || ((amount > 0 || amountLines > 0) && parser.IsCash(text)) {
+		if checkNearby && amountLines > 1 {
 			b.labelCheckFromLines(ctx, msg, text, rawID, since)
 		}
 		return false
@@ -386,36 +389,114 @@ func countAmountLines(text string) int {
 	return n
 }
 
-// labelCheckFromLines — в сообщении-списке платежей («Магомедов Ахмед 15000\n
-// Исаев Дени 20000 нал») ищем строку на сумму ждущего чека и подписываем им чек.
-func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text string, rawID int, since time.Time) {
-	chat, sender := msg.Info.Chat, msg.Info.Sender.String()
-	checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since)
-	if !ok || checkAmt <= 0 {
-		return
+// nameForCheckAmount ищет в сообщении-списке платежей НЕналичный платёж на сумму
+// amt — строку «ФИО сумма» или блок «ФИО\nсумма\nсумма» (формат парсера) — и
+// возвращает его ФИО (name) и текст, из которого оно взято (nameText — его можно
+// показать ИИ для подтверждения). ok=false — платежа на эту сумму с ФИО нет или
+// таких платежей у РАЗНЫХ людей несколько (не угадываем — спросим «чей чек?»).
+func nameForCheckAmount(text string, amt float64) (name, nameText string, ok bool) {
+	if amt <= 0 {
+		return "", "", false
+	}
+	for _, tr := range parser.ParseMessage(text).Transactions {
+		if math.Abs(tr.Amount-amt) >= 1 || tr.IsCash || parser.IsCash(tr.Line) {
+			continue
+		}
+		// ФИО — из самой строки платежа («Магомедов Ахмед 15000») или из
+		// заголовка блока («Исаев Харон» над строкой «10000»).
+		n, src, found := "", "", false
+		if n, found = looksLikeName(tr.RawName); found {
+			src = tr.RawName
+		} else if n, found = looksLikeName(tr.Line); found {
+			src = tr.Line
+		}
+		if !found {
+			continue
+		}
+		if ok && normCyr(n) != normCyr(name) {
+			return "", "", false
+		}
+		if !ok {
+			name, nameText, ok = n, src, true
+		}
+	}
+	return name, nameText, ok
+}
+
+// checkNameSource — из какого текста соседнего сообщения можно взять ФИО
+// клиента чека на сумму checkAmt. Правило то же, что у handleNameMessage и
+// очереди имён: «ФИО сумма» называет только чек на ТУ ЖЕ сумму; наличка чек не
+// называет (это другой платёж); в списке платежей подходит только строка (или
+// блок «ФИО\nсумма») с суммой чека. Сообщение без суммы называет чек любой
+// суммы. exact — сумма в сообщении совпала с суммой чека.
+func checkNameSource(text string, checkAmt float64) (src string, exact, ok bool) {
+	lines := countAmountLines(text)
+	if lines > 1 {
+		if _, nameText, found := nameForCheckAmount(text, checkAmt); found {
+			return nameText, true, true
+		}
+		return "", false, false
+	}
+	if parser.IsCash(text) {
+		return "", false, false
+	}
+	if lines == 0 {
+		return text, false, true
 	}
 	for _, ln := range strings.Split(text, "\n") {
-		if math.Abs(parser.ExtractAmount(ln)-checkAmt) >= 1 || parser.IsCash(ln) {
-			continue
+		if a := parser.ExtractAmount(ln); a > 0 && math.Abs(a-checkAmt) >= 1 {
+			return "", false, false
 		}
-		name, ok := looksLikeName(ln)
-		if !ok {
-			continue
-		}
+	}
+	return text, true, true
+}
+
+// labelCheckFromLines — в сообщении-списке платежей («Магомедов Ахмед 15000\n
+// Исаев Дени 20000 нал», «Исаев Харон\n10000\n5000 нал») ищем платёж на сумму
+// чека и подписываем им чек: свайп — тот чек, на который ответили; иначе —
+// самый старый ждущий чек отправителя.
+func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text string, rawID int, since time.Time) {
+	chat, sender := msg.Info.Chat, msg.Info.Sender.String()
+	client := func(name, nameText string) (string, *int) {
 		if _, known := b.aliases.ResolveName(name); !known && b.assistant != nil {
-			if c := b.cmfExtractClientName(ctx, ln); c != "" {
+			if c := b.cmfExtractClientName(ctx, nameText); c != "" {
 				name = c
 			}
 		}
 		canonical, _ := b.aliases.ResolveName(name)
-		var cid *int
 		if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
-			cid = &id
+			return canonical, &id
 		}
-		if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, cid, rawID, checkAmt); err == nil && found {
-			b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+		return canonical, nil
+	}
+	if quotedID := extractQuotedStanzaID(msg); quotedID != "" {
+		// Свайп на чек: подписываем ЕГО строкой на его сумму. Свайп не на чек —
+		// чужим ждущим чекам список не подпись.
+		r, err := b.db.ReceiptByWaMessageID(ctx, quotedID)
+		if err != nil || r.ID == 0 {
+			return
+		}
+		name, nameText, ok := nameForCheckAmount(text, r.Amount)
+		if !ok {
+			return
+		}
+		canonical, cid := client(name, nameText)
+		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, cid, rawID); err == nil && found {
+			b.reresolveWatchByCheck(ctx, chat, quotedID, canonical)
 		}
 		return
+	}
+	checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since)
+	if !ok || checkAmt <= 0 {
+		return
+	}
+	name, nameText, ok := nameForCheckAmount(text, checkAmt)
+	if !ok {
+		return
+	}
+	canonical, cid := client(name, nameText)
+	if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, cid, rawID, checkAmt); err == nil && found {
+		b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
 	}
 }
 
