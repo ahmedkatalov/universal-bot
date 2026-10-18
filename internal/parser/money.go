@@ -116,6 +116,15 @@ type amountHit struct {
 // amountHits — все суммы текста по порядку, без дат («18.10») и времени («12:30»).
 func amountHits(text string) []amountHit {
 	var out []amountHit
+	phones := phoneSpans(text)
+	inPhone := func(sp [2]int) bool {
+		for _, p := range phones {
+			if sp[0] < p[1] && sp[1] > p[0] {
+				return true
+			}
+		}
+		return false
+	}
 	for _, sp := range moneyNumberSpans(text) {
 		tok := text[sp[0]:sp[1]]
 		base := moneyValue(tok)
@@ -145,7 +154,7 @@ func amountHits(text string) []amountHit {
 				digits++
 			}
 		}
-		out = append(out, amountHit{v: base, start: sp[0], end: sp[1], real: base >= 100 && digits < 10 && !numberMarkerBefore(text, sp[0])})
+		out = append(out, amountHit{v: base, start: sp[0], end: sp[1], real: base >= 100 && digits < 10 && !numberMarkerBefore(text, sp[0]) && !inPhone(sp)})
 	}
 	return out
 }
@@ -172,15 +181,20 @@ func isClockToken(text string, start, end int) bool {
 }
 
 // numberMarkerBefore — перед числом «№», «#», «+7» (телефон) или слово «договор/
-// тел/счёт/кв…»: это номер, а не сумма. «15000 + 5000» — суммы.
+// дог./д./тел/счёт/кв…»: это номер, а не сумма. «15000 + 5000» — суммы.
 func numberMarkerBefore(text string, start int) bool {
 	if start > 0 && text[start-1] == '+' && (text[start] == '7' || text[start] == '8') {
 		return true
 	}
-	before := strings.TrimRightFunc(text[:start], func(r rune) bool { return unicode.IsSpace(r) || r == ':' || r == '\u00a0' })
+	// «дог.345», «д.345», «кв.12», «№ 345», «тел: 8-928…» — между словом и
+	// числом бывают пробел, двоеточие, точка сокращения, дефис, «№».
+	before := strings.TrimRightFunc(text[:start], func(r rune) bool {
+		return unicode.IsSpace(r) || r == ':' || r == '.' || r == '-' || r == '\u00a0'
+	})
 	if strings.HasSuffix(before, "№") || strings.HasSuffix(before, "#") {
 		return true
 	}
+	before = strings.TrimRightFunc(before, func(r rune) bool { return unicode.IsSpace(r) || r == '№' || r == '#' })
 	k := len(before)
 	for k > 0 {
 		r, size := utf8.DecodeLastRuneInString(before[:k])
@@ -189,7 +203,38 @@ func numberMarkerBefore(text string, start int) bool {
 		}
 		k -= size
 	}
-	return nonAmountWords[strings.ToLower(before[k:])]
+	word := before[k:]
+	if nonAmountWords[strings.ToLower(word)] {
+		return true
+	}
+	// «д.345» (дом/договор) — только строчная «д» вплотную к числу через точку:
+	// «Исаев Харон Д. 15000» — это инициал, а сумма — настоящая.
+	return shortNumberAbbr[word] && strings.HasSuffix(text[:start], ".")
+}
+
+// shortNumberAbbr — однобуквенные сокращения перед номером («д.5» — дом/договор).
+var shortNumberAbbr = map[string]bool{"д": true}
+
+// phoneRe — телефон: «8-928-123-45-67», «+7 (928) 123-45-67», «8 928 123 45 67»,
+// «123-45-67». Его части — не суммы («928», «123» — не деньги).
+var phoneRe = regexp.MustCompile(`(?:(?:\+\s?7|8)[\s\-]?\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{2}[\s\-]?\d{2}|\(?\d{3}\)?[\s\-]?\d{3}-\d{2}-\d{2}|\d{3}-\d{2}-\d{2})`)
+
+// phoneSpans — где в тексте стоят телефоны (с цифрой рядом — не телефон).
+func phoneSpans(text string) [][2]int {
+	var out [][2]int
+	for _, m := range phoneRe.FindAllStringIndex(text, -1) {
+		s, e := m[0], m[1]
+		if text[s] == '+' {
+			// «+7 …» — ок
+		} else if s > 0 && isASCIIDigit(text[s-1]) {
+			continue
+		}
+		if e < len(text) && isASCIIDigit(text[e]) {
+			continue
+		}
+		out = append(out, [2]int{s, e})
+	}
+	return out
 }
 
 // ExtractSingleAmount — сумма из ОТВЕТА работника, если она в нём одна. Две
@@ -233,30 +278,54 @@ var moneyWords = map[string]bool{
 	"косарь": true, "косаря": true, "косарей": true,
 }
 
+// moneyMultWords — первая часть составного хвоста («т.р», «тыс.руб», «млн.руб»),
+// moneyRubleWords — вторая.
+var (
+	moneyMultWords = map[string]bool{
+		"т": true, "к": true, "кк": true, "k": true, "тыс": true, "тысяч": true, "тыщ": true, "млн": true,
+	}
+	moneyRubleWords = map[string]bool{
+		"р": true, "руб": true, "рубль": true, "рубля": true, "рублей": true, "₽": true,
+	}
+)
+
 // IsMoneyWord — слово целиком — хвост суммы («т.р.», «тыс.руб», «руб.», «₽»).
 // afterNumber — перед ним стояло число: только тогда однобуквенные «т», «к»,
-// «р» считаем хвостом суммы, а не инициалом («Исаев К.»).
+// «р» и их сочетания через точку («т.р.») считаем хвостом суммы, а не
+// инициалами («Исаев К.», «Магомедов Р.К.», «Исаев Т.Р.»). Составной хвост —
+// только «множитель + рубли» («т.р», «тыс.руб»): «Р.К.», «Т.К.» так деньги не
+// пишут, это инициалы даже после числа.
 func IsMoneyWord(word string, afterNumber bool) bool {
 	w := strings.ToLower(strings.TrimFunc(word, func(r rune) bool { return !unicode.IsLetter(r) && r != '₽' }))
 	if w == "" {
 		return false
 	}
 	parts := strings.FieldsFunc(w, func(r rune) bool { return r == '.' || r == ',' })
-	if len(parts) == 0 {
+	switch len(parts) {
+	case 1:
+		if !moneyWords[parts[0]] {
+			return false
+		}
+	case 2:
+		if !moneyMultWords[parts[0]] || !moneyRubleWords[parts[1]] {
+			return false
+		}
+	default:
 		return false
 	}
+	if afterNumber {
+		return true
+	}
+	// Без числа рядом — только явные слова в нижнем регистре («руб», «тыс»,
+	// «тыс.руб»): одна буква («Р.», «Р.К.») или слово с заглавной может быть
+	// инициалом/именем.
 	for _, p := range parts {
-		if !moneyWords[p] {
+		if utf8.RuneCountInString(p) < 2 {
 			return false
 		}
 	}
-	if afterNumber || len(parts) > 1 {
-		return true // «т.р», «тыс.руб» — не имя, даже без числа перед ним
-	}
-	// Без числа рядом — только явные слова в нижнем регистре («руб», «тыс»):
-	// одна буква или слово с заглавной может быть инициалом/именем.
 	first, _ := utf8.DecodeRuneInString(strings.TrimLeftFunc(word, func(r rune) bool { return !unicode.IsLetter(r) }))
-	return utf8.RuneCountInString(w) >= 2 && !unicode.IsUpper(first)
+	return !unicode.IsUpper(first)
 }
 
 // SeparateAmountsSideBySide — в строке две РАЗНЫЕ суммы стоят рядом через

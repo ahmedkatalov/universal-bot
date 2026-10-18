@@ -243,15 +243,18 @@ var (
 // следующего дня), дата рождения.
 var notOperationDateRe = regexp.MustCompile(`(?i)формир|печат|выдач|выдан|рожд`)
 
-// operationDateLabelRe — подпись именно даты/времени операции.
-var operationDateLabelRe = regexp.MustCompile(`(?i)операци|перевод|платеж|платёж|оплат|списани`)
+// operationDateLabelRe — подпись именно даты/времени операции. «Дата
+// списания/зачисления» сюда не входит: банк списывает позже (после полуночи,
+// на следующий день), а в отчёт чек идёт по дате ОПЕРАЦИИ.
+var operationDateLabelRe = regexp.MustCompile(`(?i)операци|перевод|платеж|платёж|оплат`)
 
 // detectTxTime ищет дату/время ОПЕРАЦИИ построчно (по ней чек идёт в отчёт).
 // «Дата формирования/печати» не годится ни в одном из проходов — ни сама
-// строка, ни значение под такой подписью. Порядок: явная «дата операции» с
-// временем; «дата операции» без времени + «Время операции»; любая строка
-// «дата» с временем; любая дата с временем; любая «дата» без времени; и лишь
-// когда даты операции нет совсем — дата формирования/печати.
+// строка, ни значение под такой подписью. Порядок: «дата операции» без
+// времени + явная строка «Время операции»; «дата операции» с временем; «дата
+// операции» без времени (время — рядом или полдень); любая строка «дата»
+// («Дата списания» тоже) с временем; любая дата с временем; любая «дата» без
+// времени; и лишь когда даты операции нет совсем — дата формирования/печати.
 func detectTxTime(lines []string) (time.Time, bool) {
 	skip := make([]bool, len(lines))
 	for i, l := range lines {
@@ -276,7 +279,21 @@ func detectTxTime(lines []string) (time.Time, bool) {
 		low := strings.ToLower(lines[i])
 		return !skip[i] && (strings.Contains(low, "дата") || strings.Contains(low, "врем")) && operationDateLabelRe.MatchString(low)
 	}
-	// 1. «Дата (и время) операции/перевода/платежа» с временем.
+	// 1. «Дата операции: 17.10.2026» + «Время операции: 23:40» — пара явных
+	// подписей операции важнее любой другой даты со временем («Дата
+	// списания: 18.10.2026 00:15»).
+	for i := range lines {
+		if !isOpLabel(i) || !strings.Contains(strings.ToLower(lines[i]), "дата") {
+			continue
+		}
+		if _, ok := parseDateTimeFromLine(valueLine(i)); ok {
+			continue
+		}
+		if t, ok := dateWithLabelledTime(lines, skip, valueLine(i)); ok {
+			return t, true
+		}
+	}
+	// 2. «Дата (и время) операции/перевода/платежа» с временем.
 	for i := range lines {
 		if isOpLabel(i) {
 			if t, ok := parseDateTimeFromLine(valueLine(i)); ok {
@@ -284,7 +301,7 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			}
 		}
 	}
-	// 2. «Дата операции: 17.10.2026» и время отдельно («Время операции: 23:40»).
+	// 3. «Дата операции: 17.10.2026» без «Времени операции»: время рядом или полдень.
 	for i := range lines {
 		if isOpLabel(i) && strings.Contains(strings.ToLower(lines[i]), "дата") {
 			if t, ok := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
@@ -292,7 +309,7 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			}
 		}
 	}
-	// 3. Любая строка «дата» с временем.
+	// 4. Любая строка «дата» с временем.
 	for i, l := range lines {
 		if !skip[i] && strings.Contains(strings.ToLower(l), "дата") {
 			if t, ok := parseDateTimeFromLine(valueLine(i)); ok {
@@ -300,7 +317,7 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			}
 		}
 	}
-	// 4. Любая дата с временем.
+	// 5. Любая дата с временем.
 	for i, l := range lines {
 		if skip[i] {
 			continue
@@ -309,7 +326,7 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			return t, true
 		}
 	}
-	// 5. «Дата: 30.09.2026» без времени (или время отдельной строкой): дата с
+	// 6. «Дата: 30.09.2026» без времени (или время отдельной строкой): дата с
 	// чека важнее даты присылки.
 	for i, l := range lines {
 		if !skip[i] && strings.Contains(strings.ToLower(l), "дата") {
@@ -318,7 +335,7 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			}
 		}
 	}
-	// 6. Даты операции на чеке нет вовсе — «Дата формирования» всё же ближе к
+	// 7. Даты операции на чеке нет вовсе — «Дата формирования» всё же ближе к
 	// операции, чем время присылки (PDF скачали сразу, прислали позже). Дата
 	// рождения/выдачи документа — никогда.
 	for i, l := range lines {
@@ -352,50 +369,78 @@ func dateOnlyIn(s string) (time.Time, bool) {
 	return time.Date(year, time.Month(mon), day, 0, 0, 0, 0, time.Local), true
 }
 
+// timeOfDay — время «чч:мм[:сс]» (из timeOnlyRe) в день d.
+func timeOfDay(d time.Time, tm []string) (time.Time, bool) {
+	hour, _ := strconv.Atoi(tm[1])
+	min, _ := strconv.Atoi(tm[2])
+	sec := 0
+	if tm[3] != "" {
+		sec, _ = strconv.Atoi(tm[3])
+	}
+	if hour > 23 || min > 59 || sec > 59 {
+		return time.Time{}, false
+	}
+	return time.Date(d.Year(), d.Month(), d.Day(), hour, min, sec, 0, time.Local), true
+}
+
+// otherDateIn — в строке своя дата, и это не день d: её время к d не относится
+// («Дата списания: 18.10.2026 00:15» — не время операции 17.10).
+func otherDateIn(line string, d time.Time) bool {
+	if t, ok := dateOnlyIn(line); ok {
+		return !(t.Year() == d.Year() && t.YearDay() == d.YearDay())
+	}
+	if t, ok := parseDateTimeFromLine(line); ok {
+		return !(t.Year() == d.Year() && t.YearDay() == d.YearDay())
+	}
+	return false
+}
+
+// dateWithLabelledTime — дата из value и время из строки «Время операции/
+// перевода» (значение в ней же или строкой ниже). Нет такой строки — false.
+func dateWithLabelledTime(lines []string, skip []bool, value string) (time.Time, bool) {
+	d, ok := dateOnlyIn(value)
+	if !ok {
+		return time.Time{}, false
+	}
+	for k, l := range lines {
+		low := strings.ToLower(l)
+		if skip[k] || !strings.Contains(low, "врем") || !operationDateLabelRe.MatchString(low) || otherDateIn(l, d) {
+			continue
+		}
+		v := l
+		if timeOnlyRe.FindStringSubmatch(v) == nil {
+			if j := nextNonEmptyIndex(lines, k+1); j >= 0 && !skip[j] && !otherDateIn(lines[j], d) {
+				v = lines[j]
+			}
+		}
+		if tm := timeOnlyRe.FindStringSubmatch(v); tm != nil {
+			if t, ok := timeOfDay(d, tm); ok {
+				return t, true
+			}
+		}
+	}
+	return time.Time{}, false
+}
+
 // dateWithSeparateTime — дата из value (подпись в строке i) и время к ней:
 // строка «Время операции/перевода» где угодно на чеке, иначе время в ближайших
 // строках под датой, иначе время любой даты-со-временем ТОГО ЖЕ дня, иначе
-// полдень. Строки формирования/печати (skip) не смотрим.
+// полдень. Строки формирования/печати (skip) и строки с ДРУГОЙ датой («Дата
+// списания: 18.10.2026 00:15» под «Дата операции: 17.10.2026») не смотрим.
 func dateWithSeparateTime(lines []string, skip []bool, i int, value string) (time.Time, bool) {
 	d, ok := dateOnlyIn(value)
 	if !ok {
 		return time.Time{}, false
 	}
-	at := func(tm []string) (time.Time, bool) {
-		hour, _ := strconv.Atoi(tm[1])
-		min, _ := strconv.Atoi(tm[2])
-		sec := 0
-		if tm[3] != "" {
-			sec, _ = strconv.Atoi(tm[3])
-		}
-		if hour > 23 || min > 59 || sec > 59 {
-			return time.Time{}, false
-		}
-		return time.Date(d.Year(), d.Month(), d.Day(), hour, min, sec, 0, time.Local), true
-	}
-	for k, l := range lines {
-		low := strings.ToLower(l)
-		if skip[k] || !strings.Contains(low, "врем") || !operationDateLabelRe.MatchString(low) {
-			continue
-		}
-		v := l
-		if timeOnlyRe.FindStringSubmatch(v) == nil {
-			if j := nextNonEmptyIndex(lines, k+1); j >= 0 && !skip[j] {
-				v = lines[j]
-			}
-		}
-		if tm := timeOnlyRe.FindStringSubmatch(v); tm != nil {
-			if t, ok := at(tm); ok {
-				return t, true
-			}
-		}
+	if t, ok := dateWithLabelledTime(lines, skip, value); ok {
+		return t, true
 	}
 	for k := i; k < len(lines) && k <= i+3; k++ {
-		if skip[k] {
+		if skip[k] || otherDateIn(lines[k], d) {
 			continue
 		}
 		if tm := timeOnlyRe.FindStringSubmatch(lines[k]); tm != nil {
-			if t, ok := at(tm); ok {
+			if t, ok := timeOfDay(d, tm); ok {
 				return t, true
 			}
 		}

@@ -178,3 +178,71 @@ func TestL4parse_21_ParseMessageThousandSuffix(t *testing.T) {
 		}
 	}
 }
+
+// TestL4parse_R0_InitialsNotMoneyWord — инициалы из букв Т/Р/К без числа перед
+// ними — не хвост суммы; «т.р» после числа — хвост.
+func TestL4parse_R0_InitialsNotMoneyWord(t *testing.T) {
+	for _, w := range []string{"Р.К.", "Т.Р.", "К.Т.", "Т.К.", "т.р.", "к.р", "Р.", "К"} {
+		if IsMoneyWord(w, false) {
+			t.Errorf("IsMoneyWord(%q, false) = true — инициал принят за хвост суммы", w)
+		}
+	}
+	for _, w := range []string{"т.р.", "Т.Р.", "тыс.руб", "тыс.р.", "т.", "р.", "руб.", "₽", "тыс", "млн.руб"} {
+		if !IsMoneyWord(w, true) {
+			t.Errorf("IsMoneyWord(%q, true) = false — хвост суммы не узнан", w)
+		}
+	}
+	// После числа «Р.К.»/«Т.К.» — всё равно не деньги (так деньги не пишут).
+	for _, w := range []string{"Р.К.", "Т.К.", "К.Т."} {
+		if IsMoneyWord(w, true) {
+			t.Errorf("IsMoneyWord(%q, true) = true — инициалы приняты за хвост суммы", w)
+		}
+	}
+	for _, w := range []string{"руб", "тыс.руб", "рублей"} {
+		if !IsMoneyWord(w, false) {
+			t.Errorf("IsMoneyWord(%q, false) = false — явное слово-деньги", w)
+		}
+	}
+}
+
+// TestL4parse_R1_ContractNoNotAmount — номер договора/дома/телефона рядом с
+// суммой не делает ответ неясным.
+func TestL4parse_R1_ContractNoNotAmount(t *testing.T) {
+	for _, in := range []string{
+		"Исаев Харон 15000 дог.345", "Исаев Харон 15000 д.345", "Исаев Харон 15000 дог. 345",
+		"Исаев Харон 15000 договор №345", "Исаев Харон 15000 тел 8-928-123-45-67",
+		"Исаев Харон 15000 тел 89281234567", "Исаев Харон 15000 +7 928 123-45-67", "Исаев Харон 15000 кв.120",
+	} {
+		if got, amb := ExtractSingleAmount(in); got != 15000 || amb {
+			t.Errorf("ExtractSingleAmount(%q) = %v, %v — ожидали 15000", in, got, amb)
+		}
+	}
+	// Инициал «Д.» перед суммой — не «д.» (дом/договор).
+	if got, amb := ExtractSingleAmount("Исаев Харон Д. 15000"); got != 15000 || amb {
+		t.Errorf("ExtractSingleAmount(«Исаев Харон Д. 15000») = %v, %v — ожидали 15000", got, amb)
+	}
+	// Две настоящие суммы — по-прежнему неясно.
+	for _, in := range []string{"Исаев Харон 15000 20000", "Исаев Харон 15000-20000"} {
+		if _, amb := ExtractSingleAmount(in); !amb {
+			t.Errorf("ExtractSingleAmount(%q) — две суммы, ожидали ambiguous", in)
+		}
+	}
+}
+
+// TestL4parse_R2_DebitDateNotOperationDate — «Дата списания» не перебивает
+// «Дату операции» (ни с «Временем операции», ни без него).
+func TestL4parse_R2_DebitDateNotOperationDate(t *testing.T) {
+	cases := map[string]string{
+		"Квитанция о переводе\nДата операции: 17.10.2026\nВремя операции: 23:40\nДата списания: 18.10.2026 00:15\nСумма перевода\n11 000 ₽": "17.10.2026 23:40",
+		"Статус: Выполнен\nДата операции: 17.10.2026\nДата списания: 18.10.2026 00:15\nСумма перевода\n11 000 ₽":                            "17.10.2026 12:00",
+		"Статус: Выполнен\nДата операции: 17.10.2026\nДата списания: 17.10.2026 23:40\nСумма перевода\n11 000 ₽":                            "17.10.2026 23:40",
+		"Квитанция\nДата списания: 18.10.2026 00:15\nСумма перевода\n11 000 ₽":                                                              "18.10.2026 00:15",
+		"Квитанция\nДата и время операции: 17.10.2026 23:40\nДата списания: 18.10.2026 00:15\nСумма\n11 000 ₽":                              "17.10.2026 23:40",
+	}
+	for in, want := range cases {
+		rd := ParseReceipt(in)
+		if got := rd.TxTime.Format("02.01.2006 15:04"); got != want {
+			t.Errorf("дата чека %s — ожидали %s\n%s", got, want, in)
+		}
+	}
+}
