@@ -228,8 +228,9 @@ func dedupeReconReceipts(rs []db.ReconReceipt) []reconRec {
 // «Хаджи Мурат» = «Хаджимурат»). Однословные имена — только точное совпадение,
 // чтобы «Ахмед» не прилип ко всем Ахмедам; разные имена (Рустам/Руслан,
 // Мадина/Марина, Магомед/Магомед-Расул) — разные.
-// Движок подсчёта сравнивает клиентов текста и чека так же, как сверка:
-// «Магомедову Ахмеду» и «Магомедов Ахмед» — один клиент.
+// Движок подсчёта сравнивает клиентов текста и чека строже сверки
+// (sameClientMoney): «Магомедову Ахмеду» и «Магомедов Ахмед» — один клиент,
+// а «Омаров» и «Умаров» — разные.
 func init() { ledger.SameName = sameNameMemo }
 
 // sameNameMemo — sameClientName с запоминанием: в сверке одни и те же имена
@@ -247,7 +248,7 @@ func sameNameMemo(a, b string) bool {
 	if ok {
 		return v
 	}
-	r := sameClientName(a, b)
+	r := sameClientMoney(a, b)
 	sameNameMu.Lock()
 	if len(sameNameCache) > 300000 {
 		sameNameCache = map[string]bool{}
@@ -257,23 +258,32 @@ func sameNameMemo(a, b string) bool {
 	return r
 }
 
-func sameClientName(a, b string) bool {
+func sameClientName(a, b string) bool { return sameClientNameWith(a, b, nameWordSame) }
+
+// sameClientMoney — то же, но строже, для решений о деньгах (текст и чек — один
+// платёж, два чека — один, наличка — возможный повтор): опечатка допускается
+// только внутри слова. Первая буква должна совпасть («Омаров» ≠ «Умаров»,
+// «Османов» ≠ «Усманов»), согласную в длинном слове не заменяем
+// («Магомедов» ≠ «Магометов»). Падежи, порядок слов, инициалы — как в сверке.
+func sameClientMoney(a, b string) bool { return sameClientNameWith(a, b, nameWordMoney) }
+
+func sameClientNameWith(a, b string, same func(a, b string) bool) bool {
 	ha, hb := hasHyphen(a), hasHyphen(b)
-	if ha == hb && sameClientNameOnce(a, b) {
+	if ha == hb && sameClientNameOnce(a, b, same) {
 		return true // дефис у обоих (или ни у кого) — можно сравнивать по частям
 	}
 	da, db := dehyphen(a), dehyphen(b)
-	if (ha || hb) && sameClientNameOnce(da, db) {
+	if (ha || hb) && sameClientNameOnce(da, db, same) {
 		return true // составное имя с дефисом — одно слово
 	}
-	return joinedSame(da, db) || joinedSame(db, da)
+	return joinedSame(da, db, same) || joinedSame(db, da, same)
 }
 
 func hasHyphen(s string) bool { return strings.ContainsAny(s, "-‐–—") }
 
 // joinedSame — «Хаджи Мурат» (через пробел) против «Хаджимурат»: склеиваем
 // соседние слова x, только если склейка есть среди слов y.
-func joinedSame(x, y string) bool {
+func joinedSame(x, y string, same func(a, b string) bool) bool {
 	fy, _ := nameParts(y)
 	ws := strings.Fields(x)
 	for k := 0; k+1 < len(ws); k++ {
@@ -283,7 +293,7 @@ func joinedSame(x, y string) bool {
 		}
 		hit := false
 		for _, w := range fy {
-			if nameWordSame(a+b, w) {
+			if same(a+b, w) {
 				hit = true
 				break
 			}
@@ -292,7 +302,7 @@ func joinedSame(x, y string) bool {
 			continue
 		}
 		v := append(append(append([]string(nil), ws[:k]...), ws[k]+ws[k+1]), ws[k+2:]...)
-		if sameClientNameOnce(strings.Join(v, " "), y) {
+		if sameClientNameOnce(strings.Join(v, " "), y, same) {
 			return true
 		}
 	}
@@ -309,7 +319,7 @@ func dehyphen(s string) string {
 	}, s)
 }
 
-func sameClientNameOnce(a, b string) bool {
+func sameClientNameOnce(a, b string, same func(a, b string) bool) bool {
 	na, nb := normCyr(a), normCyr(b)
 	if na == "" || nb == "" {
 		return false
@@ -332,7 +342,7 @@ func sameClientNameOnce(a, b string) bool {
 			return false
 		}
 	}
-	score, ua, ub := matchNameWords(fa, fb)
+	score, ua, ub := matchNameWordsWith(fa, fb, same)
 	if score < mn {
 		return false
 	}
@@ -375,10 +385,14 @@ func initialsAgree(initials, otherRest []rune) bool {
 
 // matchNameWords — жадно сопоставляет полные слова (каждое — не больше одного раза).
 func matchNameWords(fa, fb []string) (score int, ua, ub []bool) {
+	return matchNameWordsWith(fa, fb, nameWordSame)
+}
+
+func matchNameWordsWith(fa, fb []string, same func(a, b string) bool) (score int, ua, ub []bool) {
 	ua, ub = make([]bool, len(fa)), make([]bool, len(fb))
 	for x, w := range fa {
 		for y, v := range fb {
-			if !ub[y] && nameWordSame(w, v) {
+			if !ub[y] && same(w, v) {
 				ua[x], ub[y] = true, true
 				score++
 				break
@@ -564,7 +578,27 @@ func nameWordSame(a, b string) bool {
 	return false
 }
 
-func nameWordSame0(a, b string) bool {
+// nameWordMoney — nameWordSame без опечатки в первой букве и без замены
+// согласной в длинном слове.
+func nameWordMoney(a, b string) bool {
+	if isPatronymic(a) != isPatronymic(b) {
+		return false
+	}
+	ra, rb := []rune(a), []rune(b)
+	if len(ra) == 0 || len(rb) == 0 || ra[0] != rb[0] {
+		return false
+	}
+	if nameWordSame0(a, b, true) {
+		return true
+	}
+	if fa, fb := foldYi(a), foldYi(b); fa != a || fb != b {
+		return nameWordSame0(fa, fb, true)
+	}
+	return false
+}
+
+func nameWordSame0(a, b string, strict ...bool) bool {
+	money := len(strict) > 0 && strict[0]
 	if a == b {
 		return true
 	}
@@ -600,7 +634,7 @@ func nameWordSame0(a, b string) bool {
 		switch len(diffs) {
 		case 1:
 			k := diffs[0]
-			return (isVowelRu(ra[k]) && isVowelRu(rb[k])) || len(ra) >= 8
+			return (isVowelRu(ra[k]) && isVowelRu(rb[k])) || (len(ra) >= 8 && !money)
 		case 2:
 			x, y := diffs[0], diffs[1]
 			if y == x+1 && ra[x] == rb[y] && ra[y] == rb[x] {
