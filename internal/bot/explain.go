@@ -165,7 +165,15 @@ func (b *Bot) explainCollectionTool() ai.Tool {
 					for _, p := range e.Parts {
 						ps = append(ps, formatMoney(p.Amount))
 					}
-					line += " (считаются чеки " + strings.Join(ps, " + ") + " ₽)"
+					line += " (считаются чеки " + strings.Join(ps, " + ") + " ₽"
+					if len(e.Missing) > 0 {
+						var ms []string
+						for _, c := range e.Missing {
+							ms = append(ms, formatMoney(c.Amount))
+						}
+						line += "; ещё часть " + strings.Join(ms, " + ") + " ₽ не в сборе — ждёт имени, исключена или удалена"
+					}
+					line += ")"
 				case e.Into != nil:
 					line += " (считается как чек " + formatMoney(e.Into.Amount) + " ₽)"
 				}
@@ -222,6 +230,9 @@ func describePayment(p *ledger.Payment, gname func(string) string) string {
 		if c.Review {
 			extra = append(extra, "в «"+gname(c.Group)+"» тот же чек ждёт «чей чек?»")
 		}
+	}
+	for _, c := range p.Conflicts {
+		extra = append(extra, "⚠️ в «"+gname(c.Group)+"» тот же чек подписан как «"+orDash(c.Client)+"» — уточни, чей он")
 	}
 	if len(extra) > 0 {
 		s += " — " + strings.Join(extra, "; ")

@@ -96,6 +96,7 @@ const ledgerCheckCols = `br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_m
 		       COALESCE(NULLIF(br.card_owner, ''), CASE WHEN NOT br.client_confirmed THEN NULLIF(br.recipient_raw, '') END, ''),
 		       COALESCE(br.sender_raw, ''),
 		       EXISTS (SELECT 1 FROM amount_corrections ac WHERE ac.kind = 'receipt' AND ac.target_id = br.id AND NOT ac.reverted),
+		       br.tx_time_guessed,
 		       COALESCE(br.collector, ''),
 		       br.ignored, br.is_duplicate, COALESCE(rm.deleted, false), br.created_at`
 
@@ -124,7 +125,7 @@ func scanLedgerChecks(rows pgx.Rows) ([]ledger.Check, error) {
 		var c ledger.Check
 		if err := rows.Scan(&c.ID, &c.RawID, &c.WaID, &c.FwdOrigin, &c.Group, &c.Sender, &c.Phone,
 			&c.ContactID, &c.Client, &c.Confirmed, &c.Review, &c.Amount, &c.OpDate, &c.PostedAt,
-			&c.Doc, &c.Auth, &c.Bank, &c.CardBank, &c.CardOwner, &c.Printed, &c.Payer, &c.Fixed, &c.Collector,
+			&c.Doc, &c.Auth, &c.Bank, &c.CardBank, &c.CardOwner, &c.Printed, &c.Payer, &c.Fixed, &c.TimeGuessed, &c.Collector,
 			&c.Ignored, &c.Duplicate, &c.Deleted, &c.Created); err != nil {
 			return nil, err
 		}

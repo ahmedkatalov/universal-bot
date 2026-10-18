@@ -203,3 +203,99 @@ func TestBuildIsFastOnBigVolume(t *testing.T) {
 		t.Fatal("пустая книга")
 	}
 }
+
+// Текст, написанный задолго до операции на чеке, — про другой платёж.
+func TestTextLongBeforeOperationIsAnotherPayment(t *testing.T) {
+	c := chk(1, "g", "Магомедов Ахмед", 1, 5000, t0, "")
+	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 5000, t0.Add(-15*time.Hour), false)})
+	if got := total(b.Counted(all)); got != 10000 {
+		t.Fatalf("%v, хочу 10000", got)
+	}
+	// Время на чеке не прочитано — сравниваем только по времени присылки.
+	c.TimeGuessed = true
+	c.PostedAt = t0.Add(-14 * time.Hour)
+	b = Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 5000, t0.Add(-15*time.Hour), false)})
+	if got := total(b.Counted(all)); got != 5000 {
+		t.Fatalf("время чека не прочитано, текст за час до присылки: %v, хочу 5000", got)
+	}
+}
+
+// Итог частями, когда одна часть ждёт имени: итог сверх чеков не считается.
+func TestSplitTotalWithWaitingPart(t *testing.T) {
+	a := chk(1, "g", "Магомедов Ахмед", 1, 10000, t0, "")
+	w := chk(2, "g", "Хадижат Ибрагимовна И.", 0, 5000, t0.Add(time.Minute), "")
+	w.Review, w.Confirmed = true, false
+	b := Build([]Check{a, w}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false)})
+	if got := total(b.Counted(all)); got != 10000 {
+		t.Fatalf("%v, хочу 10000 (5000 ждёт имени)", got)
+	}
+	var split *Excluded
+	for i, e := range b.Excluded {
+		if e.Reason == ReasonSplit {
+			split = &b.Excluded[i]
+		}
+	}
+	if split == nil || len(split.Parts) != 1 || len(split.Missing) != 1 {
+		t.Fatalf("итог должен ссылаться на посчитанный и ждущий чек: %+v", b.Excluded)
+	}
+}
+
+// Тот же итог частями во второй группе — тот же платёж.
+func TestSplitTotalInSecondGroup(t *testing.T) {
+	b := Build([]Check{
+		chk(1, "sb", "Магомедов Ахмед", 1, 10000, t0, ""),
+		chk(2, "sb", "Магомедов Ахмед", 1, 5000, t0.Add(time.Minute), ""),
+	}, []Text{
+		txt(1, "sb", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false),
+		txt(2, "main", "Магомедов Ахмед", 1, 15000, t0.Add(20*time.Minute), false),
+	})
+	for _, f := range []Filter{all, inGroup("sb"), inGroup("main")} {
+		if got := total(b.Counted(f)); got != 15000 {
+			t.Fatalf("группы %v: %v, хочу 15000", f.Groups, got)
+		}
+	}
+}
+
+// Непроверенный чек без номера с другой минутой операции — другой перевод.
+func TestReviewCopyNeedsExactTime(t *testing.T) {
+	a := chk(1, "a", "Магомедов Ахмед", 1, 5000, t0, "")
+	a.Printed, a.Payer = "Хадижат Ибрагимовна И.", "Зарема Б."
+	r := chk(2, "b", "", 0, 5000, t0.Add(time.Minute), "")
+	r.Review, r.Confirmed, r.Printed, r.Payer = true, false, "Хадижат Ибрагимовна И.", "Зарема Б."
+	b := Build([]Check{a, r}, nil)
+	if len(b.Left(all)) != 1 || b.Left(all)[0].Reason != ReasonReview {
+		t.Fatalf("чек с другой минутой — в «не вошло»: %+v", b.Left(all))
+	}
+	r.OpDate = t0
+	b = Build([]Check{a, r}, nil)
+	if len(b.Left(all)) != 0 || total(b.Counted(inGroup("b"))) != 5000 {
+		t.Fatalf("тот же чек (всё совпало) — часть платежа: %+v", b.Left(all))
+	}
+}
+
+// Один номер документа, разные клиенты в подписях — один платёж с пометкой.
+func TestSameDocDifferentClientsConflict(t *testing.T) {
+	b := Build([]Check{
+		chk(1, "sb", "Магомедов Ахмед", 1, 15000, t0, "1234567890"),
+		chk(2, "main", "Исаев Харон", 2, 15000, t0, "1234567890"),
+	}, nil)
+	if len(b.Payments) != 1 || len(b.Payments[0].Conflicts) != 1 {
+		t.Fatalf("один платёж с конфликтом подписей: %+v", b.Payments)
+	}
+}
+
+// По дате в чате платёж с чеком датируется присылкой чека, а не текста.
+func TestByChatDatesByCheck(t *testing.T) {
+	c := chk(1, "g", "Магомедов Ахмед", 1, 15000, t0, "")
+	c.PostedAt = t0.Add(6 * 24 * time.Hour)
+	b := Build([]Check{c}, []Text{txt(1, "g", "Магомедов Ахмед", 1, 15000, t0.Add(5*time.Minute), false)})
+	day := func(d time.Time) Filter {
+		return Filter{From: d.Truncate(24 * time.Hour), To: d.Truncate(24 * time.Hour).Add(24 * time.Hour), ByChat: true}
+	}
+	if got := total(b.Counted(day(t0))); got != 0 {
+		t.Fatalf("день текста по дате чата: %v, хочу 0", got)
+	}
+	if got := total(b.Counted(day(c.PostedAt))); got != 15000 {
+		t.Fatalf("день присылки чека: %v, хочу 15000", got)
+	}
+}

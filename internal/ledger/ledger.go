@@ -43,11 +43,14 @@ type Check struct {
 	Printed   string // получатель, как напечатан на чеке (пусто — не прочитан)
 	Payer     string // плательщик, как напечатан на чеке
 	Fixed     bool   // сумму чека поправили вручную («не 15000 а 13000»)
-	Collector string
-	Ignored   bool // исключён владельцем / не прошёл (отклонён)
-	Duplicate bool // повтор уже присланного чека (решено при получении)
-	Deleted   bool // сообщение удалено в WhatsApp
-	Created   time.Time
+	// TimeGuessed — время операции на чеке не прочитано (стоит время присылки
+	// или полдень): сравнивать по нему нельзя.
+	TimeGuessed bool
+	Collector   string
+	Ignored     bool // исключён владельцем / не прошёл (отклонён)
+	Duplicate   bool // повтор уже присланного чека (решено при получении)
+	Deleted     bool // сообщение удалено в WhatsApp
+	Created     time.Time
 
 	nd string // NormDoc(Doc), считается в Build
 }
@@ -85,8 +88,11 @@ type Payment struct {
 	PostedAt time.Time
 	Checks   []*Check // главный — первый
 	Texts    []*Text  // тексты про этот платёж (для чека — его «текст-дубль»)
-	groups   map[string]bool
-	mark     int // служебная метка при подборе пар
+	// Conflicts — экземпляры того же чека (тот же номер документа), подписанные
+	// другим клиентом: платёж один, но чей он — надо уточнить.
+	Conflicts []*Check
+	groups    map[string]bool
+	mark      int // служебная метка при подборе пар
 }
 
 // Main — главный чек платежа (nil — платёж только из текста).
@@ -184,7 +190,10 @@ type Excluded struct {
 	Check  *Check
 	Text   *Text
 	Into   *Payment   // для текста-дубля: к какому платежу он относится
-	Parts  []*Payment // для текста-итога платежа частями: все его чеки
+	Parts  []*Payment // для текста-итога платежа частями: все его посчитанные чеки
+	// Missing — для текста-итога: части платежа, которые сейчас не в сборе
+	// (ждут «чей чек?», исключены или удалены).
+	Missing []*Check
 	// Of — для непроверенного чека: первый непроверенный экземпляр того же
 	// чека (присланного ещё и в другую группу); в «не вошло» считается один раз.
 	Of *Check
@@ -391,10 +400,17 @@ func sameCheck(c, m *Check, named bool, nm *nameMemo) bool {
 	if a, b := NormDoc(c.Auth), NormDoc(m.Auth); a != "" && b != "" && a != b {
 		return false
 	}
+	// Время напечатано у обоих и совпадает до минуты/секунды — сильный признак.
+	exact := !c.TimeGuessed && !m.TimeGuessed && c.OpDate.Equal(m.OpDate) && c.Printed != "" && m.Printed != ""
 	if named {
-		return nm.sameClient(c.ContactID, c.Client, m.ContactID, m.Client)
+		if nm.sameClient(c.ContactID, c.Client, m.ContactID, m.Client) {
+			return true
+		}
+		// «Магомедов Ахмед» в одной группе, «Ахмед» в другой — тот же чек, если
+		// всё напечатанное совпало.
+		return exact && nm.nameCovers(c.ContactID, c.Client, m.ContactID, m.Client)
 	}
-	return c.Printed != "" && m.Printed != "" && absDur(c.OpDate.Sub(m.OpDate)) <= time.Minute
+	return exact
 }
 
 // twinGap — насколько текст далёк от чеков платежа: по времени присылки чека
@@ -405,13 +421,43 @@ func twinGap(p *Payment, t *Text) time.Duration {
 		if g := absDur(c.PostedAt.Sub(t.PostedAt)); g < best {
 			best = g
 		}
-		if !c.OpDate.IsZero() {
+		if !c.OpDate.IsZero() && !c.TimeGuessed {
 			if g := absDur(c.OpDate.Sub(t.PostedAt)); g < best {
 				best = g
 			}
 		}
 	}
 	return best
+}
+
+// textLead — текст пишут, когда деньги пришли; текст, написанный задолго ДО
+// операции на чеке, — про другой платёж (вчерашний перевод без чека не
+// «съедает» сегодняшний чек).
+const textLead = 3 * time.Hour
+
+// textBeforePayment — текст написан раньше операции на чеке больше чем на textLead.
+func textBeforePayment(p *Payment, t *Text) bool {
+	for _, c := range p.Checks {
+		if c.Review || c.TimeGuessed || c.OpDate.IsZero() {
+			continue
+		}
+		if c.OpDate.After(t.PostedAt.Add(textLead)) {
+			return true
+		}
+	}
+	return false
+}
+
+// gapBucket — близость текста к чеку крупно: рядом (2 часа), в тот же день,
+// дальше. Сначала решает близость, потом — полное ли имя.
+func gapBucket(g time.Duration) int {
+	switch {
+	case g <= shortNameWindow:
+		return 0
+	case g <= 24*time.Hour:
+		return 1
+	}
+	return 2
 }
 
 // shortNameWindow — текст с неполным именем («Ахмед 10000») относим к чеку
@@ -536,6 +582,10 @@ func Build(checks []Check, texts []Text) *Book {
 			if !sameMoney(into.Amount, c.Amount) && c.Fixed && !into.Main().Fixed {
 				into.Amount = c.Amount // сумму исправили в этой группе — верна она
 			}
+			if m := into.Main(); !nm.sameClient(c.ContactID, c.Client, m.ContactID, m.Client) &&
+				!nm.nameCovers(c.ContactID, c.Client, m.ContactID, m.Client) {
+				into.Conflicts = append(into.Conflicts, c)
+			}
 			continue
 		}
 		p := &Payment{
@@ -558,6 +608,7 @@ func Build(checks []Check, texts []Text) *Book {
 		}
 	}
 	pending := newCheckIndex()
+	reviewRoot := map[*Check]*Check{}
 	for _, c := range review {
 		var into *Payment
 		for _, m := range counted.near(c) {
@@ -580,6 +631,7 @@ func Build(checks []Check, texts []Text) *Book {
 		if e.Of == nil {
 			pending.add(c)
 		}
+		reviewRoot[c] = e.Root()
 		b.Excluded = append(b.Excluded, e)
 	}
 
@@ -588,6 +640,11 @@ func Build(checks []Check, texts []Text) *Book {
 		orig := byWa[c.FwdOrigin]
 		if p := paymentOf[orig]; p != nil {
 			attach(p, c)
+			continue
+		}
+		if root := reviewRoot[orig]; root != nil {
+			// Исходный ждёт «чей чек?» — копия ждёт вместе с ним (один раз).
+			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonReview, Check: c, Of: root})
 			continue
 		}
 		b.Excluded = append(b.Excluded, Excluded{Reason: ReasonCopy, Check: c})
@@ -659,7 +716,7 @@ func Build(checks []Check, texts []Text) *Book {
 					}
 					p.mark = mark
 					gap := twinGap(p, t)
-					if gap >= TwinWindow {
+					if gap >= TwinWindow || textBeforePayment(p, t) {
 						continue
 					}
 					kind := textMatch(p, t, gap <= shortNameWindow, nm)
@@ -673,6 +730,9 @@ func Build(checks []Check, texts []Text) *Book {
 	}
 	sort.SliceStable(cands, func(i, j int) bool {
 		a, c := cands[i], cands[j]
+		if ba, bc := gapBucket(a.gap), gapBucket(c.gap); ba != bc {
+			return ba < bc
+		}
 		if a.kind != c.kind {
 			return a.kind < c.kind
 		}
@@ -697,21 +757,30 @@ func Build(checks []Check, texts []Text) *Book {
 		textIn[c.p][c.t.Group] = true
 	}
 
-	// 7: текст-итог платежа частями.
-	splitOf := map[*Text][]*Payment{}
+	// 7: текст-итог платежа частями. Тот же итог в другой группе — тот же
+	// платёж (как и обычный текст).
+	splitOf := map[*Text]split{}
+	var splits []*Text
 	byTime := newTimeIndex(checkPays)
+	extra := uncountedChecks(b.Excluded)
 	for _, t := range transfers {
 		if t.Cash || twinOf[t] != nil {
 			continue
 		}
-		if parts := splitParts(t, byTime.around(t.PostedAt, splitWindow), textIn, nm); len(parts) > 0 {
-			splitOf[t] = parts
-			for _, p := range parts {
-				if textIn[p] == nil {
-					textIn[p] = map[string]bool{}
-				}
-				textIn[p][t.Group] = true
+		sp, ok := sameSplitElsewhere(t, splits, splitOf, textIn, nm)
+		if !ok {
+			sp = splitParts(t, byTime.around(t.PostedAt, splitWindow), extra, textIn, nm)
+		}
+		if len(sp.parts) == 0 {
+			continue
+		}
+		splitOf[t] = sp
+		splits = append(splits, t)
+		for _, p := range sp.parts {
+			if textIn[p] == nil {
+				textIn[p] = map[string]bool{}
 			}
+			textIn[p][t.Group] = true
 		}
 	}
 
@@ -719,18 +788,15 @@ func Build(checks []Check, texts []Text) *Book {
 		if p := twinOf[t]; p != nil {
 			p.Texts = append(p.Texts, t)
 			p.groups[t.Group] = true
-			if t.PostedAt.Before(p.PostedAt) {
-				p.PostedAt = t.PostedAt
-			}
 			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonTwin, Text: t, Into: p})
 			continue
 		}
-		if parts := splitOf[t]; len(parts) > 0 {
-			parts[0].Texts = append(parts[0].Texts, t)
-			for _, p := range parts {
+		if sp := splitOf[t]; len(sp.parts) > 0 {
+			sp.parts[0].Texts = append(sp.parts[0].Texts, t)
+			for _, p := range sp.parts {
 				p.groups[t.Group] = true
 			}
-			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonSplit, Text: t, Into: parts[0], Parts: parts})
+			b.Excluded = append(b.Excluded, Excluded{Reason: ReasonSplit, Text: t, Into: sp.parts[0], Parts: sp.parts, Missing: sp.missing})
 			continue
 		}
 		b.Payments = append(b.Payments, &Payment{
@@ -741,13 +807,72 @@ func Build(checks []Check, texts []Text) *Book {
 	return b
 }
 
-// splitParts — 2–3 чека того же клиента без своего текста, в той же группе и
-// рядом по времени, сумма которых равна сумме текста (платёж частями из-за
-// лимита банка). Из подходящих наборов — самый близкий по времени.
-func splitParts(t *Text, pays []*Payment, textIn map[*Payment]map[string]bool, nm *nameMemo) []*Payment {
+// split — части платежа, итог которого написан текстом: посчитанные платежи
+// и чеки, которые сейчас не в сборе.
+type split struct {
+	parts   []*Payment
+	missing []*Check
+}
+
+// uncountedChecks — чеки, которые могут быть частью платежа, но сейчас не в
+// сборе: ждут «чей чек?», исключены владельцем, удалены в WhatsApp.
+func uncountedChecks(ex []Excluded) []*Check {
+	var out []*Check
+	for _, e := range ex {
+		if e.Check == nil || e.Check.Amount <= 0 || e.Check.FwdOrigin != "" || e.Of != nil {
+			continue
+		}
+		switch e.Reason {
+		case ReasonReview, ReasonIgnored, ReasonDeleted:
+			out = append(out, e.Check)
+		}
+	}
+	return out
+}
+
+func checkGap(c *Check, t *Text) time.Duration {
+	g := absDur(c.PostedAt.Sub(t.PostedAt))
+	if !c.OpDate.IsZero() && !c.TimeGuessed {
+		if g2 := absDur(c.OpDate.Sub(t.PostedAt)); g2 < g {
+			g = g2
+		}
+	}
+	return g
+}
+
+// sameSplitElsewhere — тот же итог (клиент и сумма), уже узнанный в другой
+// группе: этот текст — про те же части.
+func sameSplitElsewhere(t *Text, splits []*Text, splitOf map[*Text]split, textIn map[*Payment]map[string]bool, nm *nameMemo) (split, bool) {
+	for _, o := range splits {
+		if o.Group == t.Group || !sameMoney(o.Amount, t.Amount) || absDur(o.PostedAt.Sub(t.PostedAt)) >= TwinWindow ||
+			!nm.sameClient(o.ContactID, o.Client, t.ContactID, t.Client) {
+			continue
+		}
+		sp := splitOf[o]
+		free := true
+		for _, p := range sp.parts {
+			if textIn[p][t.Group] {
+				free = false
+			}
+		}
+		if free {
+			return sp, true
+		}
+	}
+	return split{}, false
+}
+
+// splitParts — 2–3 чека того же клиента без своего текста в этой группе, в
+// той же группе и рядом по времени, сумма которых равна сумме текста (платёж
+// частями из-за лимита банка). Хотя бы одна часть посчитана; остальные могут
+// ждать «чей чек?», быть исключены или удалены — тогда текст всё равно не
+// считается сверх своих чеков. Из подходящих наборов — с меньшим числом
+// непосчитанных частей, меньший и самый близкий по времени.
+func splitParts(t *Text, pays []*Payment, extra []*Check, textIn map[*Payment]map[string]bool, nm *nameMemo) split {
 	var cand []*Payment
 	for _, p := range pays {
-		if len(textIn[p]) > 0 || p.Amount >= t.Amount || twinGap(p, t) > splitWindow || textMatch(p, t, false, nm) != 0 {
+		if textIn[p][t.Group] || p.Amount >= t.Amount || twinGap(p, t) > splitWindow || textBeforePayment(p, t) ||
+			textMatch(p, t, false, nm) != 0 {
 			continue
 		}
 		inGroup := false
@@ -760,41 +885,89 @@ func splitParts(t *Text, pays []*Payment, textIn map[*Payment]map[string]bool, n
 			cand = append(cand, p)
 		}
 	}
-	if len(cand) < 2 {
-		return nil
+	if len(cand) == 0 {
+		return split{}
+	}
+	var miss []*Check
+	for _, c := range extra {
+		if c.Group != t.Group || c.Amount >= t.Amount || checkGap(c, t) > splitWindow {
+			continue
+		}
+		// Чек без названного клиента может быть частью; названный — только тот же клиент.
+		if c.ContactID != 0 && c.Confirmed && !nm.sameClient(c.ContactID, c.Client, t.ContactID, t.Client) {
+			continue
+		}
+		miss = append(miss, c)
+	}
+	if len(cand)+len(miss) < 2 {
+		return split{}
 	}
 	sort.SliceStable(cand, func(i, j int) bool { return twinGap(cand[i], t) < twinGap(cand[j], t) })
 	if len(cand) > 10 {
 		cand = cand[:10]
 	}
-	var best []*Payment
+	sort.SliceStable(miss, func(i, j int) bool { return checkGap(miss[i], t) < checkGap(miss[j], t) })
+	if len(miss) > 6 {
+		miss = miss[:6]
+	}
+	type item struct {
+		p   *Payment
+		c   *Check
+		amt float64
+		gap time.Duration
+	}
+	var items []item
+	for _, p := range cand {
+		items = append(items, item{p: p, amt: p.Amount, gap: twinGap(p, t)})
+	}
+	for _, c := range miss {
+		items = append(items, item{c: c, amt: c.Amount, gap: checkGap(c, t)})
+	}
+	var best []item
+	var bestMiss int
 	var bestGap time.Duration
-	consider := func(set []*Payment) {
+	consider := func(set []item) {
 		var sum float64
 		var worst time.Duration
-		for _, p := range set {
-			sum += p.Amount
-			if g := twinGap(p, t); g > worst {
-				worst = g
+		counted, missing := 0, 0
+		for _, it := range set {
+			sum += it.amt
+			if it.gap > worst {
+				worst = it.gap
+			}
+			if it.p != nil {
+				counted++
+			} else {
+				missing++
 			}
 		}
-		if !sameMoney(sum, t.Amount) {
+		if counted == 0 || !sameMoney(sum, t.Amount) {
 			return
 		}
-		if best == nil || len(set) < len(best) || (len(set) == len(best) && worst < bestGap) {
-			best, bestGap = append([]*Payment(nil), set...), worst
+		better := best == nil || missing < bestMiss ||
+			(missing == bestMiss && (len(set) < len(best) || (len(set) == len(best) && worst < bestGap)))
+		if better {
+			best, bestMiss, bestGap = append([]item(nil), set...), missing, worst
 		}
 	}
-	for i := range cand {
-		for j := i + 1; j < len(cand); j++ {
-			consider([]*Payment{cand[i], cand[j]})
-			for k := j + 1; k < len(cand); k++ {
-				consider([]*Payment{cand[i], cand[j], cand[k]})
+	for i := range items {
+		for j := i + 1; j < len(items); j++ {
+			consider([]item{items[i], items[j]})
+			for k := j + 1; k < len(items); k++ {
+				consider([]item{items[i], items[j], items[k]})
 			}
 		}
 	}
-	sort.SliceStable(best, func(i, j int) bool { return best[i].PostedAt.Before(best[j].PostedAt) })
-	return best
+	var out split
+	for _, it := range best {
+		if it.p != nil {
+			out.parts = append(out.parts, it.p)
+		} else {
+			out.missing = append(out.missing, it.c)
+		}
+	}
+	sort.SliceStable(out.parts, func(i, j int) bool { return out.parts[i].PostedAt.Before(out.parts[j].PostedAt) })
+	return out
 }
 
 func amountKey(a float64) int64 { return int64(math.Round(a)) }
