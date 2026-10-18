@@ -1742,6 +1742,28 @@ func (d *DB) ClientAlreadyAttributedFrom(ctx context.Context, groupJID, senderJI
 	return exists, err
 }
 
+// ClientChecksOfAmountFrom — сколько ДРУГИХ чеков того же отправителя в группе
+// за недавнее время уже привязано к этому клиенту на эту сумму. Строка «ФИО
+// сумма» называет один чек на свою сумму: «Исаев Харон 5000» + два чека по
+// 5000 — второй надо спросить, а чек на 10000 из «Исаев Харон\n10000\n5000»
+// чеку на 5000 не мешает.
+func (d *DB) ClientChecksOfAmountFrom(ctx context.Context, groupJID, senderJID string, contactID int, exceptWaMessageID string, since time.Time, amount float64) (int, error) {
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT count(*) FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.contact_id = $3
+		  AND COALESCE(rm.wa_message_id, '') <> $4
+		  AND rm.received_at >= $5
+		  AND abs(br.amount - $6::float8) < 1
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+	`, groupJID, senderJID, contactID, exceptWaMessageID, since, amount).Scan(&n)
+	return n, err
+}
+
 // DuplicateWindow — окно вокруг времени операции, в котором совпадение
 // получателя и суммы считается вероятным повтором одного и того же чека
 // (например, кто-то по ошибке переслал одно и то же фото дважды).
@@ -3413,9 +3435,17 @@ func (d *DB) ReattributeOldestUnconfirmedReceipt(ctx context.Context, groupJID, 
 // OldestUnconfirmedReceiptAmount — сумма самого старого неподтверждённого чека
 // отправителя (тот, к которому привяжется имя), ok=false — такого нет.
 func (d *DB) OldestUnconfirmedReceiptAmount(ctx context.Context, groupJID, senderJID string, since time.Time) (float64, bool, error) {
+	amount, _, ok, err := d.OldestUnconfirmedReceiptCard(ctx, groupJID, senderJID, since)
+	return amount, ok, err
+}
+
+// OldestUnconfirmedReceiptCard — то же и владелец карты (получатель,
+// напечатанный на чеке): его ФИО — не клиент этого чека.
+func (d *DB) OldestUnconfirmedReceiptCard(ctx context.Context, groupJID, senderJID string, since time.Time) (float64, string, bool, error) {
 	var amount float64
+	var owner string
 	err := d.pool.QueryRow(ctx, `
-		SELECT br.amount::float8 FROM bank_receipts br
+		SELECT br.amount::float8, COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), '') FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
 		  AND rm.sender_jid = $2
@@ -3425,14 +3455,32 @@ func (d *DB) OldestUnconfirmedReceiptAmount(ctx context.Context, groupJID, sende
 		  AND COALESCE(rm.deleted, false) = false
 		ORDER BY rm.received_at ASC, br.id ASC
 		LIMIT 1
-	`, groupJID, senderJID, since).Scan(&amount)
+	`, groupJID, senderJID, since).Scan(&amount, &owner)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, false, nil
+		return 0, "", false, nil
 	}
 	if err != nil {
-		return 0, false, err
+		return 0, "", false, err
 	}
-	return amount, true, nil
+	return amount, owner, true, nil
+}
+
+// ReceiptCardOwnerByMessage — владелец карты (получатель, напечатанный на
+// чеке) чека по id его сообщения WhatsApp; "" — чека нет.
+func (d *DB) ReceiptCardOwnerByMessage(ctx context.Context, waMessageID string) (string, error) {
+	var owner string
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), '')
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE rm.wa_message_id = $1
+		ORDER BY br.id DESC
+		LIMIT 1
+	`, waMessageID).Scan(&owner)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	return owner, err
 }
 
 // ReattributeOldestUnconfirmedReceiptFrom — то же, с запоминанием, КАКОЕ

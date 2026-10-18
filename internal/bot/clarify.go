@@ -327,18 +327,25 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 	// handleNameMessage и очереди имён): «Магомедов Ахмед 20000» — не клиент чека
 	// на 15000, «… нал» — вообще другой платёж, в списке подходит только строка
 	// с суммой чека. Сначала — сообщения с суммой чека, потом — просто ФИО.
-	var exact, loose []string
+	type nameSrc struct {
+		text  string
+		exact bool
+		n     int // сколько чеков на эту сумму называет текст (платежей этого ФИО на неё)
+	}
+	var exact, loose []nameSrc
 	for _, t := range texts {
-		src, same, ok := checkNameSource(t, it.Amount)
+		src, same, n, ok := checkNameSource(t, it.Amount)
 		switch {
 		case !ok:
 		case same:
-			exact = append(exact, src)
+			exact = append(exact, nameSrc{src, true, n})
 		default:
-			loose = append(loose, src)
+			loose = append(loose, nameSrc{src, false, 0})
 		}
 	}
-	for _, t := range append(exact, loose...) {
+	since := time.Now().Add(-30 * time.Minute)
+	for _, s := range append(exact, loose...) {
+		t := s.text
 		name, ok := looksLikeName(t)
 		if !ok {
 			name, ok = firstNameLine(t)
@@ -357,15 +364,22 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		}
 		canonical, _ := b.aliases.ResolveName(name)
 		// Владелец карты (получатель на чеке) — это НЕ клиент, его не берём.
-		if it.CardOwner != "" && strings.EqualFold(strings.TrimSpace(canonical), strings.TrimSpace(it.CardOwner)) {
+		if isCardOwner(canonical, it.CardOwner) {
 			continue
 		}
 		var contactIDPtr *int
 		if cid, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 			// Это ФИО уже «ушло» на другой чек того же отправителя («Иванов» +
 			// чек1 + чек2: Иванов — это чек1). Второму чеку имя не приписываем —
-			// про него честно спросим.
-			if used, err := b.db.ClientAlreadyAttributedFrom(ctx, jid.String(), it.SenderJID, cid, it.WaMessageID, time.Now().Add(-30*time.Minute)); err == nil && used {
+			// про него честно спросим. Строка с суммой чека называет столько
+			// чеков на ЭТУ сумму, сколько в тексте таких платежей: чек 10000 из
+			// «Исаев Харон\n10000\n5000» чеку 5000 не мешает, а второй чек 5000
+			// при одной строке «Исаев Харон 5000» — спросим.
+			if s.exact {
+				if k, err := b.db.ClientChecksOfAmountFrom(ctx, jid.String(), it.SenderJID, cid, it.WaMessageID, since, it.Amount); err != nil || k >= s.n {
+					continue
+				}
+			} else if used, err := b.db.ClientAlreadyAttributedFrom(ctx, jid.String(), it.SenderJID, cid, it.WaMessageID, since); err == nil && used {
 				continue
 			}
 			contactIDPtr = &cid
