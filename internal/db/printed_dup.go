@@ -38,7 +38,14 @@ type PrintedTwin struct {
 	TxDate     time.Time
 	WaMessage  string
 	ReceivedAt time.Time
+	Asked      bool // по нему уже спрашивали «чей чек?»
 }
+
+// MinutePrecision — время операции на чеке без секунд (ВТБ печатает только часы
+// и минуты): два разных перевода в одну минуту с одной карты на одну карту
+// бывают (родственник платит за двоих подряд), поэтому «тот же чек» по такому
+// времени молча не решаем — спрашиваем человека.
+func MinutePrecision(t time.Time) bool { return t.Second() == 0 && t.Nanosecond() == 0 }
 
 // printedNorm — сравнение печатных строк без пробелов, знаков и «ё».
 func printedNorm(expr string) string {
@@ -83,7 +90,7 @@ func (d *DB) FindPrintedTwin(ctx context.Context, groupJID string, excludeID int
 		)
 		SELECT br.id, (br.client_confirmed AND br.contact_id IS NOT NULL), br.contact_id,
 		       COALESCE(c.canonical_name, br.recipient_raw, ''), br.tx_date,
-		       COALESCE(rm.wa_message_id, ''), rm.received_at
+		       COALESCE(rm.wa_message_id, ''), rm.received_at, br.clarify_asked
 		FROM p, bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
@@ -96,7 +103,7 @@ func (d *DB) FindPrintedTwin(ctx context.Context, groupJID string, excludeID int
 		ORDER BY rm.received_at, br.id
 		LIMIT 1
 	`, groupJID, excludeID, p.Amount, p.TxDate, p.Recipient, p.Sender, p.Bank, p.DocNumber, p.AuthCode).
-		Scan(&t.ID, &t.Named, &t.ContactID, &t.Client, &t.TxDate, &t.WaMessage, &t.ReceivedAt)
+		Scan(&t.ID, &t.Named, &t.ContactID, &t.Client, &t.TxDate, &t.WaMessage, &t.ReceivedAt, &t.Asked)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return t, nil
 	}
@@ -114,61 +121,4 @@ func (d *DB) MarkReceiptDuplicate(ctx context.Context, id int) (bool, error) {
 		return false, err
 	}
 	return tag.RowsAffected() == 1, nil
-}
-
-// dedupePrintedTwin — чек receiptID только что получил клиента (ответ на «чей
-// чек?», правка, перепривязка): если в группе живёт тот же напечатанный чек,
-// платёж один. Неподписанная копия становится повтором (подписанная остаётся);
-// две копии, записанные на одного клиента, — повтором становится более поздняя;
-// копии, записанные на РАЗНЫХ клиентов, не трогаем (разных клиентов не склеиваем).
-// Возвращает id чека, помеченного повтором (0 — ничего не меняли).
-func (d *DB) dedupePrintedTwin(ctx context.Context, receiptID int) (int, error) {
-	var (
-		groupJID, sender string
-		named, live      bool
-		contactID        *int
-		received         time.Time
-		p                PrintedReceipt
-	)
-	err := d.pool.QueryRow(ctx, `
-		SELECT COALESCE(br.group_jid, rm.wa_group_jid, ''), COALESCE(rm.sender_jid, ''),
-		       (br.client_confirmed AND br.contact_id IS NOT NULL), br.contact_id, rm.received_at,
-		       (br.is_duplicate = false AND br.ignored = false AND COALESCE(rm.deleted, false) = false),
-		       `+printedRecipientOf("br")+`, COALESCE(br.sender_raw, ''), COALESCE(br.bank, ''),
-		       COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''), COALESCE(br.amount, 0)::float8, br.tx_date
-		FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
-		WHERE br.id = $1`, receiptID).
-		Scan(&groupJID, &sender, &named, &contactID, &received, &live,
-			&p.Recipient, &p.Sender, &p.Bank, &p.DocNumber, &p.AuthCode, &p.Amount, &p.TxDate)
-	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, err
-	}
-	if !live || !named || sender == "bot-forward" {
-		return 0, nil
-	}
-	tw, err := d.FindPrintedTwin(ctx, groupJID, receiptID, p)
-	if err != nil || !tw.Found {
-		return 0, err
-	}
-	victim := 0
-	switch {
-	case !tw.Named:
-		victim = tw.ID // неподписанная копия — повтор подписанной
-	case tw.ContactID != nil && contactID != nil && *tw.ContactID == *contactID:
-		victim = receiptID // одна и та же — повтором считаем более позднюю
-		if tw.ReceivedAt.After(received) || (tw.ReceivedAt.Equal(received) && tw.ID > receiptID) {
-			victim = tw.ID
-		}
-	default:
-		return 0, nil // записаны на разных клиентов — не склеиваем
-	}
-	ok, err := d.MarkReceiptDuplicate(ctx, victim)
-	if err != nil || !ok {
-		return 0, err
-	}
-	fmt.Printf("Чек #%d: тот же напечатанный чек, что #%d, — #%d не учитываю повторно\n", receiptID, tw.ID, victim)
-	return victim, nil
 }

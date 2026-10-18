@@ -99,7 +99,10 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 	if ok {
 		applyAIReceiptAuthoritative(&rd, rec)
 	}
-	if !ok || rec.Kind == "cash" || rd.Amount <= 0 {
+	// Банк перевод отклонил — денег нет: в сбор не идёт, как и при приёме чека
+	// (даже если клиента назвали в подписи и сумма прочиталась).
+	declined := ok && rec.Kind != "cash" && receiptDeclined(rd.Status)
+	if !declined && (!ok || rec.Kind == "cash" || rd.Amount <= 0) {
 		next := time.Now().Add(retryBackoff(it.Attempts))
 		_ = b.db.BumpReceiptRetry(ctx, it.ID, "перечитал, но чек не распознался", next, max)
 		return
@@ -108,12 +111,34 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 		Bank: rd.Bank, Recipient: rd.Recipient, Sender: rd.Sender,
 		DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Status: rd.Status,
 		Amount: rd.Amount, Commission: rd.Commission,
-		TxDate: rd.TxTime, HasTxDate: rd.HasTxTime,
+		TxDate: rd.TxTime, HasTxDate: rd.HasTxTime, Declined: declined,
 	}); err != nil {
 		fmt.Printf("Повтор чека #%d: ошибка сохранения: %v\n", it.ID, err)
 		return
 	}
+	waID, senderJID, groupJID, _ := b.db.ReceiptReplyRef(ctx, it.ID)
+	chat, jerr := types.ParseJID(groupJID)
+	if declined {
+		fmt.Printf("Повтор чека #%d: статус «%s» — перевод не прошёл, в сбор не идёт\n", it.ID, rd.Status)
+		if jerr == nil && groupJID != "" {
+			b.dropReceiptAsk(groupJID, waID) // про сумму этого чека больше не спрашиваем
+			if !b.groupSilent(chat) {
+				b.sendReply(chat, fmt.Sprintf("⚠️ Перечитал чек: на нём статус «%s» — перевод не прошёл, в сбор не засчитываю.", rd.Status), waID, senderJID)
+			}
+		}
+		return
+	}
 	fmt.Printf("Повтор чека #%d: распознан (сумма %.0f ₽, получатель %q)\n", it.ID, rd.Amount, rd.Recipient)
+	// Чек стал полным только сейчас — при приёме проверка «уже присылали» его
+	// не поймала (не было суммы, номера). Тот же чек, уже засчитанный, — повтор.
+	same, err := b.db.DedupeCompletedReceipt(ctx, it.ID, true, true)
+	if err != nil {
+		fmt.Printf("Повтор чека #%d: проверка повтора не удалась: %v\n", it.ID, err)
+		return
+	}
+	if same.Found && jerr == nil && groupJID != "" {
+		b.reportSameCheck(ctx, chat, waID, senderJID, same, true)
+	}
 }
 
 // retryDueMedia — фото/PDF чеков, которые так и не стали чеком (не скачались

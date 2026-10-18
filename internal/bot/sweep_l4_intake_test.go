@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"whatsapp-bot/internal/ai"
+	"whatsapp-bot/internal/parser"
 
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/types"
@@ -151,9 +152,10 @@ func TestL4intake_16_ResentWithCaptionCountedOnce(t *testing.T) {
 	}
 }
 
-// Находка 16: тот же чек, присланный без подписи ПОСЛЕ подписанного, —
-// повтор, клиента не спрашиваем и дважды не считаем. Тот же чек, подписанный
-// ДРУГИМ клиентом, — не склеиваем (разных клиентов не объединяем).
+// Находка 16: тот же чек (время с секундами), присланный без подписи ПОСЛЕ
+// подписанного, — повтор, клиента не спрашиваем и дважды не считаем. Тот же
+// чек, подписанный ДРУГИМ клиентом, — не склеиваем (разных клиентов не
+// объединяем). Время только до минуты — см. R3: там спрашиваем.
 func TestL4intake_16_UnnamedRepostAfterNamedIsDuplicate(t *testing.T) {
 	ctx := context.Background()
 	e := newE2E(t, e2eOpts{WithAI: true})
@@ -161,7 +163,10 @@ func TestL4intake_16_UnnamedRepostAfterNamedIsDuplicate(t *testing.T) {
 	grp := e2eGroup("resend2")
 	e.groupsCache[grp] = "Оплата"
 	emp := user("79001112008")
-	vtb := l4intakeVTB("13:02", "Харон Исаевич И.", "7 000")
+	vtb := l4intakeVTB("13:02:41", "Харон Исаевич И.", "7 000")
+	if r := parser.ParseReceipt(vtb); !r.HasTxTime || r.TxTime.Second() != 41 {
+		t.Fatalf("время с секундами не прочиталось: %+v", r)
+	}
 	e.sendReceipt(grp, emp, "Сафаи", vtb, "Исаев Харон")
 	again := e.sendReceipt(grp, emp, "Сафаи", vtb, "")
 	if r := e.db.TestReceiptByMessage(ctx, again); !r.Duplicate {
@@ -318,5 +323,547 @@ func TestL4intake_16_NamingAnswerDedupesLateReadCopy(t *testing.T) {
 	if got := dayTotals(e, grp); got["Исаев Харон"] != 7000 || sum(got) != 7000 {
 		t.Errorf("один чек в двух копиях: в сборе %v, ожидали Исаев Харон 7000 (1: %+v, 2: %+v)", got,
 			e.db.TestReceiptByMessage(ctx, first), e.db.TestReceiptByMessage(ctx, second))
+	}
+}
+
+// ---- Регрессии второго ревью (R0…R5) ----
+
+// R0: ИИ лежал — чек с подписью «Исаев Харон» без суммы; тот же чек прислали
+// ещё раз чётко (засчитан). Автоповтор дочитал первую копию с тем же номером
+// документа — платёж один, а не два.
+func TestL4intake_R0_RetryDoesNotDoubleCountResentCheck(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	day := time.Now().Format("2006-01-02")
+	doc := "A6290101010101010G10040011791103"
+	e.ai = func(c aiCall) aiReply {
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
+		if strings.Contains(c.System, "модуль разбора изображений") {
+			return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":5000,"commission":0,"doc_number":"` + doc + `","status":"Выполнено","datetime":"` + day + ` 10:15:30"}`}
+		}
+		return aiReply{Text: ""}
+	}
+	healthy := e.assistant
+	e.assistant = ai.New("k", "m", "v", "http://127.0.0.1:1") // ИИ недоступен
+	grp := e2eGroup("rr")
+	emp := user("79001112055")
+	path := filepath.Join(t.TempDir(), "check.jpg")
+	_ = os.WriteFile(path, []byte("\xff\xd8\xff\xe0 check photo"), 0o644)
+	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+	first := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", path) // «не разобрал СУММУ»
+	clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Format("02.01.2006") + " 10:15:30" +
+		"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\n" + doc
+	second := e.sendReceipt(grp, emp, "Сафаи", clear, "Исаев Харон") // тот же чек, чётко — засчитан
+	e.assistant = healthy
+	items, err := e.db.DueReceiptRetries(ctx, time.Now().Add(time.Hour), maxReceiptRetries(), 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("автоповтор: %v %v", items, err)
+	}
+	e.retryOneReceipt(ctx, items[0])
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("сбор %v, ожидали 5000 (1: %+v, 2: %+v)", got, e.db.TestReceiptByMessage(ctx, first), e.db.TestReceiptByMessage(ctx, second))
+	}
+}
+
+// R0 (ответ суммой): размытый чек с подписью, потом тот же чек чётко с той же
+// подписью, потом на «не разобрал СУММУ» ответили «5000». Дважды не считаем —
+// бот спрашивает, тот же это чек или другой; «другой» — засчитывает отдельно.
+func TestL4intake_R0_AmountAnswerDoesNotDoubleCount(t *testing.T) {
+	ctx := context.Background()
+	setup := func(tag string) (*e2eBot, types.JID, types.JID, string) {
+		e := newE2E(t, e2eOpts{WithAI: true})
+		e.ai = func(c aiCall) aiReply {
+			if r, ok := fakeNameExtract(c); ok {
+				return r
+			}
+			if strings.Contains(c.System, "модуль разбора изображений") {
+				return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":0,"commission":0,"doc_number":"","status":"Выполнено","datetime":""}`}
+			}
+			return aiReply{Text: ""}
+		}
+		grp := e2eGroup(tag)
+		emp := user("79001112056")
+		ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+		first := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", "")
+		q := e.last()
+		if !strings.Contains(q.Text, "СУММУ") {
+			t.Fatalf("нет вопроса про сумму: %q", q.Text)
+		}
+		clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Add(-time.Minute).Format("02.01.2006 15:04:05") +
+			"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\nA6290101010101010G10040011791104"
+		e.sendReceipt(grp, emp, "Сафаи", clear, "Исаев Харон")
+		e.sendGroup(groupReply(grp, emp, "Сафаи", "5000", q.ID, e.botJID(), q.Text))
+		return e, grp, emp, first
+	}
+	e, grp, _, first := setup("ra")
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("сбор %v, ожидали 5000 (1: %+v)", got, e.db.TestReceiptByMessage(ctx, first))
+	}
+	a := e.last()
+	if !strings.Contains(a.Text, "другой") {
+		t.Errorf("бот не спросил, тот же ли это чек: %q", a.Text)
+	}
+	// «другой» — это отдельный платёж: засчитываем.
+	e.sendGroup(groupReply(grp, user("79001112056"), "Сафаи", "другой", a.ID, e.botJID(), a.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+		t.Errorf("после «другой»: сбор %v, ожидали 10000", got)
+	}
+}
+
+// R1: автоповтор прочитал на чеке с подписью «Операция отклонена» — денег нет,
+// в сбор не идёт, в группе предупреждение.
+func TestL4intake_R1_RetryDeclinedCaptionedCheckNotCounted(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	day := time.Now().Format("2006-01-02")
+	e.ai = func(c aiCall) aiReply {
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
+		if strings.Contains(c.System, "модуль разбора изображений") {
+			return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":5000,"commission":0,"doc_number":"","status":"Операция отклонена","datetime":"` + day + ` 10:15:30"}`}
+		}
+		return aiReply{Text: ""}
+	}
+	healthy := e.assistant
+	e.assistant = ai.New("k", "m", "v", "http://127.0.0.1:1")
+	grp := e2eGroup("rf")
+	emp := user("79001112062")
+	path := filepath.Join(t.TempDir(), "check.jpg")
+	_ = os.WriteFile(path, []byte("\xff\xd8\xff\xe0 declined photo"), 0o644)
+	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+	waID := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", path)
+	e.assistant = healthy
+	items, err := e.db.DueReceiptRetries(ctx, time.Now().Add(time.Hour), maxReceiptRetries(), 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("автоповтор: %v %v", items, err)
+	}
+	e.retryOneReceipt(ctx, items[0])
+	if got := dayTotals(e, grp); sum(got) != 0 {
+		t.Errorf("отклонённый перевод засчитан: %v (%+v)", got, e.db.TestReceiptByMessage(ctx, waID))
+	}
+	if a := e.last(); !strings.Contains(a.Text, "не прошёл") {
+		t.Errorf("нет предупреждения об отклонённом переводе: %q", a.Text)
+	}
+}
+
+// R2: на свёрнутый экран ответили коротким именем («Харон»/«Исаев»), потом
+// прислали полный чек с подписью «Исаев Харон» — это тот же платёж.
+func TestL4intake_R2_CollapsedShortNameReplacedByFullCheck(t *testing.T) {
+	for _, tc := range []struct{ answer, caption string }{{"Харон", "Исаев Харон"}, {"Исаев", "Исаев Харон"}} {
+		t.Run(tc.answer, func(t *testing.T) {
+			e := newE2E(t, e2eOpts{WithAI: true})
+			day := time.Now().Format("2006-01-02")
+			e.ai = func(c aiCall) aiReply {
+				if r, ok := fakeNameExtract(c); ok {
+					return r
+				}
+				if strings.Contains(c.System, "модуль разбора изображений") {
+					if strings.Contains(c.lastUserText(), "Перевод выполнен") {
+						return aiReply{Text: `{"kind":"receipt","bank":"","recipient":"","amount":5000,"commission":0,"doc_number":"","status":"Перевод выполнен","datetime":""}`}
+					}
+					return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":5000,"commission":0,"doc_number":"","status":"Выполнено","datetime":"` + day + ` 11:30:00"}`}
+				}
+				return aiReply{Text: ""}
+			}
+			grp := e2eGroup("cv")
+			emp := user("79001112057")
+			l4intakePhoto(e, grp, emp, "Сафаи", "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", "")
+			q := e.last()
+			e.sendGroup(groupReply(grp, emp, "Сафаи", tc.answer, q.ID, e.botJID(), q.Text))
+			l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", "11:30:00"), tc.caption, "")
+			if got := dayTotals(e, grp); sum(got) != 5000 {
+				t.Errorf("один платёж: сбор %v, ожидали 5000", got)
+			}
+		})
+	}
+}
+
+// R3 (а): по чеку без подписи бот спросил «чей чек?», следом пришёл такой же
+// чек ВТБ (время до минуты) с подписью «Исаев Харон». На вопрос ответили
+// «Исаева Марьям» — это другой клиент, оба платежа в учёте.
+func TestL4intake_R3_AskedUnnamedAnswerNotDroppedByNamedTwin(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.ai = aiNamesAndPayments("Исаев Харон", "Исаева Марьям")
+	grp := e2eGroup("c5")
+	e.groupsCache[grp] = "Оплата"
+	emp := user("79001112066")
+	vtb := l4intakeVTB("13:02", "Харон Исаевич И.", "7 000")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "")
+	e.age(grp.String())
+	e.clarifyTick(ctx)
+	q := e.last()
+	if !strings.Contains(q.Text, "Чей это чек") {
+		t.Fatalf("нет вопроса: %q", q.Text)
+	}
+	n := len(e.sent())
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "Исаев Харон")
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаева Марьям", q.ID, e.botJID(), q.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 7000 || got["Исаева Марьям"] != 7000 {
+		t.Errorf("ответ пропал (бот сказал %v): сбор %v", e.sentSince(n), got)
+	}
+}
+
+// R3 (б): подписанный чек ВТБ, потом такой же без подписи (время до минуты —
+// может быть второй перевод в ту же минуту): бот не решает молча «повтор», а
+// спрашивает, чей чек; ответ «Исаева Марьям» — оба платежа в учёте.
+func TestL4intake_R3_MinuteTwinWithoutCaptionAsked(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.ai = aiNamesAndPayments("Исаев Харон", "Исаева Марьям")
+	grp := e2eGroup("c6")
+	e.groupsCache[grp] = "Оплата"
+	emp := user("79001112067")
+	vtb := l4intakeVTB("13:02", "Харон Исаевич И.", "7 000")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "Исаев Харон")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "")
+	if a := e.last(); strings.Contains(a.Text, "уже присылали") {
+		t.Errorf("чек с временем до минуты молча признан повтором: %q", a.Text)
+	}
+	e.age(grp.String())
+	e.clarifyTick(ctx)
+	q := e.last()
+	if !strings.Contains(q.Text, "Чей это чек") {
+		t.Fatalf("нет вопроса: %q", q.Text)
+	}
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаева Марьям", q.ID, e.botJID(), q.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 7000 || got["Исаева Марьям"] != 7000 {
+		t.Errorf("сбор %v, ожидали Исаев Харон 7000 + Исаева Марьям 7000", got)
+	}
+}
+
+// R4: свёрнутый 5000 назван «Исаев Харон», второй свёрнутый 5000 ещё ничей;
+// полный чек с подписью «Исаев Харон» заменяет свёрнутый ТОГО ЖЕ клиента, а не
+// ничей.
+func TestL4intake_R4_FullCheckReplacesSameClientCollapsedFirst(t *testing.T) {
+	e := newE2E(t, e2eOpts{WithAI: true})
+	day := time.Now().Format("2006-01-02")
+	e.ai = func(c aiCall) aiReply {
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
+		if strings.Contains(c.System, "модуль разбора изображений") {
+			if strings.Contains(c.lastUserText(), "Перевод выполнен") {
+				return aiReply{Text: `{"kind":"receipt","bank":"","recipient":"","amount":5000,"commission":0,"doc_number":"","status":"Перевод выполнен","datetime":""}`}
+			}
+			return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":5000,"commission":0,"doc_number":"","status":"Выполнено","datetime":"` + day + ` 11:30:00"}`}
+		}
+		return aiReply{Text: ""}
+	}
+	grp := e2eGroup("ce")
+	emp := user("79001112059")
+	l4intakePhoto(e, grp, emp, "Сафаи", "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", "")
+	q := e.last()
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаев Харон", q.ID, e.botJID(), q.Text))
+	other := l4intakePhoto(e, grp, emp, "Сафаи", "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", "")
+	l4intakePhoto(e, grp, emp, "Сафаи", sberCheck("5000.00", "11:30:00"), "Исаев Харон", "")
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("сбор %v", got)
+	}
+	if r := e.db.TestReceiptByMessage(context.Background(), other); r.Duplicate {
+		t.Errorf("ничей свёрнутый (другой платёж) пропал из «не вошло»: %+v", r)
+	}
+}
+
+// R5: один и тот же чек дважды без подписи, первый удалили — оставшаяся копия
+// снова ждёт ответа «чей чек?», а не уходит в сбор на владельца карты.
+func TestL4intake_R5_UnnamedCopyPromotedNotCountedToCardOwner(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct{ name, check string }{
+		{"Сбер", sberCheck("7000.00", "13:02:11")},
+		{"ВТБ", l4intakeVTB("13:02", "Харон Исаевич И.", "7 000")},
+	} {
+		e := newE2E(t, e2eOpts{WithAI: true})
+		e.ai = aiNamesAndPayments("Исаев Харон")
+		grp := e2eGroup("pp")
+		e.groupsCache[grp] = "Оплата"
+		emp := user("79001112065")
+		first := e.sendReceipt(grp, emp, "Сафаи", tc.check, "")
+		second := e.sendReceipt(grp, emp, "Сафаи", tc.check, "")
+		e.event(&events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: grp, Sender: emp, IsGroup: true}, ID: e2eID("R"), Timestamp: time.Now()},
+			Message: &waProto.Message{ProtocolMessage: &waProto.ProtocolMessage{Type: waProto.ProtocolMessage_REVOKE.Enum(),
+				Key: &waProto.MessageKey{RemoteJID: proto.String(grp.String()), ID: proto.String(first), Participant: proto.String(emp.String())}}}})
+		if got := dayTotals(e, grp); sum(got) != 0 {
+			t.Errorf("%s: копия без ФИО ушла в сбор на владельца карты: %v (%+v)", tc.name, got, e.db.TestReceiptByMessage(ctx, second))
+		}
+		if r := e.db.TestReceiptByMessage(ctx, second); !r.Found || r.Duplicate || !r.NeedsReview {
+			t.Errorf("%s: копия должна снова ждать клиента: %+v", tc.name, r)
+		}
+	}
+}
+
+// R0 (копия без подписи): ИИ лежал — чек с подписью без суммы; тот же чек
+// прислали чётко, но без подписи (бот спросит «чей чек?»). Автоповтор дочитал
+// первый с тем же номером документа: платёж один, на клиента из подписи, а
+// неподписанная копия — повтор (про неё не спрашиваем).
+func TestL4intake_R0_RetryMakesUnnamedCopyDuplicate(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	day := time.Now().Format("2006-01-02")
+	doc := "A6290101010101010G10040011791105"
+	e.ai = func(c aiCall) aiReply {
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
+		if strings.Contains(c.System, "модуль разбора изображений") {
+			return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":5000,"commission":0,"doc_number":"` + doc + `","status":"Выполнено","datetime":"` + day + ` 10:15:30"}`}
+		}
+		return aiReply{Text: ""}
+	}
+	healthy := e.assistant
+	e.assistant = ai.New("k", "m", "v", "http://127.0.0.1:1")
+	grp := e2eGroup("ru")
+	emp := user("79001112068")
+	path := filepath.Join(t.TempDir(), "check.jpg")
+	_ = os.WriteFile(path, []byte("\xff\xd8\xff\xe0 check photo"), 0o644)
+	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+	l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", path)
+	clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Format("02.01.2006") + " 10:15:30" +
+		"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\n" + doc
+	unnamed := e.sendReceipt(grp, emp, "Сафаи", clear, "")
+	e.assistant = healthy
+	items, err := e.db.DueReceiptRetries(ctx, time.Now().Add(time.Hour), maxReceiptRetries(), 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("автоповтор: %v %v", items, err)
+	}
+	e.retryOneReceipt(ctx, items[0])
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 || sum(got) != 5000 {
+		t.Errorf("сбор %v, ожидали Исаев Харон 5000", got)
+	}
+	if r := e.db.TestReceiptByMessage(ctx, unnamed); !r.Duplicate {
+		t.Errorf("неподписанная копия того же чека не стала повтором: %+v", r)
+	}
+	e.age(grp.String())
+	e.clarifyTick(ctx)
+	if q := e.last(); strings.Contains(q.Text, "Чей это чек") {
+		t.Errorf("бот спрашивает «чей чек?» про повтор: %q", q.Text)
+	}
+}
+
+// R0 (ответ суммой): «тот же» — остаётся один платёж; чек, сделанный ПОЗЖЕ,
+// чем прислали размытый, — точно другой платёж: засчитан без вопроса.
+func TestL4intake_R0_AmountAnswerSameOrLater(t *testing.T) {
+	run := func(tag string, clearAt time.Time) (*e2eBot, types.JID, types.JID) {
+		e := newE2E(t, e2eOpts{WithAI: true})
+		e.ai = func(c aiCall) aiReply {
+			if r, ok := fakeNameExtract(c); ok {
+				return r
+			}
+			if strings.Contains(c.System, "модуль разбора изображений") {
+				return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":0,"commission":0,"doc_number":"","status":"Выполнено","datetime":""}`}
+			}
+			return aiReply{Text: ""}
+		}
+		grp := e2eGroup(tag)
+		emp := user("79001112069")
+		ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+		l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", "")
+		q := e.last()
+		clear := "СберБанк\nЧек по операции\nДата операции " + clearAt.Format("02.01.2006 15:04:05") +
+			"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\n" + e2eID("DOC")
+		e.sendReceipt(grp, emp, "Сафаи", clear, "Исаев Харон")
+		e.sendGroup(groupReply(grp, emp, "Сафаи", "5000", q.ID, e.botJID(), q.Text))
+		return e, grp, emp
+	}
+	e, grp, emp := run("rs", time.Now().Add(-2*time.Minute))
+	a := e.last()
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "тот же", a.ID, e.botJID(), a.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("«тот же»: сбор %v, ожидали 5000", got)
+	}
+	e, grp, _ = run("rl", time.Now().Add(5*time.Minute))
+	if a := e.last(); strings.Contains(a.Text, "другой") {
+		t.Errorf("чек сделан позже размытого — это другой платёж, а бот спрашивает: %q", a.Text)
+	}
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+		t.Errorf("два разных платежа: сбор %v, ожидали 10000", got)
+	}
+}
+
+// R3 (время с секундами): по неподписанному чеку спросили «чей чек?», следом
+// пришёл тот же чек с подписью — бот говорит, что считает его один раз. Если
+// на вопрос всё же назвали ДРУГОГО клиента — ответ не теряется: разных
+// клиентов не склеиваем, оба платежа в учёте. Тем же клиентом — один платёж.
+func TestL4intake_R3_SecondsTwinAskedAnswerKept(t *testing.T) {
+	ctx := context.Background()
+	for _, tc := range []struct {
+		answer string
+		want   map[string]float64
+	}{
+		{"Исаева Марьям", map[string]float64{"Исаев Харон": 7000, "Исаева Марьям": 7000}},
+		{"Исаев Харон", map[string]float64{"Исаев Харон": 7000}},
+	} {
+		e := newE2E(t, e2eOpts{WithAI: true})
+		e.ai = aiNamesAndPayments("Исаев Харон", "Исаева Марьям")
+		grp := e2eGroup("c7")
+		e.groupsCache[grp] = "Оплата"
+		emp := user("79001112070")
+		vtb := l4intakeVTB("13:02:41", "Харон Исаевич И.", "7 000")
+		e.sendReceipt(grp, emp, "Сафаи", vtb, "")
+		e.age(grp.String())
+		e.clarifyTick(ctx)
+		q := e.last()
+		if !strings.Contains(q.Text, "Чей это чек") {
+			t.Fatalf("нет вопроса: %q", q.Text)
+		}
+		e.sendReceipt(grp, emp, "Сафаи", vtb, "Исаев Харон")
+		if a := e.last(); !strings.Contains(a.Text, "один раз") {
+			t.Errorf("бот не сказал, что вопрос по неподписанной копии снят: %q", a.Text)
+		}
+		n := len(e.sent())
+		e.sendGroup(groupReply(grp, emp, "Сафаи", tc.answer, q.ID, e.botJID(), q.Text))
+		if got := dayTotals(e, grp); len(got) != len(tc.want) || got["Исаев Харон"] != tc.want["Исаев Харон"] || got["Исаева Марьям"] != tc.want["Исаева Марьям"] {
+			t.Errorf("ответ %q (бот сказал %v): сбор %v, ожидали %v", tc.answer, e.sentSince(n), got, tc.want)
+		}
+		if len(e.sentSince(n)) == 0 {
+			t.Errorf("ответ %q остался без реакции бота", tc.answer)
+		}
+	}
+}
+
+// R3 (время до минуты): неподписанная копия подписанного чека — бот спросил
+// «чей чек?», ответили тем же клиентом: один платёж, и бот спрашивает, не
+// другой ли это перевод; «другой» — засчитывает второй.
+func TestL4intake_R3_MinuteTwinSameClientAsksSameOrOther(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.ai = aiNamesAndPayments("Исаев Харон")
+	grp := e2eGroup("c8")
+	e.groupsCache[grp] = "Оплата"
+	emp := user("79001112071")
+	vtb := l4intakeVTB("13:02", "Харон Исаевич И.", "7 000")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "Исаев Харон")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "")
+	e.age(grp.String())
+	e.clarifyTick(ctx)
+	q := e.last()
+	if !strings.Contains(q.Text, "Чей это чек") {
+		t.Fatalf("нет вопроса: %q", q.Text)
+	}
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаев Харон", q.ID, e.botJID(), q.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 7000 {
+		t.Errorf("тот же клиент: сбор %v, ожидали 7000", got)
+	}
+	a := e.last()
+	if !strings.Contains(a.Text, "другой") {
+		t.Fatalf("бот не спросил, тот же ли это перевод: %q", a.Text)
+	}
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "нет, другой", a.ID, e.botJID(), a.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 14000 {
+		t.Errorf("«другой»: сбор %v, ожидали 14000", got)
+	}
+}
+
+// R0 (автоповтор без даты и номера): ИИ лежал — размытый чек с подписью; тот
+// же клиент прислал чёткий чек (засчитан). Автоповтор прочитал только сумму —
+// уверенности, что это тот же чек, нет: бот не считает второй раз и
+// спрашивает. Ответ на старый вопрос «какая сумма?» не задваивает; «другой» —
+// засчитывает отдельно.
+func TestL4intake_R0_RetryWithoutDateAsksSameOrOther(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.ai = func(c aiCall) aiReply {
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
+		if strings.Contains(c.System, "модуль разбора изображений") {
+			return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":5000,"commission":0,"doc_number":"","status":"Выполнено","datetime":""}`}
+		}
+		return aiReply{Text: ""}
+	}
+	healthy := e.assistant
+	e.assistant = ai.New("k", "m", "v", "http://127.0.0.1:1")
+	grp := e2eGroup("rt")
+	emp := user("79001112072")
+	path := filepath.Join(t.TempDir(), "check.jpg")
+	_ = os.WriteFile(path, []byte("\xff\xd8\xff\xe0 check photo"), 0o644)
+	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+	first := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", path)
+	q := e.lastWith("СУММУ")
+	clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Add(-3*time.Minute).Format("02.01.2006 15:04:05") +
+		"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\n" + e2eID("DOC")
+	e.sendReceipt(grp, emp, "Сафаи", clear, "Исаев Харон")
+	e.assistant = healthy
+	items, err := e.db.DueReceiptRetries(ctx, time.Now().Add(time.Hour), maxReceiptRetries(), 10)
+	if err != nil || len(items) != 1 {
+		t.Fatalf("автоповтор: %v %v", items, err)
+	}
+	e.retryOneReceipt(ctx, items[0])
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("после автоповтора: сбор %v, ожидали 5000 (%+v)", got, e.db.TestReceiptByMessage(ctx, first))
+	}
+	a := e.last()
+	if !strings.Contains(a.Text, "другой") {
+		t.Fatalf("бот не спросил, тот же ли это чек: %q", a.Text)
+	}
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "5000", q.ID, e.botJID(), q.Text)) // ответ на старый вопрос
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("ответ на старый вопрос задвоил: сбор %v", got)
+	}
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "другой", a.ID, e.botJID(), a.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+		t.Errorf("«другой»: сбор %v, ожидали 10000", got)
+	}
+}
+
+// R3 (б, время с секундами): подписанный чек, потом такой же без подписи —
+// повтор, но с путём назад: ответ «Это другой чек, Исаева Марьям» на
+// предупреждение засчитывает второй платёж на названного клиента.
+func TestL4intake_R3_RepeatWarningAnswerOtherClient(t *testing.T) {
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.ai = aiNamesAndPayments("Исаев Харон", "Исаева Марьям")
+	grp := e2eGroup("c9")
+	e.groupsCache[grp] = "Оплата"
+	emp := user("79001112073")
+	vtb := l4intakeVTB("13:02:41", "Харон Исаевич И.", "7 000")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "Исаев Харон")
+	e.sendReceipt(grp, emp, "Сафаи", vtb, "")
+	w := e.lastWith("уже присылали")
+	if w.ID == "" || !strings.Contains(w.Text, "другой") {
+		t.Fatalf("нет предупреждения о повторе с путём назад: %+v", e.sent())
+	}
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 7000 || sum(got) != 7000 {
+		t.Errorf("повтор: сбор %v, ожидали Исаев Харон 7000", got)
+	}
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "Это другой чек, Исаева Марьям", w.ID, e.botJID(), w.Text))
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 7000 || got["Исаева Марьям"] != 7000 {
+		t.Errorf("«другой чек, Исаева Марьям»: сбор %v (бот: %q)", got, e.last().Text)
+	}
+}
+
+// R0 (удаление): «похоже, тот же чек» — размытая копия не в сборе; чёткий чек
+// удалили — платёж не пропадает, размытая копия снова в учёте.
+func TestL4intake_R0_TentativeCopyPromotedOnDelete(t *testing.T) {
+	ctx := context.Background()
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.ai = func(c aiCall) aiReply {
+		if r, ok := fakeNameExtract(c); ok {
+			return r
+		}
+		if strings.Contains(c.System, "модуль разбора изображений") {
+			return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Хадижат Ибрагимовна И.","amount":0,"commission":0,"doc_number":"","status":"Выполнено","datetime":""}`}
+		}
+		return aiReply{Text: ""}
+	}
+	grp := e2eGroup("rd")
+	emp := user("79001112074")
+	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
+	first := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", "")
+	q := e.last()
+	clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Add(-time.Minute).Format("02.01.2006 15:04:05") +
+		"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\n" + e2eID("DOC")
+	second := e.sendReceipt(grp, emp, "Сафаи", clear, "Исаев Харон")
+	e.sendGroup(groupReply(grp, emp, "Сафаи", "5000", q.ID, e.botJID(), q.Text))
+	if r := e.db.TestReceiptByMessage(ctx, first); !r.Duplicate {
+		t.Fatalf("размытая копия не признана повтором: %+v", r)
+	}
+	e.event(&events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: grp, Sender: emp, IsGroup: true}, ID: e2eID("R"), Timestamp: time.Now()},
+		Message: &waProto.Message{ProtocolMessage: &waProto.ProtocolMessage{Type: waProto.ProtocolMessage_REVOKE.Enum(),
+			Key: &waProto.MessageKey{RemoteJID: proto.String(grp.String()), ID: proto.String(second), Participant: proto.String(emp.String())}}}})
+	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		t.Errorf("после удаления чёткого чека платёж пропал: сбор %v (%+v)", got, e.db.TestReceiptByMessage(ctx, first))
 	}
 }

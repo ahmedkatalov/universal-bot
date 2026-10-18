@@ -351,14 +351,34 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 		}
 		contactIDPtr = &cid
 	}
-	found, amount, stillReview, err := b.db.FillReceiptByMessage(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
-	if err != nil || !found {
-		if err != nil {
-			fmt.Println("Ответ про чек: не записался:", err)
-		}
+	rid, found, amount, stillReview, err := b.db.FillReceiptByMessageID(ctx, receiptWaID, canonical, contactIDPtr, replyAmount)
+	if err != nil {
+		fmt.Println("Ответ про чек: не записался:", err)
 		return false, false
 	}
+	if !found {
+		// Чек за это время стал повтором (пришла подписанная копия, автоповтор
+		// дочитал копию) — ответ человека всё равно не теряем.
+		return b.answerForRepeatedCheck(ctx, chat, receiptWaID, text, canonical, contactIDPtr)
+	}
 	b.noteAnswer(ctx, "receipt", receiptWaID)
+	// Чек стал полным/чьим только сейчас: тот же чек мог уже прийти и войти в
+	// сбор (прислали ещё раз чётче, подписали копию) — второй раз не считаем, а
+	// если не уверены — спрашиваем «тот же или другой?».
+	if amount > 0 && (canonical != "" || replyAmount > 0) {
+		same, err := b.db.DedupeCompletedReceipt(ctx, rid, replyAmount > 0, true)
+		if err != nil {
+			fmt.Println("Ответ про чек: проверка повтора не удалась:", err)
+		} else if same.Found && same.VictimIsThis {
+			if canonical != "" {
+				_ = b.db.SetReceiptSourceByMessage(ctx, receiptWaID, answerRawFrom(ctx))
+			}
+			b.reportSameCheck(ctx, chat, receiptWaID, "", same, false)
+			return true, true
+		} else if same.Found {
+			b.reportSameCheck(ctx, chat, receiptWaID, "", same, false)
+		}
+	}
 	if amount <= 0 {
 		b.askAboutReceipt(ctx, chat, receiptWaID, "Записал клиента "+canonical+", но сумму по этому чеку так и не знаю — напишите сумму (например «15000»), и чек войдёт в сбор.", true, false)
 		return true, false
