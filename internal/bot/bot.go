@@ -3485,8 +3485,37 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
 					}
 				}
+				// Такой же текст прислали заново, пока платёж был исключён: чек
+				// в паре с ним, старый текст остаётся исключённым (не дважды).
+				kept := b.keepReplacedTexts(ctx, op.Batch, back)
+				if len(kept) > 0 {
+					isKept := func(r db.OperationRef) bool {
+						for _, k := range kept {
+							if k.Kind == r.Kind && k.ID == r.ID {
+								return true
+							}
+						}
+						return false
+					}
+					var rest []db.OperationRef
+					for _, r := range back {
+						if !isKept(r) {
+							rest = append(rest, r)
+						}
+					}
+					back = rest
+					if isKept(op) {
+						// Названная запись осталась исключённой — ответ о том, что вернулось.
+						for _, r := range back {
+							if r.Kind == "receipt" {
+								op = r
+								break
+							}
+						}
+					}
+				}
 				return fmt.Sprintf("Операция возвращена в учёт: %s. Отчёты уже учитывают это изменение.", opLabel(op)) +
-					restoredNote(op, back, groupName), nil
+					restoredNote(op, back, groupName) + replacedTextsNote(op, kept, groupName), nil
 			default:
 				var sb strings.Builder
 				sb.WriteString("Нашёл несколько подходящих операций (каждая строка — отдельный платёж в сборе). " +

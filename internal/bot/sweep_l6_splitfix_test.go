@@ -2,12 +2,15 @@ package bot
 
 import (
 	"context"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"whatsapp-bot/internal/ledger"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // Регрессии L6 (платёж частями: чеки 10000 + 5000 и итог текстом
@@ -431,5 +434,212 @@ func TestL6splitfix_R2_ChainUndoThenTypoEdit(t *testing.T) {
 	if strings.Contains(reply, "Сумму пока не менял") || got != 16000 || ta != 16000 || why != ledger.ReasonSplit {
 		t.Errorf("итог исправили на 16000 (чеки 10000 + 6000): сбор %v, итог %v (%q) — хочу 16000, итог частей, без вопроса; бот: %s",
 			got, ta, why, reply)
+	}
+}
+
+// Ревью R3: чек 7000 и текст «Исаев Харон 7000» — один платёж; исключили его
+// (чек и текст вместе), сотрудник прислал текст ещё раз (посчитан сам), потом
+// «верни платёж Исаева 7000»: чек возвращается в пару к новому тексту, старый
+// текст из исключения остаётся исключённым — сбор 7000, а не 14000.
+func TestL6splitfix_R3_RestoreAfterTextResent(t *testing.T) {
+	setup := func(t *testing.T, tag string) (*e2eBot, types.JID, string, *events.Message, *events.Message) {
+		grp, emp := e2eGroup(tag), user("79001119314")
+		e := newE2E(t, e2eOpts{WithAI: true, Admins: []string{ownerPhone}, Groups: map[string]string{grp.String(): "Оплата клиентов"}})
+		e.ai = aiNamesAndPayments("Исаев Харон")
+		c := e.sendReceipt(grp, emp, "Сафаи", sberCheck("7000.00", "11:00:00"), "Исаев Харон")
+		old := groupText(grp, emp, "Сафаи", "Исаев Харон 7000")
+		e.sendGroup(old)
+		out := e.tool("correct_operation", grp, `{"action":"exclude","amount":7000,"person":"Исаев Харон"}`)
+		if got := sum(dayTotals(e, grp)); got != 0 {
+			t.Fatalf("%s предусловие: исключили платёж — сбор %v (%s)", tag, got, out)
+		}
+		again := groupText(grp, emp, "Сафаи", "Исаев Харон 7000")
+		e.sendGroup(again)
+		if got := sum(dayTotals(e, grp)); got != 7000 {
+			t.Fatalf("%s предусловие: текст прислали снова — сбор %v", tag, got)
+		}
+		return e, grp, c, old, again
+	}
+
+	e, grp, c, old, again := setup(t, "l6sfr3")
+	out := e.tool("correct_operation", grp, `{"action":"restore","amount":7000,"person":"Исаев Харон"}`)
+	got := sum(dayTotals(e, grp))
+	_, cwhy := l5splitfixCheck(e, c)
+	_, owhy := l5splitfixText(e, old.Info.ID)
+	_, awhy := l5splitfixText(e, again.Info.ID)
+	t.Logf("вернули: %s → сбор %v; чек %q, старый текст %q, новый текст %q", out, got, cwhy, owhy, awhy)
+	if got != 7000 || cwhy != "" {
+		t.Errorf("чек 7000 и его текст (текст прислали ещё раз): сбор %v, чек %q — хочу 7000, чек в сборе", got, cwhy)
+	}
+	if owhy != l5splitfixTextGone || awhy != ledger.ReasonTwin {
+		t.Errorf("старый текст %q (хочу исключён), новый %q (хочу пара чека)", owhy, awhy)
+	}
+	l5splitfixWant(t, "возврат после повторного текста", out, "возвращена", "[чек]", "оставил исключённым", "kind=text")
+	if strings.Contains(out, "вернул то, что было исключено") {
+		t.Errorf("ответ говорит, что вернул и старый текст: %s", out)
+	}
+
+	// Владелец настаивает — «верни тот текст» (kind=text): возвращается.
+	out = e.tool("correct_operation", grp, `{"action":"restore","amount":7000,"person":"Исаев Харон","kind":"text"}`)
+	if got := sum(dayTotals(e, grp)); got != 14000 {
+		t.Errorf("«верни текст» после предупреждения: сбор %v, хочу 14000 (владелец сказал — отдельный платёж): %s", got, out)
+	}
+
+	// Такой же текст, присланный ДО исключения, — отдельный платёж, как и был:
+	// возврат его не трогает (метка исключения позже этого текста).
+	t.Run("before", func(t *testing.T) { l6splitfixR3Before(t, setup) })
+}
+
+func l6splitfixR3Before(t *testing.T, setup func(*testing.T, string) (*e2eBot, types.JID, string, *events.Message, *events.Message)) {
+	ctx := context.Background()
+	e, grp, _, _, _ := setup(t, "l6sfr3b")
+	var batch string
+	ops, _ := e.db.FindOperations(ctx, 7000, "Исаев", nil, nil, "")
+	for _, op := range ops {
+		if op.Ignored && op.Batch != "" {
+			batch = op.Batch
+		}
+	}
+	back, err := e.db.RestoreBatch(ctx, batch)
+	if err != nil || len(back) != 2 {
+		t.Fatalf("возврат пачки %q: %v, %d записей", batch, err, len(back))
+	}
+	later := batch[:strings.LastIndexByte(batch, '@')+1] + strconv.FormatInt(time.Now().Add(time.Second).UnixNano(), 10)
+	if kept := e.keepReplacedTexts(ctx, later, back); len(kept) != 0 {
+		t.Errorf("текст, присланный до исключения, — отдельный платёж, а возврат оставил исключённым %v", kept)
+	}
+	if got := sum(dayTotals(e, grp)); got != 14000 {
+		t.Errorf("такой же текст был до исключения: после возврата сбор %v, хочу 14000 (как до исключения)", got)
+	}
+}
+
+// Ревью R4: итог в СБ исправили в WhatsApp, а такой же итог 15000 в основной
+// группе был связан с чеками только через него — без вопроса он посчитался бы
+// отдельным платежом (31000 / 30000). Итог с доплатой (чек 1000 уже прислан) и
+// итог, расписанный по чекам, — тот же платёж: в учёте остаётся прежний итог,
+// бот объясняет. И при импорте истории (тихо).
+func TestL6splitfix_R4_EditTotalOrphansOtherGroup(t *testing.T) {
+	for _, c := range []struct {
+		tag, text  string
+		topUp      bool
+		quiet      bool
+		want, main float64
+	}{
+		{"l6sfr4a", "Магомедов Ахмед 16000", true, false, 16000, 15000},
+		{"l6sfr4b", "Магомедов Ахмед 10000\nМагомедов Ахмед 5000", false, false, 15000, 15000},
+		{"l6sfr4aq", "Магомедов Ахмед 16000", true, true, 16000, 15000},
+		{"l6sfr4bq", "Магомедов Ахмед 10000\nМагомедов Ахмед 5000", false, true, 15000, 15000},
+	} {
+		// Своя подтестовая база на случай: соединения закрываются после каждого.
+		t.Run(c.tag, func(t *testing.T) {
+			e, sb, mg, _, _ := l6splitfixTwoGroups(t, c.tag)
+			saf := user("79001119212")
+			if c.topUp {
+				e.sendReceipt(sb, saf, "Сафаи", sberCheck("1000.00", "10:05:00"), "Магомедов Ахмед")
+			}
+			if all, _, _ := l6splitfixTotals(e, sb, mg); all != c.want {
+				t.Fatalf("%s предусловие: все %v", c.tag, all)
+			}
+			var totalID string
+			for _, x := range l5splitfixBook(e).Excluded {
+				if x.Text != nil && x.Text.Group == sb.String() {
+					totalID = x.Text.WaID
+				}
+			}
+			n := len(e.sent())
+			em := editOf(sb, saf, totalID, c.text)
+			if c.quiet {
+				budget := 10
+				if !e.applyEdit(context.Background(), em, em.Message.GetProtocolMessage(), editQuiet{budget: &budget}) {
+					t.Fatalf("%s: тихая правка не применилась", c.tag)
+				}
+			} else {
+				e.event(em)
+			}
+			reply := l4correctSent(e, n)
+			all, gsb, gmain := l6splitfixTotals(e, sb, mg)
+			t.Logf("%s: бот: %s; все %v, СБ %v, основная %v", c.tag, reply, all, gsb, gmain)
+			if all != c.want || gsb != c.want || gmain != c.main {
+				t.Errorf("%s: итог в СБ исправили на %q, такой же итог 15000 в основной: все %v, СБ %v, основная %v — хочу %v, %v, %v",
+					c.tag, c.text, all, gsb, gmain, c.want, c.want, c.main)
+			}
+			if c.quiet {
+				if reply != "" {
+					t.Errorf("%s: импорт истории — бот написал в группу: %s", c.tag, reply)
+				}
+				return
+			}
+			l5splitfixWant(t, c.tag, reply, "«Оплата клиентов»", "оставил прежний итог 15 000", "сбор не изменился")
+			if strings.Contains(reply, "поправил учёт") {
+				t.Errorf("%s: бот говорит «поправил учёт», а итог оставлен прежним: %s", c.tag, reply)
+			}
+		})
+	}
+
+	// Итог исправили на сумму одного чека («10000»: чек 5000 — не этого
+	// платежа) — от части чеков отказались, прежний итог не держим (иначе,
+	// когда чек 5000 назовут другим клиентом, итог 15000 посчитался бы сам):
+	// бот спрашивает про итог в основной группе.
+	e, sb, mg, _, c2 := l6splitfixTwoGroups(t, "l6sfr4c")
+	e.ai = aiNamesAndPayments("Магомедов Ахмед", "Исаев Харон")
+	saf := user("79001119212")
+	var totalID string
+	for _, x := range l5splitfixBook(e).Excluded {
+		if x.Text != nil && x.Text.Group == sb.String() {
+			totalID = x.Text.WaID
+		}
+	}
+	n := len(e.sent())
+	e.event(editOf(sb, saf, totalID, "Магомедов Ахмед 10000"))
+	reply := l4correctSent(e, n)
+	t.Logf("итог → 10000: бот: %s", reply)
+	l5splitfixWant(t, "итог → 10000", reply, "«Оплата клиентов»", "считается отдельным платежом")
+	if strings.Contains(reply, "оставил прежний итог") {
+		t.Errorf("итог исправили на 10000 (от чека 5000 отказались) — прежний итог держать нельзя: %s", reply)
+	}
+	e.event(editOf(sb, saf, c2, "Исаев Харон"))
+	all, gsb, gmain := l6splitfixTotals(e, sb, mg)
+	t.Logf("чек 5000 → Исаев: все %v, СБ %v, основная %v", all, gsb, gmain)
+	if all > 30000 {
+		t.Errorf("итог в СБ → 10000, чек 5000 → Исаев: все %v — итог 15000 в СБ посчитан сверх чеков", all)
+	}
+}
+
+// Ревью R5: правка итога пришла при импорте истории (тихо, спросить нельзя):
+// итог 15000 (чеки 10000 + 5000) исправлен на 16000 — как в живой правке,
+// в учёте остаётся прежний итог (не сбор 31000).
+func TestL6splitfix_R5_QuietEditSplitTotal(t *testing.T) {
+	s := l5splitfixSetup(t, "l6sfr5", "Магомедов Ахмед")
+	e := s.e
+	n := len(e.sent())
+	budget := 10
+	em := editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 16000")
+	if !e.applyEdit(context.Background(), em, em.Message.GetProtocolMessage(), editQuiet{budget: &budget}) {
+		t.Fatalf("тихая правка не применилась")
+	}
+	got := sum(dayTotals(e, s.grp))
+	ta, why := l5splitfixText(e, s.total.Info.ID)
+	t.Logf("тихо: сбор %v; итог %v (%q)", got, ta, why)
+	if got != 15000 || ta != 15000 || why != ledger.ReasonSplit {
+		t.Errorf("импорт истории: итог 15000 (чеки 10000 + 5000) исправлен на 16000 — сбор %v, итог %v (%q); хочу 15000, итог 15000 (итог частей)",
+			got, ta, why)
+	}
+	if reply := l4correctSent(e, n); reply != "" {
+		t.Errorf("импорт истории: бот написал в группу: %s", reply)
+	}
+
+	// Тихая правка итога, которая сходится с чеками как они есть (доплата 1000
+	// уже прислана чеком), — записывается как исправили.
+	s = l5splitfixSetup(t, "l6sfr5b", "Магомедов Ахмед")
+	e = s.e
+	e.sendReceipt(s.grp, s.emp, "Сафаи", sberCheck("1000.00", "10:05:00"), "Магомедов Ахмед")
+	em = editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 16000")
+	if !e.applyEdit(context.Background(), em, em.Message.GetProtocolMessage(), editQuiet{budget: &budget}) {
+		t.Fatalf("тихая правка не применилась")
+	}
+	got = sum(dayTotals(e, s.grp))
+	ta, why = l5splitfixText(e, s.total.Info.ID)
+	if got != 16000 || ta != 16000 || why != ledger.ReasonSplit {
+		t.Errorf("тихо, доплата чеком уже есть: сбор %v, итог %v (%q) — хочу 16000, итог 16000", got, ta, why)
 	}
 }
