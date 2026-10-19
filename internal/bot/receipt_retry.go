@@ -131,7 +131,10 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 	fmt.Printf("Повтор чека #%d: распознан (сумма %.0f ₽, получатель %q)\n", it.ID, rd.Amount, rd.Recipient)
 	// Чек стал полным только сейчас — при приёме проверка «уже присылали» его
 	// не поймала (не было суммы, номера). Тот же чек, уже засчитанный, — повтор.
-	same, err := b.db.DedupeCompletedReceipt(ctx, it.ID, true, true)
+	// Слабое совпадение («похоже, тот же чек») — только если в группе можно
+	// спросить «тот же или другой?»: на молчании не угадываем.
+	canAsk := jerr == nil && groupJID != "" && askReceiptsEnabled() && !b.groupSilent(chat)
+	same, err := b.db.DedupeCompletedReceipt(ctx, it.ID, true, canAsk)
 	if err != nil {
 		fmt.Printf("Повтор чека #%d: проверка повтора не удалась: %v\n", it.ID, err)
 		return

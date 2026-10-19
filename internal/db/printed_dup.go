@@ -47,6 +47,22 @@ type PrintedTwin struct {
 // времени молча не решаем — спрашиваем человека.
 func MinutePrecision(t time.Time) bool { return t.Second() == 0 && t.Nanosecond() == 0 }
 
+// FutureOpSlack — насколько напечатанное время операции может быть позже
+// присылки самого чека (часы телефона и банка расходятся). Позже — ошибка
+// чтения или другой часовой пояс: по такому времени «тот же перевод или
+// другой» не судим.
+const FutureOpSlack = 10 * time.Minute
+
+// PlausibleOpTime — напечатанное время операции op не позже, чем чек прислали
+// (posted), с допуском FutureOpSlack.
+func PlausibleOpTime(op, posted time.Time) bool { return !op.After(posted.Add(FutureOpSlack)) }
+
+// implausibleOpSQL — SQL-условие «время операции tx чека позже его присылки
+// posted (больше FutureOpSlack)»: по такому времени не судим (см. PlausibleOpTime).
+func implausibleOpSQL(tx, posted string) string {
+	return fmt.Sprintf(`(%s > %s + interval '%d seconds')`, tx, posted, int(FutureOpSlack/time.Second))
+}
+
 // sameOpTimeSQL — время операции двух чеков (a и b; *Guessed — время не с
 // чека, а по сообщению) не мешает считать их одним и тем же чеком. Если оба
 // времени НАПЕЧАТАНЫ на чеках, то копия того же чека печатает то же время: до

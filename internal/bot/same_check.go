@@ -26,7 +26,6 @@ func (b *Bot) registerSameCheckAsk(botMsgID string, a sameCheckAsk) {
 		return
 	}
 	b.clarify.mu.Lock()
-	defer b.clarify.mu.Unlock()
 	if len(b.clarify.sameAsks) >= clarifyMapCap {
 		for k := range b.clarify.sameAsks {
 			delete(b.clarify.sameAsks, k)
@@ -34,6 +33,14 @@ func (b *Bot) registerSameCheckAsk(botMsgID string, a sameCheckAsk) {
 		}
 	}
 	b.clarify.sameAsks[botMsgID] = a
+	b.clarify.mu.Unlock()
+	// Связь «вопрос → чек» и в базе: ответ «другой» сработает и после
+	// перезапуска бота (память вопросов пуста).
+	if b.db != nil {
+		if err := b.db.MarkSameCheckAsk(context.Background(), a.checkWa, botMsgID); err != nil {
+			fmt.Println("Не запомнил вопрос «тот же чек?»:", err)
+		}
+	}
 }
 
 // reportSameCheck — сказать в группе, что чек checkWa (или его ничья копия)
@@ -46,7 +53,24 @@ func (b *Bot) reportSameCheck(ctx context.Context, chat types.JID, checkWa, send
 	if !same.VictimIsThis {
 		// Повтором стала ничья копия — про неё больше не спрашиваем «чей чек?».
 		b.dropReceiptAsk(chat.String(), same.VictimWa)
-		return ""
+		if !same.VictimCounted || b.groupSilent(chat) {
+			return ""
+		}
+		// Повтором стал уже засчитанный экран без даты, а в учёте остался этот
+		// полный чек: говорим и даём путь назад — «другой» вернёт экран.
+		text := fmt.Sprintf(
+			"🤔 Похоже, это полный чек того же перевода, что уже засчитанный экран без даты выше: %s, %.0f ₽ — "+
+				"считаю его один раз, по этому чеку (от %s). "+
+				"Если это ДРУГОЙ платёж — ответьте на это сообщение «другой», и я засчитаю экран отдельно.",
+			same.Client, same.Amount, same.TxDate.Format("02.01.2006 15:04"))
+		var id string
+		if senderJID == "" {
+			id = b.sendTextReturnID(chat, text)
+		} else {
+			id = b.sendReply(chat, text, checkWa, senderJID)
+		}
+		b.registerSameCheckAsk(id, sameCheckAsk{checkWa: same.VictimWa})
+		return id
 	}
 	// Вопрос про сумму/клиента этого чека больше не нужен — он не идёт в сбор.
 	b.dropReceiptAsk(chat.String(), checkWa)

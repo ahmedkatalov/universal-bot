@@ -533,6 +533,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// Человек ответил «другой» на «похоже, это тот же чек» — назовут клиента,
 		// бот не переспрашивает «тот же?» по слабому совпадению.
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_denied BOOLEAN NOT NULL DEFAULT false`,
+		// Вопрос бота «похоже, это тот же чек/перевод… (или «другой»)» по этому
+		// чеку: ответ «другой» найдёт чек и после перезапуска бота.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_ask_msg_id TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_bank_receipts_same_check_ask ON bank_receipts(same_check_ask_msg_id) WHERE same_check_ask_msg_id IS NOT NULL`,
 		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
 		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,
@@ -1646,8 +1650,11 @@ func (d *DB) CountedCheckOfCollapsedScreen(ctx context.Context, groupJID, sender
 		  AND br.client_confirmed AND br.contact_id IS NOT NULL
 		  AND COALESCE(rm.deleted, false) = false
 		  AND rm.received_at BETWEEN $4::timestamptz - interval '3 hours' AND $4::timestamptz
-		  AND br.tx_date <= $4::timestamptz + interval '2 minutes'
-		  AND br.tx_date >= $4::timestamptz - interval '3 days'
+		  -- Время операции позже присылки самого чека — ошибка чтения (или другой
+		  -- часовой пояс): по нему не судим.
+		  AND (`+implausibleOpSQL("br.tx_date", "rm.received_at")+` OR
+		       (br.tx_date <= $4::timestamptz + interval '2 minutes'
+		        AND br.tx_date >= $4::timestamptz - interval '3 days'))
 		  AND NOT EXISTS (
 			SELECT 1 FROM bank_receipts s
 			WHERE s.superseded_by_raw = br.raw_message_id AND s.is_duplicate AND NOT s.ignored)
@@ -1673,6 +1680,16 @@ func (d *DB) CountedCheckOfCollapsedScreen(ctx context.Context, groupJID, sender
 	}
 	res.Found = true
 	return res, nil
+}
+
+// UnholdScreen — свёрнутый экран сообщения rawID признали тем же переводом,
+// что полный чек, но вопрос об этом в группу не ушёл: догадку не держим —
+// экран снова ждёт клиента (спросит клариф-цикл), а не пропадает молча.
+func (d *DB) UnholdScreen(ctx context.Context, rawID int) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET is_duplicate = false, superseded_by_raw = NULL
+		WHERE raw_message_id = $1 AND collapsed = true AND is_duplicate = true AND ignored = false`, rawID)
+	return err
 }
 
 // MarkScreenAsked — вопрос бота по свёрнутому экрану сообщения rawID (в т.ч.
@@ -2222,10 +2239,12 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 					`+printedMatchSQL("dd", "orig")+` OR
 					-- Копия без прочитанного времени, признанная «похоже, тот же»
 					-- (DedupeCompletedReceipt): тот же клиент и сумма.
+					-- Время операции оригинала позже его присылки — по нему не судим.
 					(dd.tx_time_guessed AND dd.client_confirmed AND orig.client_confirmed
 					 AND dd.contact_id = orig.contact_id AND dd.amount = orig.amount
-					 AND orig.tx_date <= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '2 minutes'
-					 AND orig.tx_date >= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '3 days')
+					 AND (`+implausibleOpSQL("orig.tx_date", "(SELECT received_at FROM raw_messages WHERE id = orig.raw_message_id)")+` OR
+					      (orig.tx_date <= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '2 minutes'
+					       AND orig.tx_date >= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '3 days')))
 				)
 			JOIN raw_messages drm ON drm.id = dd.raw_message_id AND COALESCE(drm.deleted, false) = false
 			WHERE orig.raw_message_id = $1 AND orig.is_duplicate = false AND orig.ignored = false

@@ -813,6 +813,13 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	if isPayAsk {
 		return b.applyPaymentWhoAnswer(ctx, msg.Info.Chat, quotedID, pa, text, true)
 	}
+	if !isSameAsk && !isFixAsk {
+		// «Похоже, это тот же чек/перевод… (или «другой»)» — связь могла
+		// потеряться из памяти (перезапуск бота): ищем чек по id вопроса в БД.
+		if wa, ok, _ := b.db.SameCheckByAskMsg(ctx, quotedID); ok {
+			same, isSameAsk = sameCheckAsk{checkWa: wa}, true
+		}
+	}
 	// «Этот чек уже присылали… сейчас подписан Y» — «да» переносит чек на Y.
 	if isFixAsk {
 		return b.applyDupFixAnswer(ctx, msg.Info.Chat, quotedID, fix, text)
