@@ -68,7 +68,7 @@ func (b *Bot) quotesCmfAsk(ctx context.Context, msg *events.Message) bool {
 // чека, а не ответ на старый вопрос.
 func (b *Bot) contextAnswerBlocked(ctx context.Context, msg *events.Message) bool {
 	a, ok := b.recentOpenAsk(msg.Info.Chat.String())
-	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt" && a.kind != "cross") || b.db == nil {
+	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt") || b.db == nil {
 		return false
 	}
 	has, err := b.db.HasUnconfirmedReceiptFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), a.at)
@@ -184,27 +184,6 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 	case "cmf_watch":
 		wantName := a.wantName && time.Since(a.at) < cmfNameWindow
 		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, modeContext, wantName)
-
-	case "cross":
-		// «Этот чек уже прислан в другой группе как X… Чей он?» — без свайпа
-		// принимаем короткий ответ без сумм: одно из двух ФИО или «оставь».
-		if shortPlainReply(text, 4) {
-			b.clarify.mu.Lock()
-			ca, found := b.clarify.crossAsks[a.askID]
-			b.clarify.mu.Unlock()
-			if !found {
-				ca, found = b.crossAskFromDB(ctx, a.askID)
-			}
-			if found && b.applyCrossClientAnswer(ctx, chat, a.askID, ca, text, false) {
-				return true
-			}
-		}
-		// Не ответ на «чей он?» — может быть ответом на открытый ранее «чей чек?».
-		q := b.pickReceiptAsk(groupJID, parser.ExtractAmount(text))
-		if q.receiptWaID == "" || (sender != "" && q.senderJID != "" && sender != q.senderJID && !admin) {
-			return false
-		}
-		return b.contextReceiptAnswer(ctx, chat, q, text)
 
 	case "cash_collector":
 		// Без свайпа — только явный ответ «у Дени» / «Мансур взял» / «отдал Адаму»

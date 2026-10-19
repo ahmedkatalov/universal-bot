@@ -58,8 +58,14 @@ type clarifyState struct {
 	// засчитывает чек отдельно): id вопроса → чек.
 	sameAsks map[string]sameCheckAsk
 	// crossAsks — «этот чек уже прислан в другой группе на другого клиента —
-	// чей он?»: id вопроса → обе копии чека.
+	// чей он?»: id вопроса → обе копии чека. Это НЕ «последний вопрос группы»
+	// (lastAsk): он спрашивает одного работника и не должен отнимать ответ без
+	// свайпа у открытых вопросов «чей чек?» / «новый или тот же?».
 	crossAsks map[string]crossClientAsk
+	// crossCands — ФИО без свайпа после «Чей он?» от того, кого спросили (одно
+	// из двух названных): ответ на вопрос или имя перед следующим чеком — пока
+	// не ясно (см. crossCandidate). Ключ — группа и отправитель.
+	crossCands map[string]crossCandidate
 }
 
 // dupFixAsk — повторно присланный чек подписан другим клиентом.
@@ -78,9 +84,8 @@ type paymentAsk struct {
 
 // openAsk — открытый вопрос бота в группе (для ответа без свайпа).
 type openAsk struct {
-	kind        string // "receipt" | "cash_collector" | "cash_dup" | "cmf_watch" | "cross"
+	kind        string // "receipt" | "cash_collector" | "cash_dup" | "cmf_watch"
 	receiptWaID string // для receipt — id сообщения-чека
-	askID       string // для cross — id вопроса бота «чей он?» (тот же чек в другой группе)
 	txID        int    // для cash_* — id транзакции
 	watchID     int    // для cmf_watch — наблюдение сверки («за кого платёж?»)
 	senderJID   string // чей чек/наличка (ответ без свайпа принимаем от него или от владельца)
@@ -103,6 +108,7 @@ func newClarifyState() *clarifyState {
 		dupFixAsks:  make(map[string]dupFixAsk),
 		sameAsks:    make(map[string]sameCheckAsk),
 		crossAsks:   make(map[string]crossClientAsk),
+		crossCands:  make(map[string]crossCandidate),
 	}
 }
 
@@ -198,6 +204,8 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 	// наличку («у кого?», «новый или тот же?») спрашиваем и без ИИ: ответы
 	// понимает код, а придержанная наличка без вопроса так и осталась бы вне сбора.
 	withAI := b.assistant != nil
+	// ФИО после «Чей он?», так и не доставшиеся чеку, — ответы на вопрос.
+	b.settleCrossCandidates(ctx)
 	if !askReceiptsEnabled() {
 		return
 	}
@@ -411,7 +419,7 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		if found, _, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
 			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
 			b.syncWatchByCheckWa(ctx, jid, it.WaMessageID, canonical)
-			b.crossCheckNamed(ctx, jid, it.WaMessageID, 0)
+			b.afterCheckNamed(ctx, jid, it.WaMessageID, 0)
 			return true
 		}
 	}

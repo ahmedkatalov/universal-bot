@@ -800,6 +800,11 @@ func (b *Bot) processGroupMessage(ctx context.Context, msg *events.Message) {
 				answered()
 				return
 			}
+			// «Джарвис, Исаев Харон» после «Чей он?» — ответ на него.
+			if !admin && quoted == "" && b.tryCrossAnswerNoSwipe(ctx, msg, stripped, true) {
+				answered()
+				return
+			}
 		} else {
 			// @-упоминание бота в ответе — не часть ответа (номер бота не сумма).
 			clean := text
@@ -815,6 +820,12 @@ func (b *Bot) processGroupMessage(ctx context.Context, msg *events.Message) {
 			// вопрос сверки по чеку — это ответ НА НЕГО (уже разобран выше), а не
 			// на последний вопрос.
 			if extractQuotedStanzaID(msg) == "" && !b.contextAnswerBlocked(ctx, msg) && b.tryContextAnswerFrom(ctx, msg, clean) {
+				answered()
+				return
+			}
+			// «Оставь» после «Чей он?» (или ФИО от владельца) — ответ на него.
+			// Голое ФИО работника разберёт handleNameMessage (crossCandidate).
+			if extractQuotedStanzaID(msg) == "" && b.tryCrossAnswerNoSwipe(ctx, msg, clean, false) {
 				answered()
 				return
 			}

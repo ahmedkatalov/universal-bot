@@ -525,6 +525,18 @@ func (d *DB) replaceScreenWith(ctx context.Context, checkID int, r completedRece
 	if tag.RowsAffected() != 1 {
 		return res, nil
 	}
+	// Тот же экран прислали и в другую группу (тот же клиент и сумма, «время» —
+	// время сообщения рядом с этим экраном): отчёт считал эти копии одним
+	// переводом. Теперь в учёте полный чек с напечатанным временем операции —
+	// копиям экрана ставим это время, иначе они разошлись бы с полным чеком
+	// (без номера копии сводятся по времени) и перевод посчитался бы дважды.
+	if !r.guessed && !r.p.TxDate.After(r.received.Add(10*time.Minute)) {
+		if n, err := d.moveScreenCopies(ctx, sID, r.groupJID, r.p.TxDate); err != nil {
+			return res, err
+		} else if n > 0 {
+			fmt.Printf("Экран %s: его копии в других группах (%d) — время операции с полного чека %s\n", sWa, n, r.p.TxDate.Format("02.01 15:04:05"))
+		}
+	}
 	res.Found, res.ScreenReplaced, res.Tentative = true, true, true
 	res.VictimWa, res.KeptWa = sWa, r.wa
 	res.Client, res.KeptNamed = r.client, r.named
@@ -537,4 +549,60 @@ func (d *DB) replaceScreenWith(ctx context.Context, checkID int, r completedRece
 	}
 	fmt.Printf("Чек #%d (%s): тот же перевод, что экран без времени и номера (%s) — считаю этот чек, экран — повтор\n", checkID, r.wa, sWa)
 	return res, nil
+}
+
+// screenCopyCond — чек o — копия экрана s в другой группе: экран без
+// напечатанного времени и номера, тот же названный клиент, та же сумма, «время»
+// (время сообщения) в пределах двух минут от экрана, напечатанное на экранах не
+// спорит. Так отчёт сводит копии без номера (см. ledger.sameCheck).
+func screenCopyCond(o, orm, s, sGroup string) string {
+	ro, rs := printedNorm(printedRecipientOf(o)), printedNorm(printedRecipientOf(s))
+	po, ps := printedNorm(o+".sender_raw"), printedNorm(s+".sender_raw")
+	return `COALESCE(` + o + `.group_jid, ` + orm + `.wa_group_jid, '') NOT IN ('', ` + sGroup + `)
+		AND ` + o + `.id <> ` + s + `.id
+		AND ` + o + `.is_duplicate = false AND ` + o + `.ignored = false AND COALESCE(` + orm + `.deleted, false) = false
+		AND COALESCE(` + orm + `.sender_jid, '') <> 'bot-forward'
+		AND ` + o + `.tx_time_guessed AND COALESCE(` + o + `.doc_number, '') = '' AND COALESCE(` + o + `.auth_code, '') = ''
+		AND ` + s + `.client_confirmed AND ` + s + `.contact_id IS NOT NULL
+		AND ` + o + `.client_confirmed AND ` + o + `.contact_id = ` + s + `.contact_id
+		AND ` + o + `.amount = ` + s + `.amount
+		AND (` + ro + ` = '' OR ` + rs + ` = '' OR ` + ro + ` = ` + rs + `)
+		AND (` + po + ` = '' OR ` + ps + ` = '' OR ` + po + ` = ` + ps + `)`
+}
+
+// moveScreenCopies — экран screenID заменён полным чеком группы groupJID с
+// напечатанным временем операции op: его копиям в других группах (экраны без
+// времени и номера, см. screenCopyCond) ставим время операции op. Возвращает,
+// скольким.
+func (d *DB) moveScreenCopies(ctx context.Context, screenID int, groupJID string, op time.Time) (int64, error) {
+	tag, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts o SET tx_date = $3::timestamptz
+		FROM bank_receipts s, raw_messages orm
+		WHERE s.id = $1 AND orm.id = o.raw_message_id AND COALESCE(s.group_jid, $2) = $2
+		  AND `+screenCopyCond("o", "orm", "s", "$2")+`
+		  AND abs(extract(epoch FROM o.tx_date - s.tx_date)) <= 120`, screenID, groupJID, op)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// MoveScreenCopiesBack — экран сообщения screenWa снова отдельный платёж (ответ
+// «другой» на «похоже, это полный чек того же перевода»): его копиям в других
+// группах, которым moveScreenCopies поставил время операции op полного чека,
+// возвращаем их время — время сообщения (они снова сводятся с этим экраном).
+func (d *DB) MoveScreenCopiesBack(ctx context.Context, screenWa string, op time.Time) error {
+	if screenWa == "" || op.IsZero() {
+		return nil
+	}
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts o SET tx_date = orm.received_at
+		FROM bank_receipts s, raw_messages srm, raw_messages orm
+		WHERE srm.wa_message_id = $1 AND s.raw_message_id = srm.id AND s.is_duplicate = false
+		  AND orm.id = o.raw_message_id
+		  AND s.tx_time_guessed AND COALESCE(s.doc_number, '') = '' AND COALESCE(s.auth_code, '') = ''
+		  AND `+screenCopyCond("o", "orm", "s", "COALESCE(s.group_jid, srm.wa_group_jid, '')")+`
+		  AND o.tx_date = $2::timestamptz AND orm.received_at IS NOT NULL AND o.tx_date <> orm.received_at
+		  AND abs(extract(epoch FROM orm.received_at - s.tx_date)) <= 120`, screenWa, op)
+	return err
 }

@@ -189,6 +189,9 @@ func (b *Bot) applySameCheckAnswer(ctx context.Context, chat types.JID, askID st
 		b.sendText(chat, "Понял, это повтор — второй раз не считаю.")
 		return true
 	}
+	// Каким чеком он был учтён (экран — полным чеком: копиям экрана в других
+	// группах тогда поставили время операции с полного чека).
+	orig, oerr := b.db.DuplicateOriginalOf(ctx, a.checkWa)
 	found, amount, client, needName, err := b.db.UndoReceiptDuplicate(ctx, a.checkWa)
 	if err != nil || !found {
 		if err != nil {
@@ -196,6 +199,12 @@ func (b *Bot) applySameCheckAnswer(ctx context.Context, chat types.JID, askID st
 		}
 		b.sendText(chat, "Этот чек уже не найден (удалён или исключён) — ничего не менял.")
 		return true
+	}
+	if oerr == nil && orig.Found {
+		// Экран снова отдельный перевод — его копии в других группах снова с ним.
+		if err := b.db.MoveScreenCopiesBack(ctx, a.checkWa, orig.TxDate); err != nil {
+			fmt.Println("Возврат времени копиям экрана не удался:", err)
+		}
 	}
 	if needName {
 		// «Это другой чек, Исаева Марьям» — клиента назвали в том же ответе.
@@ -265,6 +274,8 @@ type crossClientAsk struct {
 	thisWa, otherWa         string // копия чека в этой группе и в другой
 	otherGroup              string // JID другой группы
 	thisClient, otherClient string
+	group, sender           string    // где спросили и кого (кто прислал этот чек)
+	at                      time.Time // когда спросили
 }
 
 func (b *Bot) registerCrossClientAsk(botMsgID string, a crossClientAsk) {
@@ -308,23 +319,25 @@ func (b *Bot) askCrossGroupClient(ctx context.Context, chat types.JID, rawID int
 		}
 		id := b.sendReply(chat, fmt.Sprintf(
 			"🤔 Этот чек уже прислан в %s как %s, а здесь подписан %s. Чей он — %s или %s? "+
-				"Напишите ФИО клиента (ответом на это сообщение или просто следующим сообщением) — поправлю чек в обеих группах.",
+				"Ответьте на это сообщение ФИО клиента — поправлю чек в обеих группах.",
 			where, o.Client, client, o.Client, client), waMsgID, senderJID)
 		fmt.Printf("Чек %s: тот же чек в %s записан на %s, здесь — на %s: спросил, чей он\n", waMsgID, o.GroupJID, o.Client, client)
 		if id == "" {
 			return
 		}
+		// Вопрос — только к тому, кто прислал чек: в «последний вопрос группы»
+		// (ответ без свайпа) его не ставим — он отнял бы ответ без свайпа у
+		// открытых «чей чек?» / «новый или тот же?» других работников. ФИО без
+		// свайпа от него разбирает crossCandidate.
 		b.registerCrossClientAsk(id, crossClientAsk{
 			thisWa: waMsgID, otherWa: o.WaMessage, otherGroup: o.GroupJID,
 			thisClient: client, otherClient: o.Client,
+			group: chat.String(), sender: senderJID, at: time.Now(),
 		})
-		// Вопрос переживает перезапуск (ответ свайпом найдёт его в базе), а ФИО
-		// без свайпа от того, кто прислал чек, — ответ на него, а не имя для
-		// следующего чека.
+		// Вопрос переживает перезапуск (ответ свайпом найдёт его в базе).
 		if err := b.db.SetCrossAsk(ctx, waMsgID, id); err != nil {
 			fmt.Println("Не запомнил вопрос «чей он?» по чеку:", err)
 		}
-		b.setOpenAsk(chat.String(), openAsk{kind: "cross", askID: id, senderJID: senderJID, amount: amount})
 		return
 	}
 }
@@ -342,8 +355,10 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 	done := func() {
 		b.clarify.mu.Lock()
 		delete(b.clarify.crossAsks, askID)
-		if cur, ok := b.clarify.lastAsk[chat.String()]; ok && cur.kind == "cross" && cur.askID == askID {
-			delete(b.clarify.lastAsk, chat.String())
+		for k, c := range b.clarify.crossCands {
+			if c.askID == askID {
+				delete(b.clarify.crossCands, k)
+			}
 		}
 		b.clarify.mu.Unlock()
 		if err := b.db.ClearCrossAsk(ctx, askID); err != nil {

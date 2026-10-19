@@ -28,6 +28,12 @@ type CrossCheck struct {
 	Amount    float64
 	TxDate    time.Time
 	Asked     bool // по нему уже открыт вопрос «чей он?»
+	// ReceivedAt — когда чек прислали (старый чек присылают и через неделю
+	// после операции).
+	ReceivedAt time.Time
+	// SourceRawID — сообщение, которое назвало клиента (имя перед чеком, имя
+	// следом, ответ); 0 — подпись к самому чеку или не назван.
+	SourceRawID int
 }
 
 const crossCheckCols = `br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_message_id, ''),
@@ -35,12 +41,12 @@ const crossCheckCols = `br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_me
 	(br.client_confirmed AND br.contact_id IS NOT NULL), br.contact_id,
 	COALESCE(c.canonical_name, br.recipient_raw, ''),
 	COALESCE(br.doc_number, ''), COALESCE(br.auth_code, ''), COALESCE(br.amount, 0)::float8, br.tx_date,
-	br.cross_ask_msg_id IS NOT NULL`
+	br.cross_ask_msg_id IS NOT NULL, COALESCE(rm.received_at, br.tx_date), COALESCE(br.client_source_raw_id, 0)`
 
 func scanCrossCheck(row pgx.Row) (CrossCheck, error) {
 	var c CrossCheck
 	err := row.Scan(&c.ID, &c.RawID, &c.WaID, &c.GroupJID, &c.SenderJID, &c.Named, &c.ContactID, &c.Client,
-		&c.DocNumber, &c.AuthCode, &c.Amount, &c.TxDate, &c.Asked)
+		&c.DocNumber, &c.AuthCode, &c.Amount, &c.TxDate, &c.Asked, &c.ReceivedAt, &c.SourceRawID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return CrossCheck{}, nil
 	}
@@ -102,4 +108,42 @@ func (d *DB) ClearCrossAsk(ctx context.Context, askMsgID string) error {
 	}
 	_, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET cross_ask_msg_id = NULL WHERE cross_ask_msg_id = $1`, askMsgID)
 	return err
+}
+
+// LatestCheckFrom — последний (по времени сообщения) живой чек, присланный
+// senderJID в группу groupJID не раньше since.
+func (d *DB) LatestCheckFrom(ctx context.Context, groupJID, senderJID string, since time.Time) (CrossCheck, error) {
+	if groupJID == "" || senderJID == "" {
+		return CrossCheck{}, nil
+	}
+	return scanCrossCheck(d.pool.QueryRow(ctx, `
+		SELECT `+crossCheckCols+`
+		FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1 AND rm.sender_jid = $2
+		  AND rm.received_at >= $3::timestamptz
+		  AND br.is_duplicate = false AND br.ignored = false AND COALESCE(rm.deleted, false) = false
+		ORDER BY rm.received_at DESC, br.id DESC LIMIT 1`, groupJID, senderJID, since))
+}
+
+// OpenPendingNameOf — имя из очереди «написали перед чеком», пришедшее
+// сообщением rawID, ещё никому не досталось (и сообщение не удалено): id записи
+// очереди. ok=false — его уже взял чек (или его не было).
+func (d *DB) OpenPendingNameOf(ctx context.Context, rawID int) (id int, ok bool, err error) {
+	if rawID <= 0 {
+		return 0, false, nil
+	}
+	err = d.pool.QueryRow(ctx, `
+		SELECT pn.id FROM pending_client_names pn
+		WHERE pn.raw_message_id = $1 AND pn.consumed = false
+		  AND NOT EXISTS (SELECT 1 FROM raw_messages rm WHERE rm.id = pn.raw_message_id AND rm.deleted)
+		ORDER BY pn.id DESC LIMIT 1`, rawID).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
 }
