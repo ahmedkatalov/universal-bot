@@ -59,8 +59,14 @@ type clarifyState struct {
 	// засчитывает чек отдельно): id вопроса → чек.
 	sameAsks map[string]sameCheckAsk
 	// crossAsks — «этот чек уже прислан в другой группе на другого клиента —
-	// чей он?»: id вопроса → обе копии чека.
+	// чей он?»: id вопроса → обе копии чека. Это НЕ «последний вопрос группы»
+	// (lastAsk): он спрашивает одного работника и не должен отнимать ответ без
+	// свайпа у открытых вопросов «чей чек?» / «новый или тот же?».
 	crossAsks map[string]crossClientAsk
+	// crossCands — ФИО без свайпа после «Чей он?» от того, кого спросили (одно
+	// из двух названных): ответ на вопрос или имя перед следующим чеком — пока
+	// не ясно (см. crossCandidate). Ключ — группа и отправитель.
+	crossCands map[string]crossCandidate
 }
 
 // dupFixAsk — повторно присланный чек подписан другим клиентом.
@@ -103,6 +109,7 @@ func newClarifyState() *clarifyState {
 		dupFixAsks:  make(map[string]dupFixAsk),
 		sameAsks:    make(map[string]sameCheckAsk),
 		crossAsks:   make(map[string]crossClientAsk),
+		crossCands:  make(map[string]crossCandidate),
 	}
 }
 
@@ -198,6 +205,8 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 	// наличку («у кого?», «новый или тот же?») спрашиваем и без ИИ: ответы
 	// понимает код, а придержанная наличка без вопроса так и осталась бы вне сбора.
 	withAI := b.assistant != nil
+	// ФИО после «Чей он?», так и не доставшиеся чеку, — ответы на вопрос.
+	b.settleCrossCandidates(ctx)
 	if !askReceiptsEnabled() {
 		return
 	}
@@ -411,6 +420,7 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		if found, _, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
 			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
 			b.syncWatchByCheckWa(ctx, jid, it.WaMessageID, canonical)
+			b.afterCheckNamed(ctx, jid, it.WaMessageID, 0)
 			return true
 		}
 	}
@@ -825,9 +835,13 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	if isSameAsk && b.applySameCheckAnswer(ctx, msg.Info.Chat, quotedID, same, text) {
 		return true
 	}
-	// «Этот чек уже прислан в другой группе как X — чей он?» — ФИО решает за обе копии.
+	// «Этот чек уже прислан в другой группе как X — чей он?» — ФИО решает за обе
+	// копии. Связь могла потеряться из памяти (рестарт бота) — ищем в базе.
+	if !isCrossAsk && !isPayAsk && !isFixAsk && !isSameAsk {
+		cross, isCrossAsk = b.crossAskFromDB(ctx, quotedID)
+	}
 	if isCrossAsk {
-		return b.applyCrossClientAnswer(ctx, msg.Info.Chat, quotedID, cross, text)
+		return b.applyCrossClientAnswer(ctx, msg.Info.Chat, quotedID, cross, text, true)
 	}
 
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».

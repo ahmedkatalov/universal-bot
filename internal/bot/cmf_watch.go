@@ -541,11 +541,23 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 
 	// Свайп на конкретное сообщение — имя относится к НЕМУ.
 	if quotedID != "" {
-		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, contact(), rawID); err == nil && found {
+		// Чек мог взять из очереди ФИО, написанное после «Чей он?» (см.
+		// crossCandidate): тогда его новое ФИО покажет, что то было ответом.
+		cand, hasCand := b.crossCandidateOf(chat.String(), sender)
+		var prev db.CrossCheck
+		if hasCand {
+			prev, _ = b.db.CrossCheckOf(ctx, quotedID, 0)
+		}
+		cid := contact()
+		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, cid, rawID); err == nil && found {
 			_ = b.db.MarkMessageParsed(ctx, rawID)
 			if !b.reresolveWatchByCheck(ctx, chat, quotedID, canonical) {
 				fmt.Printf("Чек переатрибутирован на клиента %q (свайп с ФИО на чек)\n", canonical)
 			}
+			if hasCand {
+				b.crossCandidateResolved(ctx, chat, cand, prev, canonical, cid)
+			}
+			b.afterCheckNamed(ctx, chat, quotedID, 0)
 			return true
 		}
 		// Свайп на текстовый платёж — уточнили ФИО его клиента.
@@ -571,6 +583,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 					_ = b.db.MarkMessageParsed(ctx, rawID)
 					b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
 					fmt.Printf("Чек переатрибутирован на клиента %q (ФИО+сумма рядом с чеком)\n", canonical)
+					b.afterCheckNamed(ctx, chat, "", checkRaw)
 					return true
 				}
 			}
@@ -586,24 +599,33 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 		return false
 	}
 
-	if !checkNearby {
-		// Чека рядом нет — имя (перед чеком) в очередь.
+	// Чека, ждущего клиента, нет — имя перед следующим чеком (в очередь). Но
+	// если последний чек отправителя взял из очереди ФИО, написанное после
+	// «Чей он?», это ФИО — клиент того чека, а то было ответом (crossCandidate).
+	queueName := func() bool {
+		if b.crossCandidateNextName(ctx, msg, canonical, contact(), rawID) {
+			_ = b.db.MarkMessageParsed(ctx, rawID)
+			return true
+		}
 		b.enqueuePendingName(ctx, msg, name, 0, rawID)
 		_ = b.db.MarkMessageParsed(ctx, rawID)
+		b.noteCrossCandidate(msg, text, canonical, rawID)
 		return true
+	}
+	if !checkNearby {
+		return queueName()
 	}
 
 	// Имя без свайпа: самый старый неподтверждённый чек от отправителя
 	// (FIFO по порядку чата).
 	found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, contact(), rawID, 0)
 	if err != nil || !found {
-		b.enqueuePendingName(ctx, msg, name, 0, rawID)
-		_ = b.db.MarkMessageParsed(ctx, rawID)
-		return true
+		return queueName()
 	}
 	_ = b.db.MarkMessageParsed(ctx, rawID)
 	fmt.Printf("Чек переатрибутирован на клиента %q (ФИО написали рядом с чеком)\n", canonical)
 	b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+	b.afterCheckNamed(ctx, chat, "", checkRaw)
 	return true
 }
 
@@ -1368,6 +1390,7 @@ func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text
 		}
 		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, cid, rawID); err == nil && found {
 			b.reresolveWatchByCheck(ctx, chat, quotedID, canonical)
+			b.afterCheckNamed(ctx, chat, quotedID, 0)
 			return []float64{r.Amount}, whole
 		}
 		return nil, false
@@ -1386,6 +1409,7 @@ func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text
 			return false
 		}
 		b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+		b.afterCheckNamed(ctx, chat, "", checkRaw)
 		return true
 	}
 	// Самый старый ждущий чек: список может расписывать его сумму по частям

@@ -36,20 +36,22 @@ func TestL5dedupe_1_NullDocNumber(t *testing.T) {
 		return aiReply{Text: ""}
 	}
 	grp, emp := e2eGroup("l5nulldoc"), user("79001115923")
-	l4intakePhoto(e, grp, emp, "Сафаи", "СберБанк\nПеревод выполнен\nХадижат Ибрагимовна И.\n5 000 ₽\nСохранить чек", "Исаев Харон", "")
+	screen := l4intakePhoto(e, grp, emp, "Сафаи", "СберБанк\nПеревод выполнен\nХадижат Ибрагимовна И.\n5 000 ₽\nСохранить чек", "Исаев Харон", "")
 	full := "СберБанк\nЧек по операции\nДата операции " + op.Format("02.01.2006 15:04:05") +
 		"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер операции в СБП\n" + doc
 	ck2 := l4intakePhoto(e, grp, emp, "Сафаи", full, "Исаев Харон", "")
 	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
 		t.Errorf("тот же перевод (экран + полный чек через минуту, тот же клиент и сумма): сбор %v, ожидали Исаев Харон 5000", got)
 	}
-	if w := e.lastWith("уже присылали"); !strings.Contains(w.Text, "другой") {
+	// Совпало без общего номера (у экрана его нет) — путь назад «другой».
+	if w := e.last(); !strings.Contains(w.Text, "другой") {
 		t.Errorf("повтор без общего номера — нужен путь назад «другой»: %q", w.Text)
 	}
-	// Какой чек остался в учёте вместо повтора (у оставшегося номера нет).
-	o, err := e.db.DuplicateOriginalOf(context.Background(), ck2)
-	if err != nil || !o.Found || o.Strong {
-		t.Errorf("оригинал повтора (у оригинала номера нет): %+v, ошибка %v", o, err)
+	// В учёте остаётся полный чек (дата операции и номер — с него), повтор —
+	// экран без времени и номера (l6 находка 07).
+	o, err := e.db.DuplicateOriginalOf(context.Background(), screen)
+	if err != nil || !o.Found || o.Strong || o.KeptWa != ck2 {
+		t.Errorf("оригинал повтора-экрана — полный чек %s: %+v, ошибка %v", ck2, o, err)
 	}
 }
 

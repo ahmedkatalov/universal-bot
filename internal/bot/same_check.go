@@ -43,6 +43,9 @@ func (b *Bot) reportSameCheck(ctx context.Context, chat types.JID, checkWa, send
 	if !same.Found {
 		return ""
 	}
+	if same.ScreenReplaced {
+		return b.reportScreenReplaced(ctx, chat, checkWa, senderJID, same)
+	}
 	if !same.VictimIsThis {
 		// Повтором стала ничья копия — про неё больше не спрашиваем «чей чек?».
 		b.dropReceiptAsk(chat.String(), same.VictimWa)
@@ -84,6 +87,37 @@ func (b *Bot) reportSameCheck(ctx context.Context, chat types.JID, checkWa, send
 	if extra != "" {
 		b.registerDupFixAsk(id, dupFixAsk{checkWa: same.KeptWa, name: same.ThisClient})
 	}
+	return id
+}
+
+// reportScreenReplaced — полный чек checkWa заменил в учёте экран того же
+// перевода без времени и номера (same.VictimWa): говорим об этом и даём путь
+// назад — ответ «другой» вернёт экран отдельным платежом. Возвращает id
+// сообщения бота.
+func (b *Bot) reportScreenReplaced(ctx context.Context, chat types.JID, checkWa, senderJID string, same db.SameCheck) string {
+	// Экран больше не в сборе — про него не спрашиваем «чей чек?».
+	b.dropReceiptAsk(chat.String(), same.VictimWa)
+	if b.groupSilent(chat) {
+		return ""
+	}
+	who := ""
+	if same.KeptNamed && same.Client != "" {
+		who = same.Client + ", "
+	}
+	when := ""
+	if !same.TxDate.IsZero() {
+		when = " (операция " + same.TxDate.Format("02.01.2006 15:04") + ")"
+	}
+	text := fmt.Sprintf("🤔 Похоже, это полный чек того же перевода, что и экран «Перевод выполнен» без даты и номера: %s%.0f ₽. "+
+		"Считаю перевод один раз — по этому чеку%s. Если экран — ДРУГОЙ платёж, ответьте на это сообщение «другой», и я засчитаю его отдельно.",
+		who, same.Amount, when)
+	var id string
+	if senderJID == "" || checkWa == "" {
+		id = b.sendTextReturnID(chat, text)
+	} else {
+		id = b.sendReply(chat, text, checkWa, senderJID)
+	}
+	b.registerSameCheckAsk(id, sameCheckAsk{checkWa: same.VictimWa})
 	return id
 }
 
@@ -155,6 +189,9 @@ func (b *Bot) applySameCheckAnswer(ctx context.Context, chat types.JID, askID st
 		b.sendText(chat, "Понял, это повтор — второй раз не считаю.")
 		return true
 	}
+	// Каким чеком он был учтён (экран — полным чеком: копиям экрана в других
+	// группах тогда поставили время операции с полного чека).
+	orig, oerr := b.db.DuplicateOriginalOf(ctx, a.checkWa)
 	found, amount, client, needName, err := b.db.UndoReceiptDuplicate(ctx, a.checkWa)
 	if err != nil || !found {
 		if err != nil {
@@ -162,6 +199,12 @@ func (b *Bot) applySameCheckAnswer(ctx context.Context, chat types.JID, askID st
 		}
 		b.sendText(chat, "Этот чек уже не найден (удалён или исключён) — ничего не менял.")
 		return true
+	}
+	if oerr == nil && orig.Found {
+		// Экран снова отдельный перевод — его копии в других группах снова с ним.
+		if err := b.db.MoveScreenCopiesBack(ctx, a.checkWa, orig.TxDate); err != nil {
+			fmt.Println("Возврат времени копиям экрана не удался:", err)
+		}
 	}
 	if needName {
 		// «Это другой чек, Исаева Марьям» — клиента назвали в том же ответе.
@@ -231,6 +274,8 @@ type crossClientAsk struct {
 	thisWa, otherWa         string // копия чека в этой группе и в другой
 	otherGroup              string // JID другой группы
 	thisClient, otherClient string
+	group, sender           string    // где спросили и кого (кто прислал этот чек)
+	at                      time.Time // когда спросили
 }
 
 func (b *Bot) registerCrossClientAsk(botMsgID string, a crossClientAsk) {
@@ -277,10 +322,22 @@ func (b *Bot) askCrossGroupClient(ctx context.Context, chat types.JID, rawID int
 				"Ответьте на это сообщение ФИО клиента — поправлю чек в обеих группах.",
 			where, o.Client, client, o.Client, client), waMsgID, senderJID)
 		fmt.Printf("Чек %s: тот же чек в %s записан на %s, здесь — на %s: спросил, чей он\n", waMsgID, o.GroupJID, o.Client, client)
+		if id == "" {
+			return
+		}
+		// Вопрос — только к тому, кто прислал чек: в «последний вопрос группы»
+		// (ответ без свайпа) его не ставим — он отнял бы ответ без свайпа у
+		// открытых «чей чек?» / «новый или тот же?» других работников. ФИО без
+		// свайпа от него разбирает crossCandidate.
 		b.registerCrossClientAsk(id, crossClientAsk{
 			thisWa: waMsgID, otherWa: o.WaMessage, otherGroup: o.GroupJID,
 			thisClient: client, otherClient: o.Client,
+			group: chat.String(), sender: senderJID, at: time.Now(),
 		})
+		// Вопрос переживает перезапуск (ответ свайпом найдёт его в базе).
+		if err := b.db.SetCrossAsk(ctx, waMsgID, id); err != nil {
+			fmt.Println("Не запомнил вопрос «чей он?» по чеку:", err)
+		}
 		return
 	}
 }
@@ -289,12 +346,24 @@ func (b *Bot) askCrossGroupClient(ctx context.Context, chat types.JID, rawID int
 var crossKeepWords = []string{"оставь", "оставьте", "как было", "как есть", "не трогай"}
 
 // applyCrossClientAnswer — ответ на «этот чек уже прислан в другой группе как
-// X — чей он?»: названный клиент становится клиентом ОБЕИХ копий чека.
-func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID string, a crossClientAsk, text string) bool {
+// X — чей он?»: названный клиент становится клиентом ОБЕИХ копий чека, а
+// текст «ФИО сумма», который отчёт считал одним платежом с этим чеком, — тоже
+// (иначе текст со старым ФИО остался бы вторым платежом). swipe — ответили
+// свайпом на вопрос; без свайпа принимаем только одно из двух названных ФИО
+// (или «оставь»): другое имя — скорее, подпись к следующему чеку.
+func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID string, a crossClientAsk, text string, swipe bool) bool {
 	done := func() {
 		b.clarify.mu.Lock()
 		delete(b.clarify.crossAsks, askID)
+		for k, c := range b.clarify.crossCands {
+			if c.askID == askID {
+				delete(b.clarify.crossCands, k)
+			}
+		}
 		b.clarify.mu.Unlock()
+		if err := b.db.ClearCrossAsk(ctx, askID); err != nil {
+			fmt.Println("Не снял вопрос «чей он?» по чеку:", err)
+		}
 	}
 	low := cleanAnswer(text)
 	for _, w := range crossKeepWords {
@@ -308,10 +377,15 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 	if rest == "" {
 		return false
 	}
-	is := func(name string) bool { return sameClientMoney(rest, name) || clientNamePartMoney(rest, name) }
+	is := func(name string) bool {
+		return name != "" && (sameClientMoney(rest, name) || clientNamePartMoney(rest, name))
+	}
 	name := ""
 	switch this, other := is(a.thisClient), is(a.otherClient); {
 	case this && other:
+		if !swipe {
+			return false
+		}
 		b.sendText(chat, fmt.Sprintf("Не понял, чей чек. Ответьте на вопрос одним ФИО: %s или %s.", a.otherClient, a.thisClient))
 		return true
 	case this:
@@ -319,6 +393,9 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 	case other:
 		name = a.otherClient
 	default:
+		if !swipe {
+			return false
+		}
 		// Назвали третьего клиента — ему и принадлежит чек.
 		c, ok := b.confirmClientName(ctx, rest)
 		if !ok {
@@ -331,8 +408,20 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 	if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
 		cid = &id
 	}
+	copies := []struct{ wa, group string }{{a.thisWa, chat.String()}, {a.otherWa, a.otherGroup}}
+	// Тексты, которые отчёт сейчас считает одним платежом с этим чеком, — до
+	// поправки (после неё пара по клиенту уже не найдётся).
+	var was []string
+	groups := map[string]bool{}
+	for _, cp := range copies {
+		if cp.wa != "" {
+			was = append(was, cp.wa)
+			groups[cp.group] = true
+		}
+	}
+	texts := b.crossPairedTexts(ctx, was, groups, canonical, cid)
 	fixed := 0
-	for _, cp := range []struct{ wa, group string }{{a.thisWa, chat.String()}, {a.otherWa, a.otherGroup}} {
+	for _, cp := range copies {
 		if cp.wa == "" {
 			continue
 		}
@@ -354,11 +443,12 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 		b.sendText(chat, "Этот чек уже не найден (удалён или исключён) — ничего не менял.")
 		return true
 	}
+	moved := b.moveCrossPairedTexts(ctx, chat, texts, canonical, cid)
 	where := a.otherGroup
 	if j, err := types.ParseJID(a.otherGroup); err == nil {
 		where = b.groupLabel(ctx, j)
 	}
 	fmt.Printf("Чек %s: клиент %s — поправил и копию в %s\n", a.thisWa, canonical, a.otherGroup)
-	b.sendText(chat, fmt.Sprintf("Поправил: чек на клиента %s — и здесь, и в %s.", canonical, where))
+	b.sendText(chat, fmt.Sprintf("Поправил: чек на клиента %s — и здесь, и в %s.%s", canonical, where, moved))
 	return true
 }

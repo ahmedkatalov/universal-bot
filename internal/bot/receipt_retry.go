@@ -142,6 +142,11 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 	if same.Found && jerr == nil && groupJID != "" {
 		b.reportSameCheck(ctx, chat, waID, senderJID, same, true)
 	}
+	// Дочитали номер операции у чека с клиентом: тот же чек в другой группе
+	// может быть записан на другого клиента — спросим «чей он?».
+	if jerr == nil && groupJID != "" && !(same.Found && same.VictimIsThis) {
+		b.crossCheckNamed(ctx, chat, waID, 0)
+	}
 }
 
 // retryDueMedia — фото/PDF чеков, которые так и не стали чеком (не скачались
