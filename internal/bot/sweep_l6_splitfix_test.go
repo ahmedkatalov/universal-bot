@@ -1,6 +1,7 @@
 package bot
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -276,5 +277,159 @@ func TestL6splitfix_25_EditSplitTotalMessageAsks(t *testing.T) {
 	t.Logf("итог расписали по чекам: бот: %s; сбор %v", reply, got)
 	if got != 15000 || strings.Contains(reply, "доплата") {
 		t.Errorf("итог расписали по чекам 10000 + 5000: сбор %v (хочу 15000), бот: %s", got, reply)
+	}
+}
+
+// Ревью R0: итог «Магомедов Ахмед 15000» (чеки 10000 + 5000) исправили в
+// WhatsApp на 10000, потом чек 5000 оказался чужим (ответ на «чей чек?» или
+// подпись чека — «Исаев Харон»). Итог 10000 — пара чека 10000 (обычный текст
+// про чек), а не отдельный платёж: сбор 15000 (Магомедов 10000, Исаев 5000), не
+// 30000.
+func TestL6splitfix_R0_EditTotalDownThenOtherClientsCheck(t *testing.T) {
+	ctx := context.Background()
+	// (а) чек 5000 без подписи: бот спросил «чей чек?», ответили свайпом.
+	s := l5splitfixSetup(t, "l6sfr0a", "")
+	e := s.e
+	e.ai = aiNamesAndPayments("Магомедов Ахмед", "Исаев Харон")
+	e.age(s.grp.String())
+	e.clarifyTick(ctx)
+	n := len(e.sent())
+	e.event(editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 10000"))
+	reply := l4correctSent(e, n)
+	t.Logf("(а) правка итога на 10000: бот: %s; сбор %v", reply, sum(dayTotals(e, s.grp)))
+	if strings.Contains(reply, "Сумму пока не менял") {
+		t.Errorf("(а) итог исправили на 10000 — есть чек 10000 этого клиента, вопрос лишний: %s", reply)
+	}
+	n = len(e.sent())
+	e.sendGroup(groupReply(s.grp, s.emp, "Сафаи", "Исаев Харон", s.c2, s.emp, "чек"))
+	got := dayTotals(e, s.grp)
+	ta, why := l5splitfixText(e, s.total.Info.ID)
+	t.Logf("(а) чек 5000 → Исаев: бот: %s; сбор %v (%v); итог %v (%q)", l4correctSent(e, n), sum(got), got, ta, why)
+	if sum(got) != 15000 || got["Исаев Харон"] != 5000 {
+		t.Errorf("(а) итог исправили на 10000, чек 5000 оказался Исаева: сбор %v (%v), хочу 15000 (Магомедов 10000, Исаев 5000)", sum(got), got)
+	}
+	if ta != 10000 || why == "" {
+		t.Errorf("(а) итог %v (%q) — хочу 10000 вместе с чеком 10000", ta, why)
+	}
+
+	// (б) чек 5000 подписан тем же клиентом; подпись исправили на «Исаев Харон».
+	s = l5splitfixSetup(t, "l6sfr0b", "Магомедов Ахмед")
+	e = s.e
+	e.ai = aiNamesAndPayments("Магомедов Ахмед", "Исаев Харон")
+	n = len(e.sent())
+	e.event(editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 10000"))
+	reply = l4correctSent(e, n)
+	if strings.Contains(reply, "Сумму пока не менял") {
+		t.Errorf("(б) итог исправили на 10000 — есть чек 10000 этого клиента, вопрос лишний: %s", reply)
+	}
+	if got := sum(dayTotals(e, s.grp)); got != 15000 {
+		t.Errorf("(б) после правки итога на 10000: сбор %v, хочу 15000 (оба чека в сборе)", got)
+	}
+	e.event(editOf(s.grp, s.emp, s.c2, "Исаев Харон"))
+	got = dayTotals(e, s.grp)
+	ta, why = l5splitfixText(e, s.total.Info.ID)
+	t.Logf("(б) подпись чека 5000 → Исаев: сбор %v (%v); итог %v (%q)", sum(got), got, ta, why)
+	if sum(got) != 15000 || got["Исаев Харон"] != 5000 {
+		t.Errorf("(б) сбор %v (%v), хочу 15000 (Магомедов 10000, Исаев 5000)", sum(got), got)
+	}
+}
+
+// Ревью R1: итог исправили так, что он сходится с чеками, как они есть сейчас
+// — вопрос «доплата или ошибка?» лишний, итог записан как исправили.
+func TestL6splitfix_R1_EditTotalMatchingCurrentChecks(t *testing.T) {
+	// (а) чек 5000 прислали по ошибке и удалили, итог исправили на 10000.
+	s := l5splitfixSetup(t, "l6sfr1a", "Магомедов Ахмед")
+	e := s.e
+	e.event(l4textsRevoke(s.grp, s.emp, s.c2))
+	n := len(e.sent())
+	e.event(editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 10000"))
+	reply := l4correctSent(e, n)
+	got := sum(dayTotals(e, s.grp))
+	ta, why := l5splitfixText(e, s.total.Info.ID)
+	t.Logf("(а) чек 5000 удалён, итог → 10000: бот: %s; сбор %v; итог %v (%q)", reply, got, ta, why)
+	if strings.Contains(reply, "Сумму пока не менял") {
+		t.Errorf("(а) лишний вопрос: чек 5000 удалён, итог исправлен на 10000 — бот: %s", reply)
+	}
+	if got != 10000 || ta != 10000 {
+		t.Errorf("(а) сбор %v, итог %v — хочу 10000 и 10000", got, ta)
+	}
+
+	// (б) доплату 1000 уже прислали чеком, итог исправили на 16000.
+	s = l5splitfixSetup(t, "l6sfr1b", "Магомедов Ахмед")
+	e = s.e
+	e.sendReceipt(s.grp, s.emp, "Сафаи", sberCheck("1000.00", "10:05:00"), "Магомедов Ахмед")
+	n = len(e.sent())
+	e.event(editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 16000"))
+	reply = l4correctSent(e, n)
+	got = sum(dayTotals(e, s.grp))
+	ta, why = l5splitfixText(e, s.total.Info.ID)
+	t.Logf("(б) чек 1000 прислан, итог → 16000: бот: %s; сбор %v; итог %v (%q)", reply, got, ta, why)
+	if strings.Contains(reply, "доплата") || strings.Contains(reply, "Сумму пока не менял") {
+		t.Errorf("(б) лишний вопрос: третий чек 1000 уже прислан, итог 16000 = 10000+5000+1000 — бот: %s", reply)
+	}
+	if got != 16000 || ta != 16000 || why != ledger.ReasonSplit {
+		t.Errorf("(б) сбор %v, итог %v (%q) — хочу 16000, итог 16000 (итог частей)", got, ta, why)
+	}
+}
+
+// Ревью R2: обе части поправили, первую поправку удалили (итог 16000), потом в
+// итоге исправили только опечатку («Магомедов Ахмед, 15000» — сумма в тексте
+// та же): итог остаётся 16000, без вопроса «ошибка?», сбор 16000.
+func TestL6splitfix_R2_ChainUndoThenTypoEdit(t *testing.T) {
+	for _, quiet := range []bool{false, true} {
+		tag := "l6sfr2"
+		if quiet {
+			tag = "l6sfr2q"
+		}
+		s := l5splitfixSetup(t, tag, "Магомедов Ахмед")
+		e := s.e
+		m1 := groupReply(s.grp, s.emp, "Сафаи", "не 10000 а 11000", s.c1, s.emp, "")
+		e.sendGroup(m1)
+		e.sendGroup(groupReply(s.grp, s.emp, "Сафаи", "не 5000 а 6000", s.c2, s.emp, ""))
+		e.event(l4textsRevoke(s.grp, s.emp, m1.Info.ID))
+		if got := sum(dayTotals(e, s.grp)); got != 16000 {
+			t.Fatalf("предусловие: первая поправка удалена — сбор %v, хочу 16000", got)
+		}
+		n := len(e.sent())
+		if quiet {
+			// Импорт истории: правка применяется молча.
+			budget := 10
+			em := editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед, 15000")
+			if !e.applyEdit(context.Background(), em, em.Message.GetProtocolMessage(), editQuiet{budget: &budget}) {
+				t.Fatalf("тихая правка не применилась")
+			}
+		} else {
+			e.event(editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед, 15000"))
+		}
+		reply := l4correctSent(e, n)
+		got := sum(dayTotals(e, s.grp))
+		ta, why := l5splitfixText(e, s.total.Info.ID)
+		t.Logf("тихо=%v: правка опечатки: бот: %s; сбор %v; итог %v (%q)", quiet, reply, got, ta, why)
+		if strings.Contains(reply, "Сумму пока не менял") {
+			t.Errorf("тихо=%v: лишний вопрос на правку без смены суммы: %s", quiet, reply)
+		}
+		if got != 16000 || ta != 16000 || why != ledger.ReasonSplit {
+			t.Errorf("тихо=%v: сбор %v, итог %v (%q) — хочу сбор 16000, итог 16000 (итог частей)", quiet, got, ta, why)
+		}
+	}
+
+	// Та же цепочка, но в итоге написали новую сумму 16000 — как сейчас по
+	// чекам 10000 + 6000: итог 16000 (а не 17000 по второй поправке, у которой
+	// прежняя сумма тоже 16000), без вопроса.
+	s := l5splitfixSetup(t, "l6sfr2n", "Магомедов Ахмед")
+	e := s.e
+	m1 := groupReply(s.grp, s.emp, "Сафаи", "не 10000 а 11000", s.c1, s.emp, "")
+	e.sendGroup(m1)
+	e.sendGroup(groupReply(s.grp, s.emp, "Сафаи", "не 5000 а 6000", s.c2, s.emp, ""))
+	e.event(l4textsRevoke(s.grp, s.emp, m1.Info.ID))
+	n := len(e.sent())
+	e.event(editOf(s.grp, s.emp, s.total.Info.ID, "Магомедов Ахмед 16000"))
+	reply := l4correctSent(e, n)
+	got := sum(dayTotals(e, s.grp))
+	ta, why := l5splitfixText(e, s.total.Info.ID)
+	t.Logf("итог исправили на 16000: бот: %s; сбор %v; итог %v (%q)", reply, got, ta, why)
+	if strings.Contains(reply, "Сумму пока не менял") || got != 16000 || ta != 16000 || why != ledger.ReasonSplit {
+		t.Errorf("итог исправили на 16000 (чеки 10000 + 6000): сбор %v, итог %v (%q) — хочу 16000, итог частей, без вопроса; бот: %s",
+			got, ta, why, reply)
 	}
 }

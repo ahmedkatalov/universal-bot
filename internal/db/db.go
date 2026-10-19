@@ -3130,7 +3130,7 @@ func (d *DB) CarryOverEditedTx(ctx context.Context, rawID int, old []TxState) er
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET collector = $2 WHERE id = $1`, n.ID, o.Collector)
 		}
 		// Живые поправки суммы этого платежа: та же сумма до поправки — применяем.
-		if corrNew, ok := d.carryCorrections(ctx, o.ID, n.ID, n.Amount); ok && corrNew > 0 {
+		if corrNew, ok := d.carryCorrections(ctx, o.ID, n.ID, o.Amount, n.Amount); ok && corrNew > 0 {
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1`, n.ID, corrNew)
 			n.Amount = corrNew
 		}
@@ -3142,40 +3142,70 @@ func (d *DB) CarryOverEditedTx(ctx context.Context, rawID int, old []TxState) er
 }
 
 // carryCorrections — живые поправки суммы прежнего платежа oldID переходят к
-// новому newID (правка сообщения) и применяются к его сумме amount по порядку:
-// поправка, прежняя сумма которой совпала, и дальше по цепочке («не 15000 а
-// 16000», затем «не 16000 а 17000» — итог платежа частями вслед за двумя
-// частями). Из поправок с той же прежней суммой — последняя.
-func (d *DB) carryCorrections(ctx context.Context, oldID, newID int, amount float64) (float64, bool) {
+// новому newID (правка сообщения). cur — сумма прежнего платежа (со всеми его
+// поправками), amount — сумма нового разбора.
+//
+// Сумму в тексте не меняли (amount — та же, что была в сообщении до поправок:
+// исправили опечатку в имени, запятую) — у нового платежа сумма прежнего, со
+// всеми живыми поправками. Сумму в сообщении до поправок восстанавливаем,
+// откатывая живые поправки с конца: поправка «не X а Y» — назад к X, итог
+// платежа частями, сдвинутый вслед за своей частью, — на ту же разницу (его
+// цепочка «15000 → 16000 → 17000» могла порваться: первую поправку части
+// удалили, итог сдвинулся обратно на разницу, и вторая поправка «16000 →
+// 17000» к 15000 в тексте уже не подходит по прежней сумме).
+//
+// Сумму в тексте изменили — поправки «не X а Y» применяются по цепочке от
+// новой суммы: поправка, прежняя сумма которой совпала, и дальше. Из поправок с
+// той же прежней суммой — последняя. Сдвиги итога вслед за частями к новой
+// сумме не применяются: итог написали заново, сходится ли он с чеками — решает
+// движок (и вопрос «доплата или ошибка?» при правке итога).
+func (d *DB) carryCorrections(ctx context.Context, oldID, newID int, cur, amount float64) (float64, bool) {
 	rows, err := d.pool.Query(ctx, `
 		WITH c AS (UPDATE amount_corrections SET target_id = $2 WHERE kind = 'tx' AND target_id = $1 AND reverted = false
-		           RETURNING old_amount, new_amount, id)
-		SELECT id, old_amount::float8, new_amount::float8 FROM c ORDER BY id`, oldID, newID)
+		           RETURNING old_amount, new_amount, id, follow)
+		SELECT id, old_amount::float8, new_amount::float8, follow FROM c ORDER BY id`, oldID, newID)
 	if err != nil {
 		return 0, false
 	}
 	type corr struct {
 		id       int
 		old, new float64
+		follow   bool
 	}
 	var cs []corr
 	for rows.Next() {
 		var c corr
-		if err := rows.Scan(&c.id, &c.old, &c.new); err != nil {
+		if err := rows.Scan(&c.id, &c.old, &c.new, &c.follow); err != nil {
 			rows.Close()
 			return 0, false
 		}
 		cs = append(cs, c)
 	}
 	rows.Close()
-	if rows.Err() != nil {
-		return 0, false
+	if rows.Err() != nil || len(cs) == 0 {
+		return amount, false
+	}
+	// Сумма в сообщении до поправок.
+	base, known := cur, true
+	for i := len(cs) - 1; i >= 0 && known; i-- {
+		c := cs[i]
+		switch {
+		case c.follow:
+			base -= c.new - c.old
+		case math.Abs(base-c.new) < 0.01:
+			base = c.old
+		default:
+			known = false // сумму с тех пор меняли иначе — по цепочке
+		}
+	}
+	if known && math.Abs(base-amount) < 0.01 {
+		return cur, math.Abs(cur-amount) >= 0.01
 	}
 	changed, last := false, 0
 	for {
 		pick := -1
 		for i, c := range cs {
-			if c.id > last && math.Abs(c.old-amount) < 0.01 {
+			if !c.follow && c.id > last && math.Abs(c.old-amount) < 0.01 {
 				pick = i // по возрастанию id: последняя подходящая
 			}
 		}

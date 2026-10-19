@@ -170,7 +170,7 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 	if err := b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates); err != nil {
 		fmt.Println("Правка сообщения: перенос уточнений не удался:", err)
 	}
-	for _, ask := range b.keepEditedSplitTotals(ctx, ref.ID, splits) {
+	for _, ask := range b.keepEditedSplitTotals(ctx, ref, splits) {
 		say(ask)
 	}
 
@@ -198,20 +198,28 @@ func (b *Bot) splitTotalsOfMessage(ctx context.Context, ref db.RawMessageRef) []
 }
 
 // keepEditedSplitTotals — изменили в WhatsApp текст-итог платежа частями
-// («Магомедов Ахмед 15000» про чеки 10000 + 5000 → 16000). Новая сумма с чеками
-// не сходится: записанная как есть, она посчиталась бы отдельным платежом сверх
-// них (сбор 31000). Как и поправка «не 15000 а 16000» на итог, оставляем
-// прежнюю сумму и спрашиваем, доплата это или ошибка. Возвращает вопросы.
-func (b *Bot) keepEditedSplitTotals(ctx context.Context, rawID int, splits []*splitTotal) []string {
+// («Магомедов Ахмед 15000» про чеки 10000 + 5000 → 16000). Решает движок по
+// записям, как они есть сейчас (после нового разбора и переноса поправок):
+// новый текст — пара своего чека («10000» про чек 10000), итог других частей
+// (прислали доплату чеком, лишний чек удалили) или вовсе не в сборе — сумма
+// такая, как исправили, без вопросов. Только если новый текст посчитан
+// отдельным платежом без чеков (сверх своих чеков: сбор 31000), как и поправка
+// «не 15000 а 16000» на итог, оставляем прежнюю сумму и спрашиваем, доплата
+// это или ошибка. Возвращает вопросы.
+func (b *Bot) keepEditedSplitTotals(ctx context.Context, ref db.RawMessageRef, splits []*splitTotal) []string {
 	if len(splits) == 0 {
 		return nil
 	}
-	now, err := b.db.TxRefsByRawID(ctx, rawID)
+	now, err := b.db.TxRefsByRawID(ctx, ref.ID)
 	if err != nil {
 		return nil
 	}
+	type pick struct {
+		st *splitTotal
+		n  db.TxRef
+	}
+	var picks []pick
 	used := map[int]bool{}
-	var out []string
 	for _, st := range splits {
 		// Новый платёж того же клиента в сообщении — один (несколько — это уже
 		// не итог, а суммы по чекам: «10000», «5000» — пары своих чеков).
@@ -226,12 +234,26 @@ func (b *Bot) keepEditedSplitTotals(ctx context.Context, rawID int, splits []*sp
 		}
 		n := same[0]
 		used[n.ID] = true
-		if math.Abs(n.Amount-st.text.Amount) < 0.01 || math.Abs(n.Amount-st.sum()) < 0.5 {
-			continue // сумма итога та же (или сходится с чеками)
+		if math.Abs(n.Amount-st.text.Amount) < 0.01 {
+			continue // сумма итога та же
 		}
-		if b.db.SetTxAmount(ctx, n.ID, st.text.Amount) == nil {
-			fmt.Printf("Правка итога платежа частями %s: %v вместо %v не сходится с чеками — спрашиваю\n", st.label(), n.Amount, st.text.Amount)
-			out = append(out, splitTotalQuestion(st, n.Amount))
+		picks = append(picks, pick{st, n})
+	}
+	if len(picks) == 0 {
+		return nil
+	}
+	x := b.loadPayIndex(ctx, [][]time.Time{{ref.ReceivedAt}})
+	var out []string
+	for _, pk := range picks {
+		if x.splitOf("tx", pk.n.ID) != nil {
+			continue // итог своих чеков (как они есть сейчас)
+		}
+		if p := x.payment("tx", pk.n.ID); p == nil || len(p.Checks) > 0 {
+			continue // пара своего чека или не в сборе — сверх чеков не считается
+		}
+		if b.db.SetTxAmount(ctx, pk.n.ID, pk.st.text.Amount) == nil {
+			fmt.Printf("Правка итога платежа частями %s: %v вместо %v не сходится с чеками — спрашиваю\n", pk.st.label(), pk.n.Amount, pk.st.text.Amount)
+			out = append(out, splitTotalQuestion(pk.st, pk.n.Amount))
 		}
 	}
 	return out
