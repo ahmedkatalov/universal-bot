@@ -450,15 +450,38 @@ type exclRes struct {
 	extraPaired   bool     // такой же текст остаётся в сборе вместе с чеком
 	extraLeft     int      // таких же текстов — отдельных платежей — осталось
 
+	// batch — одно действие владельца: всё исключённое им «верни» вернёт вместе.
+	batch string
+
 	// Текст-итог платежа частями.
 	split       *splitTotal // исключён итог
 	splitOnly   bool        // исключён только текст-итог: чеки остаются в сборе
 	splitParts  []float64   // исключённые части (суммы чеков, без копий)
 	splitCopies int         // исключённые копии этих чеков
 	splitLeft   []float64   // части без названного клиента, которых нет в сборе, — не тронуты
+	// splitKept — такие же итоги в других группах, связанные с чеками только
+	// через этот текст: без него они посчитались бы сверх чеков — текст НЕ
+	// исключён (только для splitOnly).
+	splitKept []*ledger.Text
 	// Исключён чек — часть платежа с итогом текстом.
 	totalsDropped []*splitTotal // итоги, у которых в сборе не осталось других частей, — исключены тоже
 	totalsKept    []*splitTotal // итоги, у которых остались другие части
+}
+
+// excluded — запись действительно исключена (а не оставлена с объяснением).
+func (r exclRes) excluded() bool { return len(r.splitKept) == 0 }
+
+// lead — первая фраза ответа об исключении записи label.
+func (r exclRes) lead(label string) string {
+	if !r.excluded() {
+		return fmt.Sprintf("Операцию НЕ исключил: %s. Сбор не менялся.", label)
+	}
+	return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", label)
+}
+
+// newExclBatch — метка одного исключения (запись op и всё, что исключено вместе с ней).
+func newExclBatch(op db.OperationRef) string {
+	return fmt.Sprintf("%s@%d", evKey(op.Kind, op.ID), time.Now().UnixNano())
 }
 
 // moneyList — «10 000 ₽ + 5 000 ₽».
@@ -487,6 +510,25 @@ func (r exclRes) note(op db.OperationRef, groupName func(string) string) string 
 		out += " Исключена только эта текстовая запись: сам платёж остаётся в сборе по чеку."
 	}
 	switch {
+	case r.split != nil && r.splitOnly && len(r.splitKept) > 0:
+		var where []string
+		seen := map[string]bool{}
+		for _, t := range r.splitKept {
+			n := "в другой группе"
+			if g := groupName(t.Group); g != "" {
+				n = "в группе «" + g + "»"
+			}
+			if !seen[n] {
+				seen[n] = true
+				where = append(where, n)
+			}
+		}
+		out += " Это итог платежа частями (чеки " + r.split.partsLine(nil, 0) + " ₽): сверх чеков он и так не считается." +
+			" Такой же итог есть " + strings.Join(where, ", ") + ", и с этими чеками он связан только через этот текст:" +
+			" без него тот итог посчитался бы отдельным платежом и сбор по всем группам вырос бы на " +
+			formatMoney(r.split.text.Amount) + " ₽. Поэтому текст оставил." +
+			" Если тот итог тоже лишний — уточни у владельца: исключи сначала его (kind=text и его group), потом этот;" +
+			" если нужно убрать весь платёж — исключи без kind."
 	case r.split != nil && r.splitOnly:
 		out += " Исключена только эта текстовая запись — итог платежа частями: сами чеки " + r.split.partsLine(nil, 0) +
 			" ₽ остаются в сборе, сбор не изменился."
@@ -575,15 +617,24 @@ func (r exclRes) note(op db.OperationRef, groupName func(string) string) string 
 // только если других его частей в сборе не осталось (иначе итог посчитался бы
 // сверх чеков).
 func (b *Bot) excludePayment(ctx context.Context, e opEntry, x *payIndex, onlyRecord bool, scope string) (exclRes, error) {
-	var r exclRes
 	op := e.op
-	if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, true); err != nil {
+	r := exclRes{batch: newExclBatch(op)}
+	if err := b.db.ExcludeOperation(ctx, op.Kind, op.ID, r.batch); err != nil {
 		return r, err
 	}
 	if st := e.split; st != nil && x != nil {
 		r.split = st
 		if onlyRecord {
 			r.splitOnly = true
+			// Такой же итог в другой группе мог быть связан с чеками только
+			// через этот текст — без него он посчитался бы сверх чеков, и
+			// «сбор не изменился» было бы неправдой. Проверяем по движку.
+			if lost := b.orphanedTotals(ctx, st, x); len(lost) > 0 {
+				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
+					return r, err
+				}
+				r.splitKept = lost
+			}
 			return r, nil
 		}
 		dropped, here := b.dropPayments(ctx, op, st.parts, x, scope, &r)
@@ -595,7 +646,7 @@ func (b *Bot) excludePayment(ctx context.Context, e opEntry, x *payIndex, onlyRe
 				continue
 			}
 			if c.Confirmed && c.ContactID != 0 {
-				if b.db.SetOperationIgnored(ctx, "receipt", c.ID, true) == nil {
+				if b.db.ExcludeOperation(ctx, "receipt", c.ID, r.batch) == nil {
 					r.splitParts = append(r.splitParts, c.Amount)
 				}
 				continue
@@ -616,6 +667,47 @@ func (b *Bot) excludePayment(ctx context.Context, e opEntry, x *payIndex, onlyRe
 	return r, nil
 }
 
+// orphanedTotals — исключили текст-итог st (только текст): такие же итоги того
+// же платежа в других группах, которые движок теперь считает отдельными
+// платежами без чеков (были связаны с чеками только через st).
+func (b *Bot) orphanedTotals(ctx context.Context, st *splitTotal, x *payIndex) []*ledger.Text {
+	var ids []int
+	for _, p := range st.parts {
+		ids = append(ids, checkIDs(p)...)
+	}
+	for _, c := range st.missing {
+		ids = append(ids, c.ID)
+	}
+	var others []*ledger.Text
+	recs := [][]time.Time{{st.text.PostedAt, st.text.OpDate}}
+	for _, o := range x.totalsOf(ids...) {
+		if o == st || o.text.ID == st.text.ID || math.Abs(o.text.Amount-st.text.Amount) >= 0.5 {
+			continue
+		}
+		others = append(others, o.text)
+		recs = append(recs, []time.Time{o.text.PostedAt, o.text.OpDate})
+	}
+	if len(others) == 0 {
+		return nil
+	}
+	for _, p := range st.parts {
+		for _, c := range p.Checks {
+			recs = append(recs, []time.Time{c.PostedAt, c.OpDate})
+		}
+	}
+	after := b.loadPayIndex(ctx, recs)
+	var lost []*ledger.Text
+	for _, t := range others {
+		if after.splitOf("transaction", t.ID) != nil {
+			continue
+		}
+		if p := after.payment("transaction", t.ID); p != nil && len(p.Checks) == 0 {
+			lost = append(lost, t)
+		}
+	}
+	return lost
+}
+
 // dropPayments исключает (кроме самой записи op) записи платежей pays так,
 // как их объединил движок: чеки и копии в области scope, тексты-пары и итоги
 // платежа частями. Возвращает исключённые чеки и область.
@@ -624,7 +716,7 @@ func (b *Bot) dropPayments(ctx context.Context, op db.OperationRef, pays []*ledg
 		scope = op.GroupJID // копия, пересланная ботом, — «не считай здесь»
 	}
 	here := func(g string) bool { return scope == "" || g == scope }
-	ignore := func(kind string, id int) bool { return b.db.SetOperationIgnored(ctx, kind, id, true) == nil }
+	ignore := func(kind string, id int) bool { return b.db.ExcludeOperation(ctx, kind, id, r.batch) == nil }
 	dropped := map[int]bool{}
 	if op.Kind == "receipt" {
 		dropped[op.ID] = true
@@ -788,6 +880,92 @@ func sameSenderOf(a, b db.OperationRef) bool {
 		return onlyDigits(a.Phone) == onlyDigits(b.Phone)
 	}
 	return strings.EqualFold(strings.TrimSpace(a.Sender), strings.TrimSpace(b.Sender))
+}
+
+// groupOpsByBatch (для возврата исключённого) — записи, исключённые одним
+// действием владельца (ExcludeOperation с одной меткой), — одна строка: «верни»
+// вернёт их вместе. Показывается чек, если он есть среди найденных.
+func groupOpsByBatch(entries []opEntry) []opEntry {
+	var out []opEntry
+	at := map[string]int{}
+	for _, e := range entries {
+		if e.op.Batch == "" {
+			out = append(out, e)
+			continue
+		}
+		if i, ok := at[e.op.Batch]; ok {
+			if e.op.Kind == "receipt" && out[i].op.Kind != "receipt" {
+				out[i] = e
+			}
+			continue
+		}
+		at[e.op.Batch] = len(out)
+		out = append(out, e)
+	}
+	return out
+}
+
+// batchList — записи одного исключения, кроме самой op: «чеки 10 000 ₽ +
+// 5 000 ₽; текст «…» в группе «…»» (пусто — других нет).
+func batchList(op db.OperationRef, ops []db.OperationRef, groupName func(string) string) string {
+	where := func(g string) string {
+		switch {
+		case g == op.GroupJID:
+			return ""
+		case groupName(g) != "":
+			return " в группе «" + groupName(g) + "»"
+		}
+		return " в другой группе"
+	}
+	var parts, places []string
+	checks := map[string][]float64{} // чеки по группам
+	for _, r := range ops {
+		if r.Kind != "receipt" || (r.Kind == op.Kind && r.ID == op.ID) {
+			continue
+		}
+		w := where(r.GroupJID)
+		if _, ok := checks[w]; !ok {
+			places = append(places, w)
+		}
+		checks[w] = append(checks[w], r.Amount)
+	}
+	for _, w := range places {
+		if vs := checks[w]; len(vs) == 1 {
+			parts = append(parts, "чек "+moneyList(vs)+w)
+		} else {
+			parts = append(parts, "чеки "+moneyList(vs)+w)
+		}
+	}
+	for _, r := range ops {
+		if r.Kind == "receipt" || (r.Kind == op.Kind && r.ID == op.ID) {
+			continue
+		}
+		kind := "текст"
+		if r.Cash {
+			kind = "наличка"
+		}
+		parts = append(parts, kind+" «"+strings.TrimSpace(r.Name+" "+formatMoney(r.Amount))+" ₽»"+where(r.GroupJID))
+	}
+	return strings.Join(parts, "; ")
+}
+
+// restoredNote — что вернулось в учёт вместе с записью op (исключённое тем же
+// действием владельца).
+func restoredNote(op db.OperationRef, back []db.OperationRef, groupName func(string) string) string {
+	if l := batchList(op, back, groupName); l != "" {
+		return " Вместе с ней вернул то, что было исключено вместе с ней (тот же платёж): " + l + "."
+	}
+	return ""
+}
+
+// leftExcludedNote — вернули только названную запись op: что из исключённого
+// вместе с ней (тот же платёж) осталось исключённым.
+func leftExcludedNote(op db.OperationRef, left []db.OperationRef, groupName func(string) string) string {
+	if l := batchList(op, left, groupName); l != "" {
+		return " Вернул только эту запись. Вместе с ней был исключён тот же платёж — это осталось исключённым: " + l +
+			". Если нужно вернуть платёж целиком — верни без kind и sender."
+	}
+	return ""
 }
 
 // collapseTextTwins (для возврата исключённого) убирает из списка текстовую
