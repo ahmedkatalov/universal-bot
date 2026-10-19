@@ -214,17 +214,20 @@ func (b *Bot) rerunLabeledEdit(ctx context.Context, em *events.Message, ref db.R
 		}
 	}
 	switch {
-	case caption:
+	case caption && !textCashPays(newText):
 		_ = b.db.MarkMessageParsed(ctx, ref.ID)
 	case q.quiet():
+		// Разбивка чека с наличкой: наличку записываем, безналичные части
+		// (сам чек) снимет dropCaptionParts после записи.
 		if _, viaAI := b.importTextSilent(ctx, chat, senderName, ref.ID, ref.ReceivedAt, newText, q.budget); !viaAI {
 			_ = b.db.MarkMessageParsed(ctx, ref.ID)
 		}
 	default:
 		em.Info.Timestamp = ref.ReceivedAt
 		b.recordTextPayments(ctx, em, newText, ref.ID, senderName, true)
-		// Остальные платежи списка ждут свои чеки, как у нового сообщения.
-		if ref.QuotedID == "" && (countAmountLines(newText) > 1 || severalAmounts(newText)) {
+		// Остальные платежи списка ждут свои чеки, как у нового сообщения
+		// (части разбивки — нет: их чек уже назван).
+		if !caption && ref.QuotedID == "" && (countAmountLines(newText) > 1 || severalAmounts(newText)) {
 			b.enqueueListPayers(ctx, em, newText, ref.ID, used...)
 		}
 	}

@@ -3959,6 +3959,106 @@ func (d *DB) UnconfirmedReceiptAmountsFrom(ctx context.Context, groupJID, sender
 	return out, rows.Err()
 }
 
+// IgnoreTextTxOfRaw — безналичные платежи сообщения на суммы amounts больше
+// не считаются отдельно: сообщение оказалось подписью чека (разбивка его суммы
+// по частям), эти платежи — сам чек. Наличка сообщения остаётся. Возвращает,
+// сколько платежей снято.
+func (d *DB) IgnoreTextTxOfRaw(ctx context.Context, rawID int, amounts []float64) (int64, error) {
+	if len(amounts) == 0 {
+		return 0, nil
+	}
+	tag, err := d.pool.Exec(ctx, `
+		UPDATE transactions SET ignored = true, dup_same_as = NULL
+		WHERE raw_message_id = $1 AND ignored = false AND is_cash = false
+		  AND EXISTS (SELECT 1 FROM unnest($2::float8[]) a WHERE abs(transactions.amount - a) < 1)`, rawID, amounts)
+	if err != nil {
+		return 0, err
+	}
+	return tag.RowsAffected(), nil
+}
+
+// ConfirmedReceiptAmountsNamedBy — суммы чеков, клиента которых назвало
+// сообщение rawID (подпись, свайп, текст рядом) и которые считаются в сборе.
+func (d *DB) ConfirmedReceiptAmountsNamedBy(ctx context.Context, rawID int) ([]float64, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT amount::float8 FROM bank_receipts
+		WHERE client_source_raw_id = $1 AND client_confirmed = true
+		  AND is_duplicate = false AND ignored = false
+		ORDER BY id`, rawID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []float64
+	for rows.Next() {
+		var a float64
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// WaitingCheck — свежий чек отправителя без подтверждённого клиента: сумма и
+// владелец карты (получатель, напечатанный на чеке).
+type WaitingCheck struct {
+	Amount float64
+	Owner  string
+}
+
+// UnconfirmedReceiptCardsFrom — свежие чеки отправителя без подтверждённого
+// клиента по порядку чата (самый старый первым).
+func (d *DB) UnconfirmedReceiptCardsFrom(ctx context.Context, groupJID, senderJID string, since time.Time) ([]WaitingCheck, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.amount::float8, COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), '') FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.created_at >= $3::timestamptz
+		  AND br.client_confirmed = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		ORDER BY rm.received_at ASC, br.id ASC`, groupJID, senderJID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []WaitingCheck
+	for rows.Next() {
+		var c WaitingCheck
+		if err := rows.Scan(&c.Amount, &c.Owner); err != nil {
+			return nil, err
+		}
+		out = append(out, c)
+	}
+	return out, rows.Err()
+}
+
+// ConfirmedReceiptCountFrom — сколько свежих чеков отправителя уже записаны
+// на клиента name (подпись, свайп, имя рядом) на сумму amount. Сводка
+// списком после таких чеков («Исаев Харон 15000\nМагомедов Ахмед 10000») —
+// те же платежи: их клиенты не ждут ещё чеков в очереди имён. Чеки, которые
+// назвало само сообщение exceptSourceRaw, не считаем.
+func (d *DB) ConfirmedReceiptCountFrom(ctx context.Context, groupJID, senderJID string, since time.Time, name string, amount float64, exceptSourceRaw int) (int, error) {
+	var n int
+	err := d.pool.QueryRow(ctx, `
+		SELECT count(*) FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.created_at >= $3::timestamptz
+		  AND br.client_confirmed = true
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		  AND abs(br.amount - $5::float8) < 1
+		  AND (lower(c.canonical_name) = lower($4) OR lower(br.recipient_raw) = lower($4))
+		  AND COALESCE(br.client_source_raw_id, 0) <> $6
+	`, groupJID, senderJID, since, name, amount, exceptSourceRaw).Scan(&n)
+	return n, err
+}
+
 // ReattributeOldestUnconfirmedReceipt привязывает клиента к САМОМУ СТАРОМУ
 // неподтверждённому чеку от отправителя (FIFO). Порядок — по времени сообщения
 // WhatsApp (rm.received_at), а не по времени вставки строки: так привязка не

@@ -154,6 +154,13 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// Считаем ВСЕ денежные числа сообщения (не «первое в строке»): при «20000 +
 	// 5000» подсказка должна содержать оба, иначе ИИ подталкивался к неверному итогу.
 	joined := strings.Join(lines, "\n")
+	// Текст назвал чек разбивкой его суммы, а рядом наличка: записанные
+	// безналичные платежи — сам чек, снимаем их (наличка остаётся).
+	defer func() {
+		if !staleResult {
+			b.dropCaptionParts(ctx, rawID, joined)
+		}
+	}()
 	tokens := moneyTokens(joined)
 	var foundAmts []string
 	seenAmt := map[float64]bool{}
