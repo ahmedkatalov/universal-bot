@@ -3931,6 +3931,34 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 	return err == nil, err
 }
 
+// UnconfirmedReceiptAmountsFrom — суммы свежих чеков отправителя без
+// подтверждённого клиента (по порядку чата).
+func (d *DB) UnconfirmedReceiptAmountsFrom(ctx context.Context, groupJID, senderJID string, since time.Time) ([]float64, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT br.amount::float8 FROM bank_receipts br
+		JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
+		  AND rm.sender_jid = $2
+		  AND br.created_at >= $3::timestamptz
+		  AND br.client_confirmed = false
+		  AND br.is_duplicate = false AND br.ignored = false
+		  AND COALESCE(rm.deleted, false) = false
+		ORDER BY rm.received_at ASC, br.id ASC`, groupJID, senderJID, since)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []float64
+	for rows.Next() {
+		var a float64
+		if err := rows.Scan(&a); err != nil {
+			return nil, err
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
 // ReattributeOldestUnconfirmedReceipt привязывает клиента к САМОМУ СТАРОМУ
 // неподтверждённому чеку от отправителя (FIFO). Порядок — по времени сообщения
 // WhatsApp (rm.received_at), а не по времени вставки строки: так привязка не

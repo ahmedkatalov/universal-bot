@@ -1074,7 +1074,14 @@ func (b *Bot) processText(ctx context.Context, msg *events.Message, text string,
 	if b.handleNameMessage(ctx, msg, text, rawID) {
 		return false, false, true
 	}
+	routedToAI, hasPayment = b.recordTextPayments(ctx, msg, text, rawID, senderName, aiSync)
+	return routedToAI, hasPayment, false
+}
 
+// recordTextPayments — записать платежи текста (ИИ, без него — запасной
+// разбор) и отметить сообщение разобранным. Имя для чека здесь не ищется —
+// это делает processText до записи.
+func (b *Bot) recordTextPayments(ctx context.Context, msg *events.Message, text string, rawID int, senderName string, aiSync bool) (routedToAI, hasPayment bool) {
 	result := parser.ParseMessage(text)
 
 	// Грязный формат платежа (сумма и имя на разных строках, наличка/кто-собрал
@@ -1122,7 +1129,7 @@ func (b *Bot) processText(ctx context.Context, msg *events.Message, text string,
 	if !routedToAI && !keepUnparsed {
 		_ = b.db.MarkMessageParsed(ctx, rawID)
 	}
-	return routedToAI, len(result.Transactions) > 0, false
+	return routedToAI, len(result.Transactions) > 0
 }
 
 // mightBePayment — грубый фильтр «возможно, это платёж»: есть цифра (возможная

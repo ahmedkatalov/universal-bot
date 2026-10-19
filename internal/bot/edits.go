@@ -105,6 +105,21 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 		say("✏️ Поправку изменили — вернул прежнюю сумму.")
 	}
 
+	senderName := msg.Info.PushName
+	if senderName == "" {
+		senderName = ref.SenderName
+	}
+
+	// Текст с платежами, который заодно назвал чек (список «Исаев Харон 15000
+	// 20000», «ФИО сумма», записанный платежом и ждавший чек), или подпись,
+	// которую исправили в список («Исаев Харон 15000, Магомедов Ахмед 10000»):
+	// правка — заново прочитать платежи, а чек назвать по новому тексту. Одно
+	// переименование чека потеряло бы платежи сообщения.
+	if len(undo.LabeledChecks) > 0 && (len(undo.OldTx) > 0 || paymentsText(newText)) {
+		b.rerunLabeledEdit(ctx, em, ref, undo, newText, senderName, q, say)
+		return true
+	}
+
 	// Сообщение-имя, которое уже подписало чек или уточнило клиента платежа:
 	// новое имя — тем же чекам/платежам. Повторно как имя «для следующего чека»
 	// его не ставим — оно уже было использовано.
@@ -147,10 +162,6 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 		return true
 	}
 
-	senderName := msg.Info.PushName
-	if senderName == "" {
-		senderName = ref.SenderName
-	}
 	if q.quiet() {
 		if _, viaAI := b.importTextSilent(ctx, chat, senderName, ref.ID, ref.ReceivedAt, newText, q.budget); !viaAI {
 			_ = b.db.MarkMessageParsed(ctx, ref.ID)
@@ -169,6 +180,90 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 	say(editNote(undo.OldTx, now))
 	fmt.Printf("Правка сообщения %s: было %v, стало %v\n", origID, undo.OldTx, now)
 	return true
+}
+
+// rerunLabeledEdit — изменили текст с платежами, который назвал чек:
+// платежи сообщения читаем заново, а чеки, которые оно называло, получают
+// клиента по новому тексту — платёж на сумму чека («ФИО сумма», пара в строке
+// с несколькими суммами, ФИО без суммы) или разбивка суммы чека по частям
+// одного клиента (тогда сообщение — подпись чека, платежами его не пишем).
+// Чек, которого новый текст не называет, остаётся без клиента — бот спросит.
+// Чужие ждущие чеки правка не подписывает: она про свои.
+func (b *Bot) rerunLabeledEdit(ctx context.Context, em *events.Message, ref db.RawMessageRef, undo db.EditUndo, newText, senderName string, q editQuiet, say func(string)) {
+	chat := em.Info.Chat
+	var used []float64
+	caption, lost := false, 0
+	for _, w := range undo.LabeledChecks {
+		r, err := b.db.ReceiptByWaMessageID(ctx, w)
+		if err != nil || !r.Found {
+			continue
+		}
+		canonical, whole := b.editCheckClient(ctx, newText, r.Amount, w)
+		if canonical == "" {
+			lost++
+			continue
+		}
+		var cid *int
+		if id, err := b.db.GetOrCreateContact(ctx, canonical); err == nil {
+			cid = &id
+		}
+		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, w, canonical, cid, ref.ID); err == nil && found {
+			b.reresolveWatchByCheck(ctx, chat, w, canonical)
+			used = append(used, r.Amount)
+			caption = caption || whole
+		}
+	}
+	switch {
+	case caption:
+		_ = b.db.MarkMessageParsed(ctx, ref.ID)
+	case q.quiet():
+		if _, viaAI := b.importTextSilent(ctx, chat, senderName, ref.ID, ref.ReceivedAt, newText, q.budget); !viaAI {
+			_ = b.db.MarkMessageParsed(ctx, ref.ID)
+		}
+	default:
+		em.Info.Timestamp = ref.ReceivedAt
+		b.recordTextPayments(ctx, em, newText, ref.ID, senderName, true)
+		// Остальные платежи списка ждут свои чеки, как у нового сообщения.
+		if ref.QuotedID == "" && (countAmountLines(newText) > 1 || severalAmounts(newText)) {
+			b.enqueueListPayers(ctx, em, newText, ref.ID, used...)
+		}
+	}
+	if err := b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates); err != nil {
+		fmt.Println("Правка сообщения: перенос уточнений не удался:", err)
+	}
+	now, _ := b.db.TxRefsByRawID(ctx, ref.ID)
+	say(editNote(undo.OldTx, now))
+	if lost > 0 {
+		say("✏️ В сообщении больше нет ФИО клиента для чека — чек снова без клиента, спрошу, чей он.")
+	}
+	fmt.Printf("Правка сообщения %s (назвало чек): было %v, стало %v\n", em.Info.ID, undo.OldTx, now)
+}
+
+// editCheckClient — клиент чека на сумму amt по исправленному тексту (так же,
+// как его назвал бы новый текст рядом с чеком). whole — текст расписывает
+// сумму чека по частям: он целиком подпись чека.
+func (b *Bot) editCheckClient(ctx context.Context, text string, amt float64, checkWa string) (canonical string, whole bool) {
+	src, _, _, ok := checkNameSource(text, amt)
+	if !ok {
+		hit, found := breakdownOfCheck(text, amt)
+		if !found {
+			return "", false
+		}
+		src, whole = hit.nameText, true
+	}
+	name, ok := b.confirmClientName(ctx, src)
+	if !ok {
+		if n, found := firstNameLine(src); found {
+			name, ok = b.confirmClientName(ctx, n)
+		}
+	}
+	if !ok {
+		return "", false
+	}
+	if owner, _ := b.db.ReceiptCardOwnerByMessage(ctx, checkWa); isCardOwner(name, owner) {
+		return "", false
+	}
+	return name, whole
 }
 
 // editedMessage — исправленное сообщение как обычное (тот же отправитель и
