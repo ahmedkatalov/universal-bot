@@ -671,6 +671,17 @@ func (b *Bot) excludePayment(ctx context.Context, e opEntry, x *payIndex, onlyRe
 // же платежа в других группах, которые движок теперь считает отдельными
 // платежами без чеков (были связаны с чеками только через st).
 func (b *Bot) orphanedTotals(ctx context.Context, st *splitTotal, x *payIndex) []*ledger.Text {
+	others := sameTotalsElsewhere(st, x)
+	if len(others) == 0 {
+		return nil
+	}
+	return lostTotals(b.loadPayIndex(ctx, splitRecs(st, others)), others)
+}
+
+// sameTotalsElsewhere — такие же итоги (та же сумма) тех же чеков, что итог st,
+// записанные другими текстами (обычно — в других группах): движок связывает их
+// с чеками через st.
+func sameTotalsElsewhere(st *splitTotal, x *payIndex) []*ledger.Text {
 	var ids []int
 	for _, p := range st.parts {
 		ids = append(ids, checkIDs(p)...)
@@ -679,23 +690,36 @@ func (b *Bot) orphanedTotals(ctx context.Context, st *splitTotal, x *payIndex) [
 		ids = append(ids, c.ID)
 	}
 	var others []*ledger.Text
-	recs := [][]time.Time{{st.text.PostedAt, st.text.OpDate}}
 	for _, o := range x.totalsOf(ids...) {
 		if o == st || o.text.ID == st.text.ID || math.Abs(o.text.Amount-st.text.Amount) >= 0.5 {
 			continue
 		}
 		others = append(others, o.text)
-		recs = append(recs, []time.Time{o.text.PostedAt, o.text.OpDate})
 	}
-	if len(others) == 0 {
-		return nil
+	return others
+}
+
+// splitRecs — моменты итога st, его чеков и итогов others (для книги движка
+// после изменения).
+func splitRecs(st *splitTotal, others []*ledger.Text) [][]time.Time {
+	recs := [][]time.Time{{st.text.PostedAt, st.text.OpDate}}
+	for _, t := range others {
+		recs = append(recs, []time.Time{t.PostedAt, t.OpDate})
 	}
 	for _, p := range st.parts {
 		for _, c := range p.Checks {
 			recs = append(recs, []time.Time{c.PostedAt, c.OpDate})
 		}
 	}
-	after := b.loadPayIndex(ctx, recs)
+	for _, c := range st.missing {
+		recs = append(recs, []time.Time{c.PostedAt, c.OpDate})
+	}
+	return recs
+}
+
+// lostTotals — итоги others, которые движок (книга after) считает отдельными
+// платежами без чеков: связь с чеками потеряна.
+func lostTotals(after *payIndex, others []*ledger.Text) []*ledger.Text {
 	var lost []*ledger.Text
 	for _, t := range others {
 		if after.splitOf("transaction", t.ID) != nil {
@@ -966,6 +990,132 @@ func leftExcludedNote(op db.OperationRef, left []db.OperationRef, groupName func
 			". Если нужно вернуть платёж целиком — верни без kind и sender."
 	}
 	return ""
+}
+
+// exclBatchTime — когда владелец исключил записи batch (метка newExclBatch).
+func exclBatchTime(batch string) (time.Time, bool) {
+	i := strings.LastIndexByte(batch, '@')
+	if i < 0 {
+		return time.Time{}, false
+	}
+	ns, err := strconv.ParseInt(batch[i+1:], 10, 64)
+	if err != nil || ns <= 0 {
+		return time.Time{}, false
+	}
+	return time.Unix(0, ns), true
+}
+
+// keepReplacedTexts — вернули в учёт исключённое одним действием batch (чек и
+// текст про него). Пока платёж был исключён, сотрудник мог прислать такой же
+// текст ещё раз (тот же клиент, сумма, группа) — тот посчитан сам. Чек встаёт
+// в пару только к одному тексту своей группы, и второй посчитался бы отдельным
+// платежом: тот же платёж дважды (сбор 14000 вместо 7000). Старый текст из
+// исключения оставляем исключённым (с той же меткой) — чек в паре с присланным
+// заново. Такой же текст, присланный ДО исключения, — отдельный платёж, как и
+// был (его не трогаем). Возвращает оставленные исключёнными тексты.
+func (b *Bot) keepReplacedTexts(ctx context.Context, batch string, back []db.OperationRef) []db.OperationRef {
+	since, ok := exclBatchTime(batch)
+	if !ok {
+		return nil
+	}
+	inBatch := map[string]bool{}
+	var texts []db.OperationRef
+	hasCheck := false
+	for _, r := range back {
+		inBatch[evKey(r.Kind, r.ID)] = true
+		switch {
+		case r.Kind == "receipt":
+			hasCheck = true
+		case !r.Cash:
+			texts = append(texts, r)
+		}
+	}
+	if !hasCheck || len(texts) == 0 {
+		return nil
+	}
+	x := b.loadPayIndex(ctx, opTimes(back))
+	// withBack — в платеже есть вернувшийся чек.
+	withBack := func(p *ledger.Payment) bool {
+		for _, c := range p.Checks {
+			if inBatch[evKey("receipt", c.ID)] {
+				return true
+			}
+		}
+		return false
+	}
+	// Тексты движка не из этого исключения, присланные после него.
+	type rival struct {
+		t *ledger.Text
+		p *ledger.Payment
+	}
+	var rivals []rival
+	seen := map[*ledger.Payment]bool{}
+	for _, p := range x.of {
+		if seen[p] {
+			continue
+		}
+		seen[p] = true
+		for _, t := range x.texts(p) {
+			if !t.Cash && !inBatch[evKey("transaction", t.ID)] && t.PostedAt.After(since) && x.payment("transaction", t.ID) == p {
+				rivals = append(rivals, rival{t, p})
+			}
+		}
+	}
+	var out []db.OperationRef
+	for _, t := range texts {
+		pt := x.payment("transaction", t.ID)
+		if pt == nil || x.splitOf("transaction", t.ID) != nil {
+			continue
+		}
+		paired, alone := len(pt.Checks) > 0 && withBack(pt), len(pt.Checks) == 0
+		if !paired && !alone {
+			continue
+		}
+		dup := false
+		for _, r := range rivals {
+			if r.t.Group != t.GroupJID || math.Abs(r.t.Amount-t.Amount) >= 0.01 || !sameClientMoney(r.t.Client, t.Name) {
+				continue
+			}
+			// Один из двух — в паре с вернувшимся чеком, другой — сам по себе.
+			if (paired && len(r.p.Checks) == 0) || (alone && withBack(r.p)) {
+				dup = true
+				break
+			}
+		}
+		if dup && b.db.ExcludeOperation(ctx, t.Kind, t.ID, batch) == nil {
+			fmt.Printf("Возврат исключённого %s: текст %s %v оставлен исключённым — чек в паре с таким же текстом, присланным после исключения\n",
+				batch, t.Name, t.Amount)
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// replacedTextsNote — тексты, оставленные исключёнными при возврате платежа
+// (keepReplacedTexts).
+func replacedTextsNote(op db.OperationRef, kept []db.OperationRef, groupName func(string) string) string {
+	if len(kept) == 0 {
+		return ""
+	}
+	var ls []string
+	for _, t := range kept {
+		l := "«" + strings.TrimSpace(t.Name+" "+formatMoney(t.Amount)) + " ₽»"
+		if t.GroupJID != op.GroupJID {
+			if g := groupName(t.GroupJID); g != "" {
+				l += " в группе «" + g + "»"
+			} else {
+				l += " в другой группе"
+			}
+		}
+		ls = append(ls, l)
+	}
+	what := "Текст " + ls[0] + " из того же исключения оставил исключённым"
+	if len(ls) > 1 {
+		what = "Тексты " + strings.Join(ls, ", ") + " из того же исключения оставил исключёнными"
+	}
+	return " " + what + ": пока платёж был исключён, такой же текст прислали ещё раз, и чек теперь в паре с ним —" +
+		" иначе один платёж посчитался бы дважды. Если это был другой, отдельный платёж — уточни у владельца;" +
+		" вернуть старый текст: restore с kind=text."
 }
 
 // collapseTextTwins (для возврата исключённого) убирает из списка текстовую

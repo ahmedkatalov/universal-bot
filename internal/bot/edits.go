@@ -81,8 +81,10 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 	}
 	// Текст-итог платежа частями: его новую сумму проверяем, как поправку
 	// «не 15000 а 16000» (до правки — пока движок ещё видит итог с его чеками).
-	var splits []*splitTotal
-	if !q.quiet() && ref.HandledAs == "" {
+	// И при импорте истории: спросить нельзя, но и считать итог сверх чеков —
+	// тоже (прежняя сумма остаётся, вопрос — в лог).
+	var splits []editedSplit
+	if ref.HandledAs == "" {
 		splits = b.splitTotalsOfMessage(ctx, ref)
 	}
 
@@ -162,6 +164,9 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 			_ = b.db.MarkMessageParsed(ctx, ref.ID)
 		}
 		_ = b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates)
+		for _, ask := range b.keepEditedSplitTotals(ctx, ref, splits) {
+			fmt.Printf("Правка сообщения %s при импорте истории — вопрос не отправлен: %s\n", origID, ask)
+		}
 		return true
 	}
 	em.Info.Timestamp = ref.ReceivedAt
@@ -170,28 +175,36 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 	if err := b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates); err != nil {
 		fmt.Println("Правка сообщения: перенос уточнений не удался:", err)
 	}
-	for _, ask := range b.keepEditedSplitTotals(ctx, ref, splits) {
-		say(ask)
-	}
+	asks := b.keepEditedSplitTotals(ctx, ref, splits)
 
 	now, _ := b.db.TxRefsByRawID(ctx, ref.ID)
 	say(editNote(undo.OldTx, now))
+	for _, ask := range asks {
+		say(ask)
+	}
 	fmt.Printf("Правка сообщения %s: было %v, стало %v\n", origID, undo.OldTx, now)
 	return true
 }
 
+// editedSplit — текст-итог платежа частями в сообщении до правки и такие же
+// итоги в других группах, связанные с его чеками через него.
+type editedSplit struct {
+	st     *splitTotal
+	others []*ledger.Text
+}
+
 // splitTotalsOfMessage — платежи сообщения, которые движок считает текстом-
 // итогом платежа частями (сумма его чеков).
-func (b *Bot) splitTotalsOfMessage(ctx context.Context, ref db.RawMessageRef) []*splitTotal {
+func (b *Bot) splitTotalsOfMessage(ctx context.Context, ref db.RawMessageRef) []editedSplit {
 	old, err := b.db.TxRefsByRawID(ctx, ref.ID)
 	if err != nil || len(old) == 0 {
 		return nil
 	}
 	x := b.loadPayIndex(ctx, [][]time.Time{{ref.ReceivedAt}})
-	var out []*splitTotal
+	var out []editedSplit
 	for _, t := range old {
 		if st := x.splitOf("tx", t.ID); st != nil {
-			out = append(out, st)
+			out = append(out, editedSplit{st: st, others: sameTotalsElsewhere(st, x)})
 		}
 	}
 	return out
@@ -205,8 +218,11 @@ func (b *Bot) splitTotalsOfMessage(ctx context.Context, ref db.RawMessageRef) []
 // такая, как исправили, без вопросов. Только если новый текст посчитан
 // отдельным платежом без чеков (сверх своих чеков: сбор 31000), как и поправка
 // «не 15000 а 16000» на итог, оставляем прежнюю сумму и спрашиваем, доплата
-// это или ошибка. Возвращает вопросы.
-func (b *Bot) keepEditedSplitTotals(ctx context.Context, ref db.RawMessageRef, splits []*splitTotal) []string {
+// это или ошибка. Такой же итог в другой группе, связанный с чеками только
+// через этот, — тоже не должен посчитаться сверх чеков (keepOtherGroupTotals).
+// Возвращает вопросы и пояснения (при импорте истории их не отправляют — только
+// в лог, а сумма остаётся прежней так же, как в живой правке).
+func (b *Bot) keepEditedSplitTotals(ctx context.Context, ref db.RawMessageRef, splits []editedSplit) []string {
 	if len(splits) == 0 {
 		return nil
 	}
@@ -220,7 +236,8 @@ func (b *Bot) keepEditedSplitTotals(ctx context.Context, ref db.RawMessageRef, s
 	}
 	var picks []pick
 	used := map[int]bool{}
-	for _, st := range splits {
+	for _, es := range splits {
+		st := es.st
 		// Новый платёж того же клиента в сообщении — один (несколько — это уже
 		// не итог, а суммы по чекам: «10000», «5000» — пары своих чеков).
 		var same []db.TxRef
@@ -239,24 +256,155 @@ func (b *Bot) keepEditedSplitTotals(ctx context.Context, ref db.RawMessageRef, s
 		}
 		picks = append(picks, pick{st, n})
 	}
-	if len(picks) == 0 {
-		return nil
-	}
-	x := b.loadPayIndex(ctx, [][]time.Time{{ref.ReceivedAt}})
 	var out []string
-	for _, pk := range picks {
-		if x.splitOf("tx", pk.n.ID) != nil {
-			continue // итог своих чеков (как они есть сейчас)
+	held := map[*splitTotal]bool{}
+	if len(picks) > 0 {
+		x := b.loadPayIndex(ctx, [][]time.Time{{ref.ReceivedAt}})
+		for _, pk := range picks {
+			if x.splitOf("tx", pk.n.ID) != nil {
+				continue // итог своих чеков (как они есть сейчас)
+			}
+			if p := x.payment("tx", pk.n.ID); p == nil || len(p.Checks) > 0 {
+				continue // пара своего чека или не в сборе — сверх чеков не считается
+			}
+			if b.db.SetTxAmount(ctx, pk.n.ID, pk.st.text.Amount) == nil {
+				fmt.Printf("Правка итога платежа частями %s: %v вместо %v не сходится с чеками — спрашиваю\n", pk.st.label(), pk.n.Amount, pk.st.text.Amount)
+				out = append(out, splitTotalQuestion(pk.st, pk.n.Amount))
+				held[pk.st] = true
+			}
 		}
-		if p := x.payment("tx", pk.n.ID); p == nil || len(p.Checks) > 0 {
-			continue // пара своего чека или не в сборе — сверх чеков не считается
+	}
+	for _, es := range splits {
+		if len(es.others) == 0 || held[es.st] {
+			continue // прежняя сумма итога оставлена — такие же итоги связаны, как были
 		}
-		if b.db.SetTxAmount(ctx, pk.n.ID, pk.st.text.Amount) == nil {
-			fmt.Printf("Правка итога платежа частями %s: %v вместо %v не сходится с чеками — спрашиваю\n", pk.st.label(), pk.n.Amount, pk.st.text.Amount)
-			out = append(out, splitTotalQuestion(pk.st, pk.n.Amount))
+		if s := b.keepOtherGroupTotals(ctx, ref, es); s != "" {
+			out = append(out, s)
 		}
 	}
 	return out
+}
+
+// keepOtherGroupTotals — правка итога es.st: такой же итог в другой группе
+// (es.others) движок связывал с чеками только через этот (сравнивает итоги
+// по сумме). Если после правки тот итог посчитан отдельным платежом без чеков
+// (сверх чеков: сбор 31000 / 30000), а правка пересказала тот же платёж (итог
+// с доплатой, уже присланной чеком; итог расписали по чекам), в учёте остаётся
+// прежний итог этого сообщения: его сумма — у первой новой записи того же
+// клиента, остальные записи того же клиента из нового разбора — не в учёте.
+// Сбор не меняется, бот объясняет почему. Клиента в сообщении сменили или от
+// части чеков отказались («15000» → «10000»: чек 5000 не этого платежа) —
+// прежний итог не держим (иначе, когда чек 5000 назовут другим клиентом,
+// итог 15000 посчитался бы сам), только спрашиваем про тот итог. Возвращает
+// пояснение.
+func (b *Bot) keepOtherGroupTotals(ctx context.Context, ref db.RawMessageRef, es editedSplit) string {
+	st := es.st
+	recs := append(splitRecs(st, es.others), []time.Time{ref.ReceivedAt})
+	after := b.loadPayIndex(ctx, recs)
+	lost := lostTotals(after, es.others)
+	if len(lost) == 0 {
+		return ""
+	}
+	where := b.totalsWhere(ctx, lost)
+	warn := func() string {
+		fmt.Printf("Правка итога платежа частями %s: такой же итог %s теперь считается отдельным платежом\n", st.label(), where)
+		return fmt.Sprintf("❓ «%s» — итог платежа частями: чеки %s ₽. Такой же итог есть %s — с чеками он был связан только через это сообщение"+
+			" и после правки считается отдельным платежом сверх чеков. Если это тот же платёж — исправьте или удалите его там"+
+			" (или попросите владельца исключить его).", st.label(), st.partsLine(nil, 0), where)
+	}
+	now, err := b.db.TxRefsByRawID(ctx, ref.ID)
+	if err != nil {
+		return ""
+	}
+	var same []db.TxRef
+	for _, n := range now {
+		if !n.Cash && sameClientMoney(n.Name, st.text.Client) {
+			same = append(same, n)
+		}
+	}
+	if len(same) == 0 || !coversParts(after, st, same) {
+		// Клиента сменили или от части чеков отказались («15000» → «10000»:
+		// чек 5000 — не этого платежа) — прежний итог не держим: тот итог
+		// в другой группе теперь спорит с этим сообщением, спрашиваем.
+		return warn()
+	}
+	carrier := same[0]
+	if b.db.SetTxAmount(ctx, carrier.ID, st.text.Amount) != nil {
+		return warn()
+	}
+	var dropped []int
+	for _, n := range same[1:] {
+		if b.db.SetOperationIgnored(ctx, "transaction", n.ID, true) == nil {
+			dropped = append(dropped, n.ID)
+		}
+	}
+	if still := lostTotals(b.loadPayIndex(ctx, recs), lost); len(still) > 0 {
+		// Прежний итог связь не вернул — правку не держим.
+		_ = b.db.SetTxAmount(ctx, carrier.ID, carrier.Amount)
+		for _, id := range dropped {
+			_ = b.db.SetOperationIgnored(ctx, "transaction", id, false)
+		}
+		return warn()
+	}
+	fmt.Printf("Правка итога платежа частями %s: такой же итог %s связан с чеками только через него — оставил прежний итог\n", st.label(), where)
+	return fmt.Sprintf("❓ «%s» — итог платежа частями: чеки %s ₽. Такой же итог есть %s, и с чеками он связан только через это сообщение:"+
+		" после правки он посчитался бы отдельным платежом сверх чеков. Поэтому в учёте пока оставил прежний итог %s ₽ — сбор не изменился."+
+		" Если итог %s неверный или лишний — пусть его исправят или удалят там.",
+		st.label(), st.partsLine(nil, 0), where, formatMoney(st.text.Amount), where)
+}
+
+// coversParts — новые записи того же клиента same (книга after) по-прежнему
+// про все посчитанные части итога st: каждая часть — пара одной из них или
+// часть итога одной из них. Правка пересказала тот же платёж (итог с доплатой,
+// итог расписали по чекам), а не отказалась от части его чеков.
+func coversParts(after *payIndex, st *splitTotal, same []db.TxRef) bool {
+	in := map[int]bool{}
+	for _, n := range same {
+		if s := after.splitOf("tx", n.ID); s != nil {
+			for _, p := range s.parts {
+				for _, c := range p.Checks {
+					in[c.ID] = true
+				}
+			}
+			for _, c := range s.missing {
+				in[c.ID] = true
+			}
+			continue
+		}
+		if p := after.payment("tx", n.ID); p != nil {
+			for _, c := range p.Checks {
+				in[c.ID] = true
+			}
+		}
+	}
+	for _, p := range st.parts {
+		ok := false
+		for _, c := range p.Checks {
+			ok = ok || in[c.ID]
+		}
+		if !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// totalsWhere — «в группе «Оплата клиентов»» для текстов ts (по их группам).
+func (b *Bot) totalsWhere(ctx context.Context, ts []*ledger.Text) string {
+	groups := b.joinedGroups(ctx)
+	var ws []string
+	seen := map[string]bool{}
+	for _, t := range ts {
+		w := "в другой группе"
+		if jid, err := types.ParseJID(t.Group); err == nil && groups[jid] != "" {
+			w = "в группе «" + groups[jid] + "»"
+		}
+		if !seen[w] {
+			seen[w] = true
+			ws = append(ws, w)
+		}
+	}
+	return strings.Join(ws, ", ")
 }
 
 // editedMessage — исправленное сообщение как обычное (тот же отправитель и
