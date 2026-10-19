@@ -38,6 +38,17 @@ type ReceiptData struct {
 	// код должен использовать время получения сообщения как приближение.
 	TxTime    time.Time
 	HasTxTime bool
+	// TimeDefaulted — на чеке напечатана только ДАТА операции, без времени:
+	// время в TxTime (полдень) придумано. Дата годится для отчёта, а сравнивать
+	// по времени (текст написан до операции, тот же ли это перевод) нельзя —
+	// такой чек хранится с угаданным временем (tx_time_guessed).
+	TimeDefaulted bool
+}
+
+// TxTimeGuessed — время операции не напечатано на чеке: его нет вовсе (берут
+// время сообщения) или есть лишь дата (полдень).
+func (rd ReceiptData) TxTimeGuessed() bool {
+	return !rd.HasTxTime || rd.TimeDefaulted
 }
 
 // Известные банки — по характерным словам на скриншоте.
@@ -258,7 +269,8 @@ var operationDateLabelRe = regexp.MustCompile(`(?i)операци|перевод
 // операции» без времени (время — рядом или полдень); любая строка «дата»
 // («Дата списания» тоже) с временем; любая дата с временем; любая «дата» без
 // времени; и лишь когда даты операции нет совсем — дата формирования/печати.
-func detectTxTime(lines []string) (time.Time, bool) {
+// defaulted — время не нашлось нигде, у даты стоит полдень.
+func detectTxTime(lines []string) (t time.Time, ok, defaulted bool) {
 	skip := make([]bool, len(lines))
 	for i, l := range lines {
 		if !notOperationDateRe.MatchString(l) {
@@ -293,22 +305,22 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			continue
 		}
 		if t, ok := dateWithLabelledTime(lines, skip, valueLine(i)); ok {
-			return t, true
+			return t, true, false
 		}
 	}
 	// 2. «Дата (и время) операции/перевода/платежа» с временем.
 	for i := range lines {
 		if isOpLabel(i) {
 			if t, ok := parseDateTimeFromLine(valueLine(i)); ok {
-				return t, true
+				return t, true, false
 			}
 		}
 	}
 	// 3. «Дата операции: 17.10.2026» без «Времени операции»: время рядом или полдень.
 	for i := range lines {
 		if isOpLabel(i) && strings.Contains(strings.ToLower(lines[i]), "дата") {
-			if t, ok := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
-				return t, true
+			if t, ok, noon := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
+				return t, true, noon
 			}
 		}
 	}
@@ -316,7 +328,7 @@ func detectTxTime(lines []string) (time.Time, bool) {
 	for i, l := range lines {
 		if !skip[i] && strings.Contains(strings.ToLower(l), "дата") {
 			if t, ok := parseDateTimeFromLine(valueLine(i)); ok {
-				return t, true
+				return t, true, false
 			}
 		}
 	}
@@ -326,15 +338,15 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			continue
 		}
 		if t, ok := parseDateTimeFromLine(l); ok {
-			return t, true
+			return t, true, false
 		}
 	}
 	// 6. «Дата: 30.09.2026» без времени (или время отдельной строкой): дата с
 	// чека важнее даты присылки.
 	for i, l := range lines {
 		if !skip[i] && strings.Contains(strings.ToLower(l), "дата") {
-			if t, ok := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
-				return t, true
+			if t, ok, noon := dateWithSeparateTime(lines, skip, i, valueLine(i)); ok {
+				return t, true, noon
 			}
 		}
 	}
@@ -342,8 +354,8 @@ func detectTxTime(lines []string) (time.Time, bool) {
 	// 2026»): дата с чека важнее даты присылки; время — рядом или полдень.
 	for i, l := range lines {
 		if !skip[i] && namedDateTimeRe.MatchString(l) {
-			if t, ok := dateWithSeparateTime(lines, skip, i, l); ok {
-				return t, true
+			if t, ok, noon := dateWithSeparateTime(lines, skip, i, l); ok {
+				return t, true, noon
 			}
 		}
 	}
@@ -360,10 +372,10 @@ func detectTxTime(lines []string) (time.Time, bool) {
 			v = lines[j]
 		}
 		if t, ok := parseDateTimeFromLine(v); ok {
-			return t, true
+			return t, true, false
 		}
 	}
-	return time.Time{}, false
+	return time.Time{}, false, false
 }
 
 // dateOnlyIn — дата «дд.мм.гггг» или «18 октября 2026» в строке.
@@ -444,15 +456,16 @@ func dateWithLabelledTime(lines []string, skip []bool, value string) (time.Time,
 // dateWithSeparateTime — дата из value (подпись в строке i) и время к ней:
 // строка «Время операции/перевода» где угодно на чеке, иначе время в ближайших
 // строках под датой, иначе время любой даты-со-временем ТОГО ЖЕ дня, иначе
-// полдень. Строки формирования/печати (skip) и строки с ДРУГОЙ датой («Дата
-// списания: 18.10.2026 00:15» под «Дата операции: 17.10.2026») не смотрим.
-func dateWithSeparateTime(lines []string, skip []bool, i int, value string) (time.Time, bool) {
+// полдень (noon=true: время придумано). Строки формирования/печати (skip) и
+// строки с ДРУГОЙ датой («Дата списания: 18.10.2026 00:15» под «Дата операции:
+// 17.10.2026») не смотрим.
+func dateWithSeparateTime(lines []string, skip []bool, i int, value string) (t time.Time, ok, noon bool) {
 	d, ok := dateOnlyIn(value)
 	if !ok {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	if t, ok := dateWithLabelledTime(lines, skip, value); ok {
-		return t, true
+		return t, true, false
 	}
 	for k := i; k < len(lines) && k <= i+3; k++ {
 		if skip[k] || otherDateIn(lines[k], d) {
@@ -460,7 +473,7 @@ func dateWithSeparateTime(lines []string, skip []bool, i int, value string) (tim
 		}
 		if tm := timeOnlyRe.FindStringSubmatch(lines[k]); tm != nil {
 			if t, ok := timeOfDay(d, tm); ok {
-				return t, true
+				return t, true, false
 			}
 		}
 	}
@@ -469,10 +482,10 @@ func dateWithSeparateTime(lines []string, skip []bool, i int, value string) (tim
 			continue
 		}
 		if t, ok := parseDateTimeFromLine(l); ok && t.Year() == d.Year() && t.YearDay() == d.YearDay() {
-			return t, true
+			return t, true, false
 		}
 	}
-	return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, time.Local), true
+	return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, time.Local), true, true
 }
 
 // lineHasDate — в строке есть дата (числом или словом месяца).
@@ -611,9 +624,10 @@ func ParseReceipt(text string) ReceiptData {
 
 	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
 
-	if t, ok := detectTxTime(lines); ok {
+	if t, ok, noon := detectTxTime(lines); ok {
 		rd.TxTime = t
 		rd.HasTxTime = true
+		rd.TimeDefaulted = noon
 	}
 
 	// Банк ищем СНАЧАЛА в шапке чека (первые непустые строки): на чеке ВТБ

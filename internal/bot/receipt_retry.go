@@ -111,7 +111,7 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 		Bank: rd.Bank, Recipient: rd.Recipient, Sender: rd.Sender,
 		DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Status: rd.Status,
 		Amount: rd.Amount, Commission: rd.Commission,
-		TxDate: rd.TxTime, HasTxDate: rd.HasTxTime, Declined: declined,
+		TxDate: rd.TxTime, HasTxDate: rd.HasTxTime, TimeDefaulted: rd.TimeDefaulted, Declined: declined,
 	}); err != nil {
 		fmt.Printf("Повтор чека #%d: ошибка сохранения: %v\n", it.ID, err)
 		return

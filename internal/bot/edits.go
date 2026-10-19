@@ -224,6 +224,9 @@ func (b *Bot) reapplyAnswer(ctx context.Context, em *events.Message, ref db.RawM
 	case "dup":
 		if resolved, isNew := parseCashDupAnswer(text); resolved && target > 0 {
 			if amount, client, err := b.db.RedecideCashDup(ctx, target, isNew); err == nil {
+				if !isNew {
+					b.keepCorrectedCashName(ctx, target)
+				}
 				if isNew {
 					say(fmt.Sprintf("✏️ Ответ изменили — засчитал как новый платёж: наличка %s %s ₽.", client, formatMoney(amount)))
 				} else {

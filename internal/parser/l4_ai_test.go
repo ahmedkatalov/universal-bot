@@ -53,3 +53,31 @@ func TestL5ai_18_NamedMonthDateWithV(t *testing.T) {
 		t.Errorf("шапка без времени: %v, ожидали %v", rd.TxTime, want)
 	}
 }
+
+// TestL6ai_28_DateOnlyTimeDefaulted — на чеке одна дата операции без времени:
+// полдень придуман (TimeDefaulted, TxTimeGuessed), дата — с чека. Время рядом
+// или в строке «Время операции» — напечатанное.
+func TestL6ai_28_DateOnlyTimeDefaulted(t *testing.T) {
+	for _, c := range []struct {
+		text      string
+		want      time.Time
+		defaulted bool
+	}{
+		{"Почта Банк\nКвитанция о переводе\nДата операции: 14.10.2026\nКому\nХадижат Ибрагимовна И.\nСумма перевода\n15 000 ₽",
+			time.Date(2026, 10, 14, 12, 0, 0, 0, time.Local), true},
+		{"Перевод выполнен\nДата операции 14 октября 2026\nСумма перевода\n7 000 ₽",
+			time.Date(2026, 10, 14, 12, 0, 0, 0, time.Local), true},
+		{"Перевод выполнен\nДата операции: 14.10.2026\nВремя операции: 08:41\nСумма перевода\n7 000 ₽",
+			time.Date(2026, 10, 14, 8, 41, 0, 0, time.Local), false},
+		{"Перевод выполнен\nДата операции: 14.10.2026 08:41:05\nСумма перевода\n7 000 ₽",
+			time.Date(2026, 10, 14, 8, 41, 5, 0, time.Local), false},
+	} {
+		rd := ParseReceipt(c.text)
+		if !rd.HasTxTime || !rd.TxTime.Equal(c.want) || rd.TimeDefaulted != c.defaulted || rd.TxTimeGuessed() != c.defaulted {
+			t.Errorf("%q: %v (найдено=%v, придумано=%v), ожидали %v (придумано=%v)", c.text, rd.TxTime, rd.HasTxTime, rd.TimeDefaulted, c.want, c.defaulted)
+		}
+	}
+	if rd := ParseReceipt("Перевод выполнен\nСумма перевода\n7 000 ₽"); rd.HasTxTime || !rd.TxTimeGuessed() {
+		t.Errorf("без даты: найдено=%v угадано=%v, ожидали угаданное", rd.HasTxTime, rd.TxTimeGuessed())
+	}
+}

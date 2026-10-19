@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -859,7 +860,7 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 		b.clarify.mu.Lock()
 		delete(b.clarify.dupAskMap, quotedID)
 		b.clarify.mu.Unlock()
-		found, amount, client, err := b.db.ResolveCashDup(ctx, dupTxID, isNew)
+		found, amount, client, err := b.resolveCashDup(ctx, dupTxID, isNew)
 		if err != nil || !found {
 			return false
 		}
@@ -968,6 +969,11 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 			b.sendText(chat, "Этот платёж исключили из учёта — не записываю.")
 			return true
 		}
+	}
+	// «Это итог за день, не платёж» — деньги без клиента, о которых спросили,
+	// из сбора убираем (иначе итог дня считался бы вторым разом).
+	if notPaymentAnswer(t, pa.amount, swipe) && b.dropNotPayment(ctx, chat, pa, live) {
+		return true
 	}
 	// Ответ списком («Магомедов Ахмед 20000\nИсаев Харон 7000») — по строке на сумму.
 	var lines []string
@@ -1120,6 +1126,71 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 	}
 	b.sendText(chat, fmt.Sprintf("Записал: %s %s.", kind, strings.Join(done, "; ")))
 	_ = askID
+	return true
+}
+
+// notPaymentRe — ответ на «❓ чей платёж?»: это не платёж клиента («не
+// платёж», «не считай»); notPaymentTotalRe — это итог («итог за день», «это
+// общая наличка»).
+var (
+	notPaymentRe      = regexp.MustCompile(`(?i)(^|[^\p{L}])(не\s+(платеж|оплата|оплату|считай|считать|записывай|учитывай)|не\s+надо\s+(записывать|считать|учитывать))([^\p{L}]|$)`)
+	notPaymentTotalRe = regexp.MustCompile(`(?i)(^|[^\p{L}])(итог|итого|общ(ая|ий|ее|ую)\s+(сумм|налич|итог|касс)|всего\s+за|за\s+(весь\s+|целый\s+)?день)`)
+)
+
+// notPaymentAnswer — ответ говорит, что это не платёж (сумма в нём — лишь та
+// же, о которой спросили). Без свайпа — только прямое «не платёж / не
+// считай»: «Отчёт за день» следом за вопросом — не ответ на него. Ответ с ФИО
+// («Исаев Харон, итог») — про клиента, а не «не платёж».
+func notPaymentAnswer(text string, asked float64, swipe bool) bool {
+	low := strings.ReplaceAll(strings.ToLower(text), "ё", "е")
+	if !notPaymentRe.MatchString(low) && !(swipe && notPaymentTotalRe.MatchString(low)) {
+		return false
+	}
+	if a := parser.ExtractAmount(low); a > 0 && (asked <= 0 || math.Abs(a-asked) >= 1) {
+		return false
+	}
+	// Слова с заглавной буквы, кроме первого и служебных, — похоже на ФИО.
+	names := 0
+	for i, w := range strings.Fields(text) {
+		w = strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
+		r := []rune(w)
+		lw := strings.ToLower(w)
+		if i == 0 || len(r) < 3 || !unicode.IsUpper(r[0]) || nameStopwords[lw] || notClientWords[lw] || unclearWords[lw] {
+			continue
+		}
+		names++
+	}
+	return names == 0
+}
+
+// dropNotPayment — на «❓ чей платёж?» ответили «это не платёж»: заглушки
+// сообщения без клиента (о них и спрашивали) из сбора исключаем. false —
+// исключать нечего (записаны лишь платежи с ФИО): такой ответ не про них.
+func (b *Bot) dropNotPayment(ctx context.Context, chat types.JID, pa paymentAsk, live []db.TxRef) bool {
+	var drop []db.TxRef
+	for _, tx := range live {
+		if whoPlaceholders[tx.Name] && (pa.amount <= 0 || math.Abs(tx.Amount-pa.amount) < 1) {
+			drop = append(drop, tx)
+		}
+	}
+	if len(drop) == 0 && len(live) > 0 {
+		return false
+	}
+	var sums []string
+	for _, tx := range drop {
+		if err := b.db.SetOperationIgnored(ctx, "transaction", tx.ID, true); err != nil {
+			fmt.Println("Ответ «не платёж»: ошибка исключения:", err)
+			return false
+		}
+		sums = append(sums, formatMoney(tx.Amount)+" ₽")
+	}
+	_ = b.db.MarkMessageParsed(ctx, pa.rawID)
+	b.closeWhoAsk(ctx, chat, pa)
+	if len(sums) == 0 {
+		b.sendText(chat, "Понял, это не платёж — не записываю.")
+	} else {
+		b.sendText(chat, "Понял, это не платёж — не считаю: "+strings.Join(sums, ", ")+".")
+	}
 	return true
 }
 

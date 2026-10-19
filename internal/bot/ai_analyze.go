@@ -399,45 +399,11 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		saved++
 	}
 	if question != "" && !insertFailed {
-		// ИИ спросил, чей платёж. Деньги до ответа держим в сборе: строки
-		// «Нал 27000» без имени — заглушкой «Наличка» (ответ даст ей клиента), а
-		// если ИИ не записал ничего — и строки с ФИО из текста. Потом спрашиваем.
-		var savedAmts []float64
-		for _, p := range payments {
-			if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
-				savedAmts = append(savedAmts, p.Amount)
-			}
-		}
-		for _, sl := range slots {
-			savedAmts = append(savedAmts, sl.Amount)
-		}
-		lines, _ := b.deterministicLines(joined, detAll)
-		var keep []parser.Transaction
-		placeholders := 0
-		var phAmount float64
-		for _, tr := range lines {
-			canonical, _ := b.aliases.ResolveName(tr.RawName)
-			ph := whoPlaceholders[canonical] || whoPlaceholders[tr.RawName]
-			if !ph && saved > 0 {
-				continue // строки с именем ИИ уже записал
-			}
-			if ph {
-				taken := false
-				for k, a := range savedAmts {
-					if math.Abs(a-tr.Amount) < 1 {
-						savedAmts = append(savedAmts[:k], savedAmts[k+1:]...)
-						taken = true
-						break
-					}
-				}
-				if taken {
-					continue
-				}
-				placeholders++
-				phAmount = tr.Amount
-			}
-			keep = append(keep, tr)
-		}
+		// ИИ спросил, чей платёж. Деньги до ответа держим в сборе: суммы без
+		// клиента, которых нет среди записанных ИИ платежей, — заглушкой
+		// «Наличка» (ответ даст ей клиента), а если ИИ не записал ничего — и
+		// строки с ФИО из текста. Потом спрашиваем.
+		keep, placeholders, phAmount := b.heldWhileAsking(joined, payments, slots, saved, cashHint)
 		dsaved, _ := b.recordParsedLines(ctx, keep, joined, rawID, txDate, cashHint)
 		saved += dsaved
 		if (placeholders > 0 || saved == 0 || dsaved > 0 || len(slots) > 0) && !b.groupSilent(chat) {
@@ -917,6 +883,137 @@ func (b *Bot) uncoveredLines(text string, agreed []aiPayment, cashHint bool) []a
 	return out
 }
 
+// heldWhileAsking — что записать, пока ИИ спрашивает «❓ чей платёж?»: каждая
+// сумма сообщения без клиента, не покрытая записанными платежами ИИ (agreed) и
+// спорными (slots), — заглушкой «Наличка»/«(не указано)»; строки с ФИО — только
+// если ИИ не записал ничего (saved == 0). Без клиента — и строка, «имя» которой
+// парсер взял из служебных слов («Забрал наличку 27000», «Нал за сегодня
+// 85000»), и строка наличкой, которую парсер не прочёл вовсе («27000 наличными
+// в офис»). Свою сумму строка с ФИО забирает раньше строк без клиента: в
+// «Исаев Харон 15000 / Нал 15000» платёж ИИ Исаеву не «покрывает» наличку.
+func (b *Bot) heldWhileAsking(text string, agreed, slots []aiPayment, saved int, cashHint bool) (keep []parser.Transaction, placeholders int, phAmount float64) {
+	type cover struct {
+		name   string
+		amount float64
+		used   bool
+	}
+	var pool []*cover
+	for _, p := range agreed {
+		if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
+			pool = append(pool, &cover{name: strings.TrimSpace(p.Name), amount: p.Amount})
+		}
+	}
+	for _, sl := range slots {
+		pool = append(pool, &cover{amount: sl.Amount})
+	}
+	take := func(amount float64, ok func(c *cover) bool) bool {
+		for _, c := range pool {
+			if !c.used && math.Abs(c.amount-amount) < 1 && ok(c) {
+				c.used = true
+				return true
+			}
+		}
+		return false
+	}
+	anyCover := func(*cover) bool { return true }
+
+	lines, _ := b.deterministicLines(text, detAll)
+	unnamed := make([]bool, len(lines))
+	covered := make([]bool, len(lines))
+	for i, tr := range lines {
+		canonical, known := b.aliases.ResolveName(tr.RawName)
+		unnamed[i] = whoPlaceholders[canonical] || whoPlaceholders[tr.RawName] || !known && notClientName(tr.RawName)
+	}
+	// 1. Строка с ФИО — свой платёж ИИ (то же имя и сумма); 2. затем любой на
+	// ту же сумму (ИИ написал имя иначе); 3. строка без клиента — лишь оставшийся.
+	for i, tr := range lines {
+		if !unnamed[i] {
+			raw := tr.RawName
+			covered[i] = take(tr.Amount, func(c *cover) bool {
+				return c.name != "" && (sameClientName(c.name, raw) || shareNameWord(c.name, raw))
+			})
+		}
+	}
+	for i, tr := range lines {
+		if !unnamed[i] && !covered[i] {
+			covered[i] = take(tr.Amount, anyCover)
+		}
+	}
+	for i, tr := range lines {
+		if unnamed[i] {
+			covered[i] = take(tr.Amount, anyCover)
+		}
+	}
+	for i, tr := range lines {
+		switch {
+		case unnamed[i] && !covered[i]:
+			canonical, _ := b.aliases.ResolveName(tr.RawName)
+			if !whoPlaceholders[canonical] && !whoPlaceholders[tr.RawName] {
+				tr.RawName = "(не указано)"
+				if cashHint || tr.IsCash || parser.IsCash(tr.Line) {
+					tr.RawName = "Наличка"
+				}
+			}
+			placeholders++
+			phAmount = tr.Amount
+			keep = append(keep, tr)
+		case !unnamed[i] && saved == 0:
+			keep = append(keep, tr) // ИИ не записал ничего — строки с ФИО из текста
+		}
+	}
+
+	// 4. Строка наличкой, которую парсер не прочёл вовсе («27000 наличными в
+	// офис»; строка платежа у парсера — та, где сумма). Её сумму держим, если
+	// ИИ не записал платёж на неё.
+	parsedLine := map[string]bool{}
+	for _, tr := range parser.ParseMessage(text).Transactions {
+		parsedLine[strings.TrimSpace(tr.Line)] = true
+	}
+	for _, ln := range strings.Split(text, "\n") {
+		ln = strings.TrimSpace(ln)
+		if ln == "" || parsedLine[ln] || !parser.IsCash(ln) {
+			continue
+		}
+		toks := moneyTokens(ln)
+		if len(toks) != 1 || parser.LooksLikeNonPayment(parser.Transaction{Amount: toks[0], Line: ln}) {
+			continue
+		}
+		a := toks[0]
+		if take(a, anyCover) {
+			continue
+		}
+		keep = append(keep, parser.Transaction{RawName: "Наличка", Amount: a, Line: ln, IsCash: true})
+		placeholders++
+		phAmount = a
+	}
+	return keep, placeholders, phAmount
+}
+
+// notClientWords — служебные слова, которые парсер берёт «именем» строки
+// («Итого нал 85000», «Принесли 27000 наличкой», «Нал за сегодня 85000»).
+var notClientWords = map[string]bool{
+	"итого": true, "итог": true, "всего": true, "общая": true, "общий": true, "общее": true,
+	"касса": true, "кассу": true, "кассе": true, "кассы": true, "остаток": true, "сдача": true,
+	"принесла": true, "принесли": true, "забрала": true, "забрали": true, "взяла": true, "взяли": true,
+	"отдала": true, "отдали": true, "сдали": true, "передал": true, "передала": true, "передали": true,
+	"занёс": true, "занес": true, "занесла": true, "занесли": true, "собрал": true, "собрала": true,
+	"собрали": true, "получил": true, "получила": true, "получили": true, "пришло": true, "пришли": true,
+	"день": true, "дня": true, "неделю": true, "неделя": true, "наличные": true, "наличку": true,
+	"налом": true, "кэш": true, "кеш": true,
+}
+
+// notClientName — «имя» строки парсера — не клиент: в нём одни служебные слова
+// («за сегодня», «Забрал», «итого»). Хоть одно другое слово — возможно, ФИО.
+func notClientName(raw string) bool {
+	ws := strings.FieldsFunc(strings.ToLower(raw), func(r rune) bool { return !unicode.IsLetter(r) && r != '-' })
+	for _, w := range ws {
+		if !nameStopwords[w] && !notClientWords[w] && !collectorTakeWords[w] && !collectorGiveWords[w] {
+			return false
+		}
+	}
+	return true
+}
+
 // askAboutMessage — вопрос «❓» по сообщению. Свежее сообщение — вопрос сразу
 // под ним, цитата не нужна; давнее (перечитали после сбоя ИИ или перезапуска)
 // — вопрос цитирует его: иначе в группе не понять, о каком платеже речь.
@@ -1340,9 +1437,14 @@ func applyAIReceiptAuthoritative(rd *parser.ReceiptData, rec aiReceipt) {
 	if v := strings.TrimSpace(rec.Status); v != "" {
 		rd.Status = v
 	}
-	if t, ok := parseAIDatetime(rec.Datetime); ok {
-		rd.TxTime = t
-		rd.HasTxTime = true
+	if t, ok, dateOnly := parseAIDatetime(rec.Datetime); ok {
+		// Модель дала только дату, а парсер прочёл на чеке время того же дня —
+		// напечатанное время не теряем.
+		if !(dateOnly && rd.HasTxTime && !rd.TimeDefaulted && sameDay(rd.TxTime, t)) {
+			rd.TxTime = t
+			rd.HasTxTime = true
+			rd.TimeDefaulted = dateOnly
+		}
 	}
 }
 
@@ -1385,15 +1487,18 @@ func mergeAIReceipt(rd *parser.ReceiptData, rec aiReceipt) {
 		rd.Status = rec.Status
 	}
 	if !rd.HasTxTime {
-		if t, ok := parseAIDatetime(rec.Datetime); ok {
+		if t, ok, dateOnly := parseAIDatetime(rec.Datetime); ok {
 			rd.TxTime = t
 			rd.HasTxTime = true
+			rd.TimeDefaulted = dateOnly
 		}
 	}
 }
 
-// parseAIDatetime разбирает дату/время из ответа модели.
-func parseAIDatetime(s string) (time.Time, bool) {
+// parseAIDatetime разбирает дату/время из ответа модели. dateOnly — модель
+// дала только дату (времени на чеке нет): время — полдень, как у парсера, и
+// оно придумано (чек хранится с угаданным временем).
+func parseAIDatetime(s string) (t time.Time, ok, dateOnly bool) {
 	s = strings.TrimSpace(s)
 	for _, suf := range []string{"(МСК)", "МСК", "(мск)", "мск", "MSK"} {
 		s = strings.TrimSpace(strings.TrimSuffix(s, suf))
@@ -1401,23 +1506,34 @@ func parseAIDatetime(s string) (time.Time, bool) {
 	s = strings.ReplaceAll(s, ", ", " ")
 	s = strings.ReplaceAll(s, " в ", " ")
 	if s == "" {
-		return time.Time{}, false
+		return time.Time{}, false, false
 	}
 	// Принимаем не только пробел-формат, но и ISO с «T», со смещением/зоной и
 	// точечный дд.мм.гггг — модель/OCR часто отдают именно так. Иначе верно
 	// прочитанная дата операции отбрасывалась, и чек датировался временем
 	// присылки в WhatsApp (уезжал не в тот день/период).
 	for _, layout := range []string{
-		"2006-01-02 15:04:05", "2006-01-02 15:04", "2006-01-02",
+		"2006-01-02 15:04:05", "2006-01-02 15:04",
 		"2006-01-02T15:04:05", "2006-01-02T15:04",
 		time.RFC3339, "2006-01-02T15:04:05Z07:00",
-		"02.01.2006 15:04:05", "02.01.2006 15:04", "02.01.2006",
+		"02.01.2006 15:04:05", "02.01.2006 15:04",
 	} {
 		if t, err := time.ParseInLocation(layout, s, time.Local); err == nil {
-			return t, true
+			return t, true, false
 		}
 	}
-	return time.Time{}, false
+	for _, layout := range []string{"2006-01-02", "02.01.2006"} {
+		if d, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			return time.Date(d.Year(), d.Month(), d.Day(), 12, 0, 0, 0, time.Local), true, true
+		}
+	}
+	return time.Time{}, false, false
+}
+
+// sameDay — один календарный день (по местному времени).
+func sameDay(a, b time.Time) bool {
+	a, b = a.In(time.Local), b.In(time.Local)
+	return a.Year() == b.Year() && a.YearDay() == b.YearDay()
 }
 
 var multiplierRe = regexp.MustCompile(`(?i)(^|[^\p{L}])по\s*\d|[xх×*]\s*\d|\d\s*[xх×*]|за\s*\d+\s*мес`)

@@ -2161,7 +2161,7 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 			}
 		}
 		// Информационная проверка — по всем группам сразу (groupJID пустой).
-		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, "", rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime, !rd.HasTxTime)
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, "", rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime, rd.TxTimeGuessed())
 		switch {
 		case err != nil:
 			fmt.Println("Ошибка проверки дубля чека из лички:", err)
@@ -3547,7 +3547,7 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 
 		// Дубли ищем только внутри целевой группы: тот же чек в ДРУГОЙ группе
 		// (например, в группе СБ, откуда его переслали) — это не дубль.
-		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, groupJID.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate, !rd.HasTxTime)
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, groupJID.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate, rd.TxTimeGuessed())
 		if err != nil {
 			fmt.Println("Ошибка проверки дубля при дозагрузке:", err)
 		}
@@ -3572,7 +3572,7 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 			GroupJID:      groupJID.String(),
 			SubmittedBy:   sender,
 			TxDate:        txDate,
-			TxTimeGuessed: !rd.HasTxTime,
+			TxTimeGuessed: rd.TxTimeGuessed(),
 		})
 		if err != nil {
 			fmt.Fprintf(&sb, "- ОШИБКА сохранения: %s, %.0f ₽ (%v)\n", canonical, rd.Amount, err)
@@ -4000,7 +4000,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			ClientSourceRawID: payerSrc,
 			RawMessageID:      rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
 			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
-			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true, TxTimeGuessed: !rd.HasTxTime,
+			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true, TxTimeGuessed: rd.TxTimeGuessed(),
 			IsDuplicate: counted.Found, SupersededByRaw: counted.RawID,
 		}); err != nil {
 			fmt.Println("Ошибка сохранения неполного чека:", err)
@@ -4088,7 +4088,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			NeedsReview:       true,
 			GroupJID:          chat.String(),
 			TxDate:            txDate,
-			TxTimeGuessed:     !rd.HasTxTime,
+			TxTimeGuessed:     rd.TxTimeGuessed(),
 		}
 		if payerOverride != "" {
 			canonical, _ := b.aliases.ResolveName(payerOverride)
@@ -4167,12 +4167,12 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// документа, см. FindDuplicateReceipt) — до вставки, иначе новая запись
 	// найдёт сама себя. Тот же чек в другой группе дублем не считается: это
 	// рабочий процесс (чеки из группы СБ пересылают в основную группу).
-	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, !rd.HasTxTime)
+	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, rd.TxTimeGuessed())
 	if err != nil {
 		// Сбой проверки — не считаем чек сразу «новым» (тот же чек вошёл бы в
 		// сбор дважды): пробуем ещё раз.
 		fmt.Println("Ошибка проверки дубля чека (повторяю):", err)
-		dupMatch, err = b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, !rd.HasTxTime)
+		dupMatch, err = b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, rd.TxTimeGuessed())
 		if err != nil {
 			fmt.Println("Ошибка проверки дубля чека:", err)
 		}
@@ -4252,9 +4252,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// Экран показывает уже сделанный перевод: экран, присланный раньше, чем
 		// сделана операция этого чека (время напечатано на чеке), — другой перевод.
 		// Время операции позже присылки самого чека — ошибка чтения (или другой
-		// часовой пояс): по нему не судим.
+		// часовой пояс): по нему не судим. Как и по полудню у чека с одной датой.
 		var opTime time.Time
-		if rd.HasTxTime && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
+		if !rd.TxTimeGuessed() && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
 			opTime = rd.TxTime
 		}
 		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, opTime, rawID, rankCollapsed); err != nil {
@@ -4297,7 +4297,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		ClientConfirmed:   clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
 		GroupJID:          chat.String(),
 		TxDate:            txDate,
-		TxTimeGuessed:     !rd.HasTxTime,
+		TxTimeGuessed:     rd.TxTimeGuessed(),
 		Ignored:           declined,
 	})
 	if err != nil {
