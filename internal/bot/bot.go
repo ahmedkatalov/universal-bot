@@ -3538,6 +3538,15 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 		if rd.HasTxTime {
 			txDate = rd.TxTime
 		}
+		dateOnly := rd.HasTxTime && rd.TimeDefaulted
+		if dateOnly {
+			// Клиента рядом с чеком нет (получатель напечатан): время копии того же
+			// чека или самого раннего текста на эту сумму в тот день.
+			txDate = b.dateOnlyOpTime(ctx, 0, db.PrintedReceipt{
+				Recipient: rd.Recipient, Sender: rd.Sender, Bank: rd.Bank,
+				DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Amount: rd.Amount, TxDate: rd.TxTime,
+			}, "", pr.receivedAt)
+		}
 
 		canonical, matched := b.aliases.ResolveName(rd.Recipient)
 		var contactIDPtr *int
@@ -3572,7 +3581,8 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 			GroupJID:      groupJID.String(),
 			SubmittedBy:   sender,
 			TxDate:        txDate,
-			TxTimeGuessed: rd.TxTimeGuessed(),
+			TxTimeGuessed: !rd.HasTxTime,
+			TxDateOnly:    dateOnly,
 		})
 		if err != nil {
 			fmt.Fprintf(&sb, "- ОШИБКА сохранения: %s, %.0f ₽ (%v)\n", canonical, rd.Amount, err)
@@ -3968,6 +3978,15 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if rd.HasTxTime {
 		txDate = rd.TxTime
 	}
+	// На чеке только дата операции — время выбираем по копии того же чека или
+	// тексту этого платежа в тот день (см. date_only.go).
+	dateOnly := rd.HasTxTime && rd.TimeDefaulted
+	if dateOnly {
+		txDate = b.dateOnlyOpTime(ctx, 0, db.PrintedReceipt{
+			Recipient: receiptRecipient, Sender: rd.Sender, Bank: rd.Bank,
+			DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Amount: rd.Amount, TxDate: rd.TxTime,
+		}, payerOverride, receivedAt)
+	}
 
 	// Свёрнутый/неполный чек: сумма есть, но НЕ видно ДАТЫ операции — это почти
 	// всегда свёрнутый экран банка («Перевод выполнен»), который работники шлют
@@ -4000,7 +4019,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			ClientSourceRawID: payerSrc,
 			RawMessageID:      rawID, Bank: rd.Bank, RecipientRaw: rd.Recipient, SenderRaw: rd.Sender,
 			Amount: rd.Amount, Commission: rd.Commission, Status: rd.Status,
-			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true, TxTimeGuessed: rd.TxTimeGuessed(),
+			NeedsReview: true, GroupJID: chat.String(), TxDate: txDate, Collapsed: true, TxTimeGuessed: !rd.HasTxTime,
 			IsDuplicate: counted.Found, SupersededByRaw: counted.RawID,
 		}); err != nil {
 			fmt.Println("Ошибка сохранения неполного чека:", err)
@@ -4088,7 +4107,8 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			NeedsReview:       true,
 			GroupJID:          chat.String(),
 			TxDate:            txDate,
-			TxTimeGuessed:     rd.TxTimeGuessed(),
+			TxTimeGuessed:     !rd.HasTxTime,
+			TxDateOnly:        dateOnly,
 		}
 		if payerOverride != "" {
 			canonical, _ := b.aliases.ResolveName(payerOverride)
@@ -4196,7 +4216,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			// Время на чеке только до минуты (ВТБ): два разных перевода в одну
 			// минуту бывают — подписанный и неподписанный молча не склеиваем, у
 			// неподписанного спросим «чей чек?» (ответ тем же клиентом склеит их).
-			minute := db.MinutePrecision(txDate)
+			minute := db.MinutePrecision(txDate) || dateOnly
 			switch {
 			case payerOverride != "" && !tw.Named && minute:
 			case payerOverride != "" && !tw.Named:
@@ -4297,7 +4317,8 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		ClientConfirmed:   clientConfirmed, // клиента назвал владелец ИЛИ унаследован от свёрнутого
 		GroupJID:          chat.String(),
 		TxDate:            txDate,
-		TxTimeGuessed:     rd.TxTimeGuessed(),
+		TxTimeGuessed:     !rd.HasTxTime,
+		TxDateOnly:        dateOnly,
 		Ignored:           declined,
 	})
 	if err != nil {

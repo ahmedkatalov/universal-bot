@@ -403,7 +403,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// клиента, которых нет среди записанных ИИ платежей, — заглушкой
 		// «Наличка» (ответ даст ей клиента), а если ИИ не записал ничего — и
 		// строки с ФИО из текста. Потом спрашиваем.
-		keep, placeholders, phAmount := b.heldWhileAsking(joined, payments, slots, saved, cashHint)
+		keep, placeholders, phAmount := b.heldWhileAsking(joined, question, payments, slots, saved, cashHint)
 		dsaved, _ := b.recordParsedLines(ctx, keep, joined, rawID, txDate, cashHint)
 		saved += dsaved
 		if (placeholders > 0 || saved == 0 || dsaved > 0 || len(slots) > 0) && !b.groupSilent(chat) {
@@ -883,30 +883,40 @@ func (b *Bot) uncoveredLines(text string, agreed []aiPayment, cashHint bool) []a
 	return out
 }
 
-// heldWhileAsking — что записать, пока ИИ спрашивает «❓ чей платёж?»: каждая
-// сумма сообщения без клиента, не покрытая записанными платежами ИИ (agreed) и
-// спорными (slots), — заглушкой «Наличка»/«(не указано)»; строки с ФИО — только
-// если ИИ не записал ничего (saved == 0). Без клиента — и строка, «имя» которой
-// парсер взял из служебных слов («Забрал наличку 27000», «Нал за сегодня
-// 85000»), и строка наличкой, которую парсер не прочёл вовсе («27000 наличными
-// в офис»). Свою сумму строка с ФИО забирает раньше строк без клиента: в
-// «Исаев Харон 15000 / Нал 15000» платёж ИИ Исаеву не «покрывает» наличку.
-func (b *Bot) heldWhileAsking(text string, agreed, slots []aiPayment, saved int, cashHint bool) (keep []parser.Transaction, placeholders int, phAmount float64) {
+// heldWhileAsking — что записать, пока ИИ задаёт вопрос «❓» по сообщению:
+// сумма без клиента, не покрытая записанными платежами ИИ (agreed) и спорными
+// (slots), — заглушкой «Наличка»/«(не указано)»; строки с ФИО — только если ИИ
+// не записал ничего (saved == 0). Без клиента — и строка, «имя» которой парсер
+// взял из служебных слов («Забрал наличку 27000», «Нал за сегодня 85000»), и
+// строка наличкой, которую парсер не прочёл вовсе («27000 наличными в офис»).
+//
+// Спрашивает ИИ, ЧЬИ это деньги (или называет сумму строки), — свою сумму
+// строка с ФИО забирает раньше строк без клиента: в «Исаев Харон 15000 / Нал
+// 15000» платёж ИИ Исаеву не «покрывает» наличку. Спрашивает о другом («Кто
+// забрал наличку?», «Это один платёж или два?») — сумма без клиента, равная
+// записанному ИИ платежу, — тот же платёж другими словами, не держим. Строка
+// итога или сдачи денег («Итого нал 42000», «Сдал в кассу 42000», «Отдал Адаму
+// 15000»), когда ИИ записал все строки с ФИО, — не платёж: не держим, если
+// вопрос не о том, чьи это деньги, или её сумма — сумма остальных строк.
+func (b *Bot) heldWhileAsking(text, question string, agreed, slots []aiPayment, saved int, cashHint bool) (keep []parser.Transaction, placeholders int, phAmount float64) {
 	type cover struct {
 		name   string
 		amount float64
 		used   bool
 	}
-	var pool []*cover
-	for _, p := range agreed {
-		if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
-			pool = append(pool, &cover{name: strings.TrimSpace(p.Name), amount: p.Amount})
+	newPool := func() []*cover {
+		var pool []*cover
+		for _, p := range agreed {
+			if p.Amount > 0 && strings.TrimSpace(p.Name) != "" {
+				pool = append(pool, &cover{name: strings.TrimSpace(p.Name), amount: p.Amount})
+			}
 		}
+		for _, sl := range slots {
+			pool = append(pool, &cover{amount: sl.Amount})
+		}
+		return pool
 	}
-	for _, sl := range slots {
-		pool = append(pool, &cover{amount: sl.Amount})
-	}
-	take := func(amount float64, ok func(c *cover) bool) bool {
+	take := func(pool []*cover, amount float64, ok func(c *cover) bool) bool {
 		for _, c := range pool {
 			if !c.used && math.Abs(c.amount-amount) < 1 && ok(c) {
 				c.used = true
@@ -917,55 +927,23 @@ func (b *Bot) heldWhileAsking(text string, agreed, slots []aiPayment, saved int,
 	}
 	anyCover := func(*cover) bool { return true }
 
-	lines, _ := b.deterministicLines(text, detAll)
-	unnamed := make([]bool, len(lines))
-	covered := make([]bool, len(lines))
-	for i, tr := range lines {
-		canonical, known := b.aliases.ResolveName(tr.RawName)
-		unnamed[i] = whoPlaceholders[canonical] || whoPlaceholders[tr.RawName] || !known && notClientName(tr.RawName)
+	// Строки с суммами: прочитанные парсером и (4) строки наличкой, которые
+	// парсер не прочёл вовсе («27000 наличными в офис»; строка платежа у
+	// парсера — та, где сумма).
+	type entry struct {
+		tr      parser.Transaction
+		unnamed bool
+		total   bool // итог или сдача денег, а не платёж
 	}
-	// 1. Строка с ФИО — свой платёж ИИ (то же имя и сумма); 2. затем любой на
-	// ту же сумму (ИИ написал имя иначе); 3. строка без клиента — лишь оставшийся.
-	for i, tr := range lines {
-		if !unnamed[i] {
-			raw := tr.RawName
-			covered[i] = take(tr.Amount, func(c *cover) bool {
-				return c.name != "" && (sameClientName(c.name, raw) || shareNameWord(c.name, raw))
-			})
-		}
-	}
-	for i, tr := range lines {
-		if !unnamed[i] && !covered[i] {
-			covered[i] = take(tr.Amount, anyCover)
-		}
-	}
-	for i, tr := range lines {
-		if unnamed[i] {
-			covered[i] = take(tr.Amount, anyCover)
-		}
-	}
-	for i, tr := range lines {
-		switch {
-		case unnamed[i] && !covered[i]:
-			canonical, _ := b.aliases.ResolveName(tr.RawName)
-			if !whoPlaceholders[canonical] && !whoPlaceholders[tr.RawName] {
-				tr.RawName = "(не указано)"
-				if cashHint || tr.IsCash || parser.IsCash(tr.Line) {
-					tr.RawName = "Наличка"
-				}
-			}
-			placeholders++
-			phAmount = tr.Amount
-			keep = append(keep, tr)
-		case !unnamed[i] && saved == 0:
-			keep = append(keep, tr) // ИИ не записал ничего — строки с ФИО из текста
-		}
-	}
-
-	// 4. Строка наличкой, которую парсер не прочёл вовсе («27000 наличными в
-	// офис»; строка платежа у парсера — та, где сумма). Её сумму держим, если
-	// ИИ не записал платёж на неё.
+	var es []entry
 	parsedLine := map[string]bool{}
+	lines, _ := b.deterministicLines(text, detAll)
+	for _, tr := range lines {
+		canonical, known := b.aliases.ResolveName(tr.RawName)
+		unnamed := whoPlaceholders[canonical] || whoPlaceholders[tr.RawName] || !known && notClientName(tr.RawName)
+		es = append(es, entry{tr: tr, unnamed: unnamed, total: unnamed && totalOrHandoverLine(tr.Line)})
+		parsedLine[strings.TrimSpace(tr.Line)] = true
+	}
 	for _, tr := range parser.ParseMessage(text).Transactions {
 		parsedLine[strings.TrimSpace(tr.Line)] = true
 	}
@@ -978,15 +956,112 @@ func (b *Bot) heldWhileAsking(text string, agreed, slots []aiPayment, saved int,
 		if len(toks) != 1 || parser.LooksLikeNonPayment(parser.Transaction{Amount: toks[0], Line: ln}) {
 			continue
 		}
-		a := toks[0]
-		if take(a, anyCover) {
+		es = append(es, entry{tr: parser.Transaction{RawName: "Наличка", Amount: toks[0], Line: ln, IsCash: true},
+			unnamed: true, total: totalOrHandoverLine(ln)})
+	}
+
+	// О чём вопрос: чьи деньги (или прямо о сумме строки без клиента).
+	whoQ := whoQuestionRe.MatchString(strings.ToLower(question))
+	asked := moneyTokens(question)
+	askedAmount := func(a float64) bool {
+		for _, q := range asked {
+			if math.Abs(q-a) < 1 {
+				return true
+			}
+		}
+		return false
+	}
+	strict := whoQ
+	for _, e := range es {
+		strict = strict || e.unnamed && askedAmount(e.tr.Amount)
+	}
+
+	// Строки с ФИО: каждая — свой платёж ИИ (то же имя и сумма), затем любой на
+	// ту же сумму (ИИ написал имя иначе).
+	pool := newPool()
+	namedCovered := make([]bool, len(es))
+	for i, e := range es {
+		if !e.unnamed {
+			raw := e.tr.RawName
+			namedCovered[i] = take(pool, e.tr.Amount, func(c *cover) bool {
+				return c.name != "" && (sameClientName(c.name, raw) || shareNameWord(c.name, raw))
+			})
+		}
+	}
+	named, allNamed := 0, true
+	for i, e := range es {
+		if !e.unnamed {
+			if !namedCovered[i] {
+				namedCovered[i] = take(pool, e.tr.Amount, anyCover)
+			}
+			named++
+			allNamed = allNamed && namedCovered[i]
+		}
+	}
+	// Строки без клиента забирают оставшиеся платежи ИИ. Вопрос не о том, чьи
+	// деньги, — строки с ФИО платежи не «занимают»: наличка без имени на сумму
+	// записанного платежа — он же другими словами.
+	if !strict {
+		pool = newPool()
+	}
+	for i, e := range es {
+		if !e.unnamed {
+			if saved == 0 {
+				keep = append(keep, e.tr) // ИИ не записал ничего — строки с ФИО из текста
+			}
 			continue
 		}
-		keep = append(keep, parser.Transaction{RawName: "Наличка", Amount: a, Line: ln, IsCash: true})
+		if take(pool, e.tr.Amount, anyCover) {
+			continue
+		}
+		if e.total && named > 0 && allNamed {
+			others := 0.0
+			for j, o := range es {
+				if j != i && !o.total {
+					others += o.tr.Amount
+				}
+			}
+			if !whoQ && !askedAmount(e.tr.Amount) || math.Abs(others-e.tr.Amount) < 1 {
+				continue // итог / сдача уже записанных денег
+			}
+		}
+		tr := e.tr
+		canonical, _ := b.aliases.ResolveName(tr.RawName)
+		if !whoPlaceholders[canonical] && !whoPlaceholders[tr.RawName] {
+			tr.RawName = "(не указано)"
+			if cashHint || tr.IsCash || parser.IsCash(tr.Line) {
+				tr.RawName = "Наличка"
+			}
+		}
 		placeholders++
-		phAmount = a
+		phAmount = tr.Amount
+		keep = append(keep, tr)
 	}
 	return keep, placeholders, phAmount
+}
+
+// whoQuestionRe — вопрос ИИ о том, ЧЬИ это деньги (клиент платежа), а не о
+// сборщике, итоге или числе платежей.
+var whoQuestionRe = regexp.MustCompile(`(^|[^\p{L}])(чей|чья|чьё|чье|чьи|чью|чьего|чьей|чьих|от\s+кого|за\s+кого|кто\s+(платил|оплатил|заплатил|внес|внёс|внесла|принес|принёс|принесла|перевел|перевёл|перевела|скинул|скинула|прислал)|клиент\p{L}*)([^\p{L}]|$)`)
+
+// totalOrHandoverWords — слова строки итога или сдачи собранных денег
+// («Итого нал 42000», «Сдал в кассу 42000», «Отдал Адаму 15000»).
+var totalOrHandoverWords = map[string]bool{
+	"итого": true, "итог": true, "всего": true, "общая": true, "общий": true, "общее": true, "общую": true,
+	"касса": true, "кассу": true, "кассе": true, "кассы": true,
+	"сдал": true, "сдала": true, "сдали": true, "отдал": true, "отдала": true, "отдали": true,
+	"передал": true, "передала": true, "передали": true, "забрал": true, "забрала": true, "забрали": true,
+	"собрал": true, "собрала": true, "собрали": true,
+}
+
+// totalOrHandoverLine — строка итога или сдачи денег, а не платёж клиента.
+func totalOrHandoverLine(line string) bool {
+	for _, w := range strings.FieldsFunc(strings.ToLower(line), func(r rune) bool { return !unicode.IsLetter(r) }) {
+		if totalOrHandoverWords[w] {
+			return true
+		}
+	}
+	return false
 }
 
 // notClientWords — служебные слова, которые парсер берёт «именем» строки

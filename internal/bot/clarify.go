@@ -1131,36 +1131,81 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 
 // notPaymentRe — ответ на «❓ чей платёж?»: это не платёж клиента («не
 // платёж», «не считай»); notPaymentTotalRe — это итог («итог за день», «это
-// общая наличка»).
+// общая наличка»); notPaymentCashRe — ответ прямо про наличку.
 var (
 	notPaymentRe      = regexp.MustCompile(`(?i)(^|[^\p{L}])(не\s+(платеж|оплата|оплату|считай|считать|записывай|учитывай)|не\s+надо\s+(записывать|считать|учитывать))([^\p{L}]|$)`)
 	notPaymentTotalRe = regexp.MustCompile(`(?i)(^|[^\p{L}])(итог|итого|общ(ая|ий|ее|ую)\s+(сумм|налич|итог|касс)|всего\s+за|за\s+(весь\s+|целый\s+)?день)`)
+	notPaymentCashRe  = regexp.MustCompile(`(?i)(^|[^\p{L}])(нал|налом|наличк\p{L}*|наличн\p{L}*|кэш|кеш)([^\p{L}]|$)`)
 )
 
 // notPaymentAnswer — ответ говорит, что это не платёж (сумма в нём — лишь та
 // же, о которой спросили). Без свайпа — только прямое «не платёж / не
-// считай»: «Отчёт за день» следом за вопросом — не ответ на него. Ответ с ФИО
-// («Исаев Харон, итог») — про клиента, а не «не платёж».
+// считай» ПРО НАЛИЧКУ («Наличку не считай, ошибся»): «Второй не считай», «Это
+// не платёж» следом за дублем чека — про чек, а не ответ на вопрос о наличке.
+// Ответ с клиентом («Исаев Харон, итог», «исаев за весь день принёс») — про
+// клиента, а не «не платёж».
 func notPaymentAnswer(text string, asked float64, swipe bool) bool {
 	low := strings.ReplaceAll(strings.ToLower(text), "ё", "е")
 	if !notPaymentRe.MatchString(low) && !(swipe && notPaymentTotalRe.MatchString(low)) {
 		return false
 	}
+	if !swipe && (!notPaymentCashRe.MatchString(low) || strings.Contains(low, "чек")) {
+		return false
+	}
 	if a := parser.ExtractAmount(low); a > 0 && (asked <= 0 || math.Abs(a-asked) >= 1) {
 		return false
 	}
-	// Слова с заглавной буквы, кроме первого и служебных, — похоже на ФИО.
-	names := 0
+	return !answerNamesClient(text)
+}
+
+// answerNamesClient — в коротком ответе назван клиент: слово с окончанием
+// фамилии или отчества (в любом месте и регистре: «исаев харон», «Исаева не
+// считай»), слово с заглавной не в начале фразы («Это итог, Харон») или имя с
+// заглавной, за которым запятая («Ахмед, общая сумма»).
+func answerNamesClient(text string) bool {
 	for i, w := range strings.Fields(text) {
-		w = strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
-		r := []rune(w)
-		lw := strings.ToLower(w)
-		if i == 0 || len(r) < 3 || !unicode.IsUpper(r[0]) || nameStopwords[lw] || notClientWords[lw] || unclearWords[lw] {
+		clean := strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
+		r := []rune(clean)
+		lw := strings.ReplaceAll(strings.ToLower(clean), "ё", "е")
+		if len(r) < 3 || nameStopwords[lw] || notClientWords[lw] || unclearWords[lw] || notNameReplyWords[lw] {
 			continue
 		}
-		names++
+		if clientSurnameLike(lw) || isPatronymic(lw) {
+			return true
+		}
+		if unicode.IsUpper(r[0]) && (i > 0 || strings.HasSuffix(strings.TrimSpace(w), ",")) {
+			return true
+		}
 	}
-	return names == 0
+	return false
+}
+
+// notNameReplyWords — слова ответа «не платёж», которые не имена, даже с
+// заглавной в начале («Ошибся, не платёж», «Дубль, не считай»).
+var notNameReplyWords = map[string]bool{
+	"ошибся": true, "ошиблась": true, "ошиблись": true, "ошибка": true, "ошибочно": true,
+	"извините": true, "извиняюсь": true, "сорри": true, "стоп": true, "отмена": true,
+	"дубль": true, "дубля": true, "повтор": true, "второй": true, "первый": true, "лишний": true,
+	"тест": true, "проверка": true, "нечаянно": true, "случайно": true,
+}
+
+// clientSurnameTails — окончания фамилий (в том числе в косвенных падежах:
+// «Исаева», «Исаеву»), узкий список: окончания прилагательных («-ой», «-ая»)
+// не берём — «второй», «общая» не фамилии.
+var clientSurnameTails = []string{"ов", "ев", "ин", "ын", "ова", "ева", "ина", "ына", "ову", "еву", "ину", "ыну",
+	"овым", "евым", "иным", "овой", "евой", "иной", "ян", "яна", "яну", "дзе", "швили", "ский", "ская", "цкий", "цкая"}
+
+// clientSurnameLike — слово (строчными) похоже на фамилию по окончанию.
+func clientSurnameLike(w string) bool {
+	if len([]rune(w)) < 5 {
+		return false
+	}
+	for _, t := range clientSurnameTails {
+		if strings.HasSuffix(w, t) {
+			return true
+		}
+	}
+	return false
 }
 
 // dropNotPayment — на «❓ чей платёж?» ответили «это не платёж»: заглушки

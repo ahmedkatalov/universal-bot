@@ -72,8 +72,9 @@ type RecognizedReceipt struct {
 	Commission float64
 	TxDate     time.Time
 	HasTxDate  bool
-	// TimeDefaulted — на чеке только дата, время в TxDate придумано: чек
-	// хранится с угаданным временем (сравнивать по нему нельзя).
+	// TimeDefaulted — на чеке только дата, время в TxDate выбрано (полдень):
+	// чек хранится как «только дата» (tx_date_only), время потом уточняется
+	// по копии того же чека или тексту этого платежа.
 	TimeDefaulted bool
 	Declined      bool // банк перевод отклонил — денег нет, в сбор не идёт
 }
@@ -102,7 +103,8 @@ func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedRecei
 			commission    = CASE WHEN commission > 0 THEN commission
 			                     WHEN $9::numeric > 0 THEN $9::numeric ELSE commission END,
 			tx_date       = CASE WHEN $11 THEN $10::timestamptz ELSE tx_date END,
-			tx_time_guessed = CASE WHEN $11 THEN $13 ELSE tx_time_guessed END,
+			tx_time_guessed = CASE WHEN $11 THEN false ELSE tx_time_guessed END,
+			tx_date_only  = CASE WHEN $11 THEN $13 ELSE tx_date_only END,
 			-- Свёрнутый экран «Перевод выполнен» остаётся свёрнутым, если и при
 			-- повторе не видно ни даты, ни получателя, ни номера: иначе полный чек
 			-- того же перевода его не заменит, и перевод посчитается дважды.

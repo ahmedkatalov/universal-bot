@@ -116,6 +116,9 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 		fmt.Printf("Повтор чека #%d: ошибка сохранения: %v\n", it.ID, err)
 		return
 	}
+	if rd.HasTxTime && rd.TimeDefaulted {
+		b.anchorStoredDateOnly(ctx, it.ID) // на чеке только дата — время по копии/тексту платежа
+	}
 	waID, senderJID, groupJID, _ := b.db.ReceiptReplyRef(ctx, it.ID)
 	chat, jerr := types.ParseJID(groupJID)
 	if declined {
