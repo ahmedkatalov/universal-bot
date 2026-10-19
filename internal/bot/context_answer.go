@@ -130,6 +130,10 @@ func shortPlainReply(text string, maxWords int) bool {
 
 func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender string, admin bool, text string) bool {
 	groupJID := chat.String()
+	// Вопрос «чей чек?», на который уже ответили другим путём (список «ФИО
+	// сумма» на сумму чека, свайп, подпись), закрыт: голое имя следующего
+	// платежа — не ответ на него и не перезаписывает клиента чека.
+	b.dropAnsweredReceiptAsks(ctx, groupJID)
 	a, ok := b.recentOpenAsk(groupJID)
 	if !ok {
 		return false
@@ -203,8 +207,7 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		// чек?»: их запишет обычный разбор, а чек подпишет пара «ФИО сумма» на
 		// его сумму. Наличка с суммой («… нал», «… Мансур взял», «… отдал
 		// Адаму») — другой платёж, тоже не ответ про чек.
-		if countAmountLines(text) > 1 || severalAmounts(text) ||
-			parser.ExtractAmount(text) > 0 && textCash(text) {
+		if paymentsText(text) {
 			return false
 		}
 		// Несколько открытых вопросов «чей чек?»: ответ — к самому раннему, а если
@@ -283,6 +286,47 @@ func (b *Bot) pickReceiptAsk(groupJID string, amount float64) openAsk {
 		return fresh[0]
 	}
 	return openAsk{}
+}
+
+// paymentsText — текст с платежами, а не подпись или ответ про один чек:
+// несколько сумм (строками или в одной строке: «Исаев Харон 15000 20000»,
+// «Исаев Харон 15000, Магомедов Ахмед 10000») или наличка с суммой («… нал»,
+// «… Мансур взял», «… отдал Адаму»).
+func paymentsText(text string) bool {
+	return countAmountLines(text) > 1 || severalAmounts(text) ||
+		parser.ExtractAmount(text) > 0 && textCash(text)
+}
+
+// dropAnsweredReceiptAsks — снять вопросы «чей чек?» группы, чей чек уже
+// назван (клиент подтверждён и сумма известна): ответ без свайпа на такой
+// вопрос перезаписал бы клиента уже названного чека. Вопросы только про сумму
+// («проверьте сумму», «не разобрал сумму») не трогаем — у их чека клиент
+// может быть давно известен.
+func (b *Bot) dropAnsweredReceiptAsks(ctx context.Context, groupJID string) {
+	if b.db == nil {
+		return
+	}
+	b.clarify.mu.Lock()
+	var ids []string
+	for _, q := range b.clarify.receiptAsks[groupJID] {
+		if q.needName {
+			ids = append(ids, q.receiptWaID)
+		}
+	}
+	if cur, ok := b.clarify.lastAsk[groupJID]; ok && cur.kind == "receipt" && cur.needName && cur.receiptWaID != "" {
+		ids = append(ids, cur.receiptWaID)
+	}
+	b.clarify.mu.Unlock()
+	seen := map[string]bool{}
+	for _, id := range ids {
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		if _, confirmed, err := b.db.ReceiptClientByMessage(ctx, id); err == nil && confirmed {
+			b.dropReceiptAsk(groupJID, id)
+		}
+	}
 }
 
 // dropReceiptAsk — вопрос по чеку закрыт; следующим открытым становится

@@ -152,24 +152,22 @@ func firstNameLine(text string) (string, bool) {
 // Возвращает ФИО клиента и сумму, если она была в подписи/имени рядом (нужна
 // для фото наличных: «ФИО+сумма» + фото денег = наличка на эту сумму). Для
 // обычного чека сумма берётся с самого чека, и это значение игнорируется.
+//
+// Имя этого клиента, написанное ПЕРЕД чеком, снимает из очереди уже разбор
+// чека (handleBankReceipt → consumeQueuedSameName), когда известна сумма чека:
+// снимается запись на ЭТУ сумму, а не первая по имени.
 func (b *Bot) resolveReceiptPayer(ctx context.Context, msg *events.Message, caption string) (string, float64) {
-	found := func(name string, amount float64) (string, float64) {
-		// Имя этого клиента, написанное ПЕРЕД чеком, уже использовано — снимаем
-		// его из очереди, иначе оно достанется следующему чеку другого клиента.
-		b.consumeQueuedSameName(ctx, msg.Info.Chat, msg.Info.Sender.String(), name)
-		return name, amount
-	}
 	// 1. Подпись к чеку.
 	if name, amount := b.payerFromCaption(ctx, caption); name != "" {
-		return found(name, amount)
+		return name, amount
 	}
 	// 2. Чек — это ответ (свайп) на сообщение с именем.
 	if quoted := extractQuotedText(msg); strings.TrimSpace(quoted) != "" {
 		if name := b.cmfExtractClientName(ctx, quoted); name != "" {
-			return found(name, parser.ExtractAmount(quoted))
+			return name, parser.ExtractAmount(quoted)
 		}
 		if name, ok := looksLikeName(quoted); ok {
-			return found(name, parser.ExtractAmount(quoted))
+			return name, parser.ExtractAmount(quoted)
 		}
 	}
 	// 3. Имя из очереди «написали перед чеком» берётся уже при разборе чека
@@ -212,22 +210,205 @@ func (b *Bot) takeQueuedPayer(ctx context.Context, chat types.JID, senderJID str
 	return p.Name, p.RawID, ok
 }
 
-// consumeQueuedSameName — снять из очереди имя того же клиента (оно уже
-// использовано подписью или свайпом).
-func (b *Bot) consumeQueuedSameName(ctx context.Context, chat types.JID, senderJID, name string) {
-	if b.db == nil || name == "" {
-		return
+// takeQueuedBreakdown — чек на сумму, которую текст перед ним расписал по
+// частям одного клиента («Исаев Харон 15000 + 20000», затем один чек на
+// 35000): части ждут в очереди имён каждая свою сумму, а пришёл один чек на
+// всё. Это тот же платёж: чек берёт клиента, части из очереди снимаются, а
+// платежи текста — подпись чека (их снимает dropBreakdownTexts, когда чек
+// записан в сбор). Только если в очереди ждут ВСЕ части сообщения и
+// безналичные платежи сообщения целиком — разбивка суммы чека (одного
+// клиента); наличка рядом — отдельный платёж, она остаётся.
+func (b *Bot) takeQueuedBreakdown(ctx context.Context, chat types.JID, senderJID string, amount float64) (string, int, bool) {
+	if senderJID == "" || b.db == nil || amount <= 0 {
+		return "", 0, false
 	}
 	ps, err := b.db.PendingNamesOf(ctx, chat.String(), senderJID, time.Now().Add(-b.pairWindow))
 	if err != nil {
-		return
+		return "", 0, false
 	}
+	byRaw := map[int][]db.PendingName{}
+	var order []int
 	for _, p := range ps {
-		if sameClientName(p.Name, name) || normCyr(p.Name) == normCyr(name) {
+		if p.RawID <= 0 || p.Amount <= 0 {
+			continue
+		}
+		if _, seen := byRaw[p.RawID]; !seen {
+			order = append(order, p.RawID)
+		}
+		byRaw[p.RawID] = append(byRaw[p.RawID], p)
+	}
+	for _, rid := range order {
+		parts := byRaw[rid]
+		if len(parts) < 2 {
+			continue
+		}
+		total, same := 0.0, true
+		for _, p := range parts {
+			total += p.Amount
+			same = same && normCyr(p.Name) == normCyr(parts[0].Name)
+		}
+		if !same || !nearAmount(total, amount) {
+			continue
+		}
+		body, _, err := b.db.RawBodyByID(ctx, rid)
+		if err != nil {
+			continue
+		}
+		if _, ok := breakdownOfCheck(body, amount); !ok {
+			continue
+		}
+		for _, p := range parts {
 			_ = b.db.ConsumePendingNameByID(ctx, p.ID)
-			return
+		}
+		return parts[0].Name, rid, true
+	}
+	return "", 0, false
+}
+
+// dropBreakdownTexts — чек записан на клиента по разбивке, написанной до
+// него: платежи этого текста — тот же платёж, что чек, отдельно не считаются.
+// Разбор текста ИИ мог ещё идти — дожидаемся его, чтобы снять и его итог.
+// amount — сумма чека.
+func (b *Bot) dropBreakdownTexts(ctx context.Context, rawID int, amount float64) {
+	b.aiRetryMu.Lock()
+	f, busy := b.aiInFlight[rawID]
+	b.aiRetryMu.Unlock()
+	if busy {
+		select {
+		case <-f.done:
+		case <-time.After(time.Minute):
 		}
 	}
+	body, _, err := b.db.RawBodyByID(ctx, rawID)
+	if err != nil {
+		return
+	}
+	n, err := b.db.IgnoreTextTxOfRaw(ctx, rawID, breakdownAmounts(body, amount))
+	if err != nil {
+		fmt.Println("Разбивка суммы чека: не снял платежи текста:", err)
+		return
+	}
+	// Без налички текст целиком — сам чек: разбирать его больше нечего. С
+	// наличкой её ещё надо записать (ИИ мог не прочитать текст — он перечитает,
+	// а безналичные платежи снова снимет dropCaptionParts).
+	if !textCashPays(body) {
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+	}
+	fmt.Printf("Разбивка суммы чека (сообщение %d): %d платеж(а) текста — это сам чек\n", rawID, n)
+}
+
+// breakdownAmounts — суммы платежей, которыми текст мог записать чек на amount,
+// расписанный по частям: безналичные части и сама сумма чека (ИИ мог прочитать
+// разбивку одним платежом). Наличку не трогаем.
+func breakdownAmounts(text string, amount float64) []float64 {
+	out := []float64{amount}
+	for _, p := range textPays(text) {
+		if !p.cash && p.amount > 0 {
+			out = append(out, p.amount)
+		}
+	}
+	return out
+}
+
+// dropCaptionParts — платежи текста записаны, а сам текст назвал чек
+// разбивкой его суммы по частям и в нём же отдельная наличка («Исаев Харон
+// 15000 + 20000\n5000 нал» на чек 35000): безналичные платежи текста — это сам
+// чек (снимаем, иначе 35000 посчитаются дважды), наличка — отдельный платёж
+// (остаётся). Вызывается после каждой записи платежей сообщения: свайп, правка,
+// перечитывание после сбоя ИИ.
+func (b *Bot) dropCaptionParts(ctx context.Context, rawID int, text string) {
+	if b.db == nil || rawID <= 0 || !(countAmountLines(text) > 1 || severalAmounts(text)) {
+		return
+	}
+	amts, err := b.db.ConfirmedReceiptAmountsNamedBy(ctx, rawID)
+	if err != nil {
+		return
+	}
+	for _, a := range amts {
+		if _, ok := breakdownOfCheck(text, a); !ok {
+			continue
+		}
+		if n, err := b.db.IgnoreTextTxOfRaw(ctx, rawID, breakdownAmounts(text, a)); err == nil && n > 0 {
+			fmt.Printf("Разбивка суммы чека (сообщение %d): %d безналичных платеж(а) текста — это сам чек на %.0f ₽\n", rawID, n, a)
+		}
+		return
+	}
+}
+
+// consumeQueuedSameName — снять из очереди имя того же клиента: оно уже
+// использовано подписью или свайпом чека на сумму amount (иначе оно
+// достанется следующему чеку другого клиента). У клиента в очереди может быть
+// несколько записей с разными суммами («Исаев Харон 7500 и 5000»): снимаем
+// запись на сумму чека, иначе — имя без суммы, иначе — части одного
+// сообщения, которые вместе дают сумму чека («15000 + 20000» и чек 35000),
+// иначе — первую запись клиента (опечатка в сумме: лучше потом спросить про
+// его следующий чек, чем молча отдать ему чек другого клиента).
+// breakdownRaw — сообщение, расписавшее сумму этого чека по частям: его
+// безналичные платежи — сам чек (их снимет dropBreakdownTexts).
+func (b *Bot) consumeQueuedSameName(ctx context.Context, chat types.JID, senderJID, name string, amount float64) (breakdownRaw int) {
+	if b.db == nil || name == "" || senderJID == "" {
+		return 0
+	}
+	ps, err := b.db.PendingNamesOf(ctx, chat.String(), senderJID, time.Now().Add(-b.pairWindow))
+	if err != nil {
+		return 0
+	}
+	var mine []db.PendingName
+	for _, p := range ps {
+		if sameClientName(p.Name, name) || normCyr(p.Name) == normCyr(name) {
+			mine = append(mine, p)
+		}
+	}
+	if len(mine) == 0 {
+		return 0
+	}
+	consume := func(ps ...db.PendingName) {
+		for _, p := range ps {
+			_ = b.db.ConsumePendingNameByID(ctx, p.ID)
+		}
+	}
+	for _, p := range mine {
+		if nearAmount(p.Amount, amount) {
+			consume(p)
+			return 0
+		}
+	}
+	for _, p := range mine {
+		if p.Amount <= 0 {
+			consume(p)
+			return 0
+		}
+	}
+	if amount > 0 {
+		byRaw := map[int][]db.PendingName{}
+		var order []int
+		for _, p := range mine {
+			if p.RawID <= 0 {
+				continue
+			}
+			if _, seen := byRaw[p.RawID]; !seen {
+				order = append(order, p.RawID)
+			}
+			byRaw[p.RawID] = append(byRaw[p.RawID], p)
+		}
+		for _, rid := range order {
+			total := 0.0
+			for _, p := range byRaw[rid] {
+				total += p.Amount
+			}
+			if len(byRaw[rid]) > 1 && nearAmount(total, amount) {
+				consume(byRaw[rid]...)
+				if body, _, err := b.db.RawBodyByID(ctx, rid); err == nil {
+					if _, ok := breakdownOfCheck(body, amount); ok {
+						return rid
+					}
+				}
+				return 0
+			}
+		}
+	}
+	consume(mine[0])
+	return 0
 }
 
 // enqueuePendingName кладёт имя в durable-очередь (имя ПЕРЕД будущим чеком).
@@ -282,8 +463,33 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	// это всё равно несколько платежей, подписью к чеку их не съедаем.
 	multi := amountLines > 1 || severalAmounts(text)
 	if multi || ((amount > 0 || amountLines > 0) && textCash(text)) {
+		var used []float64
 		if checkNearby && multi {
-			b.labelCheckFromLines(ctx, msg, text, rawID, since)
+			labeled, caption := b.labelCheckFromLines(ctx, msg, text, rawID, since)
+			if caption {
+				// Сумма чека по частям одного клиента («Исаев Харон 15000 +
+				// 20000» на чек 35000) — подпись чека: это тот же платёж.
+				if !textCashPays(text) {
+					_ = b.db.MarkMessageParsed(ctx, rawID)
+					return true
+				}
+				// Рядом с разбивкой — наличка («…\n5000 нал»): это отдельный
+				// платёж, его записываем; безналичные платежи текста — сам чек,
+				// их после записи снимет dropCaptionParts. В очередь имён части
+				// не ставим — их чек уже назван.
+				return false
+			}
+			used = append(used, labeled...)
+			// Платёж на сумму другого ждущего чека отправителя назовёт ЕГО
+			// (соседнее сообщение) — будущему чеку он не достаётся.
+			if amts, err := b.db.UnconfirmedReceiptAmountsFrom(ctx, chat.String(), sender, since); err == nil {
+				used = append(used, amts...)
+			}
+		}
+		// Список перед чеками: остальные его платежи ждут свои чеки (на ту же
+		// сумму) в очереди имён. Свайп на что-то другое — не имя для будущего чека.
+		if multi && quotedID == "" {
+			b.enqueueListPayers(ctx, msg, text, rawID, used...)
 		}
 		return false
 	}
@@ -369,8 +575,14 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 				}
 			}
 		}
-		// Иначе это платёж: запишется как текстовый, а имя подождёт чек на эту сумму.
-		b.enqueuePendingName(ctx, msg, name, amount, rawID)
+		// Иначе это платёж: запишется как текстовый, а имя подождёт чек на эту
+		// сумму — если только чек этого клиента на эту сумму уже не записан
+		// (текст после чека с подписью — тот же платёж) и не ждёт рядом другой
+		// чек на эту сумму (его назовёт это же сообщение, как соседнее, — в
+		// очереди имя досталось бы потом чужому чеку той же суммы).
+		if b.checkedAlready(ctx, msg, canonical, amount, rawID) == 0 && !b.waitingCheckOf(ctx, chat.String(), sender, since, amount) {
+			b.enqueuePendingName(ctx, msg, name, amount, rawID)
+		}
 		return false
 	}
 
@@ -411,26 +623,120 @@ var (
 		"до": true, "в": true, "во": true, "сегодня": true, "вчера": true, "сейчас": true, "уже": true,
 		"только": true, "всё": true, "все": true, "полностью": true, "частично": true, "деньги": true,
 		"сумму": true, "оплату": true, "долг": true, "остаток": true,
+		"сбером": true, "сбербанком": true, "тинькоффом": true, "тиньком": true, "втб": true, "альфой": true, "себе": true,
+		"всю": true, "весь": true, "сразу": true, "половину": true, "предоплату": true, "часть": true, "досрочно": true,
+		"заранее": true, "вовремя": true, "свои": true, "мои": true, "больше": true, "меньше": true, "раньше": true,
+		"позже": true, "назад": true, "обратно": true, "взнос": true, "наличку": true, "наличные": true,
 	}
+	// collectorPronouns — «отдал мне», «передал ему»: деньги у человека.
+	collectorPronouns = map[string]bool{"мне": true, "ему": true, "ей": true, "нам": true, "им": true, "вам": true, "тебе": true}
 )
 
-// collectorCash — в тексте сказано, кто забрал деньги или кому их отдали.
+// collectorCash — в тексте сказано, что деньги принесли или забрали
+// («принёс», «занёс», «Мансур взял», «я забрал», «… забрал мансур»), или кому
+// их отдали («отдал Адаму», «передал мансуру», «отдал к Дени», «отдал мне»).
+// Это наличка — отдельный платёж. Обычная подпись перевода — не наличка:
+// «Исаев Харон отдал ещё 15000», «отдал последние 15000», «отдал всю сумму»
+// (не кому, а как отдал), «Исаев Харон взял айфон, первый взнос 15000» (взял
+// вещь, а не деньги).
 func collectorCash(text string) bool {
-	ws := strings.FieldsFunc(strings.ToLower(text), func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
-	for i, w := range ws {
-		if collectorTakeWords[w] {
+	for _, ln := range nonEmptyLines(text) {
+		if lineCollector(ln) {
 			return true
 		}
-		if !collectorGiveWords[w] {
-			continue
+	}
+	return false
+}
+
+// collectorGoods — вещи, которые берут в рассрочку: «взял айфон», «забрал
+// телефон» — взяли товар, а не деньги.
+var collectorGoods = map[string]bool{
+	"айфон": true, "айфона": true, "iphone": true, "телефон": true, "телефона": true, "смартфон": true,
+	"самсунг": true, "ноутбук": true, "ноут": true, "планшет": true, "товар": true, "технику": true,
+	"холодильник": true, "телевизор": true, "машину": true, "часы": true, "наушники": true,
+	"чек": true, "квитанцию": true, "сдачу": true,
+}
+
+// lineCollector — collectorCash для одной строки.
+func lineCollector(line string) bool {
+	ws := strings.FieldsFunc(line, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	low := func(i int) string { return strings.ToLower(ws[i]) }
+	// person — слово может быть именем человека (не сумма, не служебное слово).
+	person := func(i int) bool {
+		w := low(i)
+		return strings.IndexFunc(w, unicode.IsDigit) < 0 && len([]rune(w)) > 1 &&
+			!nameStopwords[w] && !notCollectorWords[w] && !pairNoiseWords[w] && !collectorPronouns[w] &&
+			!collectorTakeWords[w] && !collectorGiveWords[w] && !parser.IsMoneyWord(w, true)
+	}
+	capital := func(i int) bool {
+		r := []rune(ws[i])
+		return len(r) > 0 && unicode.IsUpper(r[0])
+	}
+	// amountBefore — сумма уже написана до слова i: «ФИО 10000 забрал мансур».
+	amountBefore := func(i int) bool {
+		for k := 0; k < i; k++ {
+			if strings.IndexFunc(ws[k], unicode.IsDigit) >= 0 {
+				return true
+			}
 		}
-		j := i + 1
-		if j < len(ws) && ws[j] == "к" {
-			j++
+		return false
+	}
+	for i := range ws {
+		w := low(i)
+		switch {
+		case collectorTakeWords[w]:
+			// «взял айфон», «телефон забрал» — взяли вещь (товар в рассрочку).
+			if i+1 < len(ws) && collectorGoods[low(i+1)] || i > 0 && collectorGoods[low(i-1)] {
+				continue
+			}
+			// «Исаев Харон взял телефон 15000» — слово с маленькой буквы сразу после
+			// глагола, до суммы, — что взяли. После суммы это тот, кто забрал
+			// («10000 забрал мансур»).
+			if i+1 < len(ws) && person(i+1) && !capital(i+1) && !amountBefore(i) {
+				continue
+			}
+			// «принёс 10000», «10000 занёс», «я забрал», «Мансур взял» — наличка.
+			return true
+		case collectorGiveWords[w]:
+			j := i + 1
+			viaK := j < len(ws) && low(j) == "к"
+			if viaK {
+				j++
+			}
+			if j >= len(ws) {
+				continue
+			}
+			// «отдал мне», «отдал к Дени», «отдал Адаму». С маленькой буквы — имя в
+			// дательном («отдал адаму», «передал мансуру») или последнее слово
+			// после суммы («10000 отдал адам»). «отдал ещё/последние/всю сумму/
+			// досрочно 15000» — не кому, а как отдал.
+			if collectorPronouns[low(j)] {
+				return true
+			}
+			if person(j) && (viaK || capital(j) || collectorDative(low(j)) || j+1 == len(ws) && amountBefore(i)) {
+				return true
+			}
 		}
-		if j < len(ws) && strings.IndexFunc(ws[j], unicode.IsDigit) < 0 && !notCollectorWords[ws[j]] && !pairNoiseWords[ws[j]] {
-			return true // «отдал Адаму», «отдал к Дени», «отдал мне»
+	}
+	return false
+}
+
+// collectorDative — слово похоже на имя в дательном падеже: «адаму»,
+// «мансуру», «мадине», «дени». Прилагательные («последние», «вторую»,
+// «полное») — нет.
+func collectorDative(w string) bool {
+	r := []rune(w)
+	if len(r) < 3 {
+		return false
+	}
+	for _, suf := range []string{"ую", "юю", "ие", "ые", "ое", "ее", "ей", "ой", "ий", "ый"} {
+		if strings.HasSuffix(w, suf) {
+			return false
 		}
+	}
+	switch r[len(r)-1] {
+	case 'у', 'ю', 'е', 'и':
+		return true
 	}
 	return false
 }
@@ -467,11 +773,39 @@ var pairNoiseWords = map[string]bool{
 	"наличкой": true, "налом": true, "наличные": true, "кэш": true, "кеш": true, "cash": true,
 }
 
-// gapNameWords — слова ФИО между суммами строки и есть ли между ними союз
-// списка («+», «,», «;», «/», «и»). Хвосты сумм («т.р.», «руб»), числа,
-// пометки и служебные слова — не ФИО.
-func gapNameWords(gap string, afterNumber bool) (words []string, joined bool) {
+// balanceWords — остаток, долг, итог перед суммой («15000, остаток 30000»,
+// «15000 из 45000», «15000 + 20000 итого 35000»): такая сумма — не ещё один
+// платёж строки, а «ФИО сумма» с пометкой.
+var balanceWords = map[string]bool{
+	"остаток": true, "остатка": true, "осталось": true, "остался": true, "осталась": true,
+	"останется": true, "ост": true, "долг": true, "долга": true, "должен": true, "должна": true,
+	"из": true, "было": true, "всего": true, "итого": true, "итог": true,
+}
+
+// debtPaidWords — «долг», «остаток» после союза списка («15000 + долг 5000»,
+// «15000 и долг 5000 закрыл», «плюс остаток 30000») — оплатили и долг: это
+// второй платёж строки. Без союза («15000, долг 5000», «остаток 30000») —
+// пометка остатка.
+var debtPaidWords = map[string]bool{"долг": true, "долга": true, "остаток": true, "остатка": true, "ост": true}
+
+func init() {
+	// Слова остатка — и не ФИО («Исаев Харон 15000, остаток 30000» — клиент
+	// «Исаев Харон»).
+	for w := range balanceWords {
+		nameStopwords[w] = true
+	}
+}
+
+// gapNameWords — слова ФИО между суммами строки, есть ли между ними союз
+// списка («+», «,», «;», «/», «и») и пометка остатка («остаток», «из»).
+// strong — союз сложения («+», «и», «плюс», «ещё»), а не просто запятая.
+// Хвосты сумм («т.р.», «руб»), числа, пометки и служебные слова — не ФИО.
+func gapNameWords(gap string, afterNumber bool) (words []string, joined, balance, strong bool) {
 	joined = strings.ContainsAny(gap, "+,;/&")
+	// strong — союз «+», «и», «плюс», «ещё» (а не просто запятая): «+ долг 5000»
+	// — оплатили и долг.
+	strong = strings.ContainsAny(gap, "+&")
+	debtOnly := true
 	tail := afterNumber
 	for _, w := range strings.Fields(gap) {
 		if tail && parser.IsMoneyWord(w, true) {
@@ -483,13 +817,19 @@ func gapNameWords(gap string, afterNumber bool) (words []string, joined bool) {
 		switch {
 		case lw == "":
 		case pairJoinWords[lw]:
-			joined = true
+			joined, strong = true, true
+		case balanceWords[lw]:
+			balance = true
+			debtOnly = debtOnly && debtPaidWords[lw]
 		case strings.IndexFunc(w, unicode.IsDigit) >= 0, nameStopwords[lw], pairNoiseWords[lw]:
 		default:
 			words = append(words, clean)
 		}
 	}
-	return words, joined
+	if balance && debtOnly && strong {
+		balance = false // «15000 + долг 5000» — второй платёж
+	}
+	return words, joined, balance, strong
 }
 
 // lineAmountPairs — платежи строки по её суммам: каждая сумма — платёж ФИО,
@@ -498,19 +838,27 @@ func gapNameWords(gap string, afterNumber bool) (words []string, joined bool) {
 // начинающаяся с суммы, — платежи ФИО заголовка блока block; если же после
 // последней суммы ещё стоит ФИО («15000 Исаев Харон 20000 Магомедов Ахмед» —
 // сумма перед именем), чьи суммы — не угадываем: ФИО у пар пустые. Та же сумма
-// повтором без союза между ними («15000 (15т)») — один платёж. Учитываются
-// только суммы, похожие на деньги («за 2 месяца» — не платёж).
+// повтором без союза между ними («15000 (15т)») — один платёж. Сумма после
+// пометки остатка («15000, остаток 30000», «15000 из 45000») — не платёж (а
+// строку, которая с такой пометки начинается, рядом с платежами отбрасывает
+// textPays). Итог частей одного ФИО («15000 + 20000 = 35000», «35000
+// (15000+20000)») — тоже не ещё один платёж: платежи — части.
+// Учитываются только суммы, похожие на деньги («за 2 месяца» — не платёж).
 func lineAmountPairs(line, block string) []amountPair {
 	var out []amountPair
+	var plus []bool // перед суммой — союз сложения («+», «и», «плюс»)
 	name, prevEnd := "", 0
 	startsWithAmount := false
+	sameName := true // все суммы строки — одного ФИО (новое ФИО не написано)
 	for _, h := range parser.AmountsAt(line) {
 		if !h.Real {
 			continue
 		}
-		words, joined := gapNameWords(line[prevEnd:h.Start], len(out) > 0)
+		words, joined, balance, strong := gapNameWords(line[prevEnd:h.Start], len(out) > 0)
 		prevEnd = h.End
 		switch {
+		case len(out) > 0 && balance && len(words) == 0:
+			continue // «15000, остаток 30000» — остаток, а не второй платёж
 		case len(out) == 0:
 			name = strings.Join(words, " ")
 			if name == "" {
@@ -518,14 +866,32 @@ func lineAmountPairs(line, block string) []amountPair {
 			}
 		case len(words) > 0:
 			name = strings.Join(words, " ")
+			sameName = false
 		case !joined && nearAmount(out[len(out)-1].amount, h.Value):
 			continue // «15000 (15т)» — та же сумма ещё раз
 		}
 		out = append(out, amountPair{name: name, amount: h.Value})
+		plus = append(plus, strong)
 	}
-	if tail, _ := gapNameWords(line[prevEnd:], len(out) > 0); startsWithAmount && len(tail) > 0 {
+	if tail, _, _, _ := gapNameWords(line[prevEnd:], len(out) > 0); startsWithAmount && len(tail) > 0 {
 		for i := range out {
 			out[i].name = ""
+		}
+	}
+	if len(out) >= 3 && sameName {
+		// Итог частей: последняя сумма после «=» («15000 + 20000 = 35000») или
+		// первая, за которой части в скобках («35000 (15000+20000)»). Сумма,
+		// прибавленная союзом («5000 + 10000 + 15000»), — не итог, а платёж.
+		total := 0.0
+		for _, p := range out {
+			total += p.amount
+		}
+		last := len(out) - 1
+		switch {
+		case !plus[last] && nearAmount(out[last].amount, total-out[last].amount):
+			out = out[:last]
+		case !plus[1] && nearAmount(out[0].amount, total-out[0].amount):
+			out = out[1:]
 		}
 	}
 	return out
@@ -557,10 +923,44 @@ func countAmountLines(text string) int {
 // nearAmount — суммы совпадают (с точностью до рубля).
 func nearAmount(a, b float64) bool { return a > 0 && b > 0 && math.Abs(a-b) < 1 }
 
-// textHasAmount — есть ли в строке платёж на сумму amt: сумма, которую читает
-// разбор платежей («Исаев Харон за 2 месяца 30000» — 30000, а не первое число
-// 2), или первая сумма строки (ExtractAmount: «22т», «22.000»).
+// balanceLine — строка начинается с пометки остатка или итога перед первой
+// суммой, без ФИО: «остаток 30000», «итого 35000», «из 45000».
+func balanceLine(line string) bool {
+	for _, h := range parser.AmountsAt(line) {
+		if h.Real {
+			words, _, balance, _ := gapNameWords(line[:h.Start], false)
+			return balance && len(words) == 0
+		}
+	}
+	return false
+}
+
+// hasRealAmount — в строке есть сумма, похожая на деньги (с суффиксом тысяч
+// или от 100 ₽).
+func hasRealAmount(text string) bool {
+	for _, h := range parser.AmountsAt(text) {
+		if h.Real {
+			return true
+		}
+	}
+	return false
+}
+
+// textHasAmount — есть ли в строке платёж на сумму amt. Сумма платежа —
+// сумма пары «ФИО сумма» (lineAmountPairs): «Исаев Харон за 2 месяца 30000» —
+// 30000, а не 2; в «Исаев Харон 15000, остаток 30000», «15000 из 45000»,
+// «15000 (было 20000)» — 15000, а не остаток (разбор платежей берёт последнее
+// число строки). Строка без сумм, похожих на деньги, — первое число или сумма
+// разбора платежей.
 func textHasAmount(text string, amt float64) bool {
+	if hasRealAmount(text) {
+		for _, p := range lineAmountPairs(text, "") {
+			if nearAmount(p.amount, amt) {
+				return true
+			}
+		}
+		return false
+	}
 	if nearAmount(parser.ExtractAmount(text), amt) {
 		return true
 	}
@@ -689,56 +1089,70 @@ type checkNameHit struct {
 	n        int    // сколько таких платежей этого ФИО в сообщении (столько чеков оно называет)
 }
 
-// nameForCheckAmount ищет в сообщении НЕналичный платёж на сумму amt — строку
-// «ФИО сумма» или блок «ФИО\nсумма\nсумма» (формат парсера) — и возвращает его
-// ФИО. seen — платёж на эту сумму в сообщении вообще есть. ok=false — такого
-// платежа с ФИО нет (он наличный или без ФИО) или таких платежей у РАЗНЫХ людей
-// несколько (не угадываем — спросим «чей чек?»).
-func nameForCheckAmount(text string, amt float64) (hit checkNameHit, seen, ok bool) {
-	if amt <= 0 {
-		return hit, false, false
-	}
-	conflict := false
-	take := func(n, src string) {
-		if ok && normCyr(n) != normCyr(hit.name) {
-			conflict = true
-			return
+// textPay — платёж сообщения так, как его видит подпись к чеку: сумма, ФИО
+// (из строки «ФИО сумма», заголовка блока «ФИО\nсумма» или пары «ФИО сумма»
+// в строке с несколькими суммами) и наличный ли он.
+type textPay struct {
+	name       string  // ФИО ("" — не написано)
+	nameText   string  // откуда оно взято
+	amount     float64 // сумма платежа
+	lineAmount float64 // первая сумма его строки (строка с одной суммой)
+	cash       bool
+}
+
+// is — платёж на сумму amt.
+func (p textPay) is(amt float64) bool {
+	return nearAmount(p.amount, amt) || nearAmount(p.lineAmount, amt)
+}
+
+// textPays — платежи сообщения по строкам. Строка с несколькими суммами
+// («Исаев Харон 15000 20000», «Исаев Харон 15000, Магомедов Ахмед 10000»,
+// «7500 и 5000» под заголовком «Магомедов Ахмед») — платежи по парам «ФИО
+// сумма»: ФИО — написанное перед суммой. Пометка налички в этой строке или
+// отдельной строкой без суммы — граница неясна, наличка вся строка. Строка,
+// которая начинается с пометки остатка или итога («остаток 30000», «итого
+// 35000», «из 45000» под блоком клиента), рядом с платежами — пометка, а не
+// ещё платёж (парсер берёт её платежом ФИО заголовка).
+func textPays(text string) []textPay {
+	var out []textPay
+	lines := nonEmptyLines(text)
+	skipBalance := false // в сообщении есть платёж, кроме строк остатка
+	for _, ln := range lines {
+		if hasRealAmount(ln) && !balanceLine(ln) {
+			skipBalance = true
+			break
 		}
-		if !ok {
-			hit, ok = checkNameHit{name: n, nameText: src}, true
-		}
-		hit.n++
 	}
 	trs, cash := paymentsCash(text)
 	for k, tr := range trs {
-		if len(lineAmountPairs(tr.Line, "")) > 1 {
+		pairs := lineAmountPairs(tr.Line, "")
+		if len(pairs) > 1 {
 			continue // строку с несколькими суммами разбираем ниже — по парам «ФИО сумма»
 		}
-		if !nearAmount(tr.Amount, amt) && !nearAmount(parser.ExtractAmount(tr.Line), amt) {
+		if skipBalance && balanceLine(tr.Line) {
 			continue
 		}
-		seen = true
-		if cash[k] {
-			continue
+		p := textPay{amount: tr.Amount, lineAmount: parser.ExtractAmount(tr.Line), cash: cash[k]}
+		if len(pairs) == 1 {
+			// Сумма платежа — сумма пары, а не остаток: в «Исаев Харон 15000
+			// остаток 30000» платёж 15000 (парсер берёт 30000).
+			p.amount = pairs[0].amount
 		}
-		// ФИО — из самой строки платежа («Магомедов Ахмед 15000») или из
-		// заголовка блока («Исаев Харон» над строкой «10000»).
-		n, src, found := "", "", false
-		if n, found = looksLikeName(tr.RawName); found {
-			src = tr.RawName
-		} else if n, found = looksLikeName(tr.Line); found {
-			src = tr.Line
+		// ФИО — из самой строки платежа («Магомедов Ахмед 15000»; перед суммой
+		// пары — даже если парсер из-за остатка в конце строки взял ФИО
+		// заголовка) или из заголовка блока («Исаев Харон» над строкой «10000»).
+		pairName := ""
+		if len(pairs) == 1 {
+			pairName = pairs[0].name
 		}
-		if found {
-			take(n, src)
+		for _, src := range []string{pairName, tr.RawName, tr.Line} {
+			if n, found := looksLikeName(src); found {
+				p.name, p.nameText = n, src
+				break
+			}
 		}
+		out = append(out, p)
 	}
-	// Строка с несколькими суммами («Исаев Харон 15000 20000», «Исаев Харон
-	// 15000, Магомедов Ахмед 10000», «7500 и 5000» под заголовком «Магомедов
-	// Ахмед»): чек называет только ФИО, написанное перед суммой чека. Пометка
-	// налички в этой строке или отдельной строкой без суммы — граница неясна,
-	// наличка вся строка (чек не называем, бот спросит).
-	lines := nonEmptyLines(text)
 	looseCash := false
 	for _, ln := range lines {
 		if parser.ExtractAmount(ln) <= 0 && textCash(ln) {
@@ -754,41 +1168,106 @@ func nameForCheckAmount(text string, amt float64) (hit checkNameHit, seen, ok bo
 			continue
 		}
 		pairs := lineAmountPairs(ln, block)
-		if len(pairs) < 2 {
+		if len(pairs) < 2 || skipBalance && balanceLine(ln) {
 			continue
 		}
 		lineCash := looseCash || textCash(ln)
-		for _, p := range pairs {
-			if !nearAmount(p.amount, amt) {
-				continue
+		for _, pr := range pairs {
+			p := textPay{amount: pr.amount, cash: lineCash}
+			if n, found := looksLikeName(pr.name); found {
+				p.name, p.nameText = n, pr.name
 			}
-			seen = true
-			if lineCash {
-				continue
-			}
-			if n, found := looksLikeName(p.name); found {
-				take(n, p.name)
-			}
+			out = append(out, p)
 		}
 	}
-	if conflict {
-		return checkNameHit{}, true, false
+	return out
+}
+
+// nameForCheckAmount ищет в сообщении НЕналичный платёж на сумму amt — строку
+// «ФИО сумма», блок «ФИО\nсумма\nсумма» (формат парсера) или пару «ФИО сумма»
+// в строке с несколькими суммами — и возвращает его ФИО. seen — платёж на эту
+// сумму в сообщении вообще есть. ok=false — такого платежа с ФИО нет (он
+// наличный или без ФИО) или таких платежей у РАЗНЫХ людей несколько (не
+// угадываем — спросим «чей чек?»).
+func nameForCheckAmount(text string, amt float64) (hit checkNameHit, seen, ok bool) {
+	if amt <= 0 {
+		return hit, false, false
+	}
+	for _, p := range textPays(text) {
+		if !p.is(amt) {
+			continue
+		}
+		seen = true
+		if p.cash || p.name == "" {
+			continue
+		}
+		if ok && normCyr(p.name) != normCyr(hit.name) {
+			return checkNameHit{}, true, false
+		}
+		if !ok {
+			hit, ok = checkNameHit{name: p.name, nameText: p.nameText}, true
+		}
+		hit.n++
 	}
 	return hit, seen, ok
 }
 
+// breakdownOfCheck — сообщение рядом с чеком расписывает ЕГО сумму по частям
+// («Исаев Харон 15000 + 20000», «Исаев Харон\n15000\n20000» на чек 35000):
+// безналичные платежи (их хотя бы два) — одного ФИО и вместе дают сумму чека.
+// Это подпись чека (один платёж), а не ещё платежи сверх него. Наличка в том
+// же сообщении («…\n5000 нал») — отдельный платёж, не часть чека (её
+// записываем, см. textCashPays).
+func breakdownOfCheck(text string, amt float64) (checkNameHit, bool) {
+	if amt <= 0 {
+		return checkNameHit{}, false
+	}
+	var hit checkNameHit
+	total, parts := 0.0, 0
+	for _, p := range textPays(text) {
+		if p.cash {
+			continue
+		}
+		if p.name == "" || p.amount <= 0 {
+			return checkNameHit{}, false
+		}
+		if hit.name != "" && normCyr(p.name) != normCyr(hit.name) {
+			return checkNameHit{}, false
+		}
+		if hit.name == "" {
+			hit = checkNameHit{name: p.name, nameText: p.nameText, n: 1}
+		}
+		total += p.amount
+		parts++
+	}
+	return hit, parts >= 2 && nearAmount(total, amt)
+}
+
+// textCashPays — в сообщении есть наличный платёж (отдельный от чеков).
+func textCashPays(text string) bool {
+	for _, p := range textPays(text) {
+		if p.cash {
+			return true
+		}
+	}
+	return false
+}
+
 // amountLinePayer — ФИО платежа в сообщении с ОДНОЙ строкой суммы: из самой
 // строки («Магомедов Ахмед\nИсаев Харон 15000» — Исаев Харон) или из
-// заголовка её блока («Магамадов Алха\n22.000₽ ✅»), как читает парсер.
+// заголовка её блока («Магамадов Алха\n22.000₽ ✅»), как читает парсер. Сумма
+// платежа — сумма пары строки, а не остаток («Исаев Харон 15000, остаток
+// 30000» — 15000).
 func amountLinePayer(text string) (checkNameHit, bool) {
 	if countAmountLines(text) != 1 {
 		return checkNameHit{}, false
 	}
 	trs := parser.ParseMessage(text).Transactions
-	if len(trs) != 1 {
+	pays := textPays(text)
+	if len(trs) != 1 || len(pays) != 1 {
 		return checkNameHit{}, false
 	}
-	hit, _, ok := nameForCheckAmount(text, trs[0].Amount)
+	hit, _, ok := nameForCheckAmount(text, pays[0].amount)
 	return hit, ok
 }
 
@@ -842,8 +1321,13 @@ func isCardOwner(name, cardOwner string) bool {
 // labelCheckFromLines — в сообщении-списке платежей («Магомедов Ахмед 15000\n
 // Исаев Дени 20000 нал», «Исаев Харон\n10000\n5000 нал») ищем платёж на сумму
 // чека и подписываем им чек: свайп — тот чек, на который ответили; иначе —
-// самый старый ждущий чек отправителя.
-func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text string, rawID int, since time.Time) {
+// каждый ждущий чек отправителя, на сумму которого в списке есть платёж с
+// одним ФИО. Список, который расписывает сумму самого старого ждущего чека
+// (или чека под свайпом) по частям одного клиента («Исаев Харон 15000 +
+// 20000» на чек 35000), — его подпись. labeled — суммы подписанных чеков;
+// caption — сообщение целиком подпись чека (его платежи — это сам чек, второй
+// раз их не записываем).
+func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text string, rawID int, since time.Time) (labeled []float64, caption bool) {
 	chat, sender := msg.Info.Chat, msg.Info.Sender.String()
 	// ФИО со строки — клиент, только если он известен или его подтвердил ИИ
 	// (заголовок «Карта Хадижат», «Карта Сбер» — не клиент), и это не владелец
@@ -858,42 +1342,193 @@ func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text
 		}
 		return canonical, nil, true
 	}
+	// Платёж списка на сумму чека, иначе — разбивка суммы чека по частям.
+	hitFor := func(amt float64) (checkNameHit, bool, bool) {
+		if hit, _, ok := nameForCheckAmount(text, amt); ok {
+			return hit, false, true
+		}
+		hit, ok := breakdownOfCheck(text, amt)
+		return hit, true, ok
+	}
 	if quotedID := extractQuotedStanzaID(msg); quotedID != "" {
 		// Свайп на чек: подписываем ЕГО строкой на его сумму. Свайп не на чек —
 		// чужим ждущим чекам список не подпись.
 		r, err := b.db.ReceiptByWaMessageID(ctx, quotedID)
 		if err != nil || r.ID == 0 {
-			return
+			return nil, false
 		}
-		hit, _, ok := nameForCheckAmount(text, r.Amount)
+		hit, whole, ok := hitFor(r.Amount)
 		if !ok {
-			return
+			return nil, false
 		}
 		owner, _ := b.db.ReceiptCardOwnerByMessage(ctx, quotedID)
 		canonical, cid, ok := client(hit.nameText, owner)
 		if !ok {
-			return
+			return nil, false
 		}
 		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, cid, rawID); err == nil && found {
 			b.reresolveWatchByCheck(ctx, chat, quotedID, canonical)
+			return []float64{r.Amount}, whole
 		}
-		return
+		return nil, false
 	}
-	checkAmt, owner, ok, _ := b.db.OldestUnconfirmedReceiptCard(ctx, chat.String(), sender, since)
-	if !ok || checkAmt <= 0 {
-		return
+	checks, err := b.db.UnconfirmedReceiptCardsFrom(ctx, chat.String(), sender, since)
+	if err != nil || len(checks) == 0 {
+		return nil, false
 	}
-	hit, _, ok := nameForCheckAmount(text, checkAmt)
-	if !ok {
-		return
-	}
-	canonical, cid, ok := client(hit.nameText, owner)
-	if !ok {
-		return
-	}
-	if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, cid, rawID, checkAmt); err == nil && found {
+	label := func(c db.WaitingCheck, nameText string) bool {
+		canonical, cid, ok := client(nameText, c.Owner)
+		if !ok {
+			return false
+		}
+		found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, cid, rawID, c.Amount)
+		if err != nil || !found {
+			return false
+		}
 		b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+		return true
 	}
+	// Самый старый ждущий чек: список может расписывать его сумму по частям
+	// одного клиента — тогда сообщение целиком его подпись.
+	if oldest := checks[0]; oldest.Amount > 0 {
+		if _, _, ok := nameForCheckAmount(text, oldest.Amount); !ok {
+			if hit, ok := breakdownOfCheck(text, oldest.Amount); ok {
+				if b.listMatchesOtherCheck(ctx, chat.String(), sender, since, text) {
+					// Без свайпа разбивка «15000 + 20000» неоднозначна, если среди
+					// ждущих чеков отправителя есть чек на одну из частей: это может
+					// быть он и отдельный платёж. Этот чек не угадываем — бот спросит.
+					checks = checks[1:]
+				} else if label(oldest, hit.nameText) {
+					return []float64{oldest.Amount}, true
+				} else {
+					return nil, false
+				}
+			}
+		}
+	}
+	// Каждый ждущий чек отправителя (по порядку чата) получает платёж списка на
+	// ЕГО сумму с одним ФИО: «Исаев Харон 15000\nМагомедов Ахмед 10000» после
+	// чеков 15000 и 10000 называет оба, и следующее голое имя достаётся
+	// следующему чеку, а не второму чеку списка. Платежей одного ФИО на сумму —
+	// столько, сколько чеков этой суммы они называют.
+	left := map[int64]int{}
+	stop := map[int64]bool{}
+	for _, c := range checks {
+		key := int64(math.Round(c.Amount))
+		if c.Amount <= 0 || stop[key] {
+			continue
+		}
+		hit, _, ok := nameForCheckAmount(text, c.Amount)
+		if !ok {
+			stop[key] = true
+			continue
+		}
+		n, seen := left[key]
+		if !seen {
+			n = hit.n
+		}
+		if n <= 0 || !label(c, hit.nameText) {
+			// Чек этой суммы не подписали — более поздний той же суммы не трогаем
+			// (подпись идёт к самому старому чеку суммы).
+			stop[key] = true
+			continue
+		}
+		left[key] = n - 1
+		labeled = append(labeled, c.Amount)
+	}
+	return labeled, false
+}
+
+// waitingCheckOf — у отправителя ждёт чек без клиента на сумму amount.
+func (b *Bot) waitingCheckOf(ctx context.Context, chat, sender string, since time.Time, amount float64) bool {
+	amts, err := b.db.UnconfirmedReceiptAmountsFrom(ctx, chat, sender, since)
+	if err != nil {
+		return false
+	}
+	for _, a := range amts {
+		if nearAmount(a, amount) {
+			return true
+		}
+	}
+	return false
+}
+
+// listMatchesOtherCheck — у отправителя есть ждущий чек на сумму одного из
+// платежей текста.
+func (b *Bot) listMatchesOtherCheck(ctx context.Context, chat, sender string, since time.Time, text string) bool {
+	amts, err := b.db.UnconfirmedReceiptAmountsFrom(ctx, chat, sender, since)
+	if err != nil {
+		return true
+	}
+	for _, p := range textPays(text) {
+		if p.cash {
+			continue // наличка — не часть разбивки чека
+		}
+		for _, a := range amts {
+			if p.is(a) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// enqueueListPayers — список платежей («Исаев Харон 7500 и 5000», «Исаев
+// Харон 15000\nМагомедов Ахмед 10000»): каждый безналичный платёж с ФИО ждёт
+// в очереди имён свой чек на ТУ ЖЕ сумму — как одиночный «ФИО сумма», чтобы
+// чек получил клиента сразу, а не голое имя следующего клиента. Платежи на
+// суммы used уже подписали чеки (по одному на сумму) — их не ставим. На
+// сумму, у которой в списке разные ФИО или наличка, не ставим: не угадываем,
+// бот спросит.
+func (b *Bot) enqueueListPayers(ctx context.Context, msg *events.Message, text string, rawID int, used ...float64) {
+	done := map[int64]bool{}
+	confirmed := map[string]string{}
+	for _, p := range textPays(text) {
+		key := int64(math.Round(p.amount))
+		if p.amount <= 0 || done[key] {
+			continue
+		}
+		done[key] = true
+		hit, _, ok := nameForCheckAmount(text, p.amount)
+		if !ok {
+			continue
+		}
+		n := hit.n
+		for k, u := range used {
+			if nearAmount(u, p.amount) {
+				n, used[k] = n-1, 0
+			}
+		}
+		if n <= 0 {
+			continue
+		}
+		canonical, seen := confirmed[hit.nameText]
+		if !seen {
+			canonical, _ = b.confirmClientName(ctx, hit.nameText)
+			confirmed[hit.nameText] = canonical
+		}
+		if canonical == "" {
+			continue
+		}
+		for n -= b.checkedAlready(ctx, msg, canonical, p.amount, rawID); n > 0; n-- {
+			b.enqueuePendingName(ctx, msg, canonical, p.amount, rawID)
+		}
+	}
+}
+
+// checkedAlready — сколько свежих чеков отправителя уже записаны на этого
+// клиента на эту сумму (подписью, свайпом, именем рядом — не этим
+// сообщением). Текст после них — сводка тех же платежей («Исаев Харон
+// 15000\nМагомедов Ахмед 10000» после чеков с подписями): его платёж не ждёт
+// ещё один чек в очереди имён, иначе следующий чек той же суммы молча уйдёт
+// этому клиенту, а не тому, чьё имя напишут рядом.
+func (b *Bot) checkedAlready(ctx context.Context, msg *events.Message, name string, amount float64, rawID int) int {
+	n, err := b.db.ConfirmedReceiptCountFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(),
+		time.Now().Add(-b.pairWindow), name, amount, rawID)
+	if err != nil {
+		return 0
+	}
+	return n
 }
 
 // syncWatchAfterLabel — клиента чека назвали отдельным сообщением: сверка с

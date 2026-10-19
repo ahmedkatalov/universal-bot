@@ -1074,7 +1074,14 @@ func (b *Bot) processText(ctx context.Context, msg *events.Message, text string,
 	if b.handleNameMessage(ctx, msg, text, rawID) {
 		return false, false, true
 	}
+	routedToAI, hasPayment = b.recordTextPayments(ctx, msg, text, rawID, senderName, aiSync)
+	return routedToAI, hasPayment, false
+}
 
+// recordTextPayments — записать платежи текста (ИИ, без него — запасной
+// разбор) и отметить сообщение разобранным. Имя для чека здесь не ищется —
+// это делает processText до записи.
+func (b *Bot) recordTextPayments(ctx context.Context, msg *events.Message, text string, rawID int, senderName string, aiSync bool) (routedToAI, hasPayment bool) {
 	result := parser.ParseMessage(text)
 
 	// Грязный формат платежа (сумма и имя на разных строках, наличка/кто-собрал
@@ -1122,7 +1129,7 @@ func (b *Bot) processText(ctx context.Context, msg *events.Message, text string,
 	if !routedToAI && !keepUnparsed {
 		_ = b.db.MarkMessageParsed(ctx, rawID)
 	}
-	return routedToAI, len(result.Transactions) > 0, false
+	return routedToAI, len(result.Transactions) > 0
 }
 
 // mightBePayment — грубый фильтр «возможно, это платёж»: есть цифра (возможная
@@ -1242,6 +1249,9 @@ func (b *Bot) recordParsedLines(ctx context.Context, keep []parser.Transaction, 
 			continue
 		}
 		saved++
+	}
+	if saved > 0 {
+		b.dropCaptionParts(ctx, rawID, text) // разбивка чека + наличка: безналичные части — сам чек
 	}
 	return saved, failed
 }
@@ -3997,6 +4007,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		if amt == 0 {
 			amt = payerAmount
 		}
+		if payerOverride != "" {
+			// ФИО из подписи/свайпа: его запись в очереди имён уже использована.
+			b.consumeQueuedSameName(ctx, chat, senderJID, payerOverride, amt)
+		}
 		b.handleCashPhoto(ctx, chat, senderJID, payerOverride, amt, receivedAt, rawID)
 		// Это наличка (фото денег), а НЕ нераспознанный чек — помечаем сообщение
 		// обработанным, чтобы оно не всплывало в списке «нераспознанные чеки».
@@ -4011,10 +4025,17 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// клиента): по нему решаем, похоже ли изображение на чек вообще.
 	// Имя, написанное ПЕРЕД чеком (очередь), — только если оно без суммы или с
 	// суммой этого чека.
-	payerSrc := 0 // сообщение с именем из очереди
-	if payerOverride == "" {
+	payerSrc := 0     // сообщение с именем из очереди
+	breakdownSrc := 0 // текст до чека, расписавший его сумму по частям
+	if payerOverride != "" {
+		// ФИО из подписи/свайпа: запись этого клиента в очереди имён (на сумму
+		// чека) уже использована — следующему чеку другого клиента не достанется.
+		breakdownSrc = b.consumeQueuedSameName(ctx, chat, senderJID, payerOverride, rd.Amount)
+	} else {
 		if name, src, ok := b.takeQueuedPayer(ctx, chat, senderJID, rd.Amount); ok {
 			payerOverride, payerSrc = name, src
+		} else if name, src, ok := b.takeQueuedBreakdown(ctx, chat, senderJID, rd.Amount); ok {
+			payerOverride, payerSrc, breakdownSrc = name, src, src
 		}
 	}
 	receiptRecipient := rd.Recipient
@@ -4362,6 +4383,10 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)
+	}
+	if err == nil && breakdownSrc > 0 && !isDuplicate && !declined && clientConfirmed {
+		// «Исаев Харон 15000 + 20000», затем чек 35000 — один платёж: чек.
+		b.dropBreakdownTexts(ctx, breakdownSrc, rd.Amount)
 	}
 	// Время операции на чеке не прочиталось и номера нет (экран «Перевод
 	// выполнен» с получателем, подписанный свёрнутый экран): у него время
