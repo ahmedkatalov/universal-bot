@@ -4177,6 +4177,27 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			fmt.Println("Ошибка проверки дубля чека:", err)
 		}
 	}
+	// Время операции на чеке (нулевое — не прочиталось). Время позже присылки
+	// самого чека — ошибка чтения (или другой часовой пояс): по нему не судим.
+	var opTime time.Time
+	if rd.HasTxTime && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
+		opTime = rd.TxTime
+	}
+	// «Тот же чек» нашёлся, но это экран перевода без напечатанного времени и
+	// номера («Перевод выполнен», присланный раньше), а у этого чека время
+	// операции напечатано или есть номер: в учёте должен остаться полный чек
+	// (дата операции с него, номер свяжет копии в других группах), а повтором —
+	// экран. Экран показывает уже сделанный перевод: присланный раньше операции
+	// чека — другой перевод, его не заменяем. Подписанный экран неподписанным
+	// чеком не заменяем — клиента назвали только у экрана.
+	screenToReplace := 0
+	if dupMatch.Found && !dupMatch.StrongID && dupMatch.Screen && !declined && senderJID != "" &&
+		(rd.HasTxTime || rd.DocNumber != "" || rd.AuthCode != "") &&
+		(payerOverride != "" || !dupMatch.Named) &&
+		(opTime.IsZero() || !dupMatch.ReceivedAt.Before(opTime.Add(-2*time.Minute))) {
+		screenToReplace = dupMatch.ID
+		dupMatch = db.DuplicateMatch{}
+	}
 	// Чек без номера операции, присланный ещё раз (сначала без ФИО, потом с ФИО
 	// — или наоборот): «тот же клиент» тут не помогает — у неподписанной копии
 	// клиентом записан владелец карты. Сверяем то, что НАПЕЧАТАНО: получатель,
@@ -4224,13 +4245,15 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if isDuplicate {
 		// Повтор того же чека — клиента не спрашиваем (он уже есть у оригинала).
 		needsReview = false
+		screenToReplace = 0
 	}
 
 	// Если до этого тот же человек прислал СВЁРНУТЫЙ экран на ту же сумму (мы
 	// просили полный чек) — этот полный чек его заменяет: свёрнутый помечаем
 	// дублем, чтобы он не висел в «не вошло» и не задваивал «Максимум».
 	clientConfirmed := payerOverride != ""
-	if !isDuplicate {
+	supFound := false
+	if !isDuplicate && screenToReplace == 0 {
 		// Свёрнутый, уже записанный на ДРУГОГО клиента, — другой платёж (у
 		// работника много чеков на круглые суммы): его не заменяем, иначе платёж
 		// того клиента молча пропал бы из сбора. Свёрнутый ТОГО ЖЕ клиента (в
@@ -4250,16 +4273,12 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			return 0
 		}
 		// Экран показывает уже сделанный перевод: экран, присланный раньше, чем
-		// сделана операция этого чека (время напечатано на чеке), — другой перевод.
-		// Время операции позже присылки самого чека — ошибка чтения (или другой
-		// часовой пояс): по нему не судим.
-		var opTime time.Time
-		if rd.HasTxTime && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
-			opTime = rd.TxTime
-		}
+		// сделана операция этого чека (время напечатано на чеке, opTime), —
+		// другой перевод.
 		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, opTime, rawID, rankCollapsed); err != nil {
 			fmt.Println("Ошибка замены свёрнутого чека:", err)
 		} else if sup.Found {
+			supFound = true
 			fmt.Printf("Чек (сообщение %d): полный чек заменил ранее присланный свёрнутый на %.0f ₽\n", rawID, rd.Amount)
 			// Свёрнутый уже был привязан к клиенту (владелец ответил ФИО), а у этого
 			// полного чека клиента рядом нет — переносим клиента на него. Иначе платёж
@@ -4302,6 +4321,21 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	})
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)
+	}
+	// Полный чек того же перевода, что экран без времени и номера, присланный
+	// раньше (или вскоре после операции): считаем полный чек, экран — повтор, и
+	// спрашиваем «тот же или другой?» (номера у экрана нет — не наверняка).
+	if err == nil && !isDuplicate && !declined && !supFound &&
+		(screenToReplace > 0 || (clientConfirmed && senderJID != "" && (rd.HasTxTime || rd.DocNumber != "" || rd.AuthCode != ""))) {
+		if rid, _, ok, e := b.db.ReceiptOfRaw(ctx, rawID); e != nil {
+			fmt.Println("Ошибка поиска сохранённого чека:", e)
+		} else if ok {
+			if same, e := b.db.ReplaceScreenWithCheck(ctx, rid, screenToReplace); e != nil {
+				fmt.Println("Ошибка замены экрана полным чеком:", e)
+			} else if same.Found {
+				b.reportScreenReplaced(ctx, chat, waMsgID, senderJID, same)
+			}
+		}
 	}
 	// Время операции на чеке не прочиталось и номера нет (экран «Перевод
 	// выполнен» с получателем, подписанный свёрнутый экран): у него время

@@ -340,6 +340,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 			if !b.reresolveWatchByCheck(ctx, chat, quotedID, canonical) {
 				fmt.Printf("Чек переатрибутирован на клиента %q (свайп с ФИО на чек)\n", canonical)
 			}
+			b.crossCheckNamed(ctx, chat, quotedID, 0)
 			return true
 		}
 		// Свайп на текстовый платёж — уточнили ФИО его клиента.
@@ -365,6 +366,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 					_ = b.db.MarkMessageParsed(ctx, rawID)
 					b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
 					fmt.Printf("Чек переатрибутирован на клиента %q (ФИО+сумма рядом с чеком)\n", canonical)
+					b.crossCheckNamed(ctx, chat, "", checkRaw)
 					return true
 				}
 			}
@@ -392,6 +394,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	_ = b.db.MarkMessageParsed(ctx, rawID)
 	fmt.Printf("Чек переатрибутирован на клиента %q (ФИО написали рядом с чеком)\n", canonical)
 	b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+	b.crossCheckNamed(ctx, chat, "", checkRaw)
 	return true
 }
 
@@ -876,6 +879,7 @@ func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text
 		}
 		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, cid, rawID); err == nil && found {
 			b.reresolveWatchByCheck(ctx, chat, quotedID, canonical)
+			b.crossCheckNamed(ctx, chat, quotedID, 0)
 		}
 		return
 	}
@@ -893,6 +897,7 @@ func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text
 	}
 	if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, cid, rawID, checkAmt); err == nil && found {
 		b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+		b.crossCheckNamed(ctx, chat, "", checkRaw)
 	}
 }
 

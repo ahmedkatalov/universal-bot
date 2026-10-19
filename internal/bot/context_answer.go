@@ -68,7 +68,7 @@ func (b *Bot) quotesCmfAsk(ctx context.Context, msg *events.Message) bool {
 // чека, а не ответ на старый вопрос.
 func (b *Bot) contextAnswerBlocked(ctx context.Context, msg *events.Message) bool {
 	a, ok := b.recentOpenAsk(msg.Info.Chat.String())
-	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt") || b.db == nil {
+	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt" && a.kind != "cross") || b.db == nil {
 		return false
 	}
 	has, err := b.db.HasUnconfirmedReceiptFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), a.at)
@@ -185,6 +185,27 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		wantName := a.wantName && time.Since(a.at) < cmfNameWindow
 		return b.applyCmfWatchAnswer(ctx, chat, a.watchID, text, modeContext, wantName)
 
+	case "cross":
+		// «Этот чек уже прислан в другой группе как X… Чей он?» — без свайпа
+		// принимаем короткий ответ без сумм: одно из двух ФИО или «оставь».
+		if shortPlainReply(text, 4) {
+			b.clarify.mu.Lock()
+			ca, found := b.clarify.crossAsks[a.askID]
+			b.clarify.mu.Unlock()
+			if !found {
+				ca, found = b.crossAskFromDB(ctx, a.askID)
+			}
+			if found && b.applyCrossClientAnswer(ctx, chat, a.askID, ca, text, false) {
+				return true
+			}
+		}
+		// Не ответ на «чей он?» — может быть ответом на открытый ранее «чей чек?».
+		q := b.pickReceiptAsk(groupJID, parser.ExtractAmount(text))
+		if q.receiptWaID == "" || (sender != "" && q.senderJID != "" && sender != q.senderJID && !admin) {
+			return false
+		}
+		return b.contextReceiptAnswer(ctx, chat, q, text)
+
 	case "cash_collector":
 		// Без свайпа — только явный ответ «у Дени» / «Мансур взял» / «отдал Адаму»
 		// или известное имя; новый платёж и болтовня («Ок понял») — не ответ.
@@ -198,54 +219,61 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		return false
 
 	case "receipt":
-		// Несколько сумм («Исаев Харон 15000 20000», «Исаев Харон 15000,
-		// Магомедов Ахмед 10000», строки сумм) — это платежи, а не ответ «чей
-		// чек?»: их запишет обычный разбор, а чек подпишет пара «ФИО сумма» на
-		// его сумму. Наличка с суммой («… нал», «… Мансур взял», «… отдал
-		// Адаму») — другой платёж, тоже не ответ про чек.
-		if countAmountLines(text) > 1 || severalAmounts(text) ||
-			parser.ExtractAmount(text) > 0 && textCash(text) {
-			return false
-		}
-		// Несколько открытых вопросов «чей чек?»: ответ — к самому раннему, а если
-		// в ответе сумма — к чеку на эту сумму.
-		amount := parser.ExtractAmount(text)
-		if q := b.pickReceiptAsk(groupJID, amount); q.receiptWaID != "" {
-			a = q
-		}
-		name, _, deferToAI := clarifyNameFromReply(text)
-		if deferToAI {
-			return false
-		}
-		switch {
-		case a.needAmount && !a.needName:
-			// Нужна только сумма — принимаем, если это ПО СУТИ одна сумма (без ФИО).
-			if amount <= 0 || name != "" {
-				return false
-			}
-		case a.needName && !a.needAmount:
-			// Нужно только ФИО — принимаем голое имя; с суммой — только если она
-			// равна сумме этого чека («Хасанов Ислам 15000» на вопрос о 15000).
-			if name == "" || (amount > 0 && (a.amount <= 0 || math.Abs(amount-a.amount) >= 1)) {
-				return false
-			}
-		default:
-			// Не прочитали ни сумму, ни клиента — примем ФИО и/или сумму.
-			if name == "" && amount <= 0 {
-				return false
-			}
-		}
-		answer := text
-		if a.needName && !a.needAmount && amount > 0 {
-			answer = name // сумму уже знаем — берём только ФИО
-		}
-		handled, done := b.applyReceiptAnswer(ctx, chat, a.receiptWaID, answer)
-		if done {
-			b.dropReceiptAsk(groupJID, a.receiptWaID)
-		}
-		return handled
+		return b.contextReceiptAnswer(ctx, chat, a, text)
 	}
 	return false
+}
+
+// contextReceiptAnswer — ответ без свайпа на вопрос «чей чек?»/«какая сумма?»
+// (a — последний такой вопрос группы).
+func (b *Bot) contextReceiptAnswer(ctx context.Context, chat types.JID, a openAsk, text string) bool {
+	groupJID := chat.String()
+	// Несколько сумм («Исаев Харон 15000 20000», «Исаев Харон 15000,
+	// Магомедов Ахмед 10000», строки сумм) — это платежи, а не ответ «чей
+	// чек?»: их запишет обычный разбор, а чек подпишет пара «ФИО сумма» на
+	// его сумму. Наличка с суммой («… нал», «… Мансур взял», «… отдал
+	// Адаму») — другой платёж, тоже не ответ про чек.
+	if countAmountLines(text) > 1 || severalAmounts(text) ||
+		parser.ExtractAmount(text) > 0 && textCash(text) {
+		return false
+	}
+	// Несколько открытых вопросов «чей чек?»: ответ — к самому раннему, а если
+	// в ответе сумма — к чеку на эту сумму.
+	amount := parser.ExtractAmount(text)
+	if q := b.pickReceiptAsk(groupJID, amount); q.receiptWaID != "" {
+		a = q
+	}
+	name, _, deferToAI := clarifyNameFromReply(text)
+	if deferToAI {
+		return false
+	}
+	switch {
+	case a.needAmount && !a.needName:
+		// Нужна только сумма — принимаем, если это ПО СУТИ одна сумма (без ФИО).
+		if amount <= 0 || name != "" {
+			return false
+		}
+	case a.needName && !a.needAmount:
+		// Нужно только ФИО — принимаем голое имя; с суммой — только если она
+		// равна сумме этого чека («Хасанов Ислам 15000» на вопрос о 15000).
+		if name == "" || (amount > 0 && (a.amount <= 0 || math.Abs(amount-a.amount) >= 1)) {
+			return false
+		}
+	default:
+		// Не прочитали ни сумму, ни клиента — примем ФИО и/или сумму.
+		if name == "" && amount <= 0 {
+			return false
+		}
+	}
+	answer := text
+	if a.needName && !a.needAmount && amount > 0 {
+		answer = name // сумму уже знаем — берём только ФИО
+	}
+	handled, done := b.applyReceiptAnswer(ctx, chat, a.receiptWaID, answer)
+	if done {
+		b.dropReceiptAsk(groupJID, a.receiptWaID)
+	}
+	return handled
 }
 
 // collectorAnswerLike — похоже на ответ «кто забрал наличку»: есть слово-маркер
@@ -400,6 +428,7 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 		_ = b.db.SetReceiptSourceByMessage(ctx, receiptWaID, answerRawFrom(ctx))
 		b.sendText(chat, "Записал: чек — клиент "+canonical+".")
 		b.syncWatchByCheckWa(ctx, chat, receiptWaID, canonical)
+		b.crossCheckNamed(ctx, chat, receiptWaID, 0)
 	} else {
 		b.sendText(chat, "Поправил сумму чека.")
 	}

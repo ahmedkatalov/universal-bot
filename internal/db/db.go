@@ -533,6 +533,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// Человек ответил «другой» на «похоже, это тот же чек» — назовут клиента,
 		// бот не переспрашивает «тот же?» по слабому совпадению.
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_denied BOOLEAN NOT NULL DEFAULT false`,
+		// Вопрос бота «этот чек уже прислан в другой группе как X — чей он?» по
+		// этому чеку: ответ свайпом найдёт его и после перезапуска бота.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS cross_ask_msg_id TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_bank_receipts_cross_ask ON bank_receipts(cross_ask_msg_id) WHERE cross_ask_msg_id IS NOT NULL`,
 		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
 		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,
@@ -2081,6 +2085,14 @@ type DuplicateMatch struct {
 	Client    string // на кого записан найденный чек
 	StrongID  bool   // совпал номер операции/документа или код авторизации
 	WaMessage string // id WhatsApp сообщения с найденным чеком
+	// Найденный чек — экран перевода без напечатанного времени и номера
+	// (время операции у него — время сообщения), присланный в группу работником
+	// (не копия, пересланная ботом): ID — его запись, ReceivedAt — когда его
+	// прислали.
+	ID         int
+	Screen     bool
+	Named      bool // клиент найденного чека назван (подпись, ответ)
+	ReceivedAt time.Time
 }
 
 // FindDuplicateReceiptEx ищет тот же чек, присланный раньше. Совпадение
@@ -2097,7 +2109,10 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 	err := d.pool.QueryRow(ctx, `
 		SELECT br.tx_date, COALESCE(c.canonical_name, br.recipient_raw, ''),
 		       COALESCE(($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8), false),
-		       COALESCE(rm.wa_message_id, '')
+		       COALESCE(rm.wa_message_id, ''), br.id,
+		       (br.tx_time_guessed AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = ''
+		        AND COALESCE(rm.sender_jid, '') <> 'bot-forward'),
+		       (br.client_confirmed AND br.contact_id IS NOT NULL), COALESCE(rm.received_at, br.tx_date)
 		FROM bank_receipts br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
@@ -2125,11 +2140,13 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 		           OR lower(split_part(trim(br.sender_raw), ' ', 1)) = lower(split_part(trim($9), ' ', 1)))
 		    )
 		  )
-		ORDER BY 3 DESC, br.tx_date
+		-- Сначала тот же номер, потом чек с напечатанным временем (а не экран без
+		-- него — тот лишь «в пределах окна»).
+		ORDER BY 3 DESC, br.tx_time_guessed, br.tx_date
 		LIMIT 1
 	`, amount, txDate.Add(-DuplicateWindow), txDate.Add(DuplicateWindow), contactID, recipientRaw, groupJID, docNumber, authCode, senderRaw,
 		txGuessed, txDate).
-		Scan(&m.TxDate, &m.Client, &m.StrongID, &m.WaMessage)
+		Scan(&m.TxDate, &m.Client, &m.StrongID, &m.WaMessage, &m.ID, &m.Screen, &m.Named, &m.ReceivedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return m, nil
 	}

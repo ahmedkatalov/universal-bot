@@ -78,8 +78,9 @@ type paymentAsk struct {
 
 // openAsk — открытый вопрос бота в группе (для ответа без свайпа).
 type openAsk struct {
-	kind        string // "receipt" | "cash_collector" | "cash_dup" | "cmf_watch"
+	kind        string // "receipt" | "cash_collector" | "cash_dup" | "cmf_watch" | "cross"
 	receiptWaID string // для receipt — id сообщения-чека
+	askID       string // для cross — id вопроса бота «чей он?» (тот же чек в другой группе)
 	txID        int    // для cash_* — id транзакции
 	watchID     int    // для cmf_watch — наблюдение сверки («за кого платёж?»)
 	senderJID   string // чей чек/наличка (ответ без свайпа принимаем от него или от владельца)
@@ -410,6 +411,7 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		if found, _, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
 			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
 			b.syncWatchByCheckWa(ctx, jid, it.WaMessageID, canonical)
+			b.crossCheckNamed(ctx, jid, it.WaMessageID, 0)
 			return true
 		}
 	}
@@ -824,9 +826,13 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	if isSameAsk && b.applySameCheckAnswer(ctx, msg.Info.Chat, quotedID, same, text) {
 		return true
 	}
-	// «Этот чек уже прислан в другой группе как X — чей он?» — ФИО решает за обе копии.
+	// «Этот чек уже прислан в другой группе как X — чей он?» — ФИО решает за обе
+	// копии. Связь могла потеряться из памяти (рестарт бота) — ищем в базе.
+	if !isCrossAsk && !isPayAsk && !isFixAsk && !isSameAsk {
+		cross, isCrossAsk = b.crossAskFromDB(ctx, quotedID)
+	}
 	if isCrossAsk {
-		return b.applyCrossClientAnswer(ctx, msg.Info.Chat, quotedID, cross, text)
+		return b.applyCrossClientAnswer(ctx, msg.Info.Chat, quotedID, cross, text, true)
 	}
 
 	// Ответ на вопрос «наличка-повтор: новый или тот же?».

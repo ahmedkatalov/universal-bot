@@ -29,6 +29,10 @@ type SameCheck struct {
 	Tentative    bool      // уверенности нет — спросить «тот же чек или другой?»
 	ThisClient   string    // клиент проверяемого чека (если назван)
 	OtherClient  bool      // тот же номер операции, но названы РАЗНЫЕ клиенты
+	// ScreenReplaced — проверяемый полный чек заменил экран того же перевода
+	// без напечатанного времени и номера (повтором стал экран, VictimWa).
+	ScreenReplaced bool
+	KeptNamed      bool // клиент оставшегося в учёте назван (а не владелец карты)
 }
 
 // completedReceipt — проверяемый чек.
@@ -129,12 +133,15 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		oWa, oClient    string
 		oNamed, oStrong bool
 		oContact        *int
-		oTx             time.Time
+		oTx, oReceived  time.Time
+		oScreen         bool
 	)
 	err = d.pool.QueryRow(ctx, `
 		SELECT br.id, COALESCE(rm.wa_message_id, ''), (br.client_confirmed AND br.contact_id IS NOT NULL), br.contact_id,
 		       COALESCE(c.canonical_name, br.recipient_raw, ''), br.tx_date,
-		       COALESCE(($3 <> '' AND br.doc_number = $3) OR ($4 <> '' AND br.auth_code = $4), false) AS strong
+		       COALESCE(($3 <> '' AND br.doc_number = $3) OR ($4 <> '' AND br.auth_code = $4), false) AS strong,
+		       (br.tx_time_guessed AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = ''),
+		       rm.received_at
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
@@ -155,13 +162,19 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		        AND (COALESCE(br.sender_raw, '') = '' OR $9 = ''
 		             OR lower(split_part(trim(br.sender_raw), ' ', 1)) = lower(split_part(trim($9), ' ', 1))))
 		  )
-		ORDER BY 7 DESC, rm.received_at, br.id
+		ORDER BY 7 DESC, br.tx_time_guessed, rm.received_at, br.id
 		LIMIT 1`, r.groupJID, receiptID, r.p.DocNumber, r.p.AuthCode, r.p.Amount, r.p.TxDate, heur, r.contactID, r.p.Sender).
-		Scan(&oID, &oWa, &oNamed, &oContact, &oClient, &oTx, &oStrong)
+		Scan(&oID, &oWa, &oNamed, &oContact, &oClient, &oTx, &oStrong, &oScreen, &oReceived)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 	case err != nil:
 		return res, err
+	case !oStrong && oScreen && !r.guessed && r.named == oNamed &&
+		(r.p.TxDate.After(r.received.Add(10*time.Minute)) || !oReceived.Before(r.p.TxDate.Add(-2*time.Minute))):
+		// Совпал экран без времени и номера, а у этого чека время операции
+		// напечатано: в учёте остаётся этот чек (дата операции с него), экран —
+		// повтор (см. replaceScreenWith).
+		return d.replaceScreenWith(ctx, receiptID, r, oID)
 	default:
 		res.Strong = oStrong
 		// Без общего номера совпали клиент, сумма и время — это может быть и
@@ -194,6 +207,15 @@ func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 			}
 			// Ничья копия при времени до минуты — решит её «чей чек?»; названные
 			// разными клиентами — не склеиваем.
+		}
+	}
+
+	// 4. У этого чека время операции напечатано (или есть номер), а экран того же
+	// перевода без времени и номера («Перевод выполнен», присланный до него или
+	// вскоре после) уже в учёте: остаётся этот чек, повтором — экран.
+	if allowTentative && !r.denied && r.named && (!r.guessed || r.p.DocNumber != "" || r.p.AuthCode != "") {
+		if s, err := d.replaceScreenWith(ctx, receiptID, r, 0); err != nil || s.Found {
+			return s, err
 		}
 	}
 
@@ -294,8 +316,8 @@ func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal,
 		JOIN bank_receipts o ON o.id <> dd.id AND o.is_duplicate = false AND o.ignored = false
 			AND COALESCE(o.group_jid, '') = COALESCE(dd.group_jid, '')
 			AND (
-				-- Свёрнутый экран: каким полным чеком он учтён.
-				(dd.collapsed AND o.raw_message_id = dd.superseded_by_raw) OR
+				-- Экран (свёрнутый или без времени и номера): каким полным чеком он учтён.
+				o.raw_message_id = dd.superseded_by_raw OR
 				(NOT dd.collapsed AND (
 				(NULLIF(dd.doc_number, '') IS NOT NULL AND o.doc_number = dd.doc_number) OR
 				(NULLIF(dd.auth_code, '') IS NOT NULL AND o.auth_code = dd.auth_code) OR
@@ -317,7 +339,7 @@ func (d *DB) DuplicateOriginalOf(ctx context.Context, waID string) (DupOriginal,
 		LEFT JOIN contacts c ON c.id = o.contact_id
 		WHERE drm.wa_message_id = $1 AND COALESCE(drm.deleted, false) = false
 		  AND dd.is_duplicate = true AND dd.ignored = false
-		ORDER BY 7 DESC, orm.received_at, o.id
+		ORDER BY 7 DESC, (o.raw_message_id = dd.superseded_by_raw) IS TRUE DESC, orm.received_at, o.id
 		LIMIT 1`, waID).
 		Scan(&o.KeptWa, &o.KeptNamed, &o.KeptContactID, &o.KeptClient, &o.Amount, &o.TxDate, &o.Strong)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -395,4 +417,124 @@ func (d *DB) NamedCopiesInOtherGroups(ctx context.Context, groupJID string, excl
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// ReplaceScreenWithCheck — полный чек checkID (время операции напечатано и/или
+// есть номер операции) — тот же перевод, что экран без времени и номера
+// («Перевод выполнен», подписанный свёрнутый экран), уже учтённый в группе.
+// screenID — найденный при приёме экран (тот же клиент, сумма, «время» экрана —
+// время сообщения — в окне проверки повтора); 0 — найти: тот же работник,
+// названный тот же клиент, сумма, получатель и плательщик на экране не спорят с
+// чеком, экран прислан не раньше операции чека (2 минуты на разницу часов) и не
+// дальше суток от него. В учёте остаётся полный чек — по нему дата операции, и
+// его номер свяжет копии чека в других группах; экран — повтор, заменённый этим
+// чеком. Номера у экрана нет — это не наверняка (Tentative): вызывающий
+// спрашивает «тот же или другой?», ответ «другой» вернёт экран.
+func (d *DB) ReplaceScreenWithCheck(ctx context.Context, checkID, screenID int) (SameCheck, error) {
+	r, ok, err := d.loadCompletedReceipt(ctx, checkID)
+	if err != nil || !ok {
+		return SameCheck{}, err
+	}
+	if !r.live || r.p.Amount <= 0 || r.sender == "bot-forward" || r.groupJID == "" {
+		return SameCheck{}, nil
+	}
+	if r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
+		return SameCheck{}, nil // это и сам экран без времени и номера
+	}
+	if screenID == 0 && (!r.named || r.denied) {
+		return SameCheck{}, nil
+	}
+	return d.replaceScreenWith(ctx, checkID, r, screenID)
+}
+
+func (d *DB) replaceScreenWith(ctx context.Context, checkID int, r completedReceipt, screenID int) (SameCheck, error) {
+	var res SameCheck
+	var (
+		sID        int
+		sWa, sName string
+		sNamed     bool
+	)
+	if screenID > 0 {
+		err := d.pool.QueryRow(ctx, `
+			SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(c.canonical_name, br.recipient_raw, ''),
+			       (br.client_confirmed AND br.contact_id IS NOT NULL)
+			FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			LEFT JOIN contacts c ON c.id = br.contact_id
+			WHERE br.id = $1 AND br.id <> $2 AND COALESCE(br.group_jid, rm.wa_group_jid) = $3
+			  AND br.is_duplicate = false AND br.ignored = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
+			  AND br.tx_time_guessed AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = ''`,
+			screenID, checkID, r.groupJID).Scan(&sID, &sWa, &sName, &sNamed)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return res, nil
+		}
+		if err != nil {
+			return res, err
+		}
+	} else {
+		if !r.named || r.contactID == nil || r.sender == "" {
+			return res, nil
+		}
+		// Время операции позже, чем прислали сам чек, — ошибка чтения (или другой
+		// часовой пояс): по нему не судим.
+		var op *time.Time
+		if !r.guessed && !r.p.TxDate.After(r.received.Add(10*time.Minute)) {
+			t := r.p.TxDate
+			op = &t
+		}
+		ownerNorm := printedNorm("$7::text")
+		payerNorm := printedNorm("$8::text")
+		err := d.pool.QueryRow(ctx, `
+			SELECT br.id, COALESCE(rm.wa_message_id, ''), COALESCE(c.canonical_name, br.recipient_raw, '')
+			FROM bank_receipts br
+			JOIN raw_messages rm ON rm.id = br.raw_message_id
+			LEFT JOIN contacts c ON c.id = br.contact_id
+			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1 AND br.id <> $2
+			  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
+			  AND NOT br.same_check_denied
+			  -- Свёрнутые экраны заменяет SupersedeCollapsedReceipt (свои правила).
+			  AND br.collapsed = false
+			  AND COALESCE(rm.deleted, false) = false
+			  AND rm.sender_jid = $3
+			  AND br.tx_time_guessed AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = ''
+			  AND br.client_confirmed AND br.contact_id = $4
+			  AND br.amount = $5::numeric
+			  AND rm.received_at BETWEEN $6::timestamptz - interval '1 day' AND $6::timestamptz + interval '1 day'
+			  AND ($9::timestamptz IS NULL OR rm.received_at >= $9::timestamptz - interval '2 minutes')
+			  AND (`+ownerNorm+` = '' OR `+printedNorm(printedRecipientOf("br"))+` = '' OR `+printedNorm(printedRecipientOf("br"))+` = `+ownerNorm+`)
+			  AND (`+payerNorm+` = '' OR `+printedNorm("br.sender_raw")+` = '' OR `+printedNorm("br.sender_raw")+` = `+payerNorm+`)
+			ORDER BY abs(extract(epoch FROM rm.received_at - $6::timestamptz)), br.id
+			LIMIT 1`, r.groupJID, checkID, r.sender, r.contactID, r.p.Amount, r.received, r.p.Recipient, r.p.Sender, op).
+			Scan(&sID, &sWa, &sName)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return res, nil
+		}
+		if err != nil {
+			return res, err
+		}
+		sNamed = true
+	}
+	tag, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts v SET is_duplicate = true, superseded_by_raw = k.raw_message_id
+		FROM bank_receipts k WHERE v.id = $1 AND k.id = $2 AND v.is_duplicate = false`, sID, checkID)
+	if err != nil {
+		return res, err
+	}
+	if tag.RowsAffected() != 1 {
+		return res, nil
+	}
+	res.Found, res.ScreenReplaced, res.Tentative = true, true, true
+	res.VictimWa, res.KeptWa = sWa, r.wa
+	res.Client, res.KeptNamed = r.client, r.named
+	if !r.named && sNamed {
+		res.Client = sName
+	}
+	res.Amount, res.TxDate = r.p.Amount, r.p.TxDate
+	if r.named {
+		res.ThisClient = r.client
+	}
+	fmt.Printf("Чек #%d (%s): тот же перевод, что экран без времени и номера (%s) — считаю этот чек, экран — повтор\n", checkID, r.wa, sWa)
+	return res, nil
 }
