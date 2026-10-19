@@ -3253,6 +3253,8 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 			"Чек и текст про него («Магомедов Ахмед 5000» рядом с чеком) — ОДИН платёж: исключаются вместе. " +
 			"Текст-итог платежа частями («Магомедов Ахмед 15000» про чеки 10000 + 5000) — тоже один платёж со всеми " +
 			"своими чеками: без kind исключается весь платёж, с kind=text — только текст (чеки остаются в сборе). " +
+			"restore без kind и sender возвращает весь платёж, исключённый одним действием (чеки и тексты во всех группах " +
+			"вместе), — одной строкой, второй раз по другой группе возвращать не нужно. " +
 			"Если один платёж записан дважды (чек и отдельный такой же текст, два одинаковых текста) — исключай " +
 			"лишнюю запись, указав kind и/или sender («исключи текст Ислама» → kind=text, sender=Ислам). " +
 			"В группе исключение касается только этой группы: если тот же чек прислан и в другую группу, " +
@@ -3378,6 +3380,9 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 				for _, op := range collapseTextTwins(candidates) {
 					entries = append(entries, opEntry{op: op})
 				}
+				// Исключённое одним действием (весь платёж частями: чеки и итоги
+				// в разных группах) — один платёж: одна строка, вернётся целиком.
+				entries = groupOpsByBatch(entries)
 			}
 			groups := b.joinedGroups(ctx)
 			groupName := func(g string) string {
@@ -3426,7 +3431,7 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 						}
 					}
 					op := entries[i].op
-					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op, groupName), nil
+					return res.lead(opLabel(op)) + res.note(op, groupName), nil
 				}
 			}
 
@@ -3450,12 +3455,38 @@ func (b *Bot) correctionTool(defaultGroupJID string) ai.Tool {
 					if err != nil {
 						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
 					}
-					return fmt.Sprintf("Операция исключена из учёта: %s. Отчёты уже учитывают это изменение.", opLabel(op)) + res.note(op, groupName), nil
+					return res.lead(opLabel(op)) + res.note(op, groupName), nil
 				}
-				if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
+				// Возвращаем всё, что владелец исключил тем же действием (весь
+				// платёж: чеки, копии, тексты, итоги в других группах), — иначе
+				// вернулся бы один текст без своих чеков и посчитался сам по себе.
+				// Владелец назвал именно эту запись (kind/sender) — только её, и
+				// говорим, что из того же платежа осталось исключённым.
+				if opKind(args.Kind) != "" || sender != "" {
+					if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
+						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+					}
+					left, _ := b.db.BatchOperations(ctx, op.Batch)
+					return fmt.Sprintf("Операция возвращена в учёт: %s. Отчёты уже учитывают это изменение.", opLabel(op)) +
+						leftExcludedNote(op, left, groupName), nil
+				}
+				back, err := b.db.RestoreBatch(ctx, op.Batch)
+				if err != nil {
 					return "", fmt.Errorf("не удалось обновить операцию: %w", err)
 				}
-				return fmt.Sprintf("Операция возвращена в учёт: %s. Отчёты уже учитывают это изменение.", opLabel(op)), nil
+				self := false
+				for _, r := range back {
+					if r.Kind == op.Kind && r.ID == op.ID {
+						self = true
+					}
+				}
+				if !self {
+					if err := b.db.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
+						return "", fmt.Errorf("не удалось обновить операцию: %w", err)
+					}
+				}
+				return fmt.Sprintf("Операция возвращена в учёт: %s. Отчёты уже учитывают это изменение.", opLabel(op)) +
+					restoredNote(op, back, groupName), nil
 			default:
 				var sb strings.Builder
 				sb.WriteString("Нашёл несколько подходящих операций (каждая строка — отдельный платёж в сборе). " +

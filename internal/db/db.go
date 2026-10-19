@@ -511,6 +511,16 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		)`,
 		`CREATE INDEX IF NOT EXISTS idx_amount_corrections_raw ON amount_corrections(raw_message_id)`,
+		// Итог платежа частями, сдвинутый вслед за поправкой своей части: при
+		// откате поправки части он сдвигается обратно на ту же разницу (а не
+		// ставится в прежнюю сумму — после поправки другой части она уже другая).
+		`ALTER TABLE amount_corrections ADD COLUMN IF NOT EXISTS follow BOOLEAN NOT NULL DEFAULT false`,
+		// Записи, исключённые владельцем одним действием (весь платёж: чеки,
+		// копии, тексты, итоги в других группах): «верни» возвращает их вместе.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS excl_batch TEXT`,
+		`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS excl_batch TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_bank_receipts_excl_batch ON bank_receipts(excl_batch) WHERE excl_batch IS NOT NULL`,
+		`CREATE INDEX IF NOT EXISTS idx_transactions_excl_batch ON transactions(excl_batch) WHERE excl_batch IS NOT NULL`,
 		// Ответ на вопрос бота: на какой вопрос (вид и цель) и какое сообщение он
 		// цитировал — чтобы правка ответа применилась к тому же вопросу.
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS answer_kind TEXT`,
@@ -2388,6 +2398,9 @@ type OperationRef struct {
 	Sender    string
 	Phone     string
 	Collector string
+	// Batch — исключена одним действием владельца вместе с другими записями
+	// (ExcludeOperation): «верни» возвращает их все.
+	Batch string
 }
 
 // FindOperations ищет операции по сумме с необязательными уточнениями:
@@ -2403,7 +2416,7 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 			       t.is_cash AS cash, COALESCE(rm.received_at, t.tx_date::timestamptz) AS received,
 			       COALESCE(NULLIF(po.name, ''), NULLIF(rm.sender_name, ''), '') AS sender,
 			       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1) AS phone,
-			       COALESCE(t.collector, '') AS collector
+			       COALESCE(t.collector, '') AS collector, COALESCE(t.excl_batch, '') AS batch
 			FROM transactions t
 			LEFT JOIN contacts c ON c.id = t.contact_id
 			LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
@@ -2417,7 +2430,7 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 			       false, COALESCE(rm.received_at, br.tx_date),
 			       COALESCE(NULLIF(po.name, ''), NULLIF(br.submitted_by, ''), NULLIF(rm.sender_name, ''), ''),
 			       split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1),
-			       COALESCE(br.collector, '')
+			       COALESCE(br.collector, ''), COALESCE(br.excl_batch, '')
 			FROM bank_receipts br
 			LEFT JOIN contacts c ON c.id = br.contact_id
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
@@ -2441,7 +2454,7 @@ func (d *DB) FindOperations(ctx context.Context, amount float64, person string, 
 		var op OperationRef
 		var groupJID string
 		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &groupJID, &op.Ignored, &op.Cash, &op.Received,
-			&op.Sender, &op.Phone, &op.Collector); err != nil {
+			&op.Sender, &op.Phone, &op.Collector, &op.Batch); err != nil {
 			return nil, err
 		}
 		op.GroupJID = groupJID
@@ -2521,6 +2534,17 @@ func (d *DB) BookSpans(ctx context.Context, spans [][2]time.Time) (*ledger.Book,
 
 // SetOperationIgnored включает/выключает ручное исключение операции из учёта.
 func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignored bool) error {
+	return d.setOperationIgnored(ctx, kind, id, ignored, "")
+}
+
+// ExcludeOperation — ручное исключение операции из учёта как часть одного
+// действия владельца batch (весь платёж: чеки, копии, тексты): «верни»
+// возвращает всё исключённое этим действием вместе (RestoreBatch).
+func (d *DB) ExcludeOperation(ctx context.Context, kind string, id int, batch string) error {
+	return d.setOperationIgnored(ctx, kind, id, true, batch)
+}
+
+func (d *DB) setOperationIgnored(ctx context.Context, kind string, id int, ignored bool, batch string) error {
 	table := ""
 	switch kind {
 	case "transaction":
@@ -2530,17 +2554,74 @@ func (d *DB) SetOperationIgnored(ctx context.Context, kind string, id int, ignor
 	default:
 		return fmt.Errorf("неизвестный тип операции %q", kind)
 	}
-	q := `UPDATE ` + table + ` SET ignored = $2 WHERE id = $1`
+	q := `UPDATE ` + table + ` SET ignored = $2, excl_batch = NULLIF($3, '') WHERE id = $1`
 	if table == "transactions" {
 		// Ручное решение владельца важнее ответа «тот же»: такую наличку
 		// удаление другого сообщения не вернёт.
-		q = `UPDATE transactions SET ignored = $2, dup_same_as = NULL WHERE id = $1`
+		q = `UPDATE transactions SET ignored = $2, dup_same_as = NULL, excl_batch = NULLIF($3, '') WHERE id = $1`
 	}
-	_, err := d.pool.Exec(ctx, q, id, ignored)
+	_, err := d.pool.Exec(ctx, q, id, ignored, batch)
 	if err == nil && kind == "receipt" {
 		d.lockCopy(ctx, id)
 	}
 	return err
+}
+
+// RestoreBatch возвращает в учёт всё, что владелец исключил одним действием
+// batch (кроме записей удалённых сообщений), и отдаёт возвращённое.
+func (d *DB) RestoreBatch(ctx context.Context, batch string) ([]OperationRef, error) {
+	ops, err := d.BatchOperations(ctx, batch)
+	if err != nil {
+		return nil, err
+	}
+	var out []OperationRef
+	for _, op := range ops {
+		if err := d.SetOperationIgnored(ctx, op.Kind, op.ID, false); err != nil {
+			return out, err
+		}
+		out = append(out, op)
+	}
+	return out, nil
+}
+
+// BatchOperations — записи, которые владелец исключил одним действием batch и
+// которые всё ещё исключены (кроме записей удалённых сообщений и налички,
+// признанной потом повтором другой).
+func (d *DB) BatchOperations(ctx context.Context, batch string) ([]OperationRef, error) {
+	if batch == "" {
+		return nil, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT 'transaction', t.id, COALESCE(c.canonical_name, t.raw_name, ''), t.amount::float8, t.tx_date::timestamptz,
+		       COALESCE(rm.wa_group_jid, ''), t.is_cash
+		FROM transactions t
+		LEFT JOIN contacts c ON c.id = t.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = t.raw_message_id
+		WHERE t.excl_batch = $1 AND t.ignored AND t.dup_same_as IS NULL AND COALESCE(rm.deleted, false) = false
+		UNION ALL
+		SELECT 'receipt', br.id, COALESCE(c.canonical_name, br.recipient_raw, ''), br.amount::float8, br.tx_date,
+		       COALESCE(br.group_jid, ''), false
+		FROM bank_receipts br
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE br.excl_batch = $1 AND br.ignored AND COALESCE(rm.deleted, false) = false
+		ORDER BY 1, 2`, batch)
+	if err != nil {
+		return nil, err
+	}
+	var ops []OperationRef
+	for rows.Next() {
+		var op OperationRef
+		if err := rows.Scan(&op.Kind, &op.ID, &op.Name, &op.Amount, &op.TxDate, &op.GroupJID, &op.Cash); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		op.Batch = batch
+		op.Ignored = true
+		ops = append(ops, op)
+	}
+	rows.Close()
+	return ops, rows.Err()
 }
 
 // ReceiptTextTwins — живые текстовые платежи того же контакта и суммы, что чек
@@ -3049,12 +3130,7 @@ func (d *DB) CarryOverEditedTx(ctx context.Context, rawID int, old []TxState) er
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET collector = $2 WHERE id = $1`, n.ID, o.Collector)
 		}
 		// Живые поправки суммы этого платежа: та же сумма до поправки — применяем.
-		var corrNew float64
-		if err := d.pool.QueryRow(ctx, `
-			WITH c AS (UPDATE amount_corrections SET target_id = $2 WHERE kind = 'tx' AND target_id = $1 AND reverted = false
-			           RETURNING old_amount, new_amount, id)
-			SELECT COALESCE((SELECT new_amount::float8 FROM c WHERE abs(old_amount - $3) < 0.01 ORDER BY id DESC LIMIT 1), 0)`,
-			o.ID, n.ID, n.Amount).Scan(&corrNew); err == nil && corrNew > 0 {
+		if corrNew, ok := d.carryCorrections(ctx, o.ID, n.ID, n.Amount); ok && corrNew > 0 {
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1`, n.ID, corrNew)
 			n.Amount = corrNew
 		}
@@ -3063,6 +3139,51 @@ func (d *DB) CarryOverEditedTx(ctx context.Context, rawID int, old []TxState) er
 		}
 	}
 	return nil
+}
+
+// carryCorrections — живые поправки суммы прежнего платежа oldID переходят к
+// новому newID (правка сообщения) и применяются к его сумме amount по порядку:
+// поправка, прежняя сумма которой совпала, и дальше по цепочке («не 15000 а
+// 16000», затем «не 16000 а 17000» — итог платежа частями вслед за двумя
+// частями). Из поправок с той же прежней суммой — последняя.
+func (d *DB) carryCorrections(ctx context.Context, oldID, newID int, amount float64) (float64, bool) {
+	rows, err := d.pool.Query(ctx, `
+		WITH c AS (UPDATE amount_corrections SET target_id = $2 WHERE kind = 'tx' AND target_id = $1 AND reverted = false
+		           RETURNING old_amount, new_amount, id)
+		SELECT id, old_amount::float8, new_amount::float8 FROM c ORDER BY id`, oldID, newID)
+	if err != nil {
+		return 0, false
+	}
+	type corr struct {
+		id       int
+		old, new float64
+	}
+	var cs []corr
+	for rows.Next() {
+		var c corr
+		if err := rows.Scan(&c.id, &c.old, &c.new); err != nil {
+			rows.Close()
+			return 0, false
+		}
+		cs = append(cs, c)
+	}
+	rows.Close()
+	if rows.Err() != nil {
+		return 0, false
+	}
+	changed, last := false, 0
+	for {
+		pick := -1
+		for i, c := range cs {
+			if c.id > last && math.Abs(c.old-amount) < 0.01 {
+				pick = i // по возрастанию id: последняя подходящая
+			}
+		}
+		if pick < 0 {
+			return amount, changed
+		}
+		amount, last, changed = cs[pick].new, cs[pick].id, true
+	}
 }
 
 // SetAnswerTarget — сообщение ответило на вопрос бота kind про target.
@@ -3244,6 +3365,11 @@ func (d *DB) PrepareMessageEdit(ctx context.Context, rawID int, body string) (Ed
 	if u.Corrections, err = d.RevertCorrections(ctx, rawID); err != nil {
 		return u, err
 	}
+	// Прежние строки сообщения больше не вернёт и «верни» исключённого вместе
+	// с ними: их заменит новый разбор.
+	if _, err := d.pool.Exec(ctx, `UPDATE transactions SET excl_batch = NULL WHERE raw_message_id = $1 AND excl_batch IS NOT NULL`, rawID); err != nil {
+		return u, err
+	}
 	// Прежние строки сообщения заменит новый разбор: их «тот же» больше не
 	// действует (новая строка заново пройдёт проверку на повтор).
 	if _, err := d.pool.Exec(ctx, `UPDATE transactions SET ignored = true, dup_same_as = NULL WHERE raw_message_id = $1 AND (ignored = false OR dup_same_as IS NOT NULL)`, rawID); err != nil {
@@ -3342,6 +3468,7 @@ type CorrectionRef struct {
 	Kind     string // "tx" | "receipt"
 	TargetID int
 	Old, New float64
+	Follow   bool // итог платежа частями, сдвинутый вслед за своей частью
 }
 
 // RecordCorrection — запомнить поправку «не old а new» сообщения rawID.
@@ -3351,40 +3478,72 @@ func (d *DB) RecordCorrection(ctx context.Context, rawID int, kind string, targe
 	return err
 }
 
+// RecordFollowCorrection — поправка части платежа частями (сообщение rawID)
+// сдвинула текст-итог txID с old на amount. Откатывается вместе с поправкой
+// части и на ту же разницу: итог могли с тех пор сдвинуть поправкой другой
+// части, и «прежняя сумма» old ему уже не подходит.
+func (d *DB) RecordFollowCorrection(ctx context.Context, rawID, txID int, old, amount float64) error {
+	_, err := d.pool.Exec(ctx, `INSERT INTO amount_corrections (raw_message_id, kind, target_id, old_amount, new_amount, follow) VALUES ($1, 'tx', $2, $3, $4, true)`,
+		rawID, txID, old, amount)
+	return err
+}
+
 // RevertCorrections — поправку удалили/изменили: суммы, которые она поменяла,
-// возвращаются (если с тех пор их не правили иначе).
+// возвращаются (если с тех пор их не правили иначе). Итог платежа частями,
+// сдвинутый вслед за исправленной частью, сдвигается обратно на ту же
+// разницу — если сама часть вернулась (её не правили с тех пор иначе).
 func (d *DB) RevertCorrections(ctx context.Context, rawID int) ([]CorrectionRef, error) {
 	rows, err := d.pool.Query(ctx, `
 		UPDATE amount_corrections SET reverted = true WHERE raw_message_id = $1 AND reverted = false
-		RETURNING kind, target_id, old_amount::float8, new_amount::float8`, rawID)
+		RETURNING kind, target_id, old_amount::float8, new_amount::float8, follow`, rawID)
 	if err != nil {
 		return nil, err
 	}
 	var out []CorrectionRef
 	for rows.Next() {
 		var c CorrectionRef
-		if err := rows.Scan(&c.Kind, &c.TargetID, &c.Old, &c.New); err != nil {
+		if err := rows.Scan(&c.Kind, &c.TargetID, &c.Old, &c.New, &c.Follow); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		out = append(out, c)
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return out, err
+	}
+	partsBack := false // сумма исправленной записи вернулась
 	for _, c := range out {
+		if c.Follow {
+			continue
+		}
 		switch c.Kind {
 		case "tx":
-			if _, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.01`, c.TargetID, c.Old, c.New); err != nil {
+			tag, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.01`, c.TargetID, c.Old, c.New)
+			if err != nil {
 				return out, err
 			}
+			partsBack = partsBack || tag.RowsAffected() > 0
 			_ = d.RecheckCashRepeat(ctx, c.TargetID)
 		case "receipt":
-			if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.01`, c.TargetID, c.Old, c.New); err != nil {
+			tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.01`, c.TargetID, c.Old, c.New)
+			if err != nil {
 				return out, err
 			}
+			partsBack = partsBack || tag.RowsAffected() > 0
 			_ = d.SyncWatchWithReceipt(ctx, c.TargetID)
 		}
 	}
-	return out, rows.Err()
+	for _, c := range out {
+		if !c.Follow || !partsBack {
+			continue
+		}
+		if _, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = round(amount - ($3::numeric - $2::numeric), 2)
+			WHERE id = $1 AND amount - ($3::numeric - $2::numeric) > 0`, c.TargetID, c.Old, c.New); err != nil {
+			return out, err
+		}
+	}
+	return out, nil
 }
 
 // CorrectionsByMessage — сколько живых поправок суммы в сообщении (по id WhatsApp).

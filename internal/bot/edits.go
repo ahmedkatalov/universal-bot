@@ -79,6 +79,12 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 	if newText == "" || newText == strings.TrimSpace(ref.Body) {
 		return false
 	}
+	// Текст-итог платежа частями: его новую сумму проверяем, как поправку
+	// «не 15000 а 16000» (до правки — пока движок ещё видит итог с его чеками).
+	var splits []*splitTotal
+	if !q.quiet() && ref.HandledAs == "" {
+		splits = b.splitTotalsOfMessage(ctx, ref)
+	}
 
 	undo, err := b.db.PrepareMessageEdit(ctx, ref.ID, newText)
 	if err != nil {
@@ -164,11 +170,71 @@ func (b *Bot) applyEdit(ctx context.Context, msg *events.Message, prot *waProto.
 	if err := b.db.CarryOverEditedTx(ctx, ref.ID, undo.OldStates); err != nil {
 		fmt.Println("Правка сообщения: перенос уточнений не удался:", err)
 	}
+	for _, ask := range b.keepEditedSplitTotals(ctx, ref.ID, splits) {
+		say(ask)
+	}
 
 	now, _ := b.db.TxRefsByRawID(ctx, ref.ID)
 	say(editNote(undo.OldTx, now))
 	fmt.Printf("Правка сообщения %s: было %v, стало %v\n", origID, undo.OldTx, now)
 	return true
+}
+
+// splitTotalsOfMessage — платежи сообщения, которые движок считает текстом-
+// итогом платежа частями (сумма его чеков).
+func (b *Bot) splitTotalsOfMessage(ctx context.Context, ref db.RawMessageRef) []*splitTotal {
+	old, err := b.db.TxRefsByRawID(ctx, ref.ID)
+	if err != nil || len(old) == 0 {
+		return nil
+	}
+	x := b.loadPayIndex(ctx, [][]time.Time{{ref.ReceivedAt}})
+	var out []*splitTotal
+	for _, t := range old {
+		if st := x.splitOf("tx", t.ID); st != nil {
+			out = append(out, st)
+		}
+	}
+	return out
+}
+
+// keepEditedSplitTotals — изменили в WhatsApp текст-итог платежа частями
+// («Магомедов Ахмед 15000» про чеки 10000 + 5000 → 16000). Новая сумма с чеками
+// не сходится: записанная как есть, она посчиталась бы отдельным платежом сверх
+// них (сбор 31000). Как и поправка «не 15000 а 16000» на итог, оставляем
+// прежнюю сумму и спрашиваем, доплата это или ошибка. Возвращает вопросы.
+func (b *Bot) keepEditedSplitTotals(ctx context.Context, rawID int, splits []*splitTotal) []string {
+	if len(splits) == 0 {
+		return nil
+	}
+	now, err := b.db.TxRefsByRawID(ctx, rawID)
+	if err != nil {
+		return nil
+	}
+	used := map[int]bool{}
+	var out []string
+	for _, st := range splits {
+		// Новый платёж того же клиента в сообщении — один (несколько — это уже
+		// не итог, а суммы по чекам: «10000», «5000» — пары своих чеков).
+		var same []db.TxRef
+		for _, n := range now {
+			if !used[n.ID] && !n.Cash && sameClientMoney(n.Name, st.text.Client) {
+				same = append(same, n)
+			}
+		}
+		if len(same) != 1 {
+			continue
+		}
+		n := same[0]
+		used[n.ID] = true
+		if math.Abs(n.Amount-st.text.Amount) < 0.01 || math.Abs(n.Amount-st.sum()) < 0.5 {
+			continue // сумма итога та же (или сходится с чеками)
+		}
+		if b.db.SetTxAmount(ctx, n.ID, st.text.Amount) == nil {
+			fmt.Printf("Правка итога платежа частями %s: %v вместо %v не сходится с чеками — спрашиваю\n", st.label(), n.Amount, st.text.Amount)
+			out = append(out, splitTotalQuestion(st, n.Amount))
+		}
+	}
+	return out
 }
 
 // editedMessage — исправленное сообщение как обычное (тот же отправитель и
@@ -545,8 +611,9 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 
 // followSplitTotals — поправили сумму чека, который входит в платёж частями с
 // итогом текстом: итог — сумма частей и меняется на ту же разницу (поправка
-// записана — удалят её, вернётся и итог). Иначе итог перестал бы сходиться с
-// чеками и посчитался отдельным платежом сверх них. Возвращает пояснение.
+// записана — удалят её, итог сдвинется обратно на ту же разницу, даже если его
+// с тех пор сдвинула поправка другой части). Иначе итог перестал бы сходиться
+// с чеками и посчитался отдельным платежом сверх них. Возвращает пояснение.
 func (b *Bot) followSplitTotals(ctx context.Context, rawID int, totals []*splitTotal, ids map[int]bool, delta, to float64) string {
 	var out string
 	for _, st := range totals {
@@ -554,9 +621,11 @@ func (b *Bot) followSplitTotals(ctx context.Context, rawID int, totals []*splitT
 		if nt <= 0 || math.Abs(delta) < 0.01 {
 			continue
 		}
-		t := db.CorrTarget{Kind: "tx", ID: st.text.ID, Name: st.text.Client, Amount: st.text.Amount, ContactID: st.text.ContactID}
-		if !b.setCorrectedAmount(ctx, rawID, t, nt) {
+		if b.db.SetTxAmount(ctx, st.text.ID, nt) != nil {
 			continue
+		}
+		if err := b.db.RecordFollowCorrection(ctx, rawID, st.text.ID, st.text.Amount, nt); err != nil {
+			fmt.Println("Поправка итога платежа частями: не записалась:", err)
 		}
 		out += fmt.Sprintf(" Это часть платежа «%s» (итог текстом): итог — сумма чеков %s, поправил и его: было %s ₽, стало %s ₽."+
 			" Если итог %s ₽ был верный — значит, ошибка в другом чеке: поправьте его сумму свайпом.",
