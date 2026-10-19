@@ -63,12 +63,13 @@ func (b *Bot) quotesCmfAsk(ctx context.Context, msg *events.Message) bool {
 	return err == nil && len(refs) > 0
 }
 
-// contextAnswerBlocked — открыт вопрос сверки «за кого платёж», но этот же
-// человек ПОСЛЕ вопроса прислал новый чек без клиента: его имя — для нового
-// чека, а не ответ на старый вопрос.
+// contextAnswerBlocked — открыт вопрос «за кого платёж» (сверка, чек или
+// «❓ чья наличка?»), но этот же человек ПОСЛЕ вопроса прислал новый чек без
+// клиента: его имя — для нового чека (обычное «чек, потом ФИО»), а не ответ на
+// старый вопрос. На вопрос по наличке тогда отвечают свайпом.
 func (b *Bot) contextAnswerBlocked(ctx context.Context, msg *events.Message) bool {
 	a, ok := b.recentOpenAsk(msg.Info.Chat.String())
-	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt") || b.db == nil {
+	if !ok || (a.kind != "cmf_watch" && a.kind != "receipt" && a.kind != "payment_who") || b.db == nil {
 		return false
 	}
 	has, err := b.db.HasUnconfirmedReceiptFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(), a.at)
@@ -152,7 +153,7 @@ func (b *Bot) tryContextAnswerAs(ctx context.Context, chat types.JID, sender str
 		if !resolved {
 			return false
 		}
-		found, amount, client, err := b.db.ResolveCashDup(ctx, a.txID, isNew)
+		found, amount, client, err := b.resolveCashDup(ctx, a.txID, isNew)
 		if err != nil || !found {
 			return false
 		}

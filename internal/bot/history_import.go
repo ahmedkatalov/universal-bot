@@ -311,7 +311,14 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 			recipient, cardOwner, needsReview = client, rd.Recipient, false
 		}
 	}
-	isDup, _, err := b.db.FindDuplicateReceipt(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, recipient, rd.Amount, txDate, !rd.HasTxTime)
+	dateOnly := rd.HasTxTime && rd.TimeDefaulted
+	if dateOnly {
+		txDate = b.dateOnlyOpTime(ctx, 0, db.PrintedReceipt{
+			Recipient: rd.Recipient, Sender: rd.Sender, Bank: rd.Bank,
+			DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Amount: rd.Amount, TxDate: rd.TxTime,
+		}, client, received)
+	}
+	isDup, _, err := b.db.FindDuplicateReceipt(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, recipient, rd.Amount, txDate, rd.TxTimeGuessed())
 	if err != nil {
 		fmt.Println("Импорт истории: ошибка проверки повтора чека:", err)
 	}
@@ -320,7 +327,7 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 		RecipientPhone: rd.RecipientPhone, SenderRaw: rd.Sender, SenderBank: rd.SenderBank, SenderAccount: rd.SenderAccount,
 		ContactID: contactIDPtr, Amount: rd.Amount, Commission: rd.Commission, DocNumber: rd.DocNumber, AuthCode: rd.AuthCode,
 		Status: rd.Status, NeedsReview: needsReview, IsDuplicate: isDup, GroupJID: chat.String(), TxDate: txDate,
-		ClientConfirmed: client != "", SubmittedBy: sender, TxTimeGuessed: !rd.HasTxTime,
+		ClientConfirmed: client != "", SubmittedBy: sender, TxTimeGuessed: !rd.HasTxTime, TxDateOnly: dateOnly,
 	}); err != nil {
 		fmt.Println("Импорт истории: ошибка сохранения чека:", err)
 		return false
@@ -394,7 +401,7 @@ func (b *Bot) applyAnswerQuiet(ctx context.Context, chat types.JID, quoted, text
 	}
 	if txID, ok, _ := b.db.DupTxByAskMsg(ctx, quoted); ok {
 		if resolved, isNew := parseCashDupAnswer(text); resolved {
-			if found, _, _, err := b.db.ResolveCashDup(ctx, txID, isNew); err == nil && found {
+			if found, _, _, err := b.resolveCashDup(ctx, txID, isNew); err == nil && found {
 				return done("dup", strconv.Itoa(txID))
 			}
 		}

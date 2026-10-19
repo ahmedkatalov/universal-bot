@@ -2171,7 +2171,7 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 			}
 		}
 		// Информационная проверка — по всем группам сразу (groupJID пустой).
-		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, "", rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime, !rd.HasTxTime)
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, "", rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txTime, rd.TxTimeGuessed())
 		switch {
 		case err != nil:
 			fmt.Println("Ошибка проверки дубля чека из лички:", err)
@@ -3608,6 +3608,15 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 		if rd.HasTxTime {
 			txDate = rd.TxTime
 		}
+		dateOnly := rd.HasTxTime && rd.TimeDefaulted
+		if dateOnly {
+			// Клиента рядом с чеком нет (получатель напечатан): время копии того же
+			// чека или самого раннего текста на эту сумму в тот день.
+			txDate = b.dateOnlyOpTime(ctx, 0, db.PrintedReceipt{
+				Recipient: rd.Recipient, Sender: rd.Sender, Bank: rd.Bank,
+				DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Amount: rd.Amount, TxDate: rd.TxTime,
+			}, "", pr.receivedAt)
+		}
 
 		canonical, matched := b.aliases.ResolveName(rd.Recipient)
 		var contactIDPtr *int
@@ -3617,7 +3626,7 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 
 		// Дубли ищем только внутри целевой группы: тот же чек в ДРУГОЙ группе
 		// (например, в группе СБ, откуда его переслали) — это не дубль.
-		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, groupJID.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate, !rd.HasTxTime)
+		isDup, dupTime, err := b.db.FindDuplicateReceipt(ctx, groupJID.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Amount, txDate, rd.TxTimeGuessed())
 		if err != nil {
 			fmt.Println("Ошибка проверки дубля при дозагрузке:", err)
 		}
@@ -3643,6 +3652,7 @@ func (b *Bot) savePendingReceipts(ctx context.Context, chat types.JID, groupName
 			SubmittedBy:   sender,
 			TxDate:        txDate,
 			TxTimeGuessed: !rd.HasTxTime,
+			TxDateOnly:    dateOnly,
 		})
 		if err != nil {
 			fmt.Fprintf(&sb, "- ОШИБКА сохранения: %s, %.0f ₽ (%v)\n", canonical, rd.Amount, err)
@@ -4049,6 +4059,15 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if rd.HasTxTime {
 		txDate = rd.TxTime
 	}
+	// На чеке только дата операции — время выбираем по копии того же чека или
+	// тексту этого платежа в тот день (см. date_only.go).
+	dateOnly := rd.HasTxTime && rd.TimeDefaulted
+	if dateOnly {
+		txDate = b.dateOnlyOpTime(ctx, 0, db.PrintedReceipt{
+			Recipient: receiptRecipient, Sender: rd.Sender, Bank: rd.Bank,
+			DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Amount: rd.Amount, TxDate: rd.TxTime,
+		}, payerOverride, receivedAt)
+	}
 
 	// Свёрнутый/неполный чек: сумма есть, но НЕ видно ДАТЫ операции — это почти
 	// всегда свёрнутый экран банка («Перевод выполнен»), который работники шлют
@@ -4170,6 +4189,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			GroupJID:          chat.String(),
 			TxDate:            txDate,
 			TxTimeGuessed:     !rd.HasTxTime,
+			TxDateOnly:        dateOnly,
 		}
 		if payerOverride != "" {
 			canonical, _ := b.aliases.ResolveName(payerOverride)
@@ -4248,12 +4268,12 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// документа, см. FindDuplicateReceipt) — до вставки, иначе новая запись
 	// найдёт сама себя. Тот же чек в другой группе дублем не считается: это
 	// рабочий процесс (чеки из группы СБ пересылают в основную группу).
-	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, !rd.HasTxTime)
+	dupMatch, err := b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, rd.TxTimeGuessed())
 	if err != nil {
 		// Сбой проверки — не считаем чек сразу «новым» (тот же чек вошёл бы в
 		// сбор дважды): пробуем ещё раз.
 		fmt.Println("Ошибка проверки дубля чека (повторяю):", err)
-		dupMatch, err = b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, !rd.HasTxTime)
+		dupMatch, err = b.db.FindDuplicateReceiptEx(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, rd.Recipient, rd.Sender, rd.Amount, txDate, rd.TxTimeGuessed())
 		if err != nil {
 			fmt.Println("Ошибка проверки дубля чека:", err)
 		}
@@ -4277,7 +4297,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 			// Время на чеке только до минуты (ВТБ): два разных перевода в одну
 			// минуту бывают — подписанный и неподписанный молча не склеиваем, у
 			// неподписанного спросим «чей чек?» (ответ тем же клиентом склеит их).
-			minute := db.MinutePrecision(txDate)
+			minute := db.MinutePrecision(txDate) || dateOnly
 			switch {
 			case payerOverride != "" && !tw.Named && minute:
 			case payerOverride != "" && !tw.Named:
@@ -4333,9 +4353,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		// Экран показывает уже сделанный перевод: экран, присланный раньше, чем
 		// сделана операция этого чека (время напечатано на чеке), — другой перевод.
 		// Время операции позже присылки самого чека — ошибка чтения (или другой
-		// часовой пояс): по нему не судим.
+		// часовой пояс): по нему не судим. Как и по полудню у чека с одной датой.
 		var opTime time.Time
-		if rd.HasTxTime && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
+		if !rd.TxTimeGuessed() && !rd.TxTime.After(receivedAt.Add(10*time.Minute)) {
 			opTime = rd.TxTime
 		}
 		if sup, err := b.db.SupersedeCollapsedReceipt(ctx, chat.String(), senderJID, rd.Amount, receivedAt, opTime, rawID, rankCollapsed); err != nil {
@@ -4379,6 +4399,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		GroupJID:          chat.String(),
 		TxDate:            txDate,
 		TxTimeGuessed:     !rd.HasTxTime,
+		TxDateOnly:        dateOnly,
 		Ignored:           declined,
 	})
 	if err != nil {

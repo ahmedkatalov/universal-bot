@@ -535,6 +535,9 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// Время операции на чеке НЕ прочиталось — в tx_date время сообщения
 		// (по нему нельзя сравнивать «тот же чек» с точным временем другого).
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS tx_time_guessed BOOLEAN NOT NULL DEFAULT false`,
+		// На чеке напечатана только ДАТА операции: время в tx_date выбрано
+		// (копия того же чека, текст этого платежа в тот день или полдень).
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS tx_date_only BOOLEAN NOT NULL DEFAULT false`,
 		// Свёрнутый экран «Перевод выполнен», признанный тем же переводом, что
 		// полный чек: сообщение (raw_messages.id) этого полного чека. Ответ ФИО
 		// другого клиента на вопрос по экрану возвращает экран в учёт, удалят
@@ -1487,6 +1490,7 @@ type BankReceiptInput struct {
 	Collapsed         bool      // свёрнутый экран банка (без даты/номера/получателя) — ждёт полного чека
 	Ignored           bool      // в сбор не идёт (например, перевод отклонён банком)
 	TxTimeGuessed     bool      // время операции с чека не прочиталось — TxDate это время сообщения
+	TxDateOnly        bool      // на чеке только дата операции — время в TxDate выбрано (см. date_only.go)
 	SupersededByRaw   int       // свёрнутый экран того же перевода, что полный чек этого сообщения (0 — нет)
 }
 
@@ -1496,14 +1500,14 @@ func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
 			 card_owner, contact_id, amount, commission, doc_number, auth_code, status, needs_review, is_duplicate,
 			 client_confirmed, group_jid, submitted_by, tx_date, collapsed, ignored, client_source_raw_id, tx_time_guessed,
-			 superseded_by_raw)
+			 superseded_by_raw, tx_date_only)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, NULLIF($24, 0), $25,
-			NULLIF($26, 0))
+			NULLIF($26, 0), $27)
 	`, r.RawMessageID, nullIfEmpty(r.Bank), nullIfEmpty(r.RecipientRaw), nullIfEmpty(r.RecipientBank), nullIfEmpty(r.RecipientPhone),
 		nullIfEmpty(r.SenderRaw), nullIfEmpty(r.SenderBank), nullIfEmpty(r.SenderAccount), nullIfEmpty(r.CardOwner),
 		r.ContactID, r.Amount, r.Commission, nullIfEmpty(r.DocNumber), nullIfEmpty(r.AuthCode), nullIfEmpty(r.Status),
 		r.NeedsReview, r.IsDuplicate, r.ClientConfirmed, nullIfEmpty(r.GroupJID), nullIfEmpty(r.SubmittedBy), r.TxDate, r.Collapsed, r.Ignored, r.ClientSourceRawID, r.TxTimeGuessed,
-		r.SupersededByRaw)
+		r.SupersededByRaw, r.TxDateOnly)
 	return err
 }
 
