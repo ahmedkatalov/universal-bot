@@ -4030,15 +4030,17 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 				}
 				return
 			}
-			// ФИО в ответ — тот же клиент: «уже учтён»; другой клиент — экран
-			// снова отдельный платёж (answerForRepeatedCheck). «другой» —
-			// отдельный платёж, бот спросит клиента.
+			// ФИО в ответ (свайпом) — тот же клиент: «уже учтён»; другой клиент
+			// — экран снова отдельный платёж (answerForRepeatedCheck). «другой»
+			// — отдельный платёж, бот спросит клиента.
 			_ = b.db.MarkScreenAsked(ctx, rawID, botMsgID)
 			b.registerClarifyAsk(botMsgID, waMsgID)
 			b.registerSameCheckAsk(botMsgID, sameCheckAsk{checkWa: waMsgID})
-			// ФИО следующим сообщением, без свайпа (как работники обычно и
-			// пишут), — тоже ответ про этот экран, а не имя для следующего чека.
-			b.setOpenAsk(chat.String(), openAsk{kind: "receipt", receiptWaID: waMsgID, needName: true, senderJID: senderJID, amount: rd.Amount})
+			// В очередь «чей чек?» (ответ без свайпа) экран НЕ ставим: он уже
+			// учтён, и голое ФИО следом скорее про следующий чек работника или
+			// ответ на более свежий вопрос. Голое ФИО того же клиента — «уже
+			// учтён»; другого — не угадываем, спросим (nameAfterHeldScreen).
+			b.rememberHeldScreen(chat.String(), senderJID, heldScreen{screenWa: waMsgID, keptClient: counted.Client, amount: rd.Amount, txDate: counted.TxDate})
 			return
 		}
 		if canAsk {
@@ -4325,19 +4327,20 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// перевод: второй раз не считаем и спрашиваем «тот же или другой?».
 	// Обратный порядок — этот чек полный (время операции напечатано), а такой
 	// экран того же клиента уже засчитан: в учёте остаётся полный чек, экран
-	// — повтор, и тоже спрашиваем. Это догадка: только если спросить можно (в
-	// группе на молчании не угадываем — оба чека в сборе, как прислали).
+	// — повтор, и тоже спрашиваем. Это догадка: в группе на молчании её не
+	// держим молча — более поздний чек без даты ждёт в «НЕ вошло», и бот
+	// спросит, когда молчание снимут (weakSameMode).
 	dateless := !rd.HasTxTime && rd.DocNumber == "" && rd.AuthCode == ""
 	if err == nil && !isDuplicate && !declined && clientConfirmed && contactIDPtr != nil &&
-		(dateless || rd.HasTxTime) && senderJID != "" && askReceiptsEnabled() && !b.groupSilent(chat) {
+		(dateless || rd.HasTxTime) && senderJID != "" {
 		if rid, _, ok, e := b.db.ReceiptOfRaw(ctx, rawID); e != nil {
 			fmt.Println("Ошибка поиска сохранённого чека:", e)
 		} else if ok {
 			var same db.SameCheck
 			if dateless {
-				same, e = b.db.DedupeCompletedReceipt(ctx, rid, false, true)
+				same, e = b.db.DedupeCompletedReceiptWeak(ctx, rid, false, b.weakSameMode(chat))
 			} else {
-				same, e = b.db.DedupeScreenOfCountedCheck(ctx, rid)
+				same, e = b.db.DedupeScreenOfCountedCheck(ctx, rid, b.weakSameMode(chat))
 			}
 			if e != nil {
 				fmt.Println("Ошибка проверки повтора чека без времени операции:", e)

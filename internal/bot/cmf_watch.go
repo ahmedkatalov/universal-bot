@@ -335,8 +335,18 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 
 	// Свайп на конкретное сообщение — имя относится к НЕМУ.
 	if quotedID != "" {
-		if found, _, err := b.db.ReattributeReceiptByMessageFrom(ctx, quotedID, canonical, contact(), rawID); err == nil && found {
+		if re, err := b.db.ReattributeReceiptByMessageRel(ctx, quotedID, canonical, contact(), rawID); err == nil && re.Found {
 			_ = b.db.MarkMessageParsed(ctx, rawID)
+			// Чеки «того же перевода» прежнего клиента снова отдельные — говорим.
+			if len(re.Released) > 0 {
+				_, qSender, _, _ := b.db.ReceiptReplyRef(ctx, re.ReceiptID)
+				b.reportReleasedHolds(chat, quotedID, qSender, canonical, re.Released)
+			}
+			// Тот же перевод того же клиента уже в сборе (экран без даты или
+			// полный чек) — второй раз не считаем, спрашиваем.
+			if same := b.dedupeNamedReceipt(ctx, chat, re.ReceiptID); same.Found && same.VictimIsThis {
+				return true
+			}
 			if !b.reresolveWatchByCheck(ctx, chat, quotedID, canonical) {
 				fmt.Printf("Чек переатрибутирован на клиента %q (свайп с ФИО на чек)\n", canonical)
 			}
@@ -363,8 +373,10 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 			if checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since); ok && (checkAmt <= 0 || math.Abs(checkAmt-amount) < 1 || amountLinesMatch(text, checkAmt)) {
 				if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, contact(), rawID, 0); err == nil && found {
 					_ = b.db.MarkMessageParsed(ctx, rawID)
-					b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
 					fmt.Printf("Чек переатрибутирован на клиента %q (ФИО+сумма рядом с чеком)\n", canonical)
+					if !b.dedupeLabeledCheck(ctx, chat, checkRaw) {
+						b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+					}
 					return true
 				}
 			}
@@ -375,6 +387,11 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	}
 
 	if !checkNearby {
+		// Свёрнутый экран этого работника только что признан тем же переводом,
+		// что полный чек: ФИО может быть и про него (nameAfterHeldScreen).
+		if b.nameAfterHeldScreen(ctx, msg, name, canonical, contact(), rawID) {
+			return true
+		}
 		// Чека рядом нет — имя (перед чеком) в очередь.
 		b.enqueuePendingName(ctx, msg, name, 0, rawID)
 		_ = b.db.MarkMessageParsed(ctx, rawID)
@@ -391,8 +408,26 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	}
 	_ = b.db.MarkMessageParsed(ctx, rawID)
 	fmt.Printf("Чек переатрибутирован на клиента %q (ФИО написали рядом с чеком)\n", canonical)
-	b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+	if !b.dedupeLabeledCheck(ctx, chat, checkRaw) {
+		b.syncWatchAfterLabel(ctx, chat, checkRaw, canonical)
+	}
 	return true
+}
+
+// dedupeLabeledCheck — чек сообщения checkRaw назвали ФИО, написанным рядом
+// (FIFO): тот же перевод того же клиента мог уже войти в сбор другим чеком
+// (dedupeNamedReceipt). true — этот чек в сбор не пошёл (повтор или ждёт
+// ответа в «НЕ вошло»).
+func (b *Bot) dedupeLabeledCheck(ctx context.Context, chat types.JID, checkRaw int) bool {
+	if checkRaw <= 0 {
+		return false
+	}
+	rid, _, ok, err := b.db.ReceiptOfRaw(ctx, checkRaw)
+	if err != nil || !ok {
+		return false
+	}
+	same := b.dedupeNamedReceipt(ctx, chat, rid)
+	return same.Found && same.VictimIsThis
 }
 
 // Наличка, написанная через того, кто её забрал, без слова «нал»: «Мансур

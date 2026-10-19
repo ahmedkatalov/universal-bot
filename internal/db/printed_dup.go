@@ -153,9 +153,13 @@ func (d *DB) FindPrintedTwin(ctx context.Context, groupJID string, excludeID int
 	return t, nil
 }
 
-// MarkReceiptDuplicate помечает чек повтором (если он ещё живой).
+// MarkReceiptDuplicate помечает чек повтором (если он ещё живой). Чек, который
+// ждал вопроса «тот же перевод?» в «НЕ вошло» (same_check_parked), ждать
+// перестаёт: «на проверку» его отправила только эта догадка.
 func (d *DB) MarkReceiptDuplicate(ctx context.Context, id int) (bool, error) {
-	tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true WHERE id = $1 AND is_duplicate = false`, id)
+	tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true,
+		needs_review = CASE WHEN same_check_parked THEN false ELSE needs_review END, same_check_parked = false
+		WHERE id = $1 AND is_duplicate = false`, id)
 	if err != nil {
 		return false, err
 	}

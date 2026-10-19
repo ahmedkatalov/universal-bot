@@ -537,6 +537,14 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// чеку: ответ «другой» найдёт чек и после перезапуска бота.
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_ask_msg_id TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_bank_receipts_same_check_ask ON bank_receipts(same_check_ask_msg_id) WHERE same_check_ask_msg_id IS NOT NULL`,
+		// «Похоже, тот же перевод», а спросить нельзя (группа на молчании):
+		// более поздний чек без даты ждёт в «НЕ вошло» (needs_review), с каким
+		// чеком совпал — superseded_by_raw; спросят, когда молчание снимут.
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_parked BOOLEAN NOT NULL DEFAULT false`,
+		// «другой» на «похоже, тот же перевод» — про КАКОЙ чек это сказано (его
+		// сообщение): экран не тот же перевод, что тот чек, но может быть экраном
+		// полного чека, присланного позже. NULL — неизвестно (не сопоставляем).
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS same_check_denied_vs INT`,
 		// Подпись к фото отдельно от распознанного текста (для повторного чтения),
 		// и само сообщение с фото, если его не удалось скачать (перекачаем позже).
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS caption TEXT`,
@@ -1657,7 +1665,7 @@ func (d *DB) CountedCheckOfCollapsedScreen(ctx context.Context, groupJID, sender
 		        AND br.tx_date >= $4::timestamptz - interval '3 days'))
 		  AND NOT EXISTS (
 			SELECT 1 FROM bank_receipts s
-			WHERE s.superseded_by_raw = br.raw_message_id AND s.is_duplicate AND NOT s.ignored)
+			WHERE s.superseded_by_raw = br.raw_message_id AND (s.is_duplicate OR s.same_check_parked) AND NOT s.ignored)
 		ORDER BY rm.received_at DESC
 		LIMIT 2
 	`, groupJID, senderJID, amount, screenAt)
@@ -1902,7 +1910,11 @@ func (d *DB) FillReceiptByMessageID(ctx context.Context, waMessageID, name strin
 			-- флаги, чтобы бот мог спросить «чей это чек?». Имя в ответе или
 			-- простое «да/верно» — подтверждают.
 			client_confirmed = CASE WHEN $2 = '' AND $4::numeric > 0 THEN client_confirmed ELSE true END,
-			clarify_asked    = CASE WHEN $2 = '' AND $4::numeric > 0 THEN clarify_asked    ELSE true END
+			clarify_asked    = CASE WHEN $2 = '' AND $4::numeric > 0 THEN clarify_asked    ELSE true END,
+			-- Ответ про чек решает и отложенную догадку «тот же перевод?»: её
+			-- проверят заново (DedupeCompletedReceipt у вызывающего).
+			superseded_by_raw = CASE WHEN same_check_parked THEN NULL ELSE superseded_by_raw END,
+			same_check_parked = false
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false ORDER BY br.id DESC LIMIT 1
@@ -1917,6 +1929,13 @@ func (d *DB) FillReceiptByMessageID(ctx context.Context, waMessageID, name strin
 	}
 	if amount > 0 {
 		_ = d.SyncWatchWithReceipt(ctx, rid)
+	}
+	if name != "" {
+		// Клиент чека поменялся — чеки «того же перевода» прежнего клиента снова
+		// отдельные платежи.
+		if _, e := d.ReleaseHeldOnClientChange(ctx, rid); e != nil {
+			fmt.Println("Возврат чеков «тот же перевод» после смены клиента не удался:", e)
+		}
 	}
 	return rid, true, got, nr, nil
 }
@@ -2171,6 +2190,9 @@ func (d *DB) UnresolvedReceipts(ctx context.Context) ([]UnresolvedReceipt, error
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, recipient_raw FROM bank_receipts
 		WHERE needs_review = true AND recipient_raw IS NOT NULL AND amount > 0
+		  -- Ждёт вопроса «тот же перевод?» (группа молчала): клиент у него есть,
+		  -- в «НЕ вошло» его держит догадка — молча в сбор не возвращаем.
+		  AND NOT same_check_parked
 	`)
 	if err != nil {
 		return nil, err
@@ -2229,8 +2251,12 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 			JOIN bank_receipts dd ON dd.id <> orig.id AND dd.is_duplicate = true AND dd.ignored = false
 				AND COALESCE(dd.group_jid, '') = COALESCE(orig.group_jid, '')
 				AND (
-					-- Свёрнутый экран, заменённый этим полным чеком.
+					-- Свёрнутый экран, заменённый этим полным чеком (или чек, учтённый
+					-- им как «похоже, тот же перевод»).
 					dd.superseded_by_raw = orig.raw_message_id OR
+					-- Чек, учтённый ДРУГИМ полным чеком (superseded_by_raw — не этот), —
+					-- не его повтор: тот чек жив, оживлять нечего.
+					(dd.superseded_by_raw IS NULL AND (
 					(NULLIF(orig.doc_number, '') IS NOT NULL AND dd.doc_number = orig.doc_number) OR
 					(NULLIF(orig.auth_code, '') IS NOT NULL AND dd.auth_code = orig.auth_code) OR
 					(dd.contact_id = orig.contact_id AND dd.amount = orig.amount
@@ -2238,13 +2264,21 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 					-- Тот же напечатанный чек (копия без ФИО при подписанном оригинале).
 					`+printedMatchSQL("dd", "orig")+` OR
 					-- Копия без прочитанного времени, признанная «похоже, тот же»
-					-- (DedupeCompletedReceipt): тот же клиент и сумма.
-					-- Время операции оригинала позже его присылки — по нему не судим.
-					(dd.tx_time_guessed AND dd.client_confirmed AND orig.client_confirmed
+					-- (DedupeCompletedReceipt, шаг 3) до того, как связь стали
+					-- запоминать (superseded_by_raw): тот же клиент и сумма, присланы
+					-- в пределах суток (как в шаге 3). Время операции оригинала позже
+					-- его присылки — по нему не судим (но сутки между присылками — всё
+					-- равно: без них ожил бы чужой старый экран).
+					(dd.tx_time_guessed
+					 AND dd.client_confirmed AND orig.client_confirmed
 					 AND dd.contact_id = orig.contact_id AND dd.amount = orig.amount
+					 AND (SELECT received_at FROM raw_messages WHERE id = orig.raw_message_id)
+					     BETWEEN (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '1 day'
+					         AND (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '1 day'
 					 AND (`+implausibleOpSQL("orig.tx_date", "(SELECT received_at FROM raw_messages WHERE id = orig.raw_message_id)")+` OR
 					      (orig.tx_date <= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '2 minutes'
 					       AND orig.tx_date >= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '3 days')))
+					))
 				)
 			JOIN raw_messages drm ON drm.id = dd.raw_message_id AND COALESCE(drm.deleted, false) = false
 			WHERE orig.raw_message_id = $1 AND orig.is_duplicate = false AND orig.ignored = false
@@ -2253,6 +2287,14 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 		WHERE u.id = sel.id
 	`, rawID); e != nil {
 		fmt.Println("Промоут дубля после удаления оригинала не удался:", e)
+	}
+	// Чеки, ждавшие в «НЕ вошло» вопроса «тот же перевод, что этот чек?» (группа
+	// молчала), — догадки больше нет: в сбор, как присланы.
+	if _, e := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET same_check_parked = false, superseded_by_raw = NULL,
+			needs_review = NOT (client_confirmed AND contact_id IS NOT NULL AND COALESCE(amount, 0) > 0)
+		WHERE superseded_by_raw = $1 AND same_check_parked AND is_duplicate = false`, rawID); e != nil {
+		fmt.Println("Возврат отложенного «тот же перевод?» чека после удаления не удался:", e)
 	}
 	d.releaseMessageLinks(ctx, rawID)
 	if e := d.restoreSameCashOf(ctx, rawID); e != nil {
@@ -4409,15 +4451,34 @@ func (d *DB) ReattributeReceiptByMessage(ctx context.Context, waMessageID, name 
 // ReattributeReceiptByMessageFrom — то же, с запоминанием сообщения, которое
 // назвало клиента (удалят — привязка откатится).
 func (d *DB) ReattributeReceiptByMessageFrom(ctx context.Context, waMessageID, name string, contactID *int, sourceRawID int) (found bool, amount float64, err error) {
-	var rid int
+	r, err := d.ReattributeReceiptByMessageRel(ctx, waMessageID, name, contactID, sourceRawID)
+	return r.Found, r.Amount, err
+}
+
+// Reattributed — итог ReattributeReceiptByMessageRel.
+type Reattributed struct {
+	Found     bool
+	ReceiptID int
+	Amount    float64
+	// Released — чеки, которые считались тем же переводом, что этот, только
+	// по тому же клиенту, — теперь они снова отдельные платежи.
+	Released []ReleasedHold
+}
+
+// ReattributeReceiptByMessageRel — ReattributeReceiptByMessageFrom с id чека и
+// чеками, вернувшимися в учёт из-за смены клиента (ReleaseHeldOnClientChange).
+func (d *DB) ReattributeReceiptByMessageRel(ctx context.Context, waMessageID, name string, contactID *int, sourceRawID int) (Reattributed, error) {
+	var res Reattributed
 	var src any
 	if sourceRawID > 0 {
 		src = sourceRawID
 	}
-	err = d.pool.QueryRow(ctx, `
+	err := d.pool.QueryRow(ctx, `
 		UPDATE bank_receipts SET
 			card_owner = COALESCE(NULLIF(card_owner, ''), NULLIF(recipient_raw, '')),
 			recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true,
+			superseded_by_raw = CASE WHEN same_check_parked THEN NULL ELSE superseded_by_raw END,
+			same_check_parked = false,
 			client_source_raw_id = COALESCE($4, client_source_raw_id)
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
@@ -4426,19 +4487,27 @@ func (d *DB) ReattributeReceiptByMessageFrom(ctx context.Context, waMessageID, n
 			ORDER BY br.id DESC LIMIT 1
 		)
 		RETURNING id, amount::float8
-	`, waMessageID, name, contactID, src).Scan(&rid, &amount)
+	`, waMessageID, name, contactID, src).Scan(&res.ReceiptID, &res.Amount)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, 0, nil
+		return res, nil
 	}
 	if err != nil {
-		return false, 0, err
+		return res, err
+	}
+	res.Found = true
+	// Чек, которым учтены чеки «того же перевода» того же клиента, теперь на
+	// другом клиенте — разных клиентов не склеиваем.
+	if rel, e := d.ReleaseHeldOnClientChange(ctx, res.ReceiptID); e != nil {
+		fmt.Println("Возврат чеков «тот же перевод» после смены клиента не удался:", e)
+	} else {
+		res.Released = rel
 	}
 	// Чек получил клиента — тот же чек, присланный ещё раз, не считаем вторым
 	// платежом.
-	if _, e := d.DedupeCompletedReceipt(ctx, rid, false, false); e != nil {
+	if _, e := d.DedupeCompletedReceipt(ctx, res.ReceiptID, false, false); e != nil {
 		fmt.Println("Проверка повтора чека после привязки клиента не удалась:", e)
 	}
-	return true, amount, nil
+	return res, nil
 }
 
 // ReceiptDetail — полные данные чека для показа владельцу.
@@ -5676,24 +5745,36 @@ func (d *DB) SetReceiptClientByMessage(ctx context.Context, waMessageID, name st
 	if rid, ok, err := d.ReceiptIDByMessage(ctx, waMessageID); err == nil && ok {
 		twins, _ = d.ReceiptTextTwins(ctx, rid)
 	}
-	tag, err := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true
+	var rid int
+	err := d.pool.QueryRow(ctx, `
+		UPDATE bank_receipts SET recipient_raw = $2, contact_id = $3, needs_review = false, client_confirmed = true,
+			superseded_by_raw = CASE WHEN same_check_parked THEN NULL ELSE superseded_by_raw END,
+			same_check_parked = false
 		WHERE id = (
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE rm.wa_message_id = $1 AND br.is_duplicate = false
 			ORDER BY br.id DESC LIMIT 1
 		)
-	`, waMessageID, name, contactID)
+		RETURNING id
+	`, waMessageID, name, contactID).Scan(&rid)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
 	if err != nil {
 		return false, err
 	}
-	if tag.RowsAffected() > 0 && contactID != nil {
+	// Клиент чека поменялся — чеки «того же перевода» прежнего клиента снова
+	// отдельные платежи.
+	if _, e := d.ReleaseHeldOnClientChange(ctx, rid); e != nil {
+		fmt.Println("Возврат чеков «тот же перевод» после смены клиента не удался:", e)
+	}
+	if contactID != nil {
 		for _, tx := range twins {
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET contact_id = $2, raw_name = $3 WHERE id = $1`, tx, *contactID, name)
 		}
 	}
-	return tag.RowsAffected() > 0, nil
+	return true, nil
 }
 
 // LatestNonameWatch — последнее наблюдение без имени от этого отправителя в

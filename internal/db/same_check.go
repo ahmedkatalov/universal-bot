@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 )
@@ -33,7 +35,30 @@ type SameCheck struct {
 	// времени операции), а в учёте остался проверяемый полный чек: сказать об
 	// этом и спросить «тот же или другой?» про тот чек.
 	VictimCounted bool
+	// Parked — спросить «тот же или другой?» сейчас нельзя (группа на
+	// молчании): более поздний чек без даты (VictimWa) не повтор, а ждёт в «НЕ
+	// вошло»; бот спросит, когда молчание снимут (ParkedSameChecks).
+	Parked bool
 }
+
+// WeakSame — что делать со слабым совпадением «похоже, тот же перевод» (шаги
+// 3–4 DedupeCompletedReceipt: общего номера нет, у одного из чеков время
+// операции не прочиталось). Это догадка — её можно держать, только пока о ней
+// спрашивают.
+type WeakSame int
+
+const (
+	// WeakOff — слабое совпадение не ищем.
+	WeakOff WeakSame = iota
+	// WeakHold — более поздний чек без даты становится повтором (не в сборе),
+	// а вызывающий спрашивает «тот же или другой?» (или спросить и не просили —
+	// вопросы бота выключены совсем).
+	WeakHold
+	// WeakPark — спросить сейчас нельзя (группа на молчании): более поздний чек
+	// без даты не повтор и не в сборе — ждёт в «НЕ вошло» (needs_review), с
+	// каким чеком совпал — superseded_by_raw; спросят, когда молчание снимут.
+	WeakPark
+)
 
 // completedReceipt — проверяемый чек.
 type completedReceipt struct {
@@ -97,11 +122,21 @@ func (d *DB) loadCompletedReceipt(ctx context.Context, id int) (completedReceipt
 // он назван, а копия ничья, — ничья копия. Копии, названные РАЗНЫМИ клиентами,
 // без общего номера операции не склеиваем.
 func (d *DB) DedupeCompletedReceipt(ctx context.Context, receiptID int, amountFilled, allowTentative bool) (SameCheck, error) {
-	return d.dedupeCompletedReceipt(ctx, receiptID, amountFilled, allowTentative, false)
+	weak := WeakOff
+	if allowTentative {
+		weak = WeakHold
+	}
+	return d.dedupeCompletedReceipt(ctx, receiptID, amountFilled, weak, false)
+}
+
+// DedupeCompletedReceiptWeak — DedupeCompletedReceipt, слабое совпадение
+// (шаги 3–4) — как скажет weak.
+func (d *DB) DedupeCompletedReceiptWeak(ctx context.Context, receiptID int, amountFilled bool, weak WeakSame) (SameCheck, error) {
+	return d.dedupeCompletedReceipt(ctx, receiptID, amountFilled, weak, false)
 }
 
 // dedupeCompletedReceipt — DedupeCompletedReceipt; screenOnly — только шаг 4.
-func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFilled, allowTentative, screenOnly bool) (SameCheck, error) {
+func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFilled bool, weak WeakSame, screenOnly bool) (SameCheck, error) {
 	var res SameCheck
 	r, ok, err := d.loadCompletedReceipt(ctx, receiptID)
 	if err != nil || !ok {
@@ -137,11 +172,41 @@ func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		return res, nil
 	}
 
-	if screenOnly {
-		if !allowTentative {
+	// Слабое совпадение (шаги 3–4): повтором (или, если спросить нельзя, в «НЕ
+	// вошло») становится более поздний чек без даты; каким чеком он учтён —
+	// superseded_by_raw (и у подписанного, не свёрнутого): ответ «другой» или ФИО
+	// другого клиента, удаление или смена клиента того чека вернут его в учёт.
+	weakHold := func(victim, kept int, victimIsThis bool, keptWa, victimWa, client string, tx time.Time) (SameCheck, error) {
+		if weak == WeakPark {
+			tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts v SET needs_review = true, same_check_parked = true,
+				superseded_by_raw = k.raw_message_id
+				FROM bank_receipts k WHERE v.id = $1 AND k.id = $2 AND v.is_duplicate = false AND v.ignored = false`, victim, kept)
+			if err != nil || tag.RowsAffected() != 1 {
+				return SameCheck{}, err
+			}
+			res.Found, res.Parked, res.Tentative, res.VictimIsThis = true, true, true, victimIsThis
+			res.KeptWa, res.VictimWa = keptWa, victimWa
+			res.Client, res.Amount, res.TxDate = client, r.p.Amount, tx
+			fmt.Printf("Чек #%d (%s): похоже, тот же перевод, что %s, а спросить нельзя — чек %s ждёт в «НЕ вошло»\n", receiptID, r.wa, keptWa, victimWa)
 			return res, nil
 		}
-		return d.dedupeScreenOfCheck(ctx, receiptID, r, res, mark)
+		out, err := mark(victim, kept, victimIsThis, keptWa, victimWa, client, tx)
+		if err != nil || !out.Found {
+			return out, err
+		}
+		out.Tentative = true
+		if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts v SET superseded_by_raw = k.raw_message_id
+			FROM bank_receipts k WHERE v.id = $1 AND k.id = $2 AND v.is_duplicate`, victim, kept); err != nil {
+			return out, err
+		}
+		return out, nil
+	}
+
+	if screenOnly {
+		if weak == WeakOff {
+			return res, nil
+		}
+		return d.dedupeScreenOfCheck(ctx, receiptID, r, res, weakHold)
 	}
 
 	// 1. Номер операции / код авторизации; тот же клиент и время (как при приёме:
@@ -225,7 +290,7 @@ func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 	// дочитали сумму, и когда назвали клиента (экран «Перевод выполнен» без
 	// даты, названный в ответ на вопрос бота, при уже засчитанном полном чеке).
 	// Человек уже сказал про этот чек «другой» — это слабое совпадение не ищем.
-	if allowTentative && !r.denied && r.named && r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
+	if weak != WeakOff && !r.denied && r.named && r.guessed && r.p.DocNumber == "" && r.p.AuthCode == "" {
 		ownerNorm := printedNorm("$6::text")
 		senderNorm := printedNorm("$7::text")
 		err = d.pool.QueryRow(ctx, `
@@ -248,6 +313,14 @@ func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 			  AND rm.received_at BETWEEN $5::timestamptz - interval '1 day' AND $5::timestamptz + interval '1 day'
 			  AND (`+ownerNorm+` = '' OR `+printedNorm(printedRecipientOf("br"))+` = '' OR `+printedNorm(printedRecipientOf("br"))+` = `+ownerNorm+`)
 			  AND (`+senderNorm+` = '' OR `+printedNorm("br.sender_raw")+` = '' OR `+printedNorm("br.sender_raw")+` = `+senderNorm+`)
+			  -- Полный чек, у которого экран того же перевода уже есть (учтён им
+			  -- или ждёт вопроса), — не пара этому: у перевода один экран (как в
+			  -- шаге 4 и CountedCheckOfCollapsedScreen). Иначе второй перевод
+			  -- той же суммы (экран + полный чек) спутался бы с первым.
+			  AND NOT EXISTS (
+				SELECT 1 FROM bank_receipts s
+				WHERE s.superseded_by_raw = br.raw_message_id AND s.id <> $2
+				  AND (s.is_duplicate OR s.same_check_parked) AND NOT s.ignored)
 			ORDER BY abs(extract(epoch FROM rm.received_at - $5::timestamptz)), br.id
 			LIMIT 1`, r.groupJID, receiptID, r.contactID, r.p.Amount, r.received, r.p.Recipient, r.p.Sender).
 			Scan(&oID, &oWa, &oClient, &oTx)
@@ -256,14 +329,13 @@ func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 		case err != nil:
 			return res, err
 		default:
-			res.Tentative = true
-			return mark(receiptID, oID, true, oWa, r.wa, oClient, oTx)
+			return weakHold(receiptID, oID, true, oWa, r.wa, oClient, oTx)
 		}
 	}
 	// 4. Обратный порядок к шагу 3: этот чек — полный, а экран того же перевода
 	// без времени уже засчитан.
-	if allowTentative {
-		return d.dedupeScreenOfCheck(ctx, receiptID, r, res, mark)
+	if weak != WeakOff {
+		return d.dedupeScreenOfCheck(ctx, receiptID, r, res, weakHold)
 	}
 	return res, nil
 }
@@ -271,10 +343,10 @@ func (d *DB) dedupeCompletedReceipt(ctx context.Context, receiptID int, amountFi
 // DedupeScreenOfCountedCheck — только шаг 4 DedupeCompletedReceipt: полный чек
 // receiptID (с напечатанным временем операции) только что засчитан клиенту при
 // приёме (подпись), а экран того же перевода без времени уже в сборе. Шаги 1–3
-// при приёме уже сделала проверка «этот чек уже присылали». Вызывать, только
-// когда в группе можно спросить «тот же или другой?».
-func (d *DB) DedupeScreenOfCountedCheck(ctx context.Context, receiptID int) (SameCheck, error) {
-	return d.dedupeCompletedReceipt(ctx, receiptID, false, true, true)
+// при приёме уже сделала проверка «этот чек уже присылали». weak — как со
+// слабым совпадением (спросить можно — WeakHold, группа на молчании — WeakPark).
+func (d *DB) DedupeScreenOfCountedCheck(ctx context.Context, receiptID int, weak WeakSame) (SameCheck, error) {
+	return d.dedupeCompletedReceipt(ctx, receiptID, false, weak, true)
 }
 
 // dedupeScreenOfCheck — шаг 4: чек r назван, время операции НАПЕЧАТАНО (и ему
@@ -286,11 +358,13 @@ func (d *DB) DedupeScreenOfCountedCheck(ctx context.Context, receiptID int) (Sam
 // наверняка (клиент мог заплатить ту же сумму ещё раз): экран становится
 // повтором (superseded_by_raw — этот чек), вызывающий спрашивает «тот же или
 // другой?» (ответ «другой» возвращает экран). Экран, про который уже ответили
-// «другой», и чек, уже сопоставленный с другим экраном, не трогаем. Из
+// «другой» на вопрос об ЭТОМ чеке (или неизвестно, о каком), и чек, уже
+// сопоставленный с другим экраном, не трогаем; «другой» про другой полный чек
+// не мешает: экран — не тот перевод, но может быть этого. Из
 // нескольких экранов — сначала от того же работника, затем ближайший по
 // времени к операции.
 func (d *DB) dedupeScreenOfCheck(ctx context.Context, receiptID int, r completedReceipt, res SameCheck,
-	mark func(victim, kept int, victimIsThis bool, keptWa, victimWa, client string, tx time.Time) (SameCheck, error)) (SameCheck, error) {
+	hold func(victim, kept int, victimIsThis bool, keptWa, victimWa, client string, tx time.Time) (SameCheck, error)) (SameCheck, error) {
 	if r.denied || !r.named || r.guessed || r.collapsed || r.contactID == nil || r.p.Amount <= 0 {
 		return res, nil
 	}
@@ -304,19 +378,21 @@ func (d *DB) dedupeScreenOfCheck(ctx context.Context, receiptID int, r completed
 	ownerNorm := printedNorm("$6::text")
 	senderNorm := printedNorm("$7::text")
 	var (
-		sID        int
-		sWa        string
-		sCollapsed bool
+		sID int
+		sWa string
 	)
 	err := d.pool.QueryRow(ctx, `
-		SELECT br.id, COALESCE(rm.wa_message_id, ''), br.collapsed
+		SELECT br.id, COALESCE(rm.wa_message_id, '')
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1 AND br.id <> $2
 		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
 		  AND br.tx_time_guessed
 		  AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = ''
-		  AND NOT br.same_check_denied
+		  -- «другой» про экран сказали в ответ на вопрос о ДРУГОМ полном чеке —
+		  -- экраном этого он ещё может быть (спросим); без памяти, о каком чеке
+		  -- был ответ, — не трогаем.
+		  AND (NOT br.same_check_denied OR (br.same_check_denied_vs IS NOT NULL AND br.same_check_denied_vs <> $9))
 		  AND COALESCE(rm.deleted, false) = false
 		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
 		  AND br.client_confirmed AND br.contact_id = $3
@@ -329,28 +405,21 @@ func (d *DB) dedupeScreenOfCheck(ctx context.Context, receiptID int, r completed
 		  AND (`+senderNorm+` = '' OR `+printedNorm("br.sender_raw")+` = '' OR `+printedNorm("br.sender_raw")+` = `+senderNorm+`)
 		  AND NOT EXISTS (
 			SELECT 1 FROM bank_receipts s
-			WHERE s.superseded_by_raw = $9 AND s.is_duplicate AND NOT s.ignored)
+			WHERE s.superseded_by_raw = $9 AND (s.is_duplicate OR s.same_check_parked) AND NOT s.ignored)
 		ORDER BY (COALESCE(rm.sender_jid, '') <> $10), abs(extract(epoch FROM rm.received_at - COALESCE($8::timestamptz, $5::timestamptz))), br.id
 		LIMIT 1`, r.groupJID, receiptID, r.contactID, r.p.Amount, r.received, r.p.Recipient, r.p.Sender, op, r.rawID, r.sender).
-		Scan(&sID, &sWa, &sCollapsed)
+		Scan(&sID, &sWa)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
 		return res, nil
 	case err != nil:
 		return res, err
 	}
-	out, err := mark(sID, receiptID, false, r.wa, sWa, r.client, r.p.TxDate)
+	out, err := hold(sID, receiptID, false, r.wa, sWa, r.client, r.p.TxDate)
 	if err != nil || !out.Found {
 		return out, err
 	}
-	out.Tentative, out.VictimCounted = true, true
-	// Экран с подписью не свёрнутый — mark связь не запомнил: каким чеком он
-	// учтён, нужно и ему (ответ ФИО другого клиента, удаление полного чека).
-	if !sCollapsed {
-		if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET superseded_by_raw = $2 WHERE id = $1 AND is_duplicate`, sID, r.rawID); err != nil {
-			return out, err
-		}
-	}
+	out.VictimCounted = true
 	return out, nil
 }
 
@@ -360,7 +429,12 @@ func (d *DB) dedupeScreenOfCheck(ctx context.Context, receiptID int, r completed
 // назван (спросить «чей чек?»).
 func (d *DB) UndoReceiptDuplicate(ctx context.Context, waID string) (found bool, amount float64, client string, needsReview bool, err error) {
 	err = d.pool.QueryRow(ctx, `
-		UPDATE bank_receipts br SET is_duplicate = false, superseded_by_raw = NULL, same_check_denied = true
+		UPDATE bank_receipts br SET is_duplicate = false, superseded_by_raw = NULL, same_check_denied = true,
+			same_check_parked = false,
+			-- «другой» — про тот чек, которым этот был учтён: экраном полного
+			-- чека, присланного позже, он ещё может оказаться (шаг 4).
+			same_check_denied_vs = CASE WHEN br.same_check_denied AND br.same_check_denied_vs IS NULL THEN NULL
+			                            ELSE br.superseded_by_raw END
 		WHERE br.id = (
 			SELECT b2.id FROM bank_receipts b2 JOIN raw_messages rm ON rm.id = b2.raw_message_id
 			WHERE rm.wa_message_id = $1 AND COALESCE(rm.deleted, false) = false
@@ -554,4 +628,227 @@ func (d *DB) NamedCopiesInOtherGroups(ctx context.Context, groupJID string, excl
 		out = append(out, o)
 	}
 	return out, rows.Err()
+}
+
+// ParkedSameCheck — чек, отложенный в «НЕ вошло» догадкой «похоже, тот же
+// перевод», пока группа молчала (WeakPark).
+type ParkedSameCheck struct {
+	ID          int
+	WaMessageID string
+	SenderJID   string
+	Client      string
+	Amount      float64
+	// KeptOK — чек, с которым он совпал, всё ещё в сборе на того же клиента и
+	// ту же сумму (иначе догадки больше нет — чек просто идёт в сбор).
+	KeptOK     bool
+	KeptClient string
+	KeptTxDate time.Time
+}
+
+// ParkedSameChecks — отложенные «похоже, тот же перевод» чеки группы (самые
+// ранние первыми): бот спрашивает о них, когда в группе снова можно писать.
+func (d *DB) ParkedSameChecks(ctx context.Context, groupJID string, limit int) ([]ParkedSameCheck, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT p.id, COALESCE(prm.wa_message_id, ''), COALESCE(prm.sender_jid, ''),
+		       COALESCE(pc.canonical_name, p.recipient_raw, ''), COALESCE(p.amount, 0)::float8,
+		       k.id IS NOT NULL, COALESCE(k.client, ''), COALESCE(k.tx_date, p.tx_date)
+		FROM bank_receipts p
+		JOIN raw_messages prm ON prm.id = p.raw_message_id
+		LEFT JOIN contacts pc ON pc.id = p.contact_id
+		LEFT JOIN LATERAL (
+			SELECT k.id, COALESCE(kc.canonical_name, k.recipient_raw, '') AS client, k.tx_date
+			FROM bank_receipts k
+			JOIN raw_messages krm ON krm.id = k.raw_message_id AND COALESCE(krm.deleted, false) = false
+			LEFT JOIN contacts kc ON kc.id = k.contact_id
+			WHERE k.raw_message_id = p.superseded_by_raw AND k.id <> p.id
+			  AND k.is_duplicate = false AND k.ignored = false AND k.needs_review = false
+			  AND k.client_confirmed AND k.contact_id = p.contact_id AND k.amount = p.amount
+			ORDER BY k.id DESC LIMIT 1
+		) k ON true
+		WHERE COALESCE(p.group_jid, prm.wa_group_jid) = $1
+		  AND p.same_check_parked AND p.needs_review AND p.is_duplicate = false AND p.ignored = false
+		  AND COALESCE(prm.deleted, false) = false
+		ORDER BY prm.received_at, p.id
+		LIMIT $2`, groupJID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ParkedSameCheck
+	for rows.Next() {
+		var p ParkedSameCheck
+		if err := rows.Scan(&p.ID, &p.WaMessageID, &p.SenderJID, &p.Client, &p.Amount, &p.KeptOK, &p.KeptClient, &p.KeptTxDate); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// UnparkSameCheck — догадки «тот же перевод» больше нет (тот чек удалён,
+// исключён, записан на другого): отложенный чек идёт в сбор как прислан.
+func (d *DB) UnparkSameCheck(ctx context.Context, id int) error {
+	_, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET same_check_parked = false, superseded_by_raw = NULL,
+			needs_review = NOT (client_confirmed AND contact_id IS NOT NULL AND COALESCE(amount, 0) > 0)
+		WHERE id = $1 AND same_check_parked AND is_duplicate = false`, id)
+	return err
+}
+
+// HoldParkedSameCheck — про отложенный чек спросили «тот же или другой?»:
+// теперь он повтор (не в сборе), ответ «другой» вернёт его (UndoReceiptDuplicate).
+func (d *DB) HoldParkedSameCheck(ctx context.Context, id int) (bool, error) {
+	tag, err := d.pool.Exec(ctx, `
+		UPDATE bank_receipts SET is_duplicate = true, needs_review = false, same_check_parked = false
+		WHERE id = $1 AND same_check_parked AND needs_review AND is_duplicate = false AND ignored = false`, id)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// ReleasedHold — чек, который считался тем же переводом, что чек другого
+// клиента, и снова идёт в сбор отдельно.
+type ReleasedHold struct {
+	WaMessageID string
+	Client      string
+	Amount      float64
+}
+
+// ReleaseHeldOnClientChange — у чека keptID поменяли клиента. Чеки, которые
+// считались тем же переводом только потому, что у них тот же клиент и сумма
+// (слабое совпадение «похоже, тот же перевод», superseded_by_raw — этот чек;
+// общего номера операции нет), теперь записаны на ДРУГОГО клиента: разных
+// клиентов не склеиваем — они снова отдельные платежи (или, если ждали вопроса
+// в «НЕ вошло», идут в сбор). Неназванный свёрнутый экран, признанный тем же
+// переводом по работнику и сумме, клиента не имеет — его не трогаем.
+func (d *DB) ReleaseHeldOnClientChange(ctx context.Context, keptID int) ([]ReleasedHold, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT s.id, COALESCE(srm.wa_message_id, ''), COALESCE(sc.canonical_name, s.recipient_raw, ''),
+		       COALESCE(s.amount, 0)::float8, COALESCE(kc.canonical_name, k.recipient_raw, '')
+		FROM bank_receipts k
+		JOIN bank_receipts s ON s.superseded_by_raw = k.raw_message_id AND s.id <> k.id
+		JOIN raw_messages srm ON srm.id = s.raw_message_id AND COALESCE(srm.deleted, false) = false
+		LEFT JOIN contacts sc ON sc.id = s.contact_id
+		LEFT JOIN contacts kc ON kc.id = k.contact_id
+		WHERE k.id = $1 AND s.ignored = false
+		  AND (s.is_duplicate OR s.same_check_parked)
+		  AND s.client_confirmed AND s.contact_id IS NOT NULL
+		  AND s.contact_id IS DISTINCT FROM k.contact_id
+		  AND NOT `+sameStrongIDSQL("s.doc_number", "s.auth_code", "k.doc_number", "k.auth_code"), keptID)
+	if err != nil {
+		return nil, err
+	}
+	type cand struct {
+		id int
+		r  ReleasedHold
+	}
+	var cands []cand
+	for rows.Next() {
+		var c cand
+		var kept string
+		if err := rows.Scan(&c.id, &c.r.WaMessageID, &c.r.Client, &c.r.Amount, &kept); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		// Тот же клиент, записанный иначе («Харон Исаев», «Исаев»), — догадка
+		// в силе.
+		if clientNamesCompatible(c.r.Client, kept) {
+			continue
+		}
+		cands = append(cands, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	var out []ReleasedHold
+	for _, c := range cands {
+		tag, err := d.pool.Exec(ctx, `
+			UPDATE bank_receipts SET is_duplicate = false, superseded_by_raw = NULL, same_check_parked = false,
+				needs_review = NOT (client_confirmed AND contact_id IS NOT NULL AND COALESCE(amount, 0) > 0)
+			WHERE id = $1 AND (is_duplicate OR same_check_parked) AND ignored = false`, c.id)
+		if err != nil {
+			return out, err
+		}
+		if tag.RowsAffected() == 1 {
+			fmt.Printf("Чек %s (%s, %.0f ₽) считался тем же переводом, что чек #%d, а тот теперь на другом клиенте — снова отдельный платёж\n",
+				c.r.WaMessageID, c.r.Client, c.r.Amount, keptID)
+			out = append(out, c.r)
+		}
+	}
+	return out, nil
+}
+
+// clientNamesCompatible — одно ФИО целиком входит в другое (порядок слов,
+// регистр, «ё», знаки не важны; инициал совпадает со словом на ту же букву):
+// «Исаев Харон» и «Харон Исаев», «Исаев» и «Исаев Харон», «Исаев Х.» и «Исаев
+// Харон».
+func clientNamesCompatible(a, b string) bool {
+	words := func(s string) [][]rune {
+		var out [][]rune
+		for _, w := range strings.FieldsFunc(strings.ToLower(strings.ReplaceAll(strings.ReplaceAll(s, "ё", "е"), "Ё", "Е")),
+			func(r rune) bool { return !unicode.IsLetter(r) }) {
+			out = append(out, []rune(w))
+		}
+		return out
+	}
+	wa, wb := words(a), words(b)
+	if len(wa) == 0 || len(wb) == 0 {
+		return false
+	}
+	if len(wa) > len(wb) {
+		wa, wb = wb, wa
+	}
+	used := make([]bool, len(wb))
+	take := func(ok func(x, y []rune) bool, w []rune) bool {
+		for j, x := range wb {
+			if !used[j] && ok(w, x) {
+				used[j] = true
+				return true
+			}
+		}
+		return false
+	}
+	same := func(x, y []rune) bool { return string(x) == string(y) }
+	initial := func(x, y []rune) bool {
+		return (len(x) == 1 || len(y) == 1) && x[0] == y[0]
+	}
+	var rest [][]rune
+	for _, w := range wa {
+		if !take(same, w) {
+			rest = append(rest, w)
+		}
+	}
+	for _, w := range rest {
+		if !take(initial, w) {
+			return false
+		}
+	}
+	return true
+}
+
+// HeldScreenPending — свёрнутый экран сообщения screenWa всё ещё считается тем
+// же переводом, что засчитанный полный чек (вопрос задан, «другой» не
+// отвечали, клиента экрану не называли), и после него отправитель экрана в
+// группу чеков больше не присылал: голое ФИО от него сейчас может быть про этот
+// экран.
+func (d *DB) HeldScreenPending(ctx context.Context, screenWa string) (bool, error) {
+	var ok bool
+	err := d.pool.QueryRow(ctx, `
+		SELECT NOT EXISTS (
+			SELECT 1 FROM bank_receipts b2 JOIN raw_messages r2 ON r2.id = b2.raw_message_id
+			WHERE COALESCE(b2.group_jid, r2.wa_group_jid) = COALESCE(br.group_jid, rm.wa_group_jid)
+			  AND r2.sender_jid = rm.sender_jid AND b2.id <> br.id
+			  AND COALESCE(r2.deleted, false) = false
+			  AND (r2.received_at > rm.received_at OR (r2.received_at = rm.received_at AND b2.id > br.id)))
+		FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
+		WHERE rm.wa_message_id = $1 AND COALESCE(rm.deleted, false) = false
+		  AND br.collapsed AND br.is_duplicate AND NOT br.ignored AND NOT br.same_check_denied
+		  AND br.superseded_by_raw IS NOT NULL AND NOT br.client_confirmed
+		ORDER BY br.id DESC LIMIT 1`, screenWa).Scan(&ok)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	return ok, err
 }

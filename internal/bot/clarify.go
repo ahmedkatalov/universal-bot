@@ -60,6 +60,12 @@ type clarifyState struct {
 	// crossAsks — «этот чек уже прислан в другой группе на другого клиента —
 	// чей он?»: id вопроса → обе копии чека.
 	crossAsks map[string]crossClientAsk
+	// heldScreens — свёрнутый экран работника, только что признанный тем же
+	// переводом, что полный чек (ключ — группа|работник).
+	heldScreens map[string]heldScreen
+	// heldNameAsks — «ФИО — это клиент экрана выше или имя для следующего
+	// чека?»: id вопроса → экран и ФИО.
+	heldNameAsks map[string]heldNameAsk
 }
 
 // dupFixAsk — повторно присланный чек подписан другим клиентом.
@@ -97,11 +103,13 @@ func newClarifyState() *clarifyState {
 		dupAskMap:  make(map[string]int),
 		lastAsk:    make(map[string]openAsk),
 
-		receiptAsks: make(map[string][]openAsk),
-		paymentAsks: make(map[string]paymentAsk),
-		dupFixAsks:  make(map[string]dupFixAsk),
-		sameAsks:    make(map[string]sameCheckAsk),
-		crossAsks:   make(map[string]crossClientAsk),
+		receiptAsks:  make(map[string][]openAsk),
+		paymentAsks:  make(map[string]paymentAsk),
+		dupFixAsks:   make(map[string]dupFixAsk),
+		sameAsks:     make(map[string]sameCheckAsk),
+		crossAsks:    make(map[string]crossClientAsk),
+		heldScreens:  make(map[string]heldScreen),
+		heldNameAsks: make(map[string]heldNameAsk),
 	}
 }
 
@@ -211,6 +219,11 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 		}
 		if b.groupSilent(jid) {
 			continue // владелец попросил молчать в этой группе — вопросов не задаём
+		}
+		// 0. Чеки, отложенные в «НЕ вошло» догадкой «похоже, тот же перевод»,
+		// пока группа молчала, — теперь спрашиваем «тот же или другой?».
+		if asked += b.askParkedSameChecks(ctx, jid, clarifyPerCycle-asked); asked >= clarifyPerCycle {
+			break
 		}
 		// 1. Чеки без имени клиента — «чей это чек?».
 		// Много чеков без ответа (сотрудник скинул пачку) — не замолкаем совсем:
@@ -803,7 +816,12 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	fix, isFixAsk := b.clarify.dupFixAsks[quotedID]
 	same, isSameAsk := b.clarify.sameAsks[quotedID]
 	cross, isCrossAsk := b.clarify.crossAsks[quotedID]
+	heldName, isHeldNameAsk := b.clarify.heldNameAsks[quotedID]
 	b.clarify.mu.Unlock()
+	// «ФИО — это клиент экрана выше?» — «да» засчитывает экран этому клиенту.
+	if isHeldNameAsk && b.applyHeldNameAnswer(ctx, msg.Info.Chat, quotedID, heldName, text) {
+		return true
+	}
 	if !isPayAsk {
 		// Связь могла потеряться из памяти (рестарт бота) — ищем в БД.
 		if p, ok, _ := b.db.WhoAskByMsg(ctx, quotedID); ok {
