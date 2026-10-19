@@ -47,6 +47,29 @@ type PrintedTwin struct {
 // времени молча не решаем — спрашиваем человека.
 func MinutePrecision(t time.Time) bool { return t.Second() == 0 && t.Nanosecond() == 0 }
 
+// FutureOpSlack — насколько напечатанное время операции может быть позже
+// присылки самого чека (часы телефона и банка расходятся). Позже — ошибка
+// чтения или другой часовой пояс: по такому времени «тот же перевод или
+// другой» не судим.
+const FutureOpSlack = 10 * time.Minute
+
+// PlausibleOpTime — напечатанное время операции op не позже, чем чек прислали
+// (posted), с допуском FutureOpSlack.
+func PlausibleOpTime(op, posted time.Time) bool { return !op.After(posted.Add(FutureOpSlack)) }
+
+// implausibleOpSQL — SQL-условие «время операции tx чека позже его присылки
+// posted (больше FutureOpSlack)»: по такому времени не судим (см. PlausibleOpTime).
+func implausibleOpSQL(tx, posted string) string {
+	return fmt.Sprintf(`(%s > %s + interval '%d seconds')`, tx, posted, int(FutureOpSlack/time.Second))
+}
+
+// untrustedOpSQL — SQL-условие «по времени операции чека alias (bank_receipts)
+// не судим»: на чеке напечатана только дата (время выбрано, tx_date_only) или
+// время позже присылки самого чека posted (implausibleOpSQL).
+func untrustedOpSQL(alias, posted string) string {
+	return `(` + alias + `.tx_date_only OR ` + implausibleOpSQL(alias+".tx_date", posted) + `)`
+}
+
 // sameOpTimeSQL — время операции двух чеков (a и b; *Guessed — время не с
 // чека, а по сообщению) не мешает считать их одним и тем же чеком. Если оба
 // времени НАПЕЧАТАНЫ на чеках, то копия того же чека печатает то же время: до
@@ -137,9 +160,13 @@ func (d *DB) FindPrintedTwin(ctx context.Context, groupJID string, excludeID int
 	return t, nil
 }
 
-// MarkReceiptDuplicate помечает чек повтором (если он ещё живой).
+// MarkReceiptDuplicate помечает чек повтором (если он ещё живой). Чек, который
+// ждал вопроса «тот же перевод?» в «НЕ вошло» (same_check_parked), ждать
+// перестаёт: «на проверку» его отправила только эта догадка.
 func (d *DB) MarkReceiptDuplicate(ctx context.Context, id int) (bool, error) {
-	tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true WHERE id = $1 AND is_duplicate = false`, id)
+	tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET is_duplicate = true,
+		needs_review = CASE WHEN same_check_parked THEN false ELSE needs_review END, same_check_parked = false
+		WHERE id = $1 AND is_duplicate = false`, id)
 	if err != nil {
 		return false, err
 	}

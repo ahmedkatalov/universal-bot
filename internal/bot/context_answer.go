@@ -427,7 +427,9 @@ func (b *Bot) applyReceiptAnswer(ctx context.Context, chat types.JID, receiptWaI
 	// сбор (прислали ещё раз чётче, подписали копию) — второй раз не считаем, а
 	// если не уверены — спрашиваем «тот же или другой?».
 	if amount > 0 && (canonical != "" || replyAmount > 0) {
-		same, err := b.db.DedupeCompletedReceipt(ctx, rid, replyAmount > 0, true)
+		// Слабое совпадение — с вопросом «тот же или другой?»; в группе на
+		// молчании чек ждёт в «НЕ вошло» и бот спросит потом (weakSameMode).
+		same, err := b.db.DedupeCompletedReceiptWeak(ctx, rid, replyAmount > 0, b.weakSameMode(chat))
 		if err != nil {
 			fmt.Println("Ответ про чек: проверка повтора не удалась:", err)
 		} else if same.Found && same.VictimIsThis {

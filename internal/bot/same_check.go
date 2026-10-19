@@ -14,6 +14,7 @@ import (
 	"whatsapp-bot/internal/db"
 
 	"go.mau.fi/whatsmeow/types"
+	"go.mau.fi/whatsmeow/types/events"
 )
 
 // sameCheckAsk — «похоже, это тот же чек, что уже засчитан» по чеку checkWa.
@@ -26,7 +27,6 @@ func (b *Bot) registerSameCheckAsk(botMsgID string, a sameCheckAsk) {
 		return
 	}
 	b.clarify.mu.Lock()
-	defer b.clarify.mu.Unlock()
 	if len(b.clarify.sameAsks) >= clarifyMapCap {
 		for k := range b.clarify.sameAsks {
 			delete(b.clarify.sameAsks, k)
@@ -34,6 +34,14 @@ func (b *Bot) registerSameCheckAsk(botMsgID string, a sameCheckAsk) {
 		}
 	}
 	b.clarify.sameAsks[botMsgID] = a
+	b.clarify.mu.Unlock()
+	// Связь «вопрос → чек» и в базе: ответ «другой» сработает и после
+	// перезапуска бота (память вопросов пуста).
+	if b.db != nil {
+		if err := b.db.MarkSameCheckAsk(context.Background(), a.checkWa, botMsgID); err != nil {
+			fmt.Println("Не запомнил вопрос «тот же чек?»:", err)
+		}
+	}
 }
 
 // reportSameCheck — сказать в группе, что чек checkWa (или его ничья копия)
@@ -43,7 +51,15 @@ func (b *Bot) reportSameCheck(ctx context.Context, chat types.JID, checkWa, send
 	if !same.Found {
 		return ""
 	}
+	if same.Parked {
+		// Группа на молчании: чек ждёт в «НЕ вошло», спросим, когда можно будет
+		// писать (askParkedSameChecks). Про «чей чек?» по нему не спрашиваем.
+		b.dropReceiptAsk(chat.String(), same.VictimWa)
+		return ""
+	}
 	if same.ScreenReplaced {
+		// Повтором стал уже засчитанный экран без даты и номера, а в учёте
+		// остался этот полный чек: говорим и даём путь назад.
 		return b.reportScreenReplaced(ctx, chat, checkWa, senderJID, same)
 	}
 	if !same.VictimIsThis {
@@ -74,6 +90,9 @@ func (b *Bot) reportSameCheck(ctx context.Context, chat types.JID, checkWa, send
 			"🤔 %s, похоже, тот же чек, что уже засчитан: %s, %.0f ₽, чек от %s. Второй раз пока не считаю. "+
 				"Если это ДРУГОЙ платёж — ответьте на это сообщение «другой», и я засчитаю его отдельно.",
 			lead, same.Client, same.Amount, when))
+		if id == "" {
+			b.parkUnasked(ctx, checkWa)
+		}
 		b.registerSameCheckAsk(id, sameCheckAsk{checkWa: checkWa})
 		return id
 	}
@@ -117,8 +136,23 @@ func (b *Bot) reportScreenReplaced(ctx context.Context, chat types.JID, checkWa,
 	} else {
 		id = b.sendReply(chat, text, checkWa, senderJID)
 	}
+	if id == "" {
+		b.parkUnasked(ctx, same.VictimWa)
+	}
 	b.registerSameCheckAsk(id, sameCheckAsk{checkWa: same.VictimWa})
 	return id
+}
+
+// parkUnasked — вопрос «тот же или другой?» про чек waID (повтор по догадке
+// «похоже, тот же перевод») в группу не ушёл: догадку молча не держим — чек
+// ждёт в «НЕ вошло», спросим в следующем цикле (askParkedSameChecks).
+func (b *Bot) parkUnasked(ctx context.Context, waID string) {
+	if b.db == nil {
+		return
+	}
+	if err := b.db.ParkHeldSameCheck(ctx, waID); err != nil {
+		fmt.Println("Не отложил чек «тот же перевод?» после неотправленного вопроса:", err)
+	}
 }
 
 // parseSameCheckAnswer — ответ на «похоже, это тот же чек»: different — это
@@ -232,7 +266,11 @@ func (b *Bot) answerForRepeatedCheck(ctx context.Context, chat types.JID, waID, 
 	if err != nil || !o.Found {
 		return false, false
 	}
-	sameClient := (cid != nil && o.KeptContactID != nil && *cid == *o.KeptContactID) || sameClientMoney(o.KeptClient, canonical)
+	// Имя, совместимое с клиентом оставшегося чека («Исаев» или «Харон» при
+	// «Исаев Харон»), — тот же клиент: всё остальное уже совпало (работник,
+	// сумма, перевод), второй платёж молча не заводим.
+	sameClient := (cid != nil && o.KeptContactID != nil && *cid == *o.KeptContactID) ||
+		sameClientMoney(o.KeptClient, canonical) || clientNamePartMoney(o.KeptClient, canonical)
 	switch {
 	case canonical != "" && o.KeptNamed && !o.Strong && !sameClient:
 		if ok, _, _, _, err := b.db.UndoReceiptDuplicate(ctx, waID); err != nil || !ok {
@@ -451,4 +489,270 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 	fmt.Printf("Чек %s: клиент %s — поправил и копию в %s\n", a.thisWa, canonical, a.otherGroup)
 	b.sendText(chat, fmt.Sprintf("Поправил: чек на клиента %s — и здесь, и в %s.%s", canonical, where, moved))
 	return true
+}
+
+// weakSameMode — как поступать в группе chat со слабым совпадением «похоже,
+// тот же перевод» (общего номера нет, у одного из чеков время операции не
+// прочиталось): держать повтором и спросить «тот же или другой?»; в группе на
+// молчании — отложить в «НЕ вошло» и спросить, когда молчание снимут
+// (askParkedSameChecks), а не угадывать молча. Вопросы по чекам выключены
+// совсем (ASK_UNNAMED_RECEIPTS=0) — повтором без вопроса, как раньше (виден в
+// «НЕ вошло» как повтор).
+func (b *Bot) weakSameMode(chat types.JID) db.WeakSame {
+	if askReceiptsEnabled() && b.groupSilent(chat) {
+		return db.WeakPark
+	}
+	return db.WeakHold
+}
+
+// dedupeNamedReceipt — чек rid только что назвали (ФИО следующим сообщением,
+// свайпом, «ФИО сумма» рядом): тот же перевод мог уже войти в сбор другим чеком
+// того же клиента — экраном «Перевод выполнен» без даты или полным чеком.
+// Второй раз не считаем; это догадка — спрашиваем «тот же или другой?» (группа
+// на молчании — чек ждёт в «НЕ вошло»). Возвращает, что нашлось.
+func (b *Bot) dedupeNamedReceipt(ctx context.Context, chat types.JID, rid int) db.SameCheck {
+	if rid <= 0 || b.db == nil {
+		return db.SameCheck{}
+	}
+	same, err := b.db.DedupeCompletedReceiptWeak(ctx, rid, false, b.weakSameMode(chat))
+	if err != nil {
+		fmt.Println("Проверка «тот же перевод» после ФИО не удалась:", err)
+		return db.SameCheck{}
+	}
+	if same.Found {
+		waID, senderJID, _, _ := b.db.ReceiptReplyRef(ctx, rid)
+		b.reportSameCheck(ctx, chat, waID, senderJID, same, false)
+	}
+	return same
+}
+
+// reportReleasedHolds — чек checkWa записали на другого клиента, а эти чеки
+// считались тем же переводом только потому, что клиент и сумма совпадали:
+// разных клиентов не склеиваем — они снова отдельные платежи. Говорим об этом.
+func (b *Bot) reportReleasedHolds(chat types.JID, checkWa, senderJID, newClient string, rel []db.ReleasedHold) {
+	if len(rel) == 0 || b.groupSilent(chat) {
+		return
+	}
+	for _, r := range rel {
+		b.dropReceiptAsk(chat.String(), r.WaMessageID)
+		text := fmt.Sprintf("Чек на %.0f ₽ (%s) я считал тем же переводом, что этот чек. Теперь этот чек — %s, поэтому тот снова считаю "+
+			"отдельным платежом: %s, %.0f ₽. Если тот чек тоже %s — ответьте на него ФИО, и я сверю.",
+			r.Amount, r.Client, newClient, r.Client, r.Amount, newClient)
+		if senderJID == "" || checkWa == "" {
+			b.sendText(chat, text)
+		} else {
+			b.sendReply(chat, text, checkWa, senderJID)
+		}
+	}
+}
+
+// heldScreen — свёрнутый экран, признанный тем же переводом, что засчитанный
+// полный чек (бот сказал «Похоже, это тот же перевод…»). Голое ФИО от того же
+// работника следом может быть и про экран, и именем для его следующего чека.
+type heldScreen struct {
+	screenWa   string
+	keptClient string
+	amount     float64
+	txDate     time.Time
+	at         time.Time
+}
+
+// heldNameAsk — «ФИО — это клиент экрана выше или имя для следующего чека?».
+type heldNameAsk struct {
+	screenWa   string
+	name       string // клиент из ФИО
+	keptClient string
+	nameRawID  int // сообщение с ФИО (оно же ждёт чек в очереди имён)
+	senderJID  string
+	amount     float64
+}
+
+func heldKey(groupJID, senderJID string) string { return groupJID + "|" + senderJID }
+
+// rememberHeldScreen — экран признан тем же переводом, что полный чек, вопрос
+// задан.
+func (b *Bot) rememberHeldScreen(groupJID, senderJID string, h heldScreen) {
+	if senderJID == "" || h.screenWa == "" {
+		return
+	}
+	h.at = time.Now()
+	b.clarify.mu.Lock()
+	defer b.clarify.mu.Unlock()
+	if len(b.clarify.heldScreens) >= clarifyMapCap {
+		for k := range b.clarify.heldScreens {
+			delete(b.clarify.heldScreens, k)
+			break
+		}
+	}
+	b.clarify.heldScreens[heldKey(groupJID, senderJID)] = h
+}
+
+// takeHeldScreen — экран этого работника, о котором голое ФИО сейчас может
+// быть ответом: вопрос свежий, на него не ответили и чеков после экрана работник
+// не присылал. Берётся один раз.
+func (b *Bot) takeHeldScreen(ctx context.Context, groupJID, senderJID string) (heldScreen, bool) {
+	k := heldKey(groupJID, senderJID)
+	b.clarify.mu.Lock()
+	h, ok := b.clarify.heldScreens[k]
+	delete(b.clarify.heldScreens, k)
+	b.clarify.mu.Unlock()
+	if !ok || time.Since(h.at) > contextAnswerWindow || b.db == nil {
+		return heldScreen{}, false
+	}
+	pending, err := b.db.HeldScreenPending(ctx, h.screenWa)
+	if err != nil || !pending {
+		return heldScreen{}, false
+	}
+	return h, true
+}
+
+// nameAfterHeldScreen — голое ФИО (без суммы и свайпа) от работника, чей
+// свёрнутый экран бот только что признал тем же переводом, что полный чек, а
+// ждущего чека рядом нет. Тот же клиент, что у полного чека (и короче:
+// «Исаев», «Харон»), — это про экран: он уже учтён. ДРУГОЙ клиент — непонятно:
+// это клиент экрана (тогда это другой платёж) или имя для следующего чека
+// (так работники и пишут — ФИО, потом чек). Не угадываем: имя ждёт следующий
+// чек, как обычно, а бот спрашивает, не про экран ли оно («да» — экран
+// засчитывается этому клиенту). Возвращает true, если сообщение обработано.
+func (b *Bot) nameAfterHeldScreen(ctx context.Context, msg *events.Message, name, canonical string, cid *int, rawID int) bool {
+	chat := msg.Info.Chat
+	sender := msg.Info.Sender.String()
+	if b.groupSilent(chat) {
+		return false
+	}
+	h, ok := b.takeHeldScreen(ctx, chat.String(), sender)
+	if !ok {
+		return false
+	}
+	if sameClientMoney(h.keptClient, canonical) || clientNamePartMoney(h.keptClient, canonical) {
+		handled, _ := b.answerForRepeatedCheck(ctx, chat, h.screenWa, canonical, canonical, cid)
+		if handled {
+			_ = b.db.MarkMessageParsed(ctx, rawID)
+		}
+		return handled
+	}
+	b.enqueuePendingName(ctx, msg, name, 0, rawID)
+	_ = b.db.MarkMessageParsed(ctx, rawID)
+	id := b.sendReply(chat, fmt.Sprintf(
+		"🤔 «%s» — это клиент экрана на %.0f ₽ выше? Я считаю тот экран тем же переводом, что чек %s (%s). "+
+			"Если экран — ДРУГОЙ платёж, клиента %s, — ответьте на это сообщение «да», и я засчитаю его отдельно. "+
+			"Если «%s» — для следующего чека, просто пришлите чек.",
+		canonical, h.amount, h.keptClient, h.txDate.Format("02.01.2006 15:04"), canonical, canonical), msg.Info.ID, sender)
+	if id == "" {
+		return true
+	}
+	b.clarify.mu.Lock()
+	if len(b.clarify.heldNameAsks) >= clarifyMapCap {
+		for k := range b.clarify.heldNameAsks {
+			delete(b.clarify.heldNameAsks, k)
+			break
+		}
+	}
+	b.clarify.heldNameAsks[id] = heldNameAsk{screenWa: h.screenWa, name: canonical, keptClient: h.keptClient,
+		nameRawID: rawID, senderJID: sender, amount: h.amount}
+	b.clarify.mu.Unlock()
+	fmt.Printf("ФИО %q после экрана того же перевода (%s): жду чек и спросил, не про экран ли оно\n", canonical, h.screenWa)
+	return true
+}
+
+// parseYesNo — «да»/«нет» на вопрос бота (resolved=false — не понятно).
+func parseYesNo(text string) (resolved, yes bool) {
+	t := strings.ReplaceAll(strings.ToLower(strings.TrimSpace(text)), "ё", "е")
+	toks := strings.FieldsFunc(t, func(r rune) bool { return !unicode.IsLetter(r) && !unicode.IsDigit(r) })
+	if len(toks) > 1 && toks[0] == "это" {
+		toks = toks[1:] // «это он», «это не он»
+	}
+	if len(toks) == 0 {
+		return false, false
+	}
+	switch toks[0] {
+	case "да", "ага", "угу", "верно", "точно", "он", "она", "его", "ее", "экран":
+		return true, true
+	case "нет", "неа", "не", "следующий", "следующего", "следующему", "для":
+		return true, false
+	}
+	if isConfirmReply(t) {
+		return true, true
+	}
+	return false, false
+}
+
+// applyHeldNameAnswer — ответ на «ФИО — это клиент экрана выше?»: «да» — экран
+// засчитывается этому клиенту отдельным платежом (а имя больше не ждёт
+// следующий чек); «нет» — экран остаётся тем же переводом, имя ждёт чек.
+func (b *Bot) applyHeldNameAnswer(ctx context.Context, chat types.JID, askID string, a heldNameAsk, text string) bool {
+	resolved, yes := parseYesNo(text)
+	if !resolved {
+		return false
+	}
+	b.clarify.mu.Lock()
+	delete(b.clarify.heldNameAsks, askID)
+	b.clarify.mu.Unlock()
+	if !yes {
+		b.sendText(chat, fmt.Sprintf("Понял: экран на %.0f ₽ — тот же перевод (%s), «%s» жду для следующего чека.", a.amount, a.keptClient, a.name))
+		return true
+	}
+	found, _, _, _, err := b.db.UndoReceiptDuplicate(ctx, a.screenWa)
+	if err != nil || !found {
+		if err != nil {
+			fmt.Println("Возврат экрана из повторов не удался:", err)
+		}
+		b.sendText(chat, "Этот экран уже не найден или уже учтён отдельно — ничего не менял.")
+		return true
+	}
+	// Имя ушло на экран — следующему чеку его не отдаём.
+	if ps, err := b.db.PendingNamesOf(ctx, chat.String(), a.senderJID, time.Now().Add(-b.pairWindow)); err == nil {
+		for _, p := range ps {
+			if p.RawID == a.nameRawID {
+				_ = b.db.ConsumePendingNameByID(ctx, p.ID)
+				break
+			}
+		}
+	}
+	if handled, _ := b.applyReceiptAnswer(ctx, chat, a.screenWa, a.name); handled {
+		return true
+	}
+	b.askAboutReceipt(ctx, chat, a.screenWa, fmt.Sprintf("Понял, экран на %.0f ₽ — отдельный платёж. Чей он? Напишите ФИО клиента — тогда засчитаю.", a.amount), false, true)
+	return true
+}
+
+// askParkedSameChecks — чеки группы, отложенные в «НЕ вошло» догадкой «похоже,
+// тот же перевод», пока группа молчала (db.WeakPark): теперь писать можно —
+// говорим, что считаем перевод один раз, и ждём «другой». Чек, с которым
+// совпало, уже не в сборе на того же клиента — догадки нет, чек идёт в сбор.
+// Возвращает, сколько вопросов задано.
+func (b *Bot) askParkedSameChecks(ctx context.Context, jid types.JID, limit int) int {
+	if limit <= 0 || b.db == nil {
+		return 0
+	}
+	items, err := b.db.ParkedSameChecks(ctx, jid.String(), limit)
+	if err != nil {
+		fmt.Println("Отложенные «тот же перевод?» чеки: ошибка выборки:", err)
+		return 0
+	}
+	asked := 0
+	for _, it := range items {
+		if !it.KeptOK {
+			if err := b.db.UnparkSameCheck(ctx, it.ID); err != nil {
+				fmt.Println("Возврат отложенного чека в сбор не удался:", err)
+			}
+			continue
+		}
+		id := b.sendReply(jid, fmt.Sprintf(
+			"🤔 Пока я молчал в группе: этот чек на %.0f ₽ (%s), похоже, тот же перевод, что чек %s от %s, — считаю его один раз. "+
+				"Если это ДРУГОЙ платёж — ответьте на это сообщение «другой», и я засчитаю его отдельно.",
+			it.Amount, it.Client, it.KeptClient, it.KeptTxDate.Format("02.01.2006 15:04")), it.WaMessageID, it.SenderJID)
+		if id == "" {
+			continue // не ушло — спросим в следующий раз, чек ждёт в «НЕ вошло»
+		}
+		if ok, err := b.db.HoldParkedSameCheck(ctx, it.ID); err != nil || !ok {
+			if err != nil {
+				fmt.Println("Отложенный чек не стал повтором:", err)
+			}
+			continue
+		}
+		b.registerSameCheckAsk(id, sameCheckAsk{checkWa: it.WaMessageID})
+		asked++
+	}
+	return asked
 }
