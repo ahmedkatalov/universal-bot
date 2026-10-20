@@ -111,3 +111,53 @@ func TestNewFromEnvStripsAPISuffix(t *testing.T) {
 		t.Errorf("baseURL = %q, ожидали без /api", c.baseURL)
 	}
 }
+
+// Вход протух, а программа отвечает 403 (не 401): бот входит заново и
+// продолжает работать, а не теряет доступ до перезапуска.
+func TestExpiredTokenAs403Relogins(t *testing.T) {
+	var logins int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/auth/login":
+			n := atomic.AddInt32(&logins, 1)
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "t" + string(rune('0'+n))})
+		case "/api/clients/lookup":
+			if r.Header.Get("Authorization") == "Bearer t1" {
+				w.WriteHeader(http.StatusForbidden) // первый токен «протух»
+				return
+			}
+			_, _ = w.Write([]byte(`[]`))
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer srv.Close()
+	c := newErrTestClient(srv.URL)
+	if _, err := c.LookupClients(context.Background(), "Ахмед"); err != nil {
+		t.Fatalf("после 403 бот должен войти заново: %v", err)
+	}
+	if got := atomic.LoadInt32(&logins); got != 2 {
+		t.Fatalf("входов %d, ожидали 2", got)
+	}
+}
+
+// 403 и после свежего входа — правда нет прав: понятная причина, без бесконечных входов.
+func TestForbiddenAfterFreshLogin(t *testing.T) {
+	var logins int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/api/auth/login" {
+			atomic.AddInt32(&logins, 1)
+			_ = json.NewEncoder(w).Encode(map[string]string{"token": "t"})
+			return
+		}
+		w.WriteHeader(http.StatusForbidden)
+	}))
+	defer srv.Close()
+	_, err := newErrTestClient(srv.URL).LookupClients(context.Background(), "Ахмед")
+	if err == nil || !strings.Contains(Human(err), "нет прав") {
+		t.Fatalf("ожидали «нет прав», получили %v / %q", err, Human(err))
+	}
+	if got := atomic.LoadInt32(&logins); got != 2 {
+		t.Fatalf("входов %d, ожидали 2 (один повторный)", got)
+	}
+}

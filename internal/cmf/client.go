@@ -257,7 +257,10 @@ func (c *Client) get(ctx context.Context, op, path string, query url.Values, bra
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
 
-		if resp.StatusCode == http.StatusUnauthorized {
+		// Протухший или отозванный вход: программа отвечает 401, а часть
+		// роутов — 403. Входим заново один раз; 403 и после свежего входа —
+		// значит, у пользователя бота правда нет прав.
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 			c.clearToken()
 			if relogged {
 				return nil, &APIError{Op: op, Status: resp.StatusCode, Body: truncate(string(body), 200)}
@@ -660,8 +663,8 @@ func (c *Client) AddPayment(ctx context.Context, contractID, branchID string, am
 	}
 	data, _ := json.Marshal(payload)
 	// ЗАПИСЬ: при сетевом сбое/таймауте НЕ повторяем — платёж мог уже записаться,
-	// и повтор задвоил бы его. Повтор только после 401 (протухший вход), когда
-	// программа точно ничего не записала.
+	// и повтор задвоил бы его. Повтор только после 401/403 (протухший вход),
+	// когда программа точно ничего не записала.
 	for attempt := 0; attempt < 2; attempt++ {
 		token, err := c.ensureToken(ctx)
 		if err != nil {
@@ -682,7 +685,8 @@ func (c *Client) AddPayment(ctx context.Context, contractID, branchID string, am
 		}
 		body, _ := io.ReadAll(resp.Body)
 		resp.Body.Close()
-		if resp.StatusCode == http.StatusUnauthorized {
+		// 401/403 — программа ничего не записала (вход протух): входим заново и повторяем.
+		if (resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden) && attempt == 0 {
 			c.clearToken()
 			continue
 		}
