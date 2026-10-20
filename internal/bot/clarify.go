@@ -67,6 +67,12 @@ type clarifyState struct {
 	// из двух названных): ответ на вопрос или имя перед следующим чеком — пока
 	// не ясно (см. crossCandidate). Ключ — группа и отправитель.
 	crossCands map[string]crossCandidate
+	// heldScreens — свёрнутый экран работника, только что признанный тем же
+	// переводом, что полный чек (ключ — группа|работник).
+	heldScreens map[string]heldScreen
+	// heldNameAsks — «ФИО — это клиент экрана выше или имя для следующего
+	// чека?»: id вопроса → экран и ФИО.
+	heldNameAsks map[string]heldNameAsk
 }
 
 // dupFixAsk — повторно присланный чек подписан другим клиентом.
@@ -104,12 +110,14 @@ func newClarifyState() *clarifyState {
 		dupAskMap:  make(map[string]int),
 		lastAsk:    make(map[string]openAsk),
 
-		receiptAsks: make(map[string][]openAsk),
-		paymentAsks: make(map[string]paymentAsk),
-		dupFixAsks:  make(map[string]dupFixAsk),
-		sameAsks:    make(map[string]sameCheckAsk),
-		crossAsks:   make(map[string]crossClientAsk),
-		crossCands:  make(map[string]crossCandidate),
+		receiptAsks:  make(map[string][]openAsk),
+		paymentAsks:  make(map[string]paymentAsk),
+		dupFixAsks:   make(map[string]dupFixAsk),
+		sameAsks:     make(map[string]sameCheckAsk),
+		crossAsks:    make(map[string]crossClientAsk),
+		crossCands:   make(map[string]crossCandidate),
+		heldScreens:  make(map[string]heldScreen),
+		heldNameAsks: make(map[string]heldNameAsk),
 	}
 }
 
@@ -221,6 +229,11 @@ func (b *Bot) clarifyTick(ctx context.Context) {
 		}
 		if b.groupSilent(jid) {
 			continue // владелец попросил молчать в этой группе — вопросов не задаём
+		}
+		// 0. Чеки, отложенные в «НЕ вошло» догадкой «похоже, тот же перевод»,
+		// пока группа молчала, — теперь спрашиваем «тот же или другой?».
+		if asked += b.askParkedSameChecks(ctx, jid, clarifyPerCycle-asked); asked >= clarifyPerCycle {
+			break
 		}
 		// 1. Чеки без имени клиента — «чей это чек?».
 		// Много чеков без ответа (сотрудник скинул пачку) — не замолкаем совсем:
@@ -419,8 +432,11 @@ func (b *Bot) tryResolveClientFromContext(ctx context.Context, jid types.JID, it
 		}
 		if found, _, _, err := b.db.FillReceiptByMessage(ctx, it.WaMessageID, canonical, contactIDPtr, 0); err == nil && found {
 			fmt.Printf("Чек %s привязан к клиенту %q из соседнего сообщения (без вопроса)\n", it.WaMessageID, canonical)
-			b.syncWatchByCheckWa(ctx, jid, it.WaMessageID, canonical)
-			b.afterCheckNamed(ctx, jid, it.WaMessageID, 0)
+			// Тот же перевод уже в сборе (экран без даты / полный чек) — спросим
+			// «тот же или другой?»; сверку заводим только по чеку, что в сборе.
+			if same := b.afterCheckNamed(ctx, jid, it.WaMessageID, 0); !(same.Found && same.VictimIsThis) {
+				b.syncWatchByCheckWa(ctx, jid, it.WaMessageID, canonical)
+			}
 			return true
 		}
 	}
@@ -814,7 +830,12 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	fix, isFixAsk := b.clarify.dupFixAsks[quotedID]
 	same, isSameAsk := b.clarify.sameAsks[quotedID]
 	cross, isCrossAsk := b.clarify.crossAsks[quotedID]
+	heldName, isHeldNameAsk := b.clarify.heldNameAsks[quotedID]
 	b.clarify.mu.Unlock()
+	// «ФИО — это клиент экрана выше?» — «да» засчитывает экран этому клиенту.
+	if isHeldNameAsk && b.applyHeldNameAnswer(ctx, msg.Info.Chat, quotedID, heldName, text) {
+		return true
+	}
 	if !isPayAsk {
 		// Связь могла потеряться из памяти (рестарт бота) — ищем в БД.
 		if p, ok, _ := b.db.WhoAskByMsg(ctx, quotedID); ok {
@@ -823,6 +844,13 @@ func (b *Bot) handleClarifyReply(ctx context.Context, msg *events.Message, text 
 	}
 	if isPayAsk {
 		return b.applyPaymentWhoAnswer(ctx, msg.Info.Chat, quotedID, pa, text, true)
+	}
+	if !isSameAsk && !isFixAsk {
+		// «Похоже, это тот же чек/перевод… (или «другой»)» — связь могла
+		// потеряться из памяти (перезапуск бота): ищем чек по id вопроса в БД.
+		if wa, ok, _ := b.db.SameCheckByAskMsg(ctx, quotedID); ok {
+			same, isSameAsk = sameCheckAsk{checkWa: wa}, true
+		}
 	}
 	// «Этот чек уже присылали… сейчас подписан Y» — «да» переносит чек на Y.
 	if isFixAsk {

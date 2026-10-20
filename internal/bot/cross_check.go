@@ -39,28 +39,34 @@ func (b *Bot) crossAskIfNeeded(ctx context.Context, chat types.JID, c db.CrossCh
 }
 
 // afterCheckNamed — чек сообщения waID (или rawID) назвали после приёма (имя
-// следом, свайп с ФИО, ФИО рядом): при приёме у него был клиентом владелец
-// карты, и ни экран того же перевода, ни его копия в другой группе с ним не
-// сошлись. Теперь:
-//   - экран «Перевод выполнен» того же перевода (тот же работник, клиент,
-//     сумма; без времени и номера), засчитанный раньше, — повтор: в учёте
-//     остаётся этот полный чек, а в группе спрашиваем «другой?»;
-//   - тот же чек в другой группе на другого клиента — «чей он?».
-func (b *Bot) afterCheckNamed(ctx context.Context, chat types.JID, waID string, rawID int) {
+// следом, свайп с ФИО, ФИО рядом, ответ из соседнего сообщения): при приёме у
+// него был клиентом владелец карты, и ни экран того же перевода, ни его копия
+// в другой группе с ним не сошлись. Теперь:
+//   - тот же перевод того же клиента уже в сборе (dedupeNamedReceipt): экран
+//     «Перевод выполнен» без времени и номера, засчитанный раньше, — повтор (в
+//     учёте остаётся этот полный чек), или этот чек без даты — повтор
+//     засчитанного полного; это догадка — спрашиваем «тот же или другой?»
+//     (группа на молчании — ждёт в «НЕ вошло», спросим потом);
+//   - тот же чек в другой группе на другого клиента — «чей он?» (если этот
+//     чек остался в сборе).
+//
+// Возвращает, что нашла проверка «тот же перевод» (Found && VictimIsThis —
+// этот чек в сбор не пошёл).
+func (b *Bot) afterCheckNamed(ctx context.Context, chat types.JID, waID string, rawID int) db.SameCheck {
 	c, err := b.db.CrossCheckOf(ctx, waID, rawID)
 	if err != nil {
 		fmt.Println("Проверка чека после привязки клиента не удалась:", err)
-		return
+		return db.SameCheck{}
 	}
 	if !c.Found {
-		return
+		return db.SameCheck{}
 	}
-	if same, err := b.db.ReplaceScreenWithCheck(ctx, c.ID, 0); err != nil {
-		fmt.Println("Ошибка замены экрана полным чеком:", err)
-	} else if same.Found {
-		b.reportScreenReplaced(ctx, chat, c.WaID, c.SenderJID, same)
+	same := b.dedupeNamedReceipt(ctx, chat, c.ID)
+	if same.Found && same.VictimIsThis {
+		return same
 	}
 	b.crossAskIfNeeded(ctx, chat, c)
+	return same
 }
 
 // crossAskFromDB — вопрос «чей он?» askID, которого нет в памяти (бот
