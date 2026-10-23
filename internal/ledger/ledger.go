@@ -1192,11 +1192,18 @@ type Filter struct {
 
 func (f Filter) inPeriod(t time.Time) bool { return !t.Before(f.From) && t.Before(f.To) }
 
+// oldOperation — чек «из другого месяца», который в режиме по дате чата
+// показывают отдельно, а не в сумме: месяц операции не совпал с месяцем
+// присылки в чат (p.chatTime). Сравниваем по самому платежу, а не по границам
+// запроса, иначе сбор за период (напр. 15.09–15.10) не сходится с суммой по
+// дням: у дня и у периода были бы разные MonthStart. MonthStart задан — значит
+// режим с выделением старых чеков включён (иначе считаем всё по дате чата).
 func (f Filter) oldOperation(p *Payment) bool {
 	if !f.ByChat || p.Main() == nil || f.MonthStart.IsZero() {
 		return false
 	}
-	return p.OpDate.Before(f.MonthStart) || !p.OpDate.Before(f.MonthEnd)
+	ct := p.chatTime()
+	return p.OpDate.Year() != ct.Year() || p.OpDate.Month() != ct.Month()
 }
 
 // Counted — платежи сбора за период.

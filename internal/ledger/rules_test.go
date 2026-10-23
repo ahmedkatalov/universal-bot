@@ -380,3 +380,33 @@ func TestFutureOperationTimeIgnored(t *testing.T) {
 		t.Fatalf("%v, хочу 10000", got)
 	}
 }
+
+// По дате в чате сбор за период (даже через границу месяца) равен сумме по
+// дням: «старый чек» решается по самому платежу, а не по месяцу начала запроса.
+func TestByChatRangeEqualsDayByDay(t *testing.T) {
+	// операция 25.09, прислали 05.10 — для октября это «старый чек».
+	c := chk(1, "g", "Исаев Харон", 2, 20000, time.Date(2026, 9, 25, 11, 0, 0, 0, time.Local), "DOC87654321")
+	c.PostedAt = time.Date(2026, 10, 5, 9, 0, 0, 0, time.Local)
+	// текст того же дня, что операция (сентябрь) — обычный платёж по дате чата.
+	tx := txt(2, "g", "Магомедов Ахмед", 1, 7000, time.Date(2026, 9, 26, 10, 0, 0, 0, time.Local), false)
+	b := Build([]Check{c}, []Text{tx})
+
+	chatF := func(from, toExcl time.Time) Filter {
+		last := toExcl.AddDate(0, 0, -1)
+		return Filter{From: from, To: toExcl, ByChat: true,
+			MonthStart: time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, from.Location()),
+			MonthEnd:   time.Date(last.Year(), last.Month(), 1, 0, 0, 0, 0, last.Location()).AddDate(0, 1, 0)}
+	}
+	from, toExcl := time.Date(2026, 9, 15, 0, 0, 0, 0, time.Local), time.Date(2026, 10, 16, 0, 0, 0, 0, time.Local)
+	rng := total(b.Counted(chatF(from, toExcl)))
+	var day float64
+	for d := from; d.Before(toExcl); d = d.AddDate(0, 0, 1) {
+		day += total(b.Counted(chatF(d, d.AddDate(0, 0, 1))))
+	}
+	if rng != day {
+		t.Fatalf("по дате в чате: период %v, по дням %v", rng, day)
+	}
+	if rng != 7000 {
+		t.Fatalf("в сумме только сентябрьский текст 7000 (чек 25.09 прислан 05.10 — старый), а получили %v", rng)
+	}
+}
