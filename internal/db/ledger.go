@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -87,28 +88,82 @@ func (d *DB) loadLedgerChecks(ctx context.Context, from, to time.Time, client st
 	// чек уже посчитан в другой день, и посчитает его второй раз.
 	have := map[int]bool{}
 	var docs []string
-	seen := map[string]bool{}
+	seenDoc := map[string]bool{}
+	// Копии без номера документа объединяются по сумме и дате операции, поэтому
+	// далёкую копию надо найти по (сумма, день операции), а не по номеру —
+	// иначе дневной отчёт по дате чата посчитал бы её вторым платежом.
+	var amts []float64
+	var days []time.Time
+	seenAD := map[string]bool{}
 	for _, c := range out {
 		have[c.ID] = true
-		if nd := ledger.NormDoc(c.Doc); len([]rune(nd)) >= 6 && !seen[nd] {
-			seen[nd] = true
-			docs = append(docs, nd)
+		nd := ledger.NormDoc(c.Doc)
+		if len([]rune(nd)) >= 6 {
+			if !seenDoc[nd] {
+				seenDoc[nd] = true
+				docs = append(docs, nd)
+			}
+			continue
+		}
+		if c.Amount <= 0 || c.OpDate.IsZero() {
+			continue
+		}
+		day := c.OpDate.Truncate(24 * time.Hour)
+		k := day.Format("2006-01-02") + "/" + strconv.FormatInt(int64(c.Amount*100+0.5), 10)
+		if !seenAD[k] {
+			seenAD[k] = true
+			amts = append(amts, c.Amount)
+			days = append(days, day)
 		}
 	}
-	if len(docs) == 0 {
-		return out, nil
+	lo, hi := from.AddDate(0, 0, -60), to.AddDate(0, 0, 60)
+	add := func(more []ledger.Check) {
+		for _, c := range more {
+			if !have[c.ID] {
+				have[c.ID] = true
+				out = append(out, c)
+			}
+		}
 	}
-	more, err := d.loadLedgerChecksByDocs(ctx, docs, from.AddDate(0, 0, -60), to.AddDate(0, 0, 60))
+	if len(docs) > 0 {
+		more, err := d.loadLedgerChecksByDocs(ctx, docs, lo, hi)
+		if err != nil {
+			return nil, err
+		}
+		add(more)
+	}
+	if len(amts) > 0 {
+		more, err := d.loadLedgerChecksByAmountDay(ctx, amts, days, lo, hi)
+		if err != nil {
+			return nil, err
+		}
+		add(more)
+	}
+	return out, nil
+}
+
+// loadLedgerChecksByAmountDay — чеки БЕЗ номера документа с теми же суммой и
+// днём операции (в пределах окна): далёкие копии одного чека, присланного в
+// другую группу/день, чтобы объединение «тот же чек» сработало и в узком окне.
+func (d *DB) loadLedgerChecksByAmountDay(ctx context.Context, amts []float64, days []time.Time, from, to time.Time) ([]ledger.Check, error) {
+	if len(amts) == 0 {
+		return nil, nil
+	}
+	rows, err := d.pool.Query(ctx, `
+		SELECT `+ledgerCheckCols+`
+		FROM bank_receipts br
+		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
+		WHERE COALESCE(br.doc_number, '') = ''
+		  AND br.tx_date >= $3 AND br.tx_date < $4
+		  AND EXISTS (SELECT 1 FROM unnest($1::float8[], $2::date[]) AS w(amt, day)
+		              WHERE br.amount = w.amt::numeric AND br.tx_date::date = w.day)`,
+		amts, days, from, to)
 	if err != nil {
 		return nil, err
 	}
-	for _, c := range more {
-		if !have[c.ID] {
-			have[c.ID] = true
-			out = append(out, c)
-		}
-	}
-	return out, nil
+	return scanLedgerChecks(rows)
 }
 
 const ledgerCheckCols = `br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_message_id, ''),

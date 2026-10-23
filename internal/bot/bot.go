@@ -265,12 +265,34 @@ func New(ctx context.Context, sessionDBPath string, database *db.DB, aliases *pa
 	return b, nil
 }
 
-var declinedRe = regexp.MustCompile(`(?i)отклон|не\s*выполн|не\s*прош[её]л|неуспеш|отказ|ошибк|declin|reject|fail`)
+var declinedRe = regexp.MustCompile(`(?i)отклон|не\s*выполн|не\s*прош[её]л|не\s*исполн|неуспеш|отказ|ошибк|declin|reject|fail`)
 
 // receiptDeclined — статус на чеке говорит, что перевод не прошёл.
 func receiptDeclined(status string) bool {
 	st := strings.TrimSpace(status)
 	return st != "" && declinedRe.MatchString(st)
+}
+
+// declineBannerRe — слова об отказе в свободном тексте чека (не под лейблом
+// «Статус»). Уже declinedRe: без «ошибк» (слишком общо для свободного текста).
+var declineBannerRe = regexp.MustCompile(`(?i)отклон|отказан|не\s*выполн|не\s*прош[её]л|не\s*исполн|неуспеш|declin|reject|fail`)
+
+// declineSuccessRe — слова, при которых строку об «отказе» считать НЕ отказом
+// («без ошибок», «выполнен успешно»).
+var declineSuccessRe = regexp.MustCompile(`(?i)выполнен|успешн|проведён|проведен|исполнен|зачислен|без\s+ошиб|без\s+сбо`)
+
+// textDeclined — где-то в тексте чека есть пометка, что перевод не прошёл.
+func textDeclined(text string) bool {
+	for _, l := range strings.Split(text, "\n") {
+		l = strings.TrimSpace(l)
+		if l == "" || declineSuccessRe.MatchString(l) {
+			continue
+		}
+		if declineBannerRe.MatchString(l) {
+			return true
+		}
+	}
+	return false
 }
 
 // nameKeyBot — имя без регистра и порядка слов (для сравнения подписей).
@@ -4274,9 +4296,18 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	// ФИО отправляем чек на ручную проверку («чей это чек?»), иначе платёж молча
 	// уйдёт в сбор под владельцем карты — не под настоящим клиентом.
 	needsReview := payerOverride == ""
+	// Несколько переводов на одном скриншоте (история операций): какую сумму
+	// считать — неясно, молча первую брать нельзя. На проверку и просим прислать
+	// по одному.
+	manyOps := len(rd.ManyAmounts) >= 2
+	if manyOps {
+		needsReview = true
+	}
 	// Перевод отклонён/не выполнен банком — денег нет: в сбор не идёт, сверку не
-	// заводим, в группе предупреждаем.
-	declined := receiptDeclined(rd.Status)
+	// заводим, в группе предупреждаем. Слово об отказе может стоять заголовком
+	// («Операция отклонена»), а не под лейблом «Статус:», поэтому смотрим и весь
+	// текст чека, а не только rd.Status.
+	declined := receiptDeclined(rd.Status) || textDeclined(text)
 
 	var contactIDPtr *int
 	contactID, err := b.db.GetOrCreateContact(ctx, canonical)
@@ -4496,9 +4527,26 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		fmt.Printf("Чек (сообщение %d): получатель %q не найден в списке известных — нужна проверка\n", rawID, rd.Recipient)
 	}
 	if declined {
-		fmt.Printf("Чек (сообщение %d): статус «%s» — перевод не прошёл, в сбор не идёт\n", rawID, rd.Status)
+		why := strings.TrimSpace(rd.Status)
+		fmt.Printf("Чек (сообщение %d): перевод не прошёл (%q), в сбор не идёт\n", rawID, why)
 		if !b.groupSilent(chat) {
-			b.sendReply(chat, fmt.Sprintf("⚠️ На чеке статус «%s» — перевод не прошёл, в сбор не засчитываю.", rd.Status), waMsgID, senderJID)
+			msg := "⚠️ Похоже, перевод по чеку НЕ прошёл — в сбор не засчитываю."
+			if why != "" {
+				msg = fmt.Sprintf("⚠️ На чеке статус «%s» — перевод не прошёл, в сбор не засчитываю.", why)
+			}
+			b.sendReply(chat, msg, waMsgID, senderJID)
+		}
+		_ = b.db.MarkMessageParsed(ctx, rawID)
+		return
+	}
+	if manyOps {
+		var parts []string
+		for _, a := range rd.ManyAmounts {
+			parts = append(parts, fmt.Sprintf("%.0f", a))
+		}
+		fmt.Printf("Чек (сообщение %d): на скриншоте несколько операций (%s) — на проверку\n", rawID, strings.Join(parts, ", "))
+		if !b.groupSilent(chat) {
+			b.sendReply(chat, fmt.Sprintf("⚠️ На скриншоте несколько переводов (%s ₽). Чтобы посчитать без ошибок, пришлите, пожалуйста, каждый перевод отдельным сообщением.", strings.Join(parts, " и ")), waMsgID, senderJID)
 		}
 		_ = b.db.MarkMessageParsed(ctx, rawID)
 		return

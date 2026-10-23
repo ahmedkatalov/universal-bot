@@ -43,6 +43,9 @@ type ReceiptData struct {
 	// по времени (текст написан до операции, тот же ли это перевод) нельзя —
 	// такой чек хранится с угаданным временем (tx_time_guessed).
 	TimeDefaulted bool
+	// ManyAmounts — на скриншоте несколько ПЕРЕВОДОВ с разными суммами (история
+	// операций): нельзя молча взять первую сумму. Здесь — разные суммы переводов.
+	ManyAmounts []float64
 }
 
 // TxTimeGuessed — время операции не напечатано на чеке: его нет вовсе (берут
@@ -666,6 +669,12 @@ func ParseReceipt(text string) ReceiptData {
 			}
 			if value != "" && !isFieldLabel(value) {
 				applyField(&rd, rule.field, value)
+				// «Сумма списания» и т.п.: лейбл «сумма» схватил слово, а не
+				// число (0) — не считаем поле заполненным, чтобы сумму нашёл
+				// netTransferAmount, а не фолбэк по остатку счёта.
+				if rule.field == "amount" && rd.Amount == 0 {
+					break
+				}
 				filled[rule.field] = true
 			}
 			break
@@ -709,15 +718,30 @@ func ParseReceipt(text string) ReceiptData {
 	// Фолбэк для суммы: у некоторых банков (РСХБ) сумма стоит крупно в шапке
 	// БЕЗ лейбла ("18000 ₽" отдельной строкой). Берём наибольшую строку вида
 	// "<число> ₽/руб/р." — наибольшую, чтобы не спутать с комиссией "0 ₽".
+	// Несколько переводов на одном скриншоте (история операций): разные суммы
+	// под лейблами «Сумма перевода»/«Перевод по СБП». Нельзя молча взять первую.
+	rd.ManyAmounts = distinctTransferAmounts(lines)
+
 	if rd.Amount == 0 {
 		standaloneAmountRe := regexp.MustCompile(`(?i)^(\d[\d\s.,]*)\s*(₽|руб\.?|р\.?)$`)
-		for _, l := range lines {
-			l = strings.TrimSpace(l)
+		prev := ""
+		for _, raw := range lines {
+			l := strings.TrimSpace(raw)
+			if l == "" {
+				continue
+			}
+			// Остаток/лимит/кэшбэк на экране подтверждения — не сумма перевода:
+			// пропускаем и саму строку, и число под таким лейблом.
+			if balanceLineRe.MatchString(l) || balanceLineRe.MatchString(prev) {
+				prev = l
+				continue
+			}
 			if m := standaloneAmountRe.FindStringSubmatch(l); m != nil {
 				if v := ParseMoneyValue(m[1]); v > rd.Amount {
 					rd.Amount = v
 				}
 			}
+			prev = l
 		}
 	}
 
@@ -779,11 +803,66 @@ var netAmountRules = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)^сумма\s+перевода\s*:?\s*(.*)$`),
 	regexp.MustCompile(`(?i)^сумма\s+операции\s*:?\s*(.*)$`),
 	regexp.MustCompile(`(?i)^сумма\s+платежа\s*:?\s*(.*)$`),
+	regexp.MustCompile(`(?i)^сумма\s+зачислени[яю]\s*:?\s*(.*)$`),
+	regexp.MustCompile(`(?i)^перевод\s+по\s+сбп\s*:?\s*(.*)$`),
+	// «Сумма списания» — сколько ушло со счёта (перевод; возможна комиссия
+	// сверху). Берём как сумму, если лейбла «перевода/операции/платежа» нет,
+	// чтобы не брать по фолбэку остаток счёта. Ставим последним — приоритет у
+	// чистых лейблов выше.
+	regexp.MustCompile(`(?i)^сумма\s+списани[яю]\s*:?\s*(.*)$`),
+}
+
+// balanceLineRe — строки с остатком/лимитом/кэшбэком: их число (часто самое
+// большое на экране) НЕ сумма перевода.
+var balanceLineRe = regexp.MustCompile(`(?i)остаток|доступн|баланс|на\s+сч[её]т|лимит|к[еэ]шб[еэ]к|cashback|задолжен|бонус`)
+
+// transferLabelRe — лейблы суммы ОТДЕЛЬНОГО перевода (для разбора истории
+// операций на одном скриншоте). Комиссия/итого/списания сюда не входят.
+var transferLabelRe = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)^сумма\s+перевода\s*:?\s*(.*)$`),
 	regexp.MustCompile(`(?i)^перевод\s+по\s+сбп\s*:?\s*(.*)$`),
 }
 
+// distinctTransferAmounts — разные ненулевые суммы переводов на скриншоте.
+// Пусто или одна сумма — обычный чек; две и больше — история операций.
+func distinctTransferAmounts(lines []string) []float64 {
+	seen := map[int64]bool{}
+	var out []float64
+	for i, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		for _, re := range transferLabelRe {
+			m := re.FindStringSubmatch(line)
+			if m == nil {
+				continue
+			}
+			value := strings.TrimSpace(m[1])
+			if value == "" {
+				value = nextNonEmptyLine(lines, i+1)
+			}
+			if value == "" || isFieldLabel(value) {
+				continue
+			}
+			if v := ParseMoneyValue(value); v > 0 {
+				k := int64(v*100 + 0.5)
+				if !seen[k] {
+					seen[k] = true
+					out = append(out, v)
+				}
+			}
+			break
+		}
+	}
+	if len(out) < 2 {
+		return nil
+	}
+	return out
+}
+
 // netTransferAmount ищет ЧИСТУЮ сумму перевода (по лейблу назначения), игнорируя
-// «Итого»/«Сумма списания»/«Сумма прописью». Возвращает первое валидное значение.
+// «Итого»/«Сумма прописью». Возвращает первое валидное значение.
 func netTransferAmount(lines []string) (float64, bool) {
 	for i, raw := range lines {
 		line := strings.TrimSpace(raw)
