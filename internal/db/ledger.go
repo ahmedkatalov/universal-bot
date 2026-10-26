@@ -6,6 +6,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/jackc/pgx/v5"
 
@@ -414,25 +415,54 @@ func (d *DB) SenderStatsByChat(ctx context.Context, from, to, monthStart, monthE
 }
 
 func senderStats(ps []*ledger.Payment, q string) []SenderStat {
-	q = strings.ToLower(strings.TrimSpace(q))
-	type key struct{ name, phone string }
-	by := map[key]*SenderStat{}
-	var order []key
+	q = strings.TrimSpace(q)
+	qDigits := phoneDigits(q)
+	qLower := strings.ToLower(q)
+	// Группируем по номеру телефона (один контакт — одна строка, даже если имя
+	// в WhatsApp то появлялось, то нет). Телефона нет — по имени.
+	by := map[string]*SenderStat{}
+	var order []string
 	sortByOp(ps)
 	for _, p := range ps {
 		name, phone := p.Sender()
-		if q != "" && !strings.Contains(strings.ToLower(name), q) && !strings.Contains(phone, q) {
-			continue
+		if q != "" {
+			match := false
+			if qDigits != "" { // спросили номер (в любом формате: 8928…, +7928…, 928…)
+				match = phoneMatch(qDigits, phone)
+			}
+			if !match && len(qLower) >= 2 && strings.Contains(strings.ToLower(name), qLower) {
+				match = true
+			}
+			if !match {
+				continue
+			}
 		}
-		k := key{name, phone}
+		k := phone
+		if k == "" {
+			k = "name:" + nameKey(name)
+		}
 		st, ok := by[k]
 		if !ok {
 			st = &SenderStat{Name: name, Phone: phone}
 			by[k] = st
 			order = append(order, k)
 		}
+		if st.Name == "" && name != "" {
+			st.Name = name
+		}
 		st.Count++
 		st.Total += p.Amount
+		switch {
+		case p.Main() != nil:
+			st.Checks++
+			st.ChecksSum += p.Amount
+		case p.Cash:
+			st.Cash++
+			st.CashSum += p.Amount
+		default:
+			st.Transfers++
+			st.TransfersSum += p.Amount
+		}
 	}
 	out := make([]SenderStat, 0, len(order))
 	for _, k := range order {
@@ -440,6 +470,41 @@ func senderStats(ps []*ledger.Payment, q string) []SenderStat {
 	}
 	sort.SliceStable(out, func(i, j int) bool { return out[i].Total > out[j].Total })
 	return out
+}
+
+// phoneDigits — только цифры номера (пусто, если это не номер: букв больше цифр).
+func phoneDigits(s string) string {
+	var d []rune
+	letters := 0
+	for _, r := range s {
+		switch {
+		case r >= '0' && r <= '9':
+			d = append(d, r)
+		case unicode.IsLetter(r):
+			letters++
+		}
+	}
+	if letters > 0 || len(d) < 4 {
+		return "" // имя или слишком короткий огрызок — не номер
+	}
+	return string(d)
+}
+
+// phoneMatch — номера совпадают по последним 10 цифрам (российские номера:
+// 8928…, +7928…, 7928…, 928… — один и тот же). q — уже только цифры.
+func phoneMatch(qDigits, phone string) bool {
+	p := phoneDigits(phone)
+	if p == "" || qDigits == "" {
+		return false
+	}
+	return tail10(p) == tail10(qDigits)
+}
+
+func tail10(d string) string {
+	if len(d) > 10 {
+		return d[len(d)-10:]
+	}
+	return d
 }
 
 // ReceiptsLedger — журнал платежей за период: по строке на платёж.

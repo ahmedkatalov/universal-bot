@@ -2645,14 +2645,42 @@ func (b *Bot) exclusionsNote(ctx context.Context, from, to time.Time, groupJIDs 
 
 // sendersTool — статистика "кто сколько чеков прислал": для групп, где
 // работники кидают чеки (их сбор считается по отправленным чекам).
+// dashRub — сумма для таблицы или «—», когда её нет (столбец вида платежа пуст).
+func dashRub(v float64) string {
+	if v <= 0 {
+		return "—"
+	}
+	return formatRub(v)
+}
+
+// senderBreakdown — разбивка суммы отправителя по виду платежа: « — чеки 40000,
+// наличка 5000, переводом 3000». Пусто, если всё одного вида (разбивка не нужна).
+func senderBreakdown(s db.SenderStat) string {
+	var parts []string
+	if s.Checks > 0 {
+		parts = append(parts, fmt.Sprintf("чеки %.0f (%d шт.)", s.ChecksSum, s.Checks))
+	}
+	if s.Cash > 0 {
+		parts = append(parts, fmt.Sprintf("наличка %.0f", s.CashSum))
+	}
+	if s.Transfers > 0 {
+		parts = append(parts, fmt.Sprintf("переводом %.0f", s.TransfersSum))
+	}
+	if len(parts) <= 1 {
+		return "" // один вид — сумма и так ясна
+	}
+	return " — " + strings.Join(parts, ", ")
+}
+
 func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 	return ai.Tool{
 		Name: "senders_report",
-		Description: "Показывает, кто сколько чеков отправил и на какую сумму за период — по отправителям " +
-			"сообщений с чеками. Используй, когда спрашивают 'какой сотрудник сколько чеков скинул', " +
-			"'сколько чеков и какой сбор сделал Расул', 'проверь по группе сб оплата клиентов кто сколько отправил' " +
-			"и т.п. Если у отправителя не сохранено имя в WhatsApp, он будет показан по номеру телефона. " +
-			"Может вернуть результат текстом или прислать PDF-документ (format=\"pdf\", если просят файл/пдф/документ).",
+		Description: "Показывает, КТО СКОЛЬКО СКИНУЛ за период — по отправителям сообщений (по номеру телефона в WhatsApp): " +
+			"сумма чеков, налички и переводов текстом, с разбивкой. Используй, когда спрашивают 'кто сколько скинул', " +
+			"'сколько чеков и какой сбор сделал Расул', 'на сколько скинул чеки вот этот номер 89287836800', " +
+			"'проверь по группе сб оплата кто сколько отправил' и т.п. Если номер сохранён (phone_memory) — покажу имя, " +
+			"иначе сам номер. Номер в поле sender можно давать в любом виде (8928…, +7928…, 928…). " +
+			"Может вернуть результат текстом или прислать PDF (format=\"pdf\").",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
@@ -2670,7 +2698,7 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				},
 				"sender": map[string]any{
 					"type":        "string",
-					"description": "Имя или номер телефона конкретного человека, если спрашивают про одного (например 'расул' или '7937...'). Пусто — по всем отправителям.",
+					"description": "Имя или номер телефона конкретного человека (например 'расул' или '89287836800' / '+7 928…' — в любом формате). Пусто — по всем отправителям.",
 				},
 				"format": map[string]any{
 					"type":        "string",
@@ -2735,7 +2763,11 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				exNote = b.exclusionsNote(ctx, from, to, groupJIDs, -1, byChat)
 			}
 			if len(stats) == 0 {
-				return fmt.Sprintf("За период %s (%s) чеков не найдено.%s", periodLabel, groupLabel, exNote), nil
+				who := ""
+				if s := strings.TrimSpace(args.Sender); s != "" {
+					who = " по «" + s + "»"
+				}
+				return fmt.Sprintf("За период %s (%s)%s ничего не нашёл.%s", periodLabel, groupLabel, who, exNote), nil
 			}
 
 			var totalCount int
@@ -2747,6 +2779,7 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 
 			if args.Format == "pdf" {
 				rows := make([][]string, 0, len(stats))
+				var tChecks, tCash, tTr float64
 				for _, s := range stats {
 					label := s.Name
 					if label == "" {
@@ -2754,13 +2787,16 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 					} else if s.Phone != "" {
 						label += " (+" + s.Phone + ")"
 					}
-					rows = append(rows, []string{label, fmt.Sprintf("%d", s.Count), formatRub(s.Total)})
+					tChecks += s.ChecksSum
+					tCash += s.CashSum
+					tTr += s.TransfersSum
+					rows = append(rows, []string{label, dashRub(s.ChecksSum), dashRub(s.CashSum), dashRub(s.TransfersSum), formatRub(s.Total)})
 				}
 				section := report.Section{
-					Title:    "Чеки по отправителям",
-					Columns:  []string{"Отправитель", "Кол-во чеков", "Сумма, ₽"},
+					Title:    "Кто сколько скинул",
+					Columns:  []string{"Отправитель", "Чеки, ₽", "Наличка, ₽", "Перевод, ₽", "Всего, ₽"},
 					Rows:     rows,
-					TotalRow: []string{"ИТОГО", fmt.Sprintf("%d", totalCount), formatRub(totalSum)},
+					TotalRow: []string{"ИТОГО", dashRub(tChecks), dashRub(tCash), dashRub(tTr), formatRub(totalSum)},
 				}
 				outPath := fmt.Sprintf("%s/senders_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
 				subtitle := "Период: " + periodLabel + " | " + groupLabel
@@ -2774,7 +2810,7 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 			}
 
 			var sb strings.Builder
-			fmt.Fprintf(&sb, "Чеки по отправителям за %s (%s):\n", periodLabel, groupLabel)
+			fmt.Fprintf(&sb, "Кто сколько скинул за %s (%s):\n", periodLabel, groupLabel)
 			for _, s := range stats {
 				label := s.Name
 				if label == "" {
@@ -2782,9 +2818,9 @@ func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
 				} else if s.Phone != "" {
 					label += " (+" + s.Phone + ")"
 				}
-				fmt.Fprintf(&sb, "- %s: %d чек(ов), %.0f ₽\n", label, s.Count, s.Total)
+				fmt.Fprintf(&sb, "- %s: %.0f ₽%s\n", label, s.Total, senderBreakdown(s))
 			}
-			fmt.Fprintf(&sb, "Итого: %d чек(ов) на %.0f ₽", totalCount, totalSum)
+			fmt.Fprintf(&sb, "Итого: %.0f ₽ (%d шт.)", totalSum, totalCount)
 			// В режиме по дате чата чеки с датой операции из другого месяца в сбор
 			// не вошли — показываем их отдельно (как в send_finance_report), чтобы
 			// сбор не выглядел заниженным без объяснения.

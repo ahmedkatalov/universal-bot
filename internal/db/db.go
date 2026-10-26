@@ -6614,6 +6614,13 @@ type SenderStat struct {
 	Phone string // номер телефона (из JID отправителя)
 	Count int
 	Total float64
+	// Разбивка по виду платежа: чеки, наличка, переводы текстом.
+	Checks       int
+	ChecksSum    float64
+	Cash         int
+	CashSum      float64
+	Transfers    int
+	TransfersSum float64
 }
 
 // CardTotal — сколько перевели на карту конкретного получателя.
