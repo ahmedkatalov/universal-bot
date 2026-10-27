@@ -32,6 +32,35 @@ func parseHM(s string) (int, int, bool) {
 	return h, m, true
 }
 
+// parseRelDate принимает «сегодня/today», «завтра/tomorrow», «послезавтра»,
+// «через N дней» или дату ГГГГ-ММ-ДД / ДД.ММ(.ГГГГ).
+func parseRelDate(s string, now time.Time) (time.Time, bool) {
+	s = strings.ToLower(strings.TrimSpace(s))
+	switch {
+	case s == "" || s == "сегодня" || s == "today":
+		return now, true
+	case s == "завтра" || s == "tomorrow":
+		return now.AddDate(0, 0, 1), true
+	case s == "послезавтра":
+		return now.AddDate(0, 0, 2), true
+	}
+	if strings.HasPrefix(s, "через ") {
+		var n int
+		if _, err := fmt.Sscanf(s, "через %d", &n); err == nil && n > 0 && n < 366 {
+			return now.AddDate(0, 0, n), true
+		}
+	}
+	for _, layout := range []string{"2006-01-02", "02.01.2006", "02.01"} {
+		if d, err := time.ParseInLocation(layout, s, time.Local); err == nil {
+			if d.Year() == 0 {
+				d = time.Date(now.Year(), d.Month(), d.Day(), 0, 0, 0, 0, time.Local)
+			}
+			return d, true
+		}
+	}
+	return time.Time{}, false
+}
+
 // parseWeekday принимает 0-6 (0=вс) или русское название дня.
 func parseWeekday(s string) (int, bool) {
 	s = strings.ToLower(strings.TrimSpace(s))
@@ -80,9 +109,12 @@ func (b *Bot) scheduleReminderTool(chat types.JID, ownerJID types.JID) ai.Tool {
 		Description: "Создаёт напоминание или сообщение по расписанию (переживает перезапуск бота). Вызывай, когда " +
 			"владелец просит «напоминай», «каждый день в 10 отправляй мне …», «через час напомни …», «в пятницу в 9 …», " +
 			"«отправь Мухаммаду в 18:00 …». kind: once (разово), daily (каждый день), weekly (раз в неделю). Время в " +
-			"формате ЧЧ:ММ (time) или через in_minutes (через сколько минут, для разового). Для weekly укажи weekday " +
+			"формате ЧЧ:ММ (time) или через in_minutes (через сколько минут, для разового). Для разового день можно " +
+			"задать словом в date: «сегодня», «завтра», «послезавтра» или ГГГГ-ММ-ДД. Если время НЕ назвали («завтра " +
+			"напомни в это время») — не указывай time, бот поставит текущее время того дня. Для weekly укажи weekday " +
 			"(пн/вт/…/вс). Кому: target = me (владельцу лично), here (в этот чат), group (укажи group=название), " +
-			"person (укажи number или name). message — точный текст, который отправлять. Если просят присылать " +
+			"person (укажи number или name — «напомни Мухаммаду», «напомни ему» про конкретного человека). message — " +
+			"точный текст, который отправлять. Если просят присылать " +
 			"СБОР/ОТЧЁТ/ИТОГ за день («каждый день в 21:00 присылай сбор за день») — укажи report=day_collection " +
 			"(и group, если сбор нужен по одной группе): бот сам посчитает настоящие цифры за этот день. Простой " +
 			"message — это всегда неизменный текст, цифр в нём не будет.",
@@ -179,24 +211,41 @@ func (b *Bot) scheduleReminderTool(chat types.JID, ownerJID types.JID) ai.Tool {
 				kind = "once"
 				onceAt = now.Add(time.Duration(a.InMinutes) * time.Minute)
 			} else {
-				h, m, ok := parseHM(a.Time)
-				if !ok {
-					return "Во сколько отправлять? Укажи время в формате ЧЧ:ММ (например 10:00) или «через N минут».", nil
+				// Время: если не указали — «в это время» (как сейчас). Для
+				// daily/weekly время обязательно (там «в это время» бессмысленно).
+				haveTime := false
+				hour, minute = now.Hour(), now.Minute()
+				if strings.TrimSpace(a.Time) != "" {
+					h, m, ok := parseHM(a.Time)
+					if !ok {
+						return "Во сколько отправлять? Укажи время в формате ЧЧ:ММ (например 10:00) или «через N минут».", nil
+					}
+					hour, minute, haveTime = h, m, true
 				}
-				hour, minute = h, m
 				switch kind {
 				case "weekly":
+					if !haveTime {
+						return "Во сколько в этот день? Укажи время ЧЧ:ММ.", nil
+					}
 					wd, ok := parseWeekday(a.Weekday)
 					if !ok {
 						return "В какой день недели? Укажи пн/вт/ср/чт/пт/сб/вс.", nil
 					}
 					weekday = wd
+				case "daily":
+					if !haveTime {
+						return "Во сколько каждый день? Укажи время ЧЧ:ММ.", nil
+					}
 				case "once":
+					dateGiven := strings.TrimSpace(a.Date) != ""
+					if !haveTime && !dateGiven {
+						return "Когда напомнить? Скажи время (ЧЧ:ММ), «через N минут» или день (например «завтра»).", nil
+					}
 					day := time.Date(now.Year(), now.Month(), now.Day(), hour, minute, 0, 0, time.Local)
-					if s := strings.TrimSpace(a.Date); s != "" {
-						d, err := time.ParseInLocation("2006-01-02", s, time.Local)
-						if err != nil {
-							return "Не понял дату, нужен формат ГГГГ-ММ-ДД.", nil
+					if dateGiven {
+						d, ok := parseRelDate(a.Date, now)
+						if !ok {
+							return "Не понял дату — напиши «сегодня», «завтра», «послезавтра» или ГГГГ-ММ-ДД.", nil
 						}
 						day = time.Date(d.Year(), d.Month(), d.Day(), hour, minute, 0, 0, time.Local)
 					}

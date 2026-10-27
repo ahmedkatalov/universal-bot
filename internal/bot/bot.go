@@ -2276,7 +2276,7 @@ func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) (
 		"Общайся дружелюбно и по-человечески, на русском.\n\n" +
 		"У тебя НЕТ инструментов по деньгам для этого собеседника: любые цифры, чеки, суммы и отчёты — закрыты." +
 		talkRules + accessNote(false)
-	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ")."
+	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + "), сейчас " + now.Format("15:04") + "."
 	return staticPart, dynamicPart
 }
 
@@ -2370,7 +2370,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 	}
 
 	// Динамическая часть (маленькая, меняется) — НЕ кэшируется.
-	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + ").\n" +
+	dynamicPart = "Сегодняшняя дата: " + now.Format("2006-01-02") + " (" + now.Format("02.01.2006") + "), сейчас " + now.Format("15:04") + ".\n" +
 		"Группы, в которых состоит бот: " + groupsList + ".\n" +
 		"Основная группа учёта: " + mainGroupNote + ".\n" +
 		"Текущая рабочая группа для записи платежей: " + workingGroupNote + ".\n" +
