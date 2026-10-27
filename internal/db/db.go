@@ -521,6 +521,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS excl_batch TEXT`,
 		`CREATE INDEX IF NOT EXISTS idx_bank_receipts_excl_batch ON bank_receipts(excl_batch) WHERE excl_batch IS NOT NULL`,
 		`CREATE INDEX IF NOT EXISTS idx_transactions_excl_batch ON transactions(excl_batch) WHERE excl_batch IS NOT NULL`,
+		// Хэш картинки чека: та же картинка, присланная в группу ещё раз, —
+		// точно повтор; ловим ДО чтения зрением (быстрый ответ + предупреждение).
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS media_sha TEXT`,
+		`CREATE INDEX IF NOT EXISTS idx_raw_messages_media_sha ON raw_messages(media_sha) WHERE media_sha IS NOT NULL`,
 		// Ответ на вопрос бота: на какой вопрос (вид и цель) и какое сообщение он
 		// цитировал — чтобы правка ответа применилась к тому же вопросу.
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS answer_kind TEXT`,
@@ -781,6 +785,55 @@ func (d *DB) ReceiptOfRaw(ctx context.Context, rawID int) (id int, amount float6
 		return 0, 0, false, nil
 	}
 	return id, amount, err == nil, err
+}
+
+// SetMediaSha запоминает хэш картинки сообщения (для отлова повторной картинки).
+func (d *DB) SetMediaSha(ctx context.Context, rawID int, sha string) error {
+	if sha == "" {
+		return nil
+	}
+	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET media_sha = $2 WHERE id = $1`, rawID, sha)
+	return err
+}
+
+// SameImageReceipt — РАНЕЕ присланная в ту же группу та же картинка чека (тот же
+// хэш), с которой уже сделан чек в учёте (не удалён, не отклонён). Это точный
+// повтор: ту же картинку прислали второй раз. selfRaw — текущее сообщение
+// (исключаем его самого).
+type SameImageReceipt struct {
+	WaMessageID string
+	Client      string
+	Amount      float64
+	TxDate      time.Time
+	Found       bool
+}
+
+func (d *DB) SameImageReceipt(ctx context.Context, groupJID, sha string, selfRaw int) (SameImageReceipt, error) {
+	var r SameImageReceipt
+	if sha == "" || groupJID == "" {
+		return r, nil
+	}
+	err := d.pool.QueryRow(ctx, `
+		SELECT COALESCE(orm.wa_message_id, ''), COALESCE(c.canonical_name, br.recipient_raw, ''),
+		       COALESCE(br.amount, 0)::float8, br.tx_date
+		FROM raw_messages rm
+		JOIN raw_messages orm ON orm.media_sha = rm.media_sha AND orm.id <> rm.id
+		JOIN bank_receipts br ON br.raw_message_id = orm.id
+		LEFT JOIN contacts c ON c.id = br.contact_id
+		WHERE rm.id = $1 AND rm.media_sha = $2
+		  AND COALESCE(orm.wa_group_jid, '') = $3
+		  AND NOT br.is_duplicate AND NOT br.ignored
+		  AND COALESCE(br.amount, 0) > 0
+		  AND COALESCE(orm.deleted, false) = false
+		ORDER BY br.id ASC LIMIT 1`, selfRaw, sha, groupJID).Scan(&r.WaMessageID, &r.Client, &r.Amount, &r.TxDate)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return r, nil
+	}
+	if err != nil {
+		return r, err
+	}
+	r.Found = true
+	return r, nil
 }
 
 // GapAnchor — для запроса истории с телефона: первое сообщение после самого

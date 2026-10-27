@@ -95,6 +95,38 @@ var nameStopwords = map[string]bool{
 // looksLikeName проверяет, похожа ли строка на ФИО клиента. Требует 2+ слова
 // (реальные подписи к чекам — это ФИО: "цихаев саляхь", "Атабаев Турпал"),
 // без команд, вопросов, цифр и стоп-слов. Возвращает очищенное имя.
+// cleanNameCaption — подпись к чеку состоит ТОЛЬКО из ФИО (плюс, может быть,
+// суммы и валюты): тогда клиента можно взять без запроса к ИИ. Если в подписи
+// есть посторонние слова (глаголы, «с карты», «брат» и т.п. — их looksLikeName
+// отбрасывает как стоп-слова), считаем подпись шумной и возвращаем ok=false,
+// чтобы её разобрал ИИ (он отличит плательщика от упомянутых посторонних).
+func cleanNameCaption(caption string) (string, bool) {
+	name, ok := looksLikeName(caption)
+	if !ok {
+		return "", false
+	}
+	nameSet := map[string]bool{}
+	for _, w := range strings.Fields(name) {
+		nameSet[strings.ToLower(w)] = true
+	}
+	for _, w := range strings.Fields(caption) {
+		if strings.IndexFunc(w, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0 {
+			continue // число (сумма)
+		}
+		clean := strings.TrimFunc(w, func(r rune) bool { return !unicode.IsLetter(r) })
+		if clean == "" {
+			continue // эмодзи/знаки
+		}
+		if parser.IsMoneyWord(clean, true) {
+			continue // «руб», «тыс», «₽»
+		}
+		if !nameSet[strings.ToLower(clean)] {
+			return "", false // слово не из имени и не сумма — подпись шумная, нужен ИИ
+		}
+	}
+	return name, true
+}
+
 func looksLikeName(text string) (string, bool) {
 	name := strings.TrimSpace(text)
 	if name == "" || len([]rune(name)) > 60 || strings.ContainsAny(name, "?/\n@") {
@@ -184,6 +216,15 @@ func (b *Bot) payerFromCaption(ctx context.Context, caption string) (string, flo
 	}
 	if isCommandText(caption) || strings.TrimSpace(caption) == "" {
 		return "", 0
+	}
+	// Чистая подпись-ФИО («Магомедов Ахмед», «Магомедов Ахмед 15000») —
+	// распознаём на месте, без лишнего запроса к ИИ (ускоряет ответ на чек).
+	// Шумные подписи («с карты Пияна Ахмед оплатил») по-прежнему разбирает ИИ.
+	if name, ok := cleanNameCaption(caption); ok {
+		if canon, _ := b.aliases.ResolveName(name); canon != "" {
+			return canon, parser.ExtractAmount(caption)
+		}
+		return name, parser.ExtractAmount(caption)
 	}
 	if name := b.cmfExtractClientName(ctx, caption); name != "" {
 		return name, parser.ExtractAmount(caption)

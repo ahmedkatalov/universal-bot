@@ -7,6 +7,8 @@ package bot
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
@@ -4023,6 +4025,29 @@ func (b *Bot) recordCashPayment(ctx context.Context, chat types.JID, payer strin
 }
 
 func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, waMsgID, text string, rawID int, receivedAt time.Time, media []byte, mediaExt, payerOverride string, payerAmount float64) {
+	// Та же КАРТИНКА чека, присланная в группу ещё раз, — точный повтор: ловим
+	// сразу, по хэшу, НЕ читая зрением (быстрый ответ + понятное предупреждение).
+	// Только для реальных сообщений группы (не пересланная ботом копия).
+	if len(media) > 0 && senderJID != "bot-forward" && chat.Server != "" {
+		sum := sha256.Sum256(media)
+		sha := hex.EncodeToString(sum[:])
+		_ = b.db.SetMediaSha(ctx, rawID, sha)
+		if same, err := b.db.SameImageReceipt(ctx, chat.String(), sha, rawID); err != nil {
+			fmt.Println("Проверка повторной картинки чека:", err)
+		} else if same.Found {
+			who := same.Client
+			if who == "" {
+				who = "без имени"
+			}
+			fmt.Printf("Чек (сообщение %d): та же картинка уже присылалась (%s, %.0f ₽) — повтор, в сбор не идёт\n", rawID, who, same.Amount)
+			if !b.groupSilent(chat) {
+				b.sendReply(chat, fmt.Sprintf("⚠️ Этот чек уже присылали (%s, %.0f ₽) — второй раз не считаю. Если это ДРУГОЙ перевод, пришлите другой чек или напишите «другой».", who, same.Amount), waMsgID, senderJID)
+			}
+			_ = b.db.MarkMessageParsed(ctx, rawID)
+			return
+		}
+	}
+
 	rd := parser.ParseReceipt(text)
 
 	// RECEIPT_VISION_FIRST=1 — читать чек-фото сразу глазами Claude (макс.
