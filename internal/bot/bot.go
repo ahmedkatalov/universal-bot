@@ -2413,14 +2413,16 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 • Отправитель/получатель НА чеке — это банковские реквизиты (кто платил с карты, на чью карту пришло), не клиент. Пример: на чеке отправитель «Исаев Харон», получатель «Хадижат Ибрагимова», а работник написал рядом «Ахмед Каталов» → КЛИЕНТ = Ахмед Каталов; Исаев и Хадижат — просто реквизиты.
 • КТО ПРИСЛАЛ — участник WhatsApp, отправивший сообщение (submitted_by). КТО ЗАБРАЛ НАЛИЧКУ — отдельное поле (collector). Никогда не подставляй одно вместо другого; происхождение каждого чека (кто прислал, куда) смотри в receipts_ledger. «Почему это чек Ахмеда» объясняй реальной причиной из контекста («рядом написали Ахмед Каталов»), не выдумывай.
 
-СБОР = кто ЗАБРАЛ деньги: senders_report считает по тому, КТО ПРИСЛАЛ чек в WhatsApp (= кто собрал), плюс наличку/текст по ответственному — это ключевой смысл сбора. «Сбор X» обычно про собравшего (senders_report); если из контекста ясно, что X — клиент (его платежи по рассрочке), тогда person_report.
+СБОР ПО СОТРУДНИКАМ: senders_report показывает КТО ПРИСЛАЛ чеки в WhatsApp, их количество и сумму; наличка и переводы текстом считаются отдельно. На «сколько Мансур закинул чеков, сумму и ФИО плательщиков» используй sender=Мансур, kind=checks, view=payments. ФИО клиента бери из подписи к чеку; если явно просят банковского плательщика — добавь колонку bank_payer, не подменяй ею клиента. На «кто забрал наличку» укажи kind=cash, attribution=collector; на «кто прислал» — attribution=submitter. Если X — клиент рассрочки, используй person_report. Не называй количество всех платежей количеством чеков.
 
-ДВЕ ДАТЫ У ПЛАТЕЖА (date_basis): дата ОПЕРАЦИИ, напечатанная на чеке (по умолчанию, operation), и дата присылки в чат (chat — если владелец говорит «бери дату из чата / когда скинули»). В режиме chat сбор за день = всё присланное в этот день, а чеки с датой операции из ДРУГОГО месяца бот покажет ОТДЕЛЬНО, вне суммы, с пометкой. Наличка в обоих режимах датируется присылкой. Всегда пиши в ответе, по какой дате и по каким группам считал.
+ДВЕ ДАТЫ У ПЛАТЕЖА (date_basis): дата операции на чеке и дата присылки в чат. Для senders_report («сколько сотрудник скинул за период») по умолчанию chat: считаются присланные в период чеки, даже со старой датой операции. Для финансового отчёта send_finance_report по умолчанию operation; в его режиме chat чеки из другого месяца показываются отдельно. Наличка обычно датируется присылкой. Всегда называй период, основание даты и группы. Если в первом запросе период не указан — возьми текущий месяц и явно назови его; уточнение «за вчера/за неделю/за всё время» меняет только период, сохраняй сотрудника, группы и состав списка из контекста.
+
+СПИСКИ СОТРУДНИКА. Если просят список или ФИО — senders_report view=payments, а не только сводка. Пользователь может выбрать колонки, порядок, сортировку (сумма, ФИО, дата), PDF или текст. На «сколько чеков» kind=checks, на «весь сбор, включая наличку» kind=all. Возвращай количество чеков, сумму и всех запрошенных клиентов. Непроверенные показывай отдельно с причиной, неизвестное ФИО/сумму не выдумывай. Если инструмент вернул next_offset, это ещё НЕ полный список: запроси следующие страницы с теми же фильтрами; для большого списка предложи/сделай полный PDF. Итог бери только из строки за ВЕСЬ период, не складывай итоги страниц. Два разных сотрудника с одинаковым именем — не один человек: уточни телефон или покажи каждого отдельно.
 
 СВЕРКА И ИСКЛЮЧЕНИЯ. Отчёты сами добавляют раздел «НЕ вошло в сбор» (непроверенные чеки, придержанная наличка, чеки с датой вне месяца) и заметку «текстовых зачтено как дубль чека» — передавай их владельцу дословно, называя, какие чеки и почему не вошли. Если владелец говорит «сумма не сходится / ты ошибаешься» — вызови explain_collection: он покажет, из каких чеков и текстов сложен сбор, что не вошло и почему, и что похоже на двойной счёт; объясни владельцу по нему и предложи поправить (исключить лишнее, ответить на вопросы бота). Никогда не выдумывай сумму, чтобы «сошлось».
 
 ИНСТРУМЕНТЫ. У каждого своё описание со всеми параметрами — читай его и выбирай по смыслу задачи, комбинируя в цепочки (например «пересчитай эти чеки и скажи сбор за июнь» = recount_everything, затем send_finance_report). Не путай близкие по смыслу:
-• senders_report — кто СОБРАЛ (по отправителю чека); person_report — вся статистика ОДНОГО человека; cards_report — на чью КАРТУ-получатель сколько пришло (владелец карты, не клиент и не сборщик); record_payment — записать ДИКТУЕМЫЙ платёж; make_custom_pdf — нестандартная таблица по описанию владельца (данные бери из других инструментов, для обычных отчётов проще PDF прямо из senders_report / send_finance_report).
+• senders_report — отчёт и список платежей СОТРУДНИКА; person_report — платежи КЛИЕНТА по рассрочке; cards_report — поступления на КАРТУ-получатель (не клиент и не сотрудник); record_payment — записать ДИКТУЕМЫЙ платёж; make_custom_pdf — нестандартная таблица по описанию владельца (данные бери из инструментов, для списка сотрудника используй senders_report view=payments format=pdf).
 • missing_in_group сравнивает группы в ОБЕ стороны (source_group → group; «из А не попало в Б» и «наоборот» = поменять их местами; «основная»/«главная» — из контекста). Разговорные уточнения после сравнения («только за сегодня», «только Ахмеда», «а наоборот») — вызови инструмент СНОВА, поменяв ТОЛЬКО нужный параметр, остальное оставь как было; не заставляй повторять названия групп.
 • phone_memory и assign_receipt_collector привязывают номер WhatsApp или конкретный чек к тому, кто забрал деньги — так он и показывается в senders_report. Номер бери из слов владельца или из [Контекст ответа: ...], если он ответил свайпом на чек.
 • find_messages показывает, ЧТО присылал конкретный номер или человек — в том числе УДАЛЁННЫЕ в WhatsApp сообщения (я сохраняю каждое сообщение сразу при получении). На «что тебе написал номер …92», «покажи сообщения этого номера», «что он удалил» — вызывай find_messages (по последним цифрам номера и/или имени, можно за период). НЕ отвечай, что «нет функции показать сообщения» — она есть.
@@ -2643,218 +2645,6 @@ func (b *Bot) exclusionsNote(ctx context.Context, from, to time.Time, groupJIDs 
 		fmt.Fprintf(&nb, "\n\nⓘ Текстовых платежей зачтено как дубль чека (уже в сумме, не дважды): %d шт на %.0f ₽. Если какой-то из них — ОТДЕЛЬНЫЙ платёж, скажи, зачту.", ex.TextDupCount, ex.TextDupSum)
 	}
 	return nb.String()
-}
-
-// sendersTool — статистика "кто сколько чеков прислал": для групп, где
-// работники кидают чеки (их сбор считается по отправленным чекам).
-// dashRub — сумма для таблицы или «—», когда её нет (столбец вида платежа пуст).
-func dashRub(v float64) string {
-	if v <= 0 {
-		return "—"
-	}
-	return formatRub(v)
-}
-
-// senderBreakdown — разбивка суммы отправителя по виду платежа: « — чеки 40000,
-// наличка 5000, переводом 3000». Пусто, если всё одного вида (разбивка не нужна).
-func senderBreakdown(s db.SenderStat) string {
-	var parts []string
-	if s.Checks > 0 {
-		parts = append(parts, fmt.Sprintf("чеки %.0f (%d шт.)", s.ChecksSum, s.Checks))
-	}
-	if s.Cash > 0 {
-		parts = append(parts, fmt.Sprintf("наличка %.0f", s.CashSum))
-	}
-	if s.Transfers > 0 {
-		parts = append(parts, fmt.Sprintf("переводом %.0f", s.TransfersSum))
-	}
-	if len(parts) <= 1 {
-		return "" // один вид — сумма и так ясна
-	}
-	return " — " + strings.Join(parts, ", ")
-}
-
-func (b *Bot) sendersTool(ctx context.Context, chat types.JID) ai.Tool {
-	return ai.Tool{
-		Name: "senders_report",
-		Description: "Показывает, КТО СКОЛЬКО СКИНУЛ за период — по отправителям сообщений (по номеру телефона в WhatsApp): " +
-			"сумма чеков, налички и переводов текстом, с разбивкой. Используй, когда спрашивают 'кто сколько скинул', " +
-			"'сколько чеков и какой сбор сделал Расул', 'на сколько скинул чеки вот этот номер 89287836800', " +
-			"'проверь по группе сб оплата кто сколько отправил' и т.п. Если номер сохранён (phone_memory) — покажу имя, " +
-			"иначе сам номер. Номер в поле sender можно давать в любом виде (8928…, +7928…, 928…). " +
-			"Может вернуть результат текстом или прислать PDF (format=\"pdf\").",
-		InputSchema: map[string]any{
-			"type": "object",
-			"properties": map[string]any{
-				"from_date": map[string]any{
-					"type":        "string",
-					"description": "Начало периода включительно, формат YYYY-MM-DD",
-				},
-				"to_date": map[string]any{
-					"type":        "string",
-					"description": "Конец периода включительно, формат YYYY-MM-DD",
-				},
-				"group": map[string]any{
-					"type":        "string",
-					"description": "Название группы; можно несколько через запятую или \"и\". Пусто — по всем группам.",
-				},
-				"sender": map[string]any{
-					"type":        "string",
-					"description": "Имя или номер телефона конкретного человека (например 'расул' или '89287836800' / '+7 928…' — в любом формате). Пусто — по всем отправителям.",
-				},
-				"format": map[string]any{
-					"type":        "string",
-					"enum":        []string{"pdf", "text"},
-					"description": "\"pdf\" — прислать документ; \"text\" (по умолчанию) — вернуть цифры текстом",
-				},
-				"date_basis": map[string]any{
-					"type": "string",
-					"enum": []string{"operation", "chat"},
-					"description": "По какой дате считать чеки. \"operation\" (по умолчанию) — по дате операции на чеке. " +
-						"\"chat\" — по дате присылки в чат (бери, если просят «по дате чата»/«когда прислали»).",
-				},
-			},
-			"required": []string{"from_date", "to_date"},
-		},
-		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
-			var args struct {
-				FromDate  string `json:"from_date"`
-				ToDate    string `json:"to_date"`
-				Group     string `json:"group"`
-				Sender    string `json:"sender"`
-				Format    string `json:"format"`
-				DateBasis string `json:"date_basis"`
-			}
-			if err := json.Unmarshal(input, &args); err != nil {
-				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
-			}
-			from, err := time.ParseInLocation("2006-01-02", args.FromDate, time.Local)
-			if err != nil {
-				return "", fmt.Errorf("неверная дата начала периода %q, нужен формат YYYY-MM-DD", args.FromDate)
-			}
-			toDay, err := time.ParseInLocation("2006-01-02", args.ToDate, time.Local)
-			if err != nil {
-				return "", fmt.Errorf("неверная дата конца периода %q, нужен формат YYYY-MM-DD", args.ToDate)
-			}
-			groupJIDs, groupLabel, err := b.resolveGroups(ctx, args.Group)
-			if err != nil {
-				return "", err
-			}
-
-			to := toDay.AddDate(0, 0, 1)
-			monthStart := time.Date(from.Year(), from.Month(), 1, 0, 0, 0, 0, from.Location())
-			monthEnd := time.Date(toDay.Year(), toDay.Month(), 1, 0, 0, 0, 0, toDay.Location()).AddDate(0, 1, 0)
-			var stats []db.SenderStat
-			byChat := args.DateBasis == "chat"
-			if byChat {
-				stats, err = b.db.SenderStatsByChat(ctx, from, to, monthStart, monthEnd, groupJIDs, strings.TrimSpace(args.Sender))
-			} else {
-				stats, err = b.db.SenderStats(ctx, from, to, groupJIDs, strings.TrimSpace(args.Sender))
-			}
-			if err != nil {
-				return "", fmt.Errorf("ошибка выборки: %w", err)
-			}
-			periodLabel := from.Format("02.01.2006") + " — " + toDay.Format("02.01.2006")
-			if byChat {
-				periodLabel += " · по дате в чате"
-			}
-			// Что не вошло в суммы (чеки без клиента, придержанная наличка) — для всей
-			// выборки; при фильтре по человеку не показываем (это не его цифры).
-			exNote := ""
-			if strings.TrimSpace(args.Sender) == "" {
-				exNote = b.exclusionsNote(ctx, from, to, groupJIDs, -1, byChat)
-			}
-			if len(stats) == 0 {
-				who := ""
-				if s := strings.TrimSpace(args.Sender); s != "" {
-					who = " по «" + s + "»"
-				}
-				return fmt.Sprintf("За период %s (%s)%s ничего не нашёл.%s", periodLabel, groupLabel, who, exNote), nil
-			}
-
-			var totalCount int
-			var totalSum float64
-			for _, s := range stats {
-				totalCount += s.Count
-				totalSum += math.RoundToEven(s.Total) // сумма округлённых строк = «Итого» без дрейфа
-			}
-
-			if args.Format == "pdf" {
-				rows := make([][]string, 0, len(stats))
-				var tChecks, tCash, tTr float64
-				for _, s := range stats {
-					label := s.Name
-					if label == "" {
-						label = "+" + s.Phone
-					} else if s.Phone != "" {
-						label += " (+" + s.Phone + ")"
-					}
-					tChecks += s.ChecksSum
-					tCash += s.CashSum
-					tTr += s.TransfersSum
-					rows = append(rows, []string{label, dashRub(s.ChecksSum), dashRub(s.CashSum), dashRub(s.TransfersSum), formatRub(s.Total)})
-				}
-				section := report.Section{
-					Title:    "Кто сколько скинул",
-					Columns:  []string{"Отправитель", "Чеки, ₽", "Наличка, ₽", "Перевод, ₽", "Всего, ₽"},
-					Rows:     rows,
-					TotalRow: []string{"ИТОГО", dashRub(tChecks), dashRub(tCash), dashRub(tTr), formatRub(totalSum)},
-				}
-				outPath := fmt.Sprintf("%s/senders_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
-				subtitle := "Период: " + periodLabel + " | " + groupLabel
-				if err := report.GenerateCustom("Отчёт: кто сколько чеков скинул", subtitle, []report.Section{section}, b.fontDir, outPath); err != nil {
-					return "", fmt.Errorf("ошибка генерации PDF: %w", err)
-				}
-				if err := b.sendDocument(chat, outPath, "Чеки_по_отправителям_"+from.Format("2006-01-02")+".pdf"); err != nil {
-					return "", fmt.Errorf("не удалось отправить PDF по отправителям: %w", err)
-				}
-				return fmt.Sprintf("PDF с разбивкой по отправителям за %s (%s) отправлен: %d чек(ов) на %.0f ₽.%s", periodLabel, groupLabel, totalCount, totalSum, exNote), nil
-			}
-
-			var sb strings.Builder
-			fmt.Fprintf(&sb, "Кто сколько скинул за %s (%s):\n", periodLabel, groupLabel)
-			for _, s := range stats {
-				label := s.Name
-				if label == "" {
-					label = "+" + s.Phone
-				} else if s.Phone != "" {
-					label += " (+" + s.Phone + ")"
-				}
-				fmt.Fprintf(&sb, "- %s: %.0f ₽%s\n", label, s.Total, senderBreakdown(s))
-			}
-			fmt.Fprintf(&sb, "Итого: %.0f ₽ (%d шт.)", totalSum, totalCount)
-			// В режиме по дате чата чеки с датой операции из другого месяца в сбор
-			// не вошли — показываем их отдельно (как в send_finance_report), чтобы
-			// сбор не выглядел заниженным без объяснения.
-			if byChat {
-				if old, oerr := b.db.ChecksPostedOldOperation(ctx, from, to, monthStart, monthEnd, groupJIDs, 50); oerr == nil && len(old) > 0 {
-					senderQ := strings.ToLower(strings.TrimSpace(args.Sender))
-					var nb strings.Builder
-					var oldTotal float64
-					shown := 0
-					for _, r := range old {
-						if senderQ != "" && !strings.Contains(strings.ToLower(r.SubmittedBy), senderQ) {
-							continue // при фильтре по человеку — только его старые чеки
-						}
-						who := ""
-						if r.SubmittedBy != "" {
-							who = " (прислал: " + r.SubmittedBy + ")"
-						}
-						fmt.Fprintf(&nb, "- %s: %.0f ₽ — чек от %s%s\n", r.Name, r.Amount, r.TxDate.Format("02.01.2006"), who)
-						oldTotal += r.Amount
-						shown++
-					}
-					if shown > 0 {
-						sb.WriteString("\n\n⚠️ Старые чеки — присланы в период, но дата операции из другого месяца (НЕ в сборе выше):\n")
-						sb.WriteString(strings.TrimRight(nb.String(), "\n"))
-						fmt.Fprintf(&sb, "\nИтого старых чеков: %.0f ₽", oldTotal)
-					}
-				}
-			}
-			sb.WriteString(exNote)
-			return sb.String(), nil
-		},
-	}
 }
 
 // customPDFTool — произвольный PDF по запросу владельца: он описывает, какие

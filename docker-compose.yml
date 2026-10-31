@@ -21,7 +21,13 @@ services:
     depends_on:
       - postgres
     environment:
-      DATABASE_URL: postgres://financebot:${POSTGRES_PASSWORD}@postgres:5432/finance
+      # Пароль передаётся отдельно, поэтому кириллица и символы URL допустимы.
+      PGHOST: postgres
+      PGPORT: "5432"
+      PGDATABASE: finance
+      PGUSER: financebot
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGSSLMODE: disable
       # Часовой пояс бота: влияет на "сегодня" у ассистента, границы суток
       # в отчётах и разбор времени с чеков (банки печатают московское время).
       TZ: ${TZ:-Europe/Moscow}

@@ -110,6 +110,10 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 		return 0, 0, 0
 	}
 	ctx := context.Background()
+	names := make(map[string]string)
+	for _, p := range data.GetPushnames() {
+		names[p.GetID()] = p.GetPushname()
+	}
 	var seen, receipts, payments int
 	aiBudget := 60 // столько текстов за импорт читает ИИ (дальше — только явные платежи)
 	for _, conv := range data.GetConversations() {
@@ -187,7 +191,24 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 			if sender.Server == types.DefaultUserServer && sender.User != "" {
 				senderPhone = sender.ToNonAD().String()
 			}
-			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), senderPhone, sender.User, text, img != nil || isPDFDoc, mediaPath, ts)
+			senderName := wmi.GetPushName()
+			if senderName == "" {
+				senderName = names[sender.ToNonAD().String()]
+			}
+			if senderName == "" && b.client != nil && b.client.Store != nil && b.client.Store.Contacts != nil {
+				if contact, err := b.client.Store.Contacts.GetContact(ctx, sender); err == nil {
+					for _, name := range []string{contact.FullName, contact.FirstName, contact.PushName, contact.BusinessName} {
+						if name != "" {
+							senderName = name
+							break
+						}
+					}
+				}
+			}
+			if senderName == "" {
+				senderName = sender.User
+			}
+			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), senderPhone, senderName, text, img != nil || isPDFDoc, mediaPath, ts)
 			if err == nil && existed && mediaBytes != nil {
 				// Это сообщение уже было, но фото тогда не скачалось / не прочиталось —
 				// сейчас телефон прислал его снова: разбираем.
@@ -245,7 +266,7 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 					receipts++
 				}
 			} else if text != "" {
-				n, viaAI := b.importTextSilent(ctx, chat, sender.User, rawID, ts, text, &aiBudget)
+				n, viaAI := b.importTextSilent(ctx, chat, senderName, rawID, ts, text, &aiBudget)
 				payments += n
 				if viaAI {
 					continue // разбор ИИ сам отмечает сообщение (и вернёт его, если ИИ лежал)

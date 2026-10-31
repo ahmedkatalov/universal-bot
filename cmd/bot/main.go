@@ -19,14 +19,6 @@ import (
 	"whatsapp-bot/internal/parser"
 )
 
-func mustEnv(key string) string {
-	v := os.Getenv(key)
-	if v == "" {
-		log.Fatalf("переменная окружения %s обязательна", key)
-	}
-	return v
-}
-
 func envOr(key, def string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -73,7 +65,12 @@ func main() {
 		return
 	}
 
-	pgConn := mustEnv("DATABASE_URL") // например: postgres://user:pass@localhost:5432/finance
+	// Docker передаёт реквизиты отдельно: пароль не вставляется в URL.
+	// DATABASE_URL сохранён для существующих установок вне Docker.
+	pgConn := os.Getenv("DATABASE_URL")
+	if pgConn == "" && os.Getenv("PGHOST") == "" {
+		log.Fatal("задайте DATABASE_URL или PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD")
+	}
 	// WHATSAPP_GROUP_JIDS — необязательный список групп через запятую
 	// (120363...1@g.us,120363...2@g.us). Не задан — бот учитывает ВСЕ группы,
 	// в которых состоит номер. WHATSAPP_GROUP_JID оставлен для обратной

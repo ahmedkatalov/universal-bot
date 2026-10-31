@@ -39,17 +39,34 @@ type DB struct {
 }
 
 func Connect(ctx context.Context, connString string) (*DB, error) {
-	pool, err := pgxpool.New(ctx, connString)
+	cfg, err := connectionConfig(connString)
+	if err != nil {
+		return nil, err
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, err
 	}
 	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
 		return nil, err
 	}
 	if err := runMigrations(ctx, pool); err != nil {
+		pool.Close()
 		return nil, fmt.Errorf("миграция схемы: %w", err)
 	}
 	return &DB{pool: pool}, nil
+}
+
+func connectionConfig(connString string) (*pgxpool.Config, error) {
+	// Пустая строка: pgx читает стандартные PG* переменные, включая пароль.
+	cfg, err := pgxpool.ParseConfig(connString)
+	if err != nil {
+		// ParseError может включать исходный URL с открытым паролем во вложенной
+		// ошибке net/url. Такой текст нельзя передавать в логи.
+		return nil, fmt.Errorf("неверные настройки PostgreSQL: проверь DATABASE_URL или PG*; пароль в DATABASE_URL должен быть URL-кодирован")
+	}
+	return cfg, nil
 }
 
 // runMigrations доводит уже развёрнутую БД (созданную по старой schema.sql)
