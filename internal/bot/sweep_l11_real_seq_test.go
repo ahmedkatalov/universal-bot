@@ -15,8 +15,25 @@ func TestREAL_ScreenshotSequences(t *testing.T) {
 		t.Run(fmt.Sprintf("ai=%v", withAI), func(t *testing.T) {
 			e := newE2E(t, e2eOpts{WithAI: withAI, Admins: []string{ownerPhone}})
 			if withAI {
-				e.ai = aiNamesAndPayments("Мусаев Рахимжан", "Альмурзаева Марха Абдулмажидовна", "Матаев Алихан",
+				base := aiNamesAndPayments("Мусаев Рахимжан", "Альмурзаева Марха Абдулмажидовна", "Матаев Алихан",
 					"Ибрагимов Аюб", "Керимов Турпал-Али Рашидович", "Шыйтуркаев Тамерлан", "Ханжиев Нурид")
+				// Явные ответы модели на многострочные платежи: общий фейк
+				// читает только суммы на той же строке, что и фамилия.
+				e.ai = func(c aiCall) aiReply {
+					if strings.Contains(c.System, "модуль разбора платежей") {
+						for name, payment := range map[string]string{
+							"Матаев Алихан":                `{"name":"Матаев Алихан","amount":21400,"cash":true,"collector":"Мансур"}`,
+							"Керимов Турпал-Али Рашидович": `{"name":"Керимов Турпал-Али Рашидович","amount":36800,"cash":true,"collector":"МБ"}`,
+							"Ханжиев Нурид":                `{"name":"Ханжиев Нурид","amount":20100,"cash":true,"collector":"Сафаи"}`,
+						} {
+							if strings.Contains(c.lastUserText(), name) {
+								return aiReply{Text: `{"payments":[` + payment + `],"clarify":""}`}
+							}
+						}
+						return aiReply{Text: `{"payments":[],"clarify":""}`}
+					}
+					return base(c)
+				}
 			}
 			grp := e2eGroup("klnt")
 			me := user(ownerPhone) // «Вы» — владелец пересылает

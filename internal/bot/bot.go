@@ -1,7 +1,7 @@
 // Package bot подключается к WhatsApp через whatsmeow, слушает сообщения
 // рабочих групп (по умолчанию — всех групп, в которых состоит номер),
 // парсит их и сохраняет транзакции в БД. Умеет отвечать на команду "/отчет"
-// готовым PDF в группе и отвечать в личных сообщениях через Claude,
+// готовым PDF в группе и отвечать в личных сообщениях через GPT,
 // включая формирование отчёта за произвольный период по запросу.
 package bot
 
@@ -46,8 +46,8 @@ import (
 )
 
 // maxPrivateHistory — сколько последних реплик личного диалога держим в
-// памяти как контекст для Claude. История не переживает рестарт бота —
-// это не журнал операций (тот в БД), а просто продолжение разговора.
+// памяти как контекст для GPT. Окно сохраняется в assistant_history и
+// восстанавливается после рестарта отдельно от журнала операций.
 const maxPrivateHistory = 40
 
 type Bot struct {
@@ -907,7 +907,7 @@ func (b *Bot) processGroupMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	if text == "" {
-		// OCR не дал текста вообще. Последний шанс — Claude смотрит на само
+		// OCR не дал текста вообще. Последний шанс — GPT смотрит на само
 		// изображение: handleBankReceipt с пустым текстом сразу уйдёт в
 		// вижн-фолбэк. СИНХРОННО (как путь с OCR ниже): иначе строка чека ещё не
 		// в БД, когда придёт следующее сообщение-имя, и имя привяжется не к тому
@@ -925,7 +925,7 @@ func (b *Bot) processGroupMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	// Любое медиа (фото/PDF/фото-как-файл) в рабочей группе трактуем как чек
-	// и отдаём в каскад разбора: парсер полей -> ИИ по тексту -> Claude
+	// и отдаём в каскад разбора: парсер полей -> ИИ по тексту -> GPT
 	// смотрит на само изображение. Раньше сюда попадали только те, где OCR
 	// выдал знакомые слова ("получатель", "сумма перевода"); если Tesseract
 	// на кириллице выдавал кашу, чёткий чек проваливался в разбор текста и
@@ -1376,7 +1376,7 @@ func looksLikeSilence(reply string) bool {
 }
 
 // handlePrivateMessage отвечает на сообщение, присланное прямо номеру бота
-// (не в рабочую группу), через Claude — с учётом сводки по текущему сбору
+// (не в рабочую группу), через GPT — с учётом сводки по текущему сбору
 // и с доступом к инструменту "отчёт за произвольный период", чтобы владелец
 // мог просто написать, например, "сколько собрали 3 и 4 июля", и получить
 // ответ текстом или PDF-файлом — как попросит.
@@ -1478,7 +1478,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 	}
 
 	sender := msg.Info.Sender.String()
-	fmt.Println("Спрашиваю ассистента (OpenRouter)...")
+	fmt.Println("Спрашиваю ассистента...")
 
 	b.historyMu.Lock()
 	history := append([]ai.Turn(nil), b.history[sender]...)
@@ -1498,8 +1498,8 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
 	if err != nil {
-		fmt.Println("Ошибка ответа Claude:", err) // технические детали — только в лог
-		b.sendText(chat, ai.UserMessage(err))     // в чат — чистое человеческое сообщение
+		fmt.Println("Ошибка ответа ИИ:", err) // технические детали — только в лог
+		b.sendText(chat, ai.UserMessage(err)) // в чат — чистое человеческое сообщение
 		return
 	}
 
@@ -2126,7 +2126,7 @@ func (b *Bot) describePrivateMedia(ctx context.Context, msg *events.Message, med
 	rd := parser.ParseReceipt(ocrText)
 
 	// Парсер не справился — пробуем доразобрать через ИИ по тексту,
-	// а если и это не помогло — Claude смотрит на само изображение.
+	// а если и это не помогло — GPT смотрит на само изображение.
 	if rd.Amount == 0 || rd.Recipient == "" {
 		if rec, ok := b.aiRescueReceipt(ctx, ocrText); ok {
 			mergeAIReceipt(&rd, rec)
@@ -2434,7 +2434,7 @@ func (b *Bot) buildAssistantSystemPrompt(ctx context.Context) (staticPart, dynam
 	return staticPart, dynamicPart
 }
 
-// reportTool — инструмент Claude для отчёта за произвольный период. При
+// reportTool — инструмент GPT для отчёта за произвольный период. При
 // format="pdf" сразу отправляет PDF-документ в чат и возвращает модели
 // короткое подтверждение; при format="text" возвращает текстовую сводку,
 // которую модель сама превратит в ответ пользователю.
@@ -3941,7 +3941,7 @@ func (b *Bot) startForward(msg *events.Message, senderName string, media []byte,
 // receivedAt — время получения сообщения в WhatsApp, используется как
 // запасной вариант, если на самом чеке не удалось распознать дату/время операции.
 // media/mediaExt — исходный файл чека (может быть nil): если и парсер, и
-// текстовый ИИ-доразбор не справились, Claude смотрит на изображение чека
+// текстовый ИИ-доразбор не справились, GPT смотрит на изображение чека
 // напрямую (последний рубеж распознавания).
 // senderJID — кто прислал чек (для сверки с программой). payerOverride —
 // ФИО клиента, написанное рядом с чеком; если задано, платёж относится
@@ -4050,7 +4050,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 
 	rd := parser.ParseReceipt(text)
 
-	// RECEIPT_VISION_FIRST=1 — читать чек-фото сразу глазами Claude (макс.
+	// RECEIPT_VISION_FIRST=1 — читать чек-фото сразу глазами GPT (макс.
 	// точность на «неразборчивых» фото, дороже по токенам). Для PDF не нужно —
 	// там надёжный текстовый слой.
 	cashPhoto := false
@@ -4067,7 +4067,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
 				applyAIReceiptAuthoritative(&rd, rec)
-				fmt.Printf("Чек (сообщение %d): прочитан Claude с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
+				fmt.Printf("Чек (сообщение %d): прочитан GPT с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
 			}
 		} else if !reachable {
 			visionUnavailable = true
@@ -4086,7 +4086,7 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 
 	// Слабый OCR: нет ключевых полей ИЛИ не прочитались ни номер документа,
 	// ни время операции (значит структура чека не распозналась) — показываем
-	// Claude само изображение. Пропускаем, если вижн уже отработал первым.
+	// GPT само изображение. Пропускаем, если вижн уже отработал первым.
 	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
 	if !visionFirst && weakOCR && media != nil {
 		if rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {

@@ -34,7 +34,7 @@ type Transaction struct {
 var cashWordRe = regexp.MustCompile(`(?i)(^|[\s,.:;—-])(нал|наличка|наличкой|наличку|наличные|наличными|наличных|налом|кэш|кеш|cash)([\s,.:;!—-]|$)`)
 
 // collectorTailRe — «… у Дени», «… Мансур взял», «… отдал Адаму» в конце строки.
-var collectorTailRe = regexp.MustCompile(`(?:\s+у\s+([А-ЯЁ][а-яё]+)|\s+([А-ЯЁ][а-яё]+)\s+(?:взял|взяла|забрал|забрала)|\s+(?:отдал|отдала|передал|передала)\s+([А-ЯЁ][а-яё]+))\s*[.!]?\s*$`)
+var collectorTailRe = regexp.MustCompile(`(?:\s+у\s+([А-ЯЁ][А-ЯЁа-яё-]*)|\s+([А-ЯЁ][А-ЯЁа-яё-]*)\s+(?:взял|взяла|забрал|забрала)|\s+(?:взял|взяла|забрал|забрала|отдал|отдала|передал|передала)\s+([А-ЯЁ][А-ЯЁа-яё-]*))\s*[.!]?\s*$`)
 
 // pureAmountRe — строка — только сумма («27000», «27 000р», «27к»).
 var pureAmountRe = regexp.MustCompile(`(?i)^\d[\d\s.,]*\s*(?:тыс[а-яё]*|тыщ[а-яё]*|т|к|k)?\s*(?:₽|руб[а-яё]*|р\.?)?\s*$`)
@@ -68,8 +68,6 @@ type ParseResult struct {
 }
 
 var (
-	numberRe = regexp.MustCompile(`^\d[\d\s.,]*`)
-
 	// "5тысяч", "5 тысяч", "9тысяя" (опечатка), "40к", "40k" -> множитель 1000
 	// Примечание: Go's \b не распознаёт кириллицу как "word"-символы, поэтому
 	// граница задаётся явно через отрицание класса символов, а не через \b.
@@ -96,28 +94,21 @@ func ParseMessage(text string) ParseResult {
 	var res ParseResult
 
 	// Нормализуем переносы строк и убираем пустые строки по краям
-	lines := strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n")
+	var lines []string
+	for _, raw := range strings.Split(strings.ReplaceAll(text, "\r\n", "\n"), "\n") {
+		line := strings.TrimSpace(StripPaymentReferences(raw))
+		if strings.IndexFunc(line, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) >= 0 && !IsPaymentAnnotation(line) {
+			lines = append(lines, line)
+		}
+	}
 
 	currentName := ""
 	blockCash := false // заголовок «Наличка:» — дальше по блоку наличка
-	nonEmpty := 0
-	for _, raw := range lines {
-		if strings.TrimSpace(raw) != "" {
-			nonEmpty++
-		}
-	}
-	seen := 0
-	for _, raw := range lines {
-		orig := strings.TrimSpace(raw)
-		if orig == "" {
-			continue // пустая строка — просто разделитель блоков, не сбрасываем currentName,
-			// т.к. в реальных сообщениях люди не всегда аккуратно отбивают блоки
-		}
-		seen++
+	for i, orig := range lines {
 		line, lineCash, collector, onlyCash := stripCashMarkers(orig)
 		if onlyCash {
 			// «Магомедов Ахмед 15000\nналичка» — пометка к единственному платежу.
-			if seen == nonEmpty && len(res.Transactions) == 1 {
+			if i == len(lines)-1 && len(res.Transactions) == 1 {
 				res.Transactions[0].IsCash = true
 			}
 			if currentName == "" {
@@ -236,20 +227,8 @@ func parseLine(res *ParseResult, line string, currentName *string, cash bool) {
 // Примеры: "40000", "40 000", "5тысяч", "30к", "3000 аванс", "20к премия"
 func tryParseAmountLine(line string) (amount float64, note string, card string, ok bool) {
 	lower := strings.ToLower(line)
-
-	// Ищем денежный множитель "тысяч/к/k"
-	if m := thousandWordRe.FindStringSubmatch(lower); m != nil {
-		val, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", "."), 64)
-		if err == nil {
-			amount = val * 1000
-			ok = true
-		}
-	} else if m := numberRe.FindString(line); m != "" {
-		val := ParseMoneyValue(m)
-		if val > 0 {
-			amount = val
-			ok = true
-		}
+	if hits := amountHits(line); len(hits) > 0 && hits[0].start == 0 {
+		amount, ok = hits[0].v, true
 	}
 
 	if !ok {
@@ -264,29 +243,13 @@ func tryParseAmountLine(line string) (amount float64, note string, card string, 
 // tryParseFreeformLine обрабатывает строки вида "Скинул 15к на карту втб",
 // "9тысяя скинул на твою карту", "Закрыл договор 903 35.000" — сумма может быть
 // не в начале строки и соседствовать с другими числами (номер договора и т.п.).
-// Если чисел несколько — берём НАИБОЛЬШЕЕ: сумма практически всегда больше
-// номера договора/квартиры/процента, а ошибка в меньшую сторону (взять номер
-// договора вместо суммы) исказила бы отчёт незаметно.
+// Служебные номера исключаются тем же правилом, что в ExtractAmount.
 func tryParseFreeformLine(line string) (amount float64, note string, card string, ok bool) {
 	lower := strings.ToLower(line)
 
-	if m := thousandWordRe.FindStringSubmatch(lower); m != nil {
-		val, err := strconv.ParseFloat(strings.ReplaceAll(m[1], ",", "."), 64)
-		if err == nil {
-			amount = val * 1000
-			ok = true
-		}
-	} else {
-		// Ищем ВСЕ числа в строке и берём наибольшее осмысленное.
-		// Пробел внутри числа НЕ допускаем: в свободном тексте "договор 903 35.000"
-		// пробел разделяет разные числа, а не группы тысяч.
-		anyNumRe := regexp.MustCompile(`\d[\d.,]*`)
-		for _, m := range anyNumRe.FindAllString(line, -1) {
-			val := ParseMoneyValue(m)
-			if val >= 100 && val > amount { // отсекаем мелкие случайные числа
-				amount = val
-				ok = true
-			}
+	for _, h := range amountHits(line) {
+		if h.real && h.v > amount {
+			amount, ok = h.v, true
 		}
 	}
 

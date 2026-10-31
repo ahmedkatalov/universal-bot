@@ -101,6 +101,30 @@ var nameStopwords = map[string]bool{
 // отбрасывает как стоп-слова), считаем подпись шумной и возвращаем ok=false,
 // чтобы её разобрал ИИ (он отличит плательщика от упомянутых посторонних).
 func cleanNameCaption(caption string) (string, bool) {
+	var lines []string
+	nameLines := 0
+	for _, line := range strings.Split(parser.StripPaymentReferences(caption), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.IndexFunc(line, func(r rune) bool { return unicode.IsLetter(r) || unicode.IsDigit(r) }) < 0 || parser.IsPaymentAnnotation(line) {
+			continue
+		}
+		lines = append(lines, line)
+		if _, ok := looksLikeName(line); ok {
+			nameLines++
+		}
+	}
+	if len(lines) > 1 && nameLines != 1 {
+		return "", false // два разных ФИО нельзя склеить в одного клиента
+	}
+	caption = strings.Join(lines, " ")
+	low := strings.ToLower(strings.Join(strings.FieldsFunc(caption, func(r rune) bool { return !unicode.IsLetter(r) }), " "))
+	// Отсекаем фразы целиком: отдельное слово («Салам», «День») может быть
+	// настоящим именем/фамилией и не должно исчезать из ФИО.
+	for _, phrase := range []string{"доброе утро", "добрый день", "добрый вечер", "ассаламу алейкум", "салам алейкум", "карта", "карты"} {
+		if low == phrase || strings.HasPrefix(low, phrase+" ") {
+			return "", false
+		}
+	}
 	name, ok := looksLikeName(caption)
 	if !ok {
 		return "", false
@@ -119,6 +143,10 @@ func cleanNameCaption(caption string) (string, bool) {
 		}
 		if parser.IsMoneyWord(clean, true) {
 			continue // «руб», «тыс», «₽»
+		}
+		switch strings.ToLower(clean) {
+		case "за", "месяц", "месяца", "месяцев", "мес":
+			continue // «ФИО 25т за 2 месяца» — по-прежнему один клиент
 		}
 		if !nameSet[strings.ToLower(clean)] {
 			return "", false // слово не из имени и не сумма — подпись шумная, нужен ИИ
@@ -229,10 +257,8 @@ func (b *Bot) payerFromCaption(ctx context.Context, caption string) (string, flo
 	if name := b.cmfExtractClientName(ctx, caption); name != "" {
 		return name, parser.ExtractAmount(caption)
 	}
-	// ИИ не выделил, но подпись сама похожа на ФИО ("цихаев саляхь").
-	if name, ok := looksLikeName(caption); ok {
-		return name, parser.ExtractAmount(caption)
-	}
+	// Шумную подпись, которую ИИ не подтвердил, не превращаем в клиента
+	// более слабой эвристикой. Чистое ФИО уже обработано выше.
 	return "", 0
 }
 
@@ -483,6 +509,7 @@ func (b *Bot) consumePendingNameCash(ctx context.Context, chat types.JID, sender
 // это ПЛАТЁЖ: он записывается (возвращаем false), а имя заодно ждёт чек НА ТУ ЖЕ
 // сумму (текст + чек одного платежа сводятся в отчётах в один).
 func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string, rawID int) bool {
+	text = strings.TrimSpace(parser.StripPaymentReferences(text))
 	chat := msg.Info.Chat
 	sender := msg.Info.Sender.String()
 	quotedID := extractQuotedStanzaID(msg)
@@ -556,14 +583,13 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 		}
 	}
 
-	// Уверены ли, что это ВООБЩЕ ФИО человека, а не фраза, случайно прошедшая
-	// эвристику («Доброе Утро», «Новый Клиент»)? Уверенно — если совпал известный
-	// алиас. Иначе спрашиваем ИИ: он подтвердит/нормализует настоящее ФИО или
-	// вернёт пусто для не-имени. Без ассистента доверяем только известным
-	// алиасам, остальное НЕ перехватываем (чек останется на проверку).
+	// Чистое ФИО рядом с ожидающим чеком — такая же подпись, как подпись к
+	// фото: она работает и без ИИ. Шумные фразы по-прежнему подтверждает ИИ.
 	if _, known := b.aliases.ResolveName(name); !known {
 		confirmed := ""
-		if b.assistant != nil {
+		if clean, ok := cleanNameCaption(nameText); checkNearby && ok {
+			confirmed = clean
+		} else if b.assistant != nil {
 			confirmed = b.cmfExtractClientName(ctx, nameText)
 		}
 		if confirmed == "" {

@@ -1,5 +1,3 @@
-version: "3.8"
-
 # Все секреты и настройки — в файле .env рядом (см. .env.example).
 # .env НЕ коммитится в git (закрыт через .gitignore).
 
@@ -31,31 +29,22 @@ services:
       # Чтобы ограничить конкретными группами — перечисли JID через запятую:
       # WHATSAPP_GROUP_JIDS: "120363...1@g.us,120363...2@g.us"
       WHATSAPP_GROUP_JIDS: ${WHATSAPP_GROUP_JIDS:-}
-      # Личный ассистент идёт через OpenRouter (OpenAI-совместимый API).
-      # Пусто => бот не отвечает в личных сообщениях, вся остальная логика работает как обычно.
+      # GPT-6.1 Sol через ODIRouter. Прежний OPENROUTER_API_KEY тоже поддержан.
+      ODIROUTER_API_KEY: ${ODIROUTER_API_KEY:-}
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
-      # Адрес API. Пусто = openrouter.ai. Для совместимого шлюза (напр. российский
-      # аналог odirouter.ai) укажи его базовый OpenAI-совместимый адрес, например
-      # https://odirouter.ai/api/v1 (бот сам добавит /chat/completions).
-      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-}
-      # Модель "мозга" бота. По умолчанию — Opus 4.8 (самая умная: отчёты,
-      # сверка, чтение чеков, цепочки инструментов). Промпт кэшируется, поэтому
-      # повторные запросы дешевле. Варианты по убыванию силы/цены:
-      #   anthropic/claude-opus-4.8      — максимум ума (рекомендую для денег)
-      #   anthropic/claude-sonnet-4.6    — баланс цена/качество
-      #   anthropic/claude-haiku-4.5     — самая дешёвая, для простых задач
-      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-anthropic/claude-opus-4.8}
-      # Модель для ЧТЕНИЯ ЧЕКОВ (зрение). Пусто => та же, что и мозг (лучшее
-      # распознавание). Хочешь удешевить распознавание, не трогая ум отчётов —
-      # поставь дешёвую, напр. anthropic/claude-haiku-4.5.
-      OPENROUTER_VISION_MODEL: ${OPENROUTER_VISION_MODEL:-}
-      # Резервные модели (через запятую), если основная недоступна/перегружена/5xx.
-      # Пусто = без резерва. Указывай реальные id из каталога OpenRouter.
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://api.odirouter.ai/v1}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-gpt-6.1-sol}
+      OPENROUTER_VISION_MODEL: ${OPENROUTER_VISION_MODEL:-gpt-6.1-sol}
+      OPENROUTER_API_MODE: ${OPENROUTER_API_MODE:-responses}
+      # Диалог — medium; короткое чтение платежей и чеков — low.
+      OPENROUTER_REASONING_EFFORT: ${OPENROUTER_REASONING_EFFORT:-medium}
+      OPENROUTER_EXTRACT_REASONING_EFFORT: ${OPENROUTER_EXTRACT_REASONING_EFFORT:-low}
+      # Резервные модели только по явной настройке, без автоматического Claude.
       OPENROUTER_FALLBACK_MODELS: ${OPENROUTER_FALLBACK_MODELS:-}
       OPENROUTER_VISION_FALLBACK_MODELS: ${OPENROUTER_VISION_FALLBACK_MODELS:-}
-      # Лимит токенов ответа по типу запроса (чтение чека короткое).
-      OPENROUTER_MAX_TOKENS: ${OPENROUTER_MAX_TOKENS:-3072}
-      OPENROUTER_VISION_MAX_TOKENS: ${OPENROUTER_VISION_MAX_TOKENS:-1024}
+      # Responses считает в лимите и рассуждения, и видимый ответ.
+      OPENROUTER_MAX_TOKENS: ${OPENROUTER_MAX_TOKENS:-8192}
+      OPENROUTER_VISION_MAX_TOKENS: ${OPENROUTER_VISION_MAX_TOKENS:-4096}
       # Имя, по которому к боту обращаются в группах: "Джарвис скинь отчет"
       BOT_NAME: ${BOT_NAME:-Джарвис}
       # Кто может писать боту в личку (ассистент, дозагрузка чеков) — номера
@@ -85,7 +74,7 @@ services:
       # умолчанию (полная свобода). Кулдаун 90с/группа только против флуда.
       # Полностью отключить: PROACTIVE_CHAT=0.
       PROACTIVE_CHAT: ${PROACTIVE_CHAT:-1}
-      # Читать фото-чеки СРАЗУ через Claude (глазами), а не полагаться на OCR —
+      # Читать фото-чеки СРАЗУ через GPT (глазами), а не полагаться на OCR —
       # заметно точнее (OCR по кириллице врёт). По умолчанию ВКЛючено.
       # Чтобы сэкономить на токенах (и вернуть OCR-first), поставь 0.
       # PDF с текстовым слоем это не затрагивает (там точный pdftotext).

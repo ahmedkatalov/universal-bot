@@ -16,6 +16,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -225,11 +226,33 @@ func fakeCMFProgram(t *testing.T, clients []cmf.ClientInfo, pays map[string][]ma
 
 // fakeAI — фейковый OpenRouter: отдаёт то, что вернёт e.ai.
 func (e *e2eBot) fakeAI() *ai.Assistant {
+	return e.fakeAIWithModel("test-model")
+}
+
+func (e *e2eBot) fakeAIWithModel(model string) *ai.Assistant {
+	var responseSeq atomic.Int64
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		var req map[string]any
 		_ = json.Unmarshal(body, &req)
 		c := aiCall{Raw: req}
+		if r.URL.Path == "/responses" {
+			var messages []any
+			if input, ok := req["input"].([]any); ok {
+				for _, v := range input {
+					item := v.(map[string]any)
+					if item["type"] == "function_call_output" {
+						messages = append(messages, map[string]any{"role": "tool", "content": item["output"]})
+					} else if role, ok := item["role"].(string); ok {
+						if role == "developer" {
+							role = "system"
+						}
+						messages = append(messages, map[string]any{"role": role, "content": item["content"]})
+					}
+				}
+			}
+			req["messages"] = messages
+		}
 		if msgs, ok := req["messages"].([]any); ok {
 			for _, m := range msgs {
 				mm, _ := m.(map[string]any)
@@ -242,6 +265,10 @@ func (e *e2eBot) fakeAI() *ai.Assistant {
 		}
 		if tools, ok := req["tools"].([]any); ok {
 			for _, tl := range tools {
+				if name, ok := tl.(map[string]any)["name"].(string); ok {
+					c.Tools = append(c.Tools, name)
+					continue
+				}
 				if fm, ok := tl.(map[string]any)["function"].(map[string]any); ok {
 					c.Tools = append(c.Tools, fmt.Sprint(fm["name"]))
 				}
@@ -254,6 +281,17 @@ func (e *e2eBot) fakeAI() *ai.Assistant {
 		rep := aiReply{Text: "ок"}
 		if f != nil {
 			rep = f(c)
+		}
+		if r.URL.Path == "/responses" {
+			var output []any
+			if rep.Text != "" || len(rep.ToolCalls) == 0 {
+				output = append(output, map[string]any{"type": "message", "role": "assistant", "content": []any{map[string]any{"type": "output_text", "text": rep.Text}}})
+			}
+			for _, tc := range rep.ToolCalls {
+				output = append(output, map[string]any{"type": "function_call", "call_id": fmt.Sprintf("response_call_%d", responseSeq.Add(1)), "name": tc.Name, "arguments": tc.Args})
+			}
+			json.NewEncoder(w).Encode(map[string]any{"status": "completed", "output": output})
+			return
 		}
 		msg := map[string]any{"role": "assistant", "content": rep.Text}
 		finish := "stop"
@@ -271,7 +309,11 @@ func (e *e2eBot) fakeAI() *ai.Assistant {
 		})
 	}))
 	e.t.Cleanup(srv.Close)
-	return ai.New("test-key", "test-model", "test-vision", srv.URL)
+	vision := "test-vision"
+	if strings.HasPrefix(model, "gpt-") {
+		vision = model
+	}
+	return ai.New("test-key", model, vision, srv.URL)
 }
 
 func contentText(c any) string {
@@ -282,7 +324,9 @@ func contentText(c any) string {
 		var sb strings.Builder
 		for _, p := range v {
 			if pm, ok := p.(map[string]any); ok {
-				sb.WriteString(fmt.Sprint(pm["text"]))
+				if text, ok := pm["text"].(string); ok {
+					sb.WriteString(text)
+				}
 			}
 		}
 		return sb.String()

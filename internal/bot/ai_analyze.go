@@ -117,6 +117,8 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	system := "Ты — модуль разбора платежей в WhatsApp-боте учёта финансов. " +
 		"Тебе дают сообщение из рабочей группы — в нём могут быть платежи (переводы и/или наличка) в ЛЮБОМ формате. " +
 		"Разбери их по СМЫСЛУ, как понял бы человек, а не по шаблону. " +
+		"Номера договоров, счетов и телефонов — НЕ суммы платежей. «ФИО / Договор 983» — только подпись, payments пусто. " +
+		"«ФИО / Договор 941 / 20.100 наличку взял Сафаи» — один платёж 20100, номер 941 не учитывай. " +
 		"Известные люди: " + strings.Join(b.aliases.Canonicals(), ", ") + ".\n\n" +
 		"Верни СТРОГО один JSON-объект вида " +
 		`{"payments":[{"name":"ФИО клиента","amount":12345,"cash":false,"collector":"","note":"","card":"втб|сбер|наличные|"}],"clarify":""}` + ".\n\n" +
@@ -451,102 +453,14 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 }
 
-// reDateLikeToken — «08.09», «8.9.26», «08.09.2026»: это дата, а не сумма.
-var reDateLikeToken = regexp.MustCompile(`^\d{1,2}\.\d{1,2}(?:\.\d{2,4})?$`)
-
-// looksLikeClockToken — токен из 1–2 цифр вплотную к двоеточию (часы/минуты в
-// «12:30»). Так «12»/«30» из времени не считаются суммой, а «35.000» из
-// «наличными:35.000» (не 1–2 цифры) — считается.
-func looksLikeClockToken(text string, start, end int, tok string) bool {
-	if len(tok) < 1 || len(tok) > 2 {
-		return false
-	}
-	for _, r := range tok {
-		if r < '0' || r > '9' {
-			return false
-		}
-	}
-	if end < len(text) && text[end] == ':' {
-		return true
-	}
-	if start > 0 && text[start-1] == ':' {
-		return true
-	}
-	return false
-}
-
-// moneyTokens — «денежные» числа сообщения: с суффиксом тысяч/миллионов ИЛИ не
-// меньше 100 (и не похожие на дату/время). По их количеству решаем, ОДНА ли
-// сумма в сообщении: только тогда её можно безопасно навязать ИИ и подменить ею
-// результат; при нескольких числах («20000 + 5000») подмена ломала бы итог.
-// digitCount — сколько цифр в строке (чтобы отличить телефон/счёт от суммы).
-func digitCount(s string) int {
-	n := 0
-	for _, r := range s {
-		if r >= '0' && r <= '9' {
-			n++
-		}
-	}
-	return n
-}
-
-// precededByNonAmountMarker — перед числом стоит маркер НЕ-суммы (номер договора/
-// счёта или телефон): такое число — не деньги. Смотрим короткое окно слева.
-// «карту/номер/год» НЕ фильтруем намеренно — там часто стоит реальная сумма
-// («на карту 50000»), и их отбрасывание потеряло бы платёж.
-func precededByNonAmountMarker(text string, start int) bool {
-	if start > 0 && text[start-1] == '+' {
-		return true // +7… — телефон
-	}
-	lo := start - 24
-	if lo < 0 {
-		lo = 0
-	}
-	ctx := strings.ToLower(text[lo:start])
-	for _, w := range []string{"договор", "счёт", "счет", "№", "тел", "телефон"} {
-		if strings.Contains(ctx, w) {
-			return true
-		}
-	}
-	return false
-}
-
+// moneyTokens — денежные суммы для подсказки и проверки ответа ИИ.
+// Используем те же правила, что у обычного парсера: служебные номера не деньги.
 func moneyTokens(text string) []float64 {
 	var out []float64
-	// Числа — как их читает парсер: «30 000» — одно число, а «15000 200» и
-	// «15000\n20000» — два (раньше склеивались в одну огромную сумму).
-	for _, m := range parser.MoneyNumberSpans(text) {
-		tok := strings.Trim(text[m[0]:m[1]], ".,")
-		if tok == "" {
-			continue
+	for _, h := range parser.AmountsAt(text) {
+		if h.Real {
+			out = append(out, h.Value)
 		}
-		// Суффикс проверяем ПЕРВЫМ: «1.5 млн» — сумма, а не дата; «22т» — тысячи.
-		// Правило суффикса — то же, что у парсера: «15000 к Адаму» — «к»
-		// предлог, а не тысячи (иначе страховка ниже делала 15 000 000).
-		v := parser.ParseMoneyValue(tok)
-		mult := parser.ThousandsMultiplier(text[m[1]:], v)
-		suffix := mult > 0
-		if !suffix && reDateLikeToken.MatchString(tok) {
-			continue // «08.09» без суффикса — дата
-		}
-		if !suffix && looksLikeClockToken(text, m[0], m[1], tok) {
-			continue // «12:30» — время
-		}
-		if !suffix && digitCount(tok) >= 10 {
-			continue // 10+ цифр — телефон/счёт/карта, а не сумма
-		}
-		if !suffix && precededByNonAmountMarker(text, m[0]) {
-			continue // номер договора/счёта/телефон («договор 12345», «+7...») — не сумма
-		}
-		if v <= 0 {
-			continue
-		}
-		if suffix {
-			v *= mult
-		} else if v < 100 {
-			continue // мелкое число без суффикса — вряд ли сумма (номер, «за 2 месяца»)
-		}
-		out = append(out, v)
 	}
 	return out
 }
@@ -1234,7 +1148,7 @@ func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, b
 
 // aiVisionReceipt показывает файл чека (фото или PDF) модели "глазами" —
 // последний рубеж распознавания, когда OCR выдал кашу или вообще ничего.
-// Claude читает чек прямо с изображения: банк, получатель, сумма, дата.
+// GPT читает чек прямо с изображения: банк, получатель, сумма, дата.
 // Возвращает (результат, ok, reachable). reachable=false означает, что модель
 // зрения НЕ дала вердикт (нет ассистента, не отрендерился PDF, ошибка вызова) —
 // тогда нельзя заключать «это не чек»: вызывающий не должен помечать сообщение
@@ -1297,7 +1211,7 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint strin
 	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" {
 		return aiReceipt{}, false, true
 	}
-	fmt.Printf("Вижн-разбор: Claude прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
+	fmt.Printf("Вижн-разбор: GPT прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
 	return rec, true, true
 }
 
@@ -1468,7 +1382,7 @@ func consensusAmount(amounts []float64) float64 {
 	return sorted[(len(sorted)-1)/2]
 }
 
-// receiptVisionFirst — читать фото-чеки СРАЗУ глазами Claude, не полагаясь на
+// receiptVisionFirst — читать фото-чеки СРАЗУ глазами GPT, не полагаясь на
 // Tesseract-OCR (тот на кириллице часто выдаёт «правдоподобный мусор» с неверной
 // суммой, и тогда зрение как фолбэк не включалось). По умолчанию ВКЛЮЧЕНО —
 // это заметно точнее. Отключить: RECEIPT_VISION_FIRST=0.
@@ -1779,7 +1693,7 @@ func (b *Bot) aiHealthAlert() {
 	b.cmfHealthMu.Unlock()
 	switch {
 	case alert:
-		b.notifyOwners("⚠️ ИИ-сервис (OpenRouter) сейчас не отвечает: " + problem + " Чеки и непонятные сообщения я сохранил — дочитаю их сам, когда он вернётся.")
+		b.notifyOwners("⚠️ ИИ-сервис сейчас не отвечает: " + problem + " Чеки и непонятные сообщения я сохранил — дочитаю их сам, когда он вернётся.")
 	case recovered:
 		b.notifyOwners("✅ ИИ-сервис снова отвечает — дочитываю чеки и сообщения, которые ждали.")
 	}

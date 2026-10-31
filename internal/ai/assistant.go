@@ -1,5 +1,5 @@
-// Package ai отвечает на личные сообщения владельцу через OpenRouter
-// (OpenAI-совместимый API, https://openrouter.ai/api/v1/chat/completions) —
+// Package ai отвечает на личные сообщения владельцу через ODIRouter/GPT
+// (Responses API; также поддерживает совместимый Chat Completions) —
 // когда пишут не в рабочую группу, а напрямую номеру бота. Поддерживает
 // tool use (function calling): модель сама решает, когда нужно свериться
 // с данными бота (например, сформировать отчёт за произвольный период)
@@ -23,8 +23,8 @@ import (
 )
 
 const (
-	defaultBaseURL = "https://openrouter.ai/api/v1"
-	defaultModel   = "~anthropic/claude-sonnet-latest" // алиас OpenRouter на последнюю версию Sonnet
+	defaultBaseURL = "https://api.odirouter.ai/v1"
+	defaultModel   = "gpt-6.1-sol"
 
 	// maxToolIterations — предохранитель от зацикливания, если модель
 	// почему-то продолжает звать инструменты бесконечно. Щедрый запас, чтобы
@@ -38,8 +38,8 @@ const (
 	// «икание» рушил весь ответ бота; с ретраями — переживает.
 	maxHTTPAttempts = 3
 
-	defaultChatMaxTokens   = 3072 // диалог/инструменты: нужен запас на аргументы инструментов
-	defaultVisionMaxTokens = 1024 // чтение чека: ответ короткий, 3000 токенов не нужны
+	defaultChatMaxTokens   = 8192 // включает рассуждения GPT и видимый ответ/аргументы
+	defaultVisionMaxTokens = 4096 // запас на рассуждения и JSON с полями чека
 )
 
 // ProviderError — ошибка ИИ-провайдера с ЧИСТЫМ сообщением для пользователя и
@@ -89,7 +89,7 @@ func classifyProviderError(status int, providerMsg string, transportErr error) *
 	case status == http.StatusTooManyRequests || has("rate limit", "rate-limit", "too many requests"):
 		return &ProviderError{"rate_limit", "Слишком много запросов к ИИ подряд — чуть перегружено. Повтори через минуту.", detail}
 	case status == http.StatusPaymentRequired || has("credit", "insufficient", "quota", "billing", "payment"):
-		return &ProviderError{"credits", "Не могу ответить: на балансе ИИ-сервиса закончились средства — нужно пополнить OpenRouter.", detail}
+		return &ProviderError{"credits", "Не могу ответить: на балансе ИИ-сервиса закончились средства — нужно пополнить баланс.", detail}
 	case has("maximum context", "context length", "context_length", "too long") || (status == http.StatusBadRequest && has("token")):
 		return &ProviderError{"context", "Слишком длинный запрос для ИИ. Сформулируй короче или разбей на части.", detail}
 	case status == http.StatusNotFound || has("no endpoints", "no allowed providers", "model not found", "unavailable", "not a valid model"):
@@ -152,11 +152,14 @@ type Tool struct {
 }
 
 type Assistant struct {
-	apiKey      string
-	model       string // «мозг»: диалог, отчёты, сверка, вызовы инструментов
-	visionModel string // чтение чеков (зрение); по умолчанию совпадает с model
-	baseURL     string
-	http        *http.Client
+	apiKey           string
+	model            string // «мозг»: диалог, отчёты, сверка, вызовы инструментов
+	visionModel      string // чтение чеков (зрение); по умолчанию совпадает с model
+	baseURL          string
+	http             *http.Client
+	apiMode          string // auto | responses | chat_completions
+	reasoning        string // диалог с инструментами
+	extractReasoning string // чтение платежей и изображений
 
 	// Резервные модели: если основная недоступна/перегружена/отвечает 5xx, бот
 	// пробует их по очереди (OPENROUTER_FALLBACK_MODELS / _VISION_FALLBACK_MODELS).
@@ -273,14 +276,9 @@ func (a *Assistant) ResetBreaker() {
 // Degraded — ИИ-сервис сейчас считается недоступным (предохранитель разомкнут).
 func (a *Assistant) Degraded() bool { return a.breakerCheck() != nil }
 
-// New создаёт клиента OpenRouter. apiKey — значение OPENROUTER_API_KEY.
-// model — id модели в каталоге OpenRouter (например, "anthropic/claude-sonnet-4.6");
-// пусто -> берётся defaultModel. baseURL — обычно оставляют пустым
-// (используется https://openrouter.ai/api/v1), задаётся отдельно только
-// если стоит прокси/самостоятельный gateway с тем же протоколом.
-// visionModel пусто -> зрение идёт той же моделью, что и «мозг» (лучшее
-// распознавание). Можно задать отдельную дешёвую модель (напр. Haiku) через
-// OPENROUTER_VISION_MODEL, если распознавание чеков хочется удешевить.
+// New создаёт клиент ODIRouter или совместимого API. По умолчанию используется
+// GPT-6.1 Sol; GPT вызывает Responses API, старые модели — Chat Completions.
+// Пустой visionModel означает ту же модель для изображений и диалога.
 func New(apiKey, model, visionModel, baseURL string) *Assistant {
 	if model == "" {
 		model = defaultModel
@@ -296,6 +294,9 @@ func New(apiKey, model, visionModel, baseURL string) *Assistant {
 		model:                model,
 		visionModel:          visionModel,
 		baseURL:              strings.TrimRight(baseURL, "/"),
+		apiMode:              envOr("OPENROUTER_API_MODE", "auto"),
+		reasoning:            envOr("OPENROUTER_REASONING_EFFORT", "medium"),
+		extractReasoning:     envOr("OPENROUTER_EXTRACT_REASONING_EFFORT", "low"),
 		http:                 &http.Client{Timeout: envDuration("OPENROUTER_HTTP_TIMEOUT", 60*time.Second)},
 		fallbackModels:       splitModels(os.Getenv("OPENROUTER_FALLBACK_MODELS")),
 		visionFallbackModels: splitModels(os.Getenv("OPENROUTER_VISION_FALLBACK_MODELS")),
@@ -305,10 +306,11 @@ func New(apiKey, model, visionModel, baseURL string) *Assistant {
 }
 
 type chatMessage struct {
-	Role       string     `json:"role"`
-	Content    any        `json:"content"` // string или []contentBlock (для кэширования)
-	ToolCalls  []toolCall `json:"tool_calls,omitempty"`
-	ToolCallID string     `json:"tool_call_id,omitempty"`
+	Role          string            `json:"role"`
+	Content       any               `json:"content"` // string или []contentBlock (для кэширования)
+	ToolCalls     []toolCall        `json:"tool_calls,omitempty"`
+	ToolCallID    string            `json:"tool_call_id,omitempty"`
+	responseItems []json.RawMessage `json:"-"` // исходные output Items, включая reasoning
 }
 
 // contentBlock — блок контента; на статичный блок вешаем cache_control,
@@ -415,6 +417,7 @@ func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem strin
 			},
 		})
 	}
+	executed := map[string]executedTool{}
 
 	for i := 0; i < maxToolIterations; i++ {
 		respMsg, _, err := a.chat(ctx, messages, toolDefs)
@@ -432,7 +435,12 @@ func (a *Assistant) Reply(ctx context.Context, staticSystem, dynamicSystem strin
 		}
 
 		for _, call := range respMsg.ToolCalls {
-			result := runTool(ctx, tools, call)
+			var result string
+			if len(respMsg.responseItems) > 0 {
+				result = runToolOnce(ctx, tools, call, executed)
+			} else {
+				result = runTool(ctx, tools, call)
+			}
 			messages = append(messages, chatMessage{
 				Role:       "tool",
 				ToolCallID: call.ID,
@@ -547,6 +555,25 @@ func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userTex
 	models := append([]string{a.visionModel}, a.visionFallbackModels...)
 	var lastErr error
 	for _, model := range models {
+		if a.usesResponses(model) {
+			msg, _, cerr := a.respond(ctx, model, []json.RawMessage{
+				responseInput(map[string]any{"role": "developer", "content": systemPrompt}),
+				responseInput(map[string]any{"role": "user", "content": []map[string]any{
+					{"type": "input_text", "text": userText},
+					{"type": "input_image", "image_url": dataURL, "detail": "high"},
+				}}),
+			}, nil, a.visionMaxTokens, a.extractReasoning)
+			a.breakerNote(cerr)
+			if cerr == nil {
+				return contentString(msg.Content), nil
+			}
+			lastErr = cerr
+			var pe *ProviderError
+			if ctx.Err() == nil && errors.As(cerr, &pe) && shouldFallback(pe.Category) {
+				continue
+			}
+			return "", cerr
+		}
 		payload, err := json.Marshal(visionRequest{
 			Model: model,
 			Messages: []visionMessage{
@@ -563,6 +590,7 @@ func (a *Assistant) CompleteWithImage(ctx context.Context, systemPrompt, userTex
 		}
 		body, status, terr := a.postCompletions(ctx, payload)
 		msg, cerr := interpretText(body, status, terr)
+		cerr = a.safeError(cerr)
 		a.breakerNote(cerr)
 		if cerr == nil {
 			return msg, nil
@@ -609,6 +637,23 @@ func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []to
 	models := append([]string{a.model}, a.fallbackModels...)
 	var lastErr error
 	for _, model := range models {
+		if a.usesResponses(model) {
+			effort := a.reasoning
+			if len(tools) == 0 {
+				effort = a.extractReasoning
+			}
+			msg, finish, cerr := a.respond(ctx, model, responseHistory(messages), tools, a.chatMaxTokens, effort)
+			a.breakerNote(cerr)
+			if cerr == nil {
+				return msg, finish, nil
+			}
+			lastErr = cerr
+			var pe *ProviderError
+			if ctx.Err() == nil && errors.As(cerr, &pe) && shouldFallback(pe.Category) {
+				continue
+			}
+			return chatMessage{}, "", cerr
+		}
 		payload, err := json.Marshal(chatRequest{
 			Model:     model,
 			Messages:  messages,
@@ -620,6 +665,7 @@ func (a *Assistant) chat(ctx context.Context, messages []chatMessage, tools []to
 		}
 		body, status, terr := a.postCompletions(ctx, payload)
 		msg, finish, cerr := interpretChat(body, status, terr)
+		cerr = a.safeError(cerr)
 		a.breakerNote(cerr)
 		if cerr == nil {
 			return msg, finish, nil
@@ -677,6 +723,10 @@ func interpretText(body []byte, status int, transportErr error) (string, error) 
 // transportErr != nil только если ответа так и не получили (сеть/таймаут).
 // backoff растёт (≈0.6s, 1.2s), но упирается в ctx.
 func (a *Assistant) postCompletions(ctx context.Context, payload []byte) (body []byte, status int, transportErr error) {
+	return a.postJSON(ctx, "/chat/completions", payload)
+}
+
+func (a *Assistant) postJSON(ctx context.Context, path string, payload []byte) (body []byte, status int, transportErr error) {
 	var lastErr error
 	var lastStatus int
 	var lastBody []byte
@@ -689,7 +739,7 @@ func (a *Assistant) postCompletions(ctx context.Context, payload []byte) (body [
 			}
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+"/chat/completions", bytes.NewReader(payload))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, a.baseURL+path, bytes.NewReader(payload))
 		if err != nil {
 			return nil, 0, err
 		}
@@ -739,6 +789,16 @@ func snippet(b []byte) string {
 		s = s[:300] + "…"
 	}
 	return s
+}
+
+func (a *Assistant) safeError(err error) error {
+	var pe *ProviderError
+	if a.apiKey != "" && errors.As(err, &pe) {
+		copy := *pe
+		copy.Detail = strings.ReplaceAll(copy.Detail, a.apiKey, "[redacted]")
+		return &copy
+	}
+	return err
 }
 
 func runTool(ctx context.Context, tools []Tool, call toolCall) string {

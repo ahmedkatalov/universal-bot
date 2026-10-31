@@ -125,6 +125,46 @@ var nonAmountWords = map[string]bool{
 	"счет": true, "счёт": true, "счета": true, "кв": true, "квартира": true, "дом": true, "код": true,
 }
 
+// Номер договора/счёта может содержать буквы, дефисы и год («№983/2026»).
+// Убираем всю ссылку, иначе её вторая часть снова стала бы денежной суммой.
+// Пробел между номером и следующим числом не включаем: «договор 983 15000»
+// содержит номер 983 и отдельный платёж 15000.
+var paymentReferenceRe = regexp.MustCompile(`(?i)(^|[^\p{L}\d])((?:номер[ \t]+)?(?:договор(?:а|у|ом)?|дог\.?|(?-i:д\.)|сч[её]т(?:а)?|тел(?:ефон)?\.?|кв\.?|квартира|дом|код|№|#)[ \t\x{00a0}]*(?:[№#:.—-][ \t\x{00a0}]*)*(?:[\p{L}]+[-/]?)?\d+(?:[-/.][\p{L}\d]+)*)`)
+
+var phoneLabelRe = regexp.MustCompile(`(?i)(^|[^\p{L}])((?:номер[ \t]+)?тел(?:ефон(?:а)?)?\.?[ \t:.]*)$`)
+
+// StripPaymentReferences скрывает служебные номера, сохраняя длину строки и
+// позиции сумм. Исходное сообщение остаётся в raw_messages без изменений.
+func StripPaymentReferences(text string) string {
+	matches := paymentReferenceRe.FindAllStringSubmatchIndex(text, -1)
+	spans := phoneSpans(text)
+	if len(matches) == 0 && len(spans) == 0 {
+		return text
+	}
+	for _, m := range matches {
+		spans = append(spans, [2]int{m[4], m[5]})
+	}
+	for i, sp := range spans {
+		if m := phoneLabelRe.FindStringSubmatchIndex(text[:sp[0]]); m != nil {
+			spans[i][0] = m[4] // «телефон: +7 (…)» убираем вместе с подписью поля
+		}
+	}
+	out := []byte(text)
+	for _, sp := range spans {
+		for i := sp[0]; i < sp[1]; i++ {
+			out[i] = ' '
+		}
+	}
+	return string(out)
+}
+
+var paymentAnnotationRe = regexp.MustCompile(`(?i)^(?:договор\s+)?(?:закрыт[ао]?|закрыл[аи]?)\s*[.!✅]*$`)
+
+// IsPaymentAnnotation — пометка о закрытии договора, а не новое имя клиента.
+func IsPaymentAnnotation(line string) bool {
+	return paymentAnnotationRe.MatchString(strings.TrimSpace(line))
+}
+
 // amountHit — число-сумма в тексте ([start,end) — где оно стоит).
 type amountHit struct {
 	v          float64
@@ -146,9 +186,12 @@ func amountHits(text string) []amountHit {
 		}
 		return false
 	}
-	for _, sp := range moneyNumberSpans(text) {
+	for _, sp := range moneyNumberSpans(StripPaymentReferences(text)) {
 		tok := text[sp[0]:sp[1]]
 		base := moneyValue(tok)
+		if numberMarkerBefore(text, sp[0]) || inPhone(sp) {
+			continue // служебные номера нельзя возвращать даже как запасную сумму
+		}
 		// «Отдал 15000 к Адаму» — «к» тут предлог, а не тысячи (ThousandsMultiplier).
 		if k := ThousandsMultiplier(text[sp[1]:], base); k > 0 {
 			out = append(out, amountHit{v: base * k, start: sp[0], end: sp[1], real: true})
@@ -166,7 +209,10 @@ func amountHits(text string) []amountHit {
 				digits++
 			}
 		}
-		out = append(out, amountHit{v: base, start: sp[0], end: sp[1], real: base >= 100 && digits < 10 && !numberMarkerBefore(text, sp[0]) && !inPhone(sp)})
+		if digits >= 10 {
+			continue // телефон/счёт/карта, а не мелкая сумма для запасного разбора
+		}
+		out = append(out, amountHit{v: base, start: sp[0], end: sp[1], real: base >= 100})
 	}
 	return out
 }

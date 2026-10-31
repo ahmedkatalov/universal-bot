@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -51,6 +53,25 @@ func parseGroupJIDs(raw string) []string {
 
 func main() {
 	ctx := context.Background()
+	checkAI := flag.Bool("check-ai", false, "проверить ИИ без подключения к WhatsApp и БД")
+	flag.Parse()
+	if *checkAI {
+		a, err := ai.NewFromEnv()
+		if err != nil {
+			log.Fatal(err)
+		}
+		if a == nil {
+			log.Fatal("задайте ODIROUTER_API_KEY в .env/окружении")
+		}
+		log.Println("Проверка ИИ:", a.Description())
+		checkCtx, cancel := context.WithTimeout(ctx, 3*time.Minute)
+		defer cancel()
+		if err := a.CheckConnection(checkCtx); err != nil {
+			log.Fatal("Проверка ИИ не пройдена: ", err)
+		}
+		fmt.Println("ИИ готов: JSON, изображения и вызов инструмента проверены.")
+		return
+	}
 
 	pgConn := mustEnv("DATABASE_URL") // например: postgres://user:pass@localhost:5432/finance
 	// WHATSAPP_GROUP_JIDS — необязательный список групп через запятую
@@ -123,34 +144,27 @@ func main() {
 		log.Fatalf("не удалось настроить OCR: %v", err)
 	}
 
-	// Личный ассистент идёт через OpenRouter (OpenAI-совместимый API).
-	// OPENAI_API_KEY/OPENAI_MODEL поддержаны как синонимы для удобства,
-	// если переменные уже заведены в таком виде в другом окружении.
-	var assistant *ai.Assistant
-	apiKey := envOr("OPENROUTER_API_KEY", os.Getenv("OPENAI_API_KEY"))
-	if apiKey != "" {
-		model := envOr("OPENROUTER_MODEL", os.Getenv("OPENAI_MODEL"))
-		visionModel := os.Getenv("OPENROUTER_VISION_MODEL") // пусто => тем же, что и мозг
-		baseURL := envOr("OPENROUTER_BASE_URL", "")
-		assistant = ai.New(apiKey, model, visionModel, baseURL)
-		log.Println("Личный ассистент (OpenRouter) включён — отвечаю на сообщения в личку номеру бота")
+	assistant, err := ai.NewFromEnv()
+	if err != nil {
+		log.Fatalf("неверные настройки ИИ: %v", err)
+	}
+	if assistant != nil {
+		log.Println("Личный ассистент включён:", assistant.Description())
 
 		// Самодиагностика на старте: реально ли отвечают модель и «зрение».
 		// Частая причина «бот тупит / не распознаёт чеки» — неверный id модели,
-		// протухший ключ или нулевой баланс OpenRouter: тогда чтение чеков молча
+		// протухший ключ или нулевой баланс ИИ-сервиса: тогда чтение чеков молча
 		// падает на слабый OCR. Пусть это видно в логах сразу, не блокируя старт.
-		modelForLog := model
-		if modelForLog == "" {
-			modelForLog = "(по умолчанию)"
-		}
 		go func(a *ai.Assistant) {
 			ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
-			defer cancel()
 			if err := a.Ping(ctx); err != nil {
-				log.Printf("⚠️ ПРОВЕРКА МОДЕЛИ: основная модель %q НЕ отвечает: %v — проверь OPENROUTER_MODEL, ключ и баланс OpenRouter", modelForLog, err)
+				log.Printf("⚠️ ПРОВЕРКА МОДЕЛИ: ИИ не отвечает: %v — проверь модель, ключ и баланс сервиса", err)
 			} else {
 				log.Println("Проверка модели: основная модель отвечает ✔")
 			}
+			cancel()
+			ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
 			if err := a.PingVision(ctx); err != nil {
 				log.Printf("⚠️ ПРОВЕРКА ЗРЕНИЯ: модель чтения чеков НЕ отвечает: %v — чеки будут распознаваться ПЛОХО (падение на OCR). Проверь OPENROUTER_VISION_MODEL / OPENROUTER_MODEL", err)
 			} else {
@@ -158,7 +172,7 @@ func main() {
 			}
 		}(assistant)
 	} else {
-		log.Println("OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
+		log.Println("ODIROUTER_API_KEY/OPENROUTER_API_KEY не задан — бот не будет отвечать в личных сообщениях")
 	}
 
 	// Интеграция с программой рассрочек (cmf): сверка чеков с внесёнными
