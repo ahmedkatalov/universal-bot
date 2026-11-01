@@ -157,8 +157,12 @@ func (b *Bot) explainCollectionTool() ai.Tool {
 					}
 					who = e.Text.Sender
 				}
+				reason := string(e.Reason)
+				if e.Into != nil && e.Into.ReviewRequired() {
+					reason = "связано с противоречащими копиями чека; требуется уточнение"
+				}
 				line := fmt.Sprintf("• [%s] %s ₽ — %s, прислал %s, %s, группа «%s» — %s", what, formatMoney(e.Amount()),
-					orDash(e.Client()), orDash(who), e.PostedAt().In(time.Local).Format("02.01 15:04"), gname(e.Group()), e.Reason)
+					orDash(e.Client()), orDash(who), e.PostedAt().In(time.Local).Format("02.01 15:04"), gname(e.Group()), reason)
 				switch {
 				case len(e.Parts) > 0:
 					var ps []string
@@ -174,6 +178,8 @@ func (b *Bot) explainCollectionTool() ai.Tool {
 						line += "; ещё часть " + strings.Join(ms, " + ") + " ₽ не в сборе — ждёт имени, исключена или удалена"
 					}
 					line += ")"
+				case e.Into != nil && e.Into.ReviewRequired():
+					line += " (в сбор не включено)"
 				case e.Into != nil:
 					line += " (считается как чек " + formatMoney(e.Into.Amount) + " ₽)"
 				}
@@ -254,7 +260,7 @@ func suspicious(pays []*ledger.Payment, match func(string) bool) []string {
 		if !match(p.Client) {
 			continue
 		}
-		k := key{ledger.ClientKey(p.Client), int64(math.Round(p.Amount)), p.OpDate.In(time.Local).Format("2006-01-02")}
+		k := key{ledger.ClientKey(p.Client), int64(math.Round(p.Amount * 100)), p.OpDate.In(time.Local).Format("2006-01-02")}
 		seen[k] = append(seen[k], p)
 	}
 	for k, ps := range seen {
@@ -273,7 +279,7 @@ func suspicious(pays []*ledger.Payment, match func(string) bool) []string {
 			}
 		}
 		out = append(out, fmt.Sprintf("• %s: %d платежа по %s ₽ за %s (%s) — если это один платёж, исключи лишний",
-			ps[0].Client, len(ps), formatMoney(float64(k.amount)), ps[0].OpDate.In(time.Local).Format("02.01"), strings.Join(kinds, ", ")))
+			ps[0].Client, len(ps), formatMoney(float64(k.amount)/100), ps[0].OpDate.In(time.Local).Format("02.01"), strings.Join(kinds, ", ")))
 	}
 	sort.Strings(out)
 	return out

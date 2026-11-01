@@ -3,7 +3,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -196,6 +195,9 @@ func (x *payIndex) add(book *ledger.Book) {
 		}
 	}
 	for _, p := range book.Payments {
+		if p.ReviewRequired() {
+			continue
+		}
 		for _, c := range p.Checks {
 			set(evKey("receipt", c.ID), p)
 			if c.FwdOrigin != "" {
@@ -209,7 +211,7 @@ func (x *payIndex) add(book *ledger.Book) {
 		}
 	}
 	for _, e := range book.Excluded {
-		if e.Into == nil || e.Text == nil || e.Reason == ledger.ReasonSplit || x.splits[e.Text.ID] != nil {
+		if e.Into == nil || e.Into.ReviewRequired() || e.Text == nil || e.Reason == ledger.ReasonSplit || x.splits[e.Text.ID] != nil {
 			continue
 		}
 		in := false
@@ -691,7 +693,7 @@ func sameTotalsElsewhere(st *splitTotal, x *payIndex) []*ledger.Text {
 	}
 	var others []*ledger.Text
 	for _, o := range x.totalsOf(ids...) {
-		if o == st || o.text.ID == st.text.ID || math.Abs(o.text.Amount-st.text.Amount) >= 0.5 {
+		if o == st || o.text.ID == st.text.ID || !sameMoneyCents(o.text.Amount, st.text.Amount) {
 			continue
 		}
 		others = append(others, o.text)
@@ -881,7 +883,7 @@ func extraTextCopy(entries []opEntry) (int, bool) {
 	pick := -1
 	for i, e := range entries {
 		op := e.op
-		if op.Kind != "transaction" || (e.pay == nil && e.split == nil) || op.Cash != f.Cash || math.Abs(op.Amount-f.Amount) >= 1 ||
+		if op.Kind != "transaction" || (e.pay == nil && e.split == nil) || op.Cash != f.Cash || !sameMoneyCents(op.Amount, f.Amount) ||
 			!strings.EqualFold(strings.TrimSpace(op.Name), strings.TrimSpace(f.Name)) || op.GroupJID != f.GroupJID ||
 			!sameSenderOf(op, f) || op.TxDate.Format("2006-01-02") != f.TxDate.Format("2006-01-02") {
 			return -1, false
@@ -1073,7 +1075,7 @@ func (b *Bot) keepReplacedTexts(ctx context.Context, batch string, back []db.Ope
 		}
 		dup := false
 		for _, r := range rivals {
-			if r.t.Group != t.GroupJID || math.Abs(r.t.Amount-t.Amount) >= 0.01 || !sameClientMoney(r.t.Client, t.Name) {
+			if r.t.Group != t.GroupJID || !sameMoneyCents(r.t.Amount, t.Amount) || !sameClientMoney(r.t.Client, t.Name) {
 				continue
 			}
 			// Один из двух — в паре с вернувшимся чеком, другой — сам по себе.
@@ -1131,7 +1133,7 @@ func collapseTextTwins(ops []db.OperationRef) []db.OperationRef {
 		}
 		best, bestGap := -1, time.Duration(0)
 		for j, op := range ops {
-			if hidden[j] || op.Kind != "transaction" || op.Cash || math.Abs(r.Amount-op.Amount) >= 1 ||
+			if hidden[j] || op.Kind != "transaction" || op.Cash || !sameMoneyCents(r.Amount, op.Amount) ||
 				!ledger.SameName(r.Name, op.Name) {
 				continue
 			}

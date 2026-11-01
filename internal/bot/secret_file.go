@@ -66,8 +66,7 @@ func (b *Bot) isSecretRecipient(info types.MessageInfo) bool {
 	if len(b.secretRecipients) == 0 {
 		return false
 	}
-	return b.secretRecipients[normalizePhone(info.Sender.User)] ||
-		b.secretRecipients[normalizePhone(info.SenderAlt.User)]
+	return senderInSet(b.secretRecipients, info)
 }
 
 // handleSecretFile обрабатывает поток выдачи секретного файла в ЛИЧКЕ. Возвращает
@@ -84,7 +83,7 @@ func (b *Bot) handleSecretFile(msg *events.Message) bool {
 	if text == "" {
 		return false
 	}
-	key := normalizePhone(msg.Info.Sender.User)
+	key := normalizePhone(senderPhoneDigits(msg.Info))
 	chat := msg.Info.Chat
 
 	// Ждём ли подтверждения от этого отправителя?

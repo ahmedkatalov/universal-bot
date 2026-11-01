@@ -228,7 +228,7 @@ func TestL4texts_25_DisputedReadsRetried(t *testing.T) {
 	<-mu
 	consistent = true
 	mu <- struct{}{}
-	e.retryAIText(ctx)
+	e.retryAITextAfterBackoff(ctx)
 	e.waitIdle()
 	if got := dayTotals(e, grp); got["Магомедов Ахмед"] != 15000 || sum(got) != 15000 {
 		t.Errorf("повторное чтение не записало платёж: %v", got)
@@ -515,7 +515,7 @@ func TestL4texts_R3_DisputedImportNotAskedAfterRestart(t *testing.T) {
 	e.aiDisputed, e.aiRetry = nil, nil
 	e.aiRetryMu.Unlock()
 	e.startedAt = time.Now()
-	e.retryAIText(ctx)
+	e.retryAITextAfterBackoff(ctx)
 	e.waitIdle()
 	for _, m := range e.sentSince(n0) {
 		if strings.HasPrefix(m.Text, "❓") {
@@ -568,7 +568,7 @@ func TestL4texts_R3_LateDisputedQuestionQuotes(t *testing.T) {
 	down = false
 	mu.Unlock()
 	n0 := len(e.sent())
-	e.retryAIText(ctx)
+	e.retryAITextAfterBackoff(ctx)
 	e.waitIdle()
 	var q e2eSent
 	for _, s := range e.sentSince(n0) {
@@ -661,7 +661,7 @@ func TestL4texts_R4_PartialDisputeRetriedThenAsked(t *testing.T) {
 	}
 	reads <- `{"payments":[{"name":"Исаев Харон","amount":20000,"cash":false},{"name":"Магомедов","amount":5000,"cash":false}],"clarify":""}`
 	reads <- `{"payments":[{"name":"Исаев Харон","amount":20000,"cash":false},{"name":"Магомедов Ахмед","amount":5000,"cash":false}],"clarify":""}`
-	e.retryAIText(ctx)
+	e.retryAITextAfterBackoff(ctx)
 	e.waitIdle()
 	asked := false
 	for _, m := range e.sentSince(n0) {

@@ -10,6 +10,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -20,6 +21,7 @@ import (
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"google.golang.org/protobuf/proto"
 
 	"whatsapp-bot/internal/db"
 	"whatsapp-bot/internal/parser"
@@ -142,54 +144,55 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 			if content == nil {
 				continue
 			}
-			sender := chat
-			if p := key.GetParticipant(); p != "" {
-				if s, e := types.ParseJID(p); e == nil {
-					sender = s
-				}
+			// Match whatsmeow.ParseWebMessage precedence. The top-level
+			// participant is authoritative; a group itself is never an employee.
+			participant := wmi.GetParticipant()
+			if participant == "" {
+				participant = key.GetParticipant()
 			}
-			// Правка сообщения в истории — как вживую: исходное уже импортировано
-			// (сообщения идут по времени), применяем к нему новый текст молча.
-			if prot := content.GetProtocolMessage(); prot != nil && prot.GetType() == waProto.ProtocolMessage_MESSAGE_EDIT {
-				em := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsGroup: true},
-					ID: key.GetID(), Timestamp: time.Unix(int64(wmi.GetMessageTimestamp()), 0)}, Message: content}
-				if b.applyEdit(ctx, em, prot, editQuiet{budget: &aiBudget}) {
-					seen++
-				}
+			sender, parseErr := types.ParseJID(participant)
+			if parseErr != nil || sender.User == "" || (sender.Server != types.DefaultUserServer && sender.Server != types.HiddenUserServer) {
+				sender = types.JID{}
+			}
+			if err := b.rememberMessageSender(ctx, types.MessageInfo{MessageSource: types.MessageSource{Sender: sender}}); err != nil {
 				continue
+			}
+			// Protocol events must be applied even though they have no text/media.
+			if prot := content.GetProtocolMessage(); prot != nil {
+				switch prot.GetType() {
+				case waProto.ProtocolMessage_MESSAGE_EDIT:
+					em := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsGroup: true},
+						ID: key.GetID(), Timestamp: time.Unix(int64(wmi.GetMessageTimestamp()), 0)}, Message: content}
+					if b.applyEdit(ctx, em, prot, editQuiet{budget: &aiBudget}) {
+						seen++
+					}
+					continue
+				case waProto.ProtocolMessage_REVOKE:
+					if b.importRevokeQuiet(ctx, chat, prot, time.Unix(int64(wmi.GetMessageTimestamp()), 0)) {
+						seen++
+					}
+					continue
+				}
 			}
 			text := extractText(content)
 			img := content.GetImageMessage()
 			doc := content.GetDocumentMessage()
 			isPDFDoc := doc != nil && isPDFDocument(doc.GetMimetype(), doc.GetFileName())
-			if text == "" && img == nil && !isPDFDoc {
+			isImageDoc := doc != nil && strings.HasPrefix(strings.ToLower(doc.GetMimetype()), "image/")
+			hasMedia := img != nil || isPDFDoc || isImageDoc
+			if text == "" && !hasMedia {
 				continue
 			}
 			seen++
-
 			ts := time.Unix(int64(wmi.GetMessageTimestamp()), 0)
 			waID := key.GetID()
-
-			// Скачиваем медиа (если ещё доступно на серверах WhatsApp).
-			var mediaBytes []byte
-			var mediaPath, ext string
-			switch {
-			case img != nil:
-				ext = ".jpg"
-				if data, derr := b.client.Download(ctx, img); derr == nil {
-					mediaBytes, mediaPath = data, b.saveMediaFile(waID, data, ext)
-				}
-			case isPDFDoc:
-				ext = ".pdf"
-				if data, derr := b.client.Download(ctx, doc); derr == nil {
-					mediaBytes, mediaPath = data, b.saveMediaFile(waID, data, ext)
-				}
-			}
 
 			// Реальный номер — только если участник в телефонной форме (не LID).
 			senderPhone := ""
 			if sender.Server == types.DefaultUserServer && sender.User != "" {
 				senderPhone = sender.ToNonAD().String()
+			} else if actor, phone, err := b.db.ResolveSenderIdentity(ctx, sender.String()); err == nil && phone != "" {
+				senderPhone = actor
 			}
 			senderName := wmi.GetPushName()
 			if senderName == "" {
@@ -208,34 +211,78 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 			if senderName == "" {
 				senderName = sender.User
 			}
-			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), senderPhone, senderName, text, img != nil || isPDFDoc, mediaPath, ts)
-			if err == nil && existed && mediaBytes != nil {
-				// Это сообщение уже было, но фото тогда не скачалось / не прочиталось —
-				// сейчас телефон прислал его снова: разбираем.
-				if b.db.NeedsMediaReread(ctx, rawID) {
-					_ = b.db.SetMediaPath(ctx, rawID, mediaPath)
-					if b.importReceiptSilent(ctx, chat, rawID, ts, mediaBytes, ext) {
-						receipts++
+			// Commit the original caption before network/AI work. A failed
+			// download must remain an inspectable, retryable media message.
+			rawID, existed, err := b.db.SaveRawMessage(ctx, waID, chat.String(), sender.String(), senderPhone, senderName, text, hasMedia, "", ts)
+			if err != nil {
+				continue
+			}
+			if hasMedia {
+				if existed && !b.db.NeedsMediaReread(ctx, rawID) {
+					continue
+				}
+				payload, err := proto.Marshal(content)
+				if err != nil {
+					continue
+				}
+				if err := b.db.SetMediaInfo(ctx, rawID, text, payload); err != nil {
+					continue
+				}
+				var mediaBytes []byte
+				var mediaPath string
+				ext := ".jpg"
+				if isPDFDoc {
+					ext = ".pdf"
+				}
+				// Repeated history may repair recognition without downloading a
+				// file again when its original local bytes already exist.
+				if existed {
+					if path, err := b.db.UnclearMediaPath(ctx, "message", rawID); err == nil && path != "" {
+						if data, err := os.ReadFile(path); err == nil {
+							mediaBytes, mediaPath = data, path
+						}
 					}
+				}
+				if mediaBytes == nil {
+					var data []byte
+					var err error
+					if img != nil {
+						data, err = b.download(ctx, img)
+					} else {
+						data, err = b.download(ctx, doc)
+					}
+					if err != nil {
+						continue
+					}
+					mediaBytes, mediaPath = data, b.saveMediaFile(waID, data, ext)
+				}
+				if err := b.db.SetMediaPath(ctx, rawID, mediaPath); err != nil {
+					continue
+				}
+				saved, complete := b.importReceiptReadSilent(ctx, chat, rawID, ts, mediaBytes, ext)
+				if saved {
+					receipts++
+				}
+				if complete {
 					_ = b.db.MarkMessageParsed(ctx, rawID)
 				}
 				continue
 			}
-			if err != nil || existed {
-				continue // уже было (идемпотентно) или ошибка — не дублируем
+			if existed {
+				continue
 			}
 			// Обращения к боту («Джарвис запиши …») и ответы на его сообщения — это
 			// команды и ответы на вопросы, а не платежи: их уже выполнили вживую.
 			em := &events.Message{Info: types.MessageInfo{MessageSource: types.MessageSource{Chat: chat, Sender: sender, IsGroup: true}, ID: waID, Timestamp: ts}, Message: content}
 			// Ответ на вопрос бота, данный, пока бот был отключён, — применяем молча.
-			if q := extractQuotedStanzaID(em); mediaBytes == nil && q != "" {
+			if q := extractQuotedStanzaID(em); q != "" {
 				_ = b.db.SetQuotedID(ctx, rawID, q)
 				if b.applyAnswerQuiet(ctx, chat, q, b.stripBotMention(text), rawID) {
 					continue
 				}
 			}
 			// ФИО следом за чеком того же сотрудника — клиент этого чека (как вживую).
-			if mediaBytes == nil && importNameOf(text) != "" && !strings.Contains(text, "\n") {
+			if !sender.IsEmpty() && importNameOf(text) != "" && !strings.Contains(text, "\n") {
 				if wa, ok, _ := b.db.UnnamedReceiptOfSenderBefore(ctx, chat.String(), sender.String(), ts, 15*time.Minute); ok {
 					if canonical, ok := b.confirmClientName(ctx, importNameOf(text)); ok {
 						var cid *int
@@ -249,7 +296,7 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 					}
 				}
 			}
-			if stripped, addressed := b.stripBotName(text); mediaBytes == nil && (addressed || b.isReplyToBot(em)) {
+			if stripped, addressed := b.stripBotName(text); addressed || b.isReplyToBot(em) {
 				// Платёж сотрудника, написанный боту, вживую записывается как обычный —
 				// и при импорте тоже. Остальное (команды, ответы) уже выполнено.
 				if !addressed {
@@ -261,15 +308,11 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 				}
 				text = stripped
 			}
-			if mediaBytes != nil {
-				if b.importReceiptSilent(ctx, chat, rawID, ts, mediaBytes, ext) {
-					receipts++
-				}
-			} else if text != "" {
+			if text != "" {
 				n, viaAI := b.importTextSilent(ctx, chat, senderName, rawID, ts, text, &aiBudget)
 				payments += n
 				if viaAI {
-					continue // разбор ИИ сам отмечает сообщение (и вернёт его, если ИИ лежал)
+					continue
 				}
 			}
 			_ = b.db.MarkMessageParsed(ctx, rawID)
@@ -287,20 +330,33 @@ func histTS(hm *waHistorySync.HistorySyncMsg) uint64 {
 }
 
 // importReceiptSilent распознаёт чек с изображения/PDF и пишет его в базу БЕЗ
-// каких-либо сообщений в группу. Клиент — по печатному получателю (если он
-// известен), иначе needs_review, чтобы владелец потом привязал вручную.
+// каких-либо сообщений в группу. Клиент — по подписи/ФИО рядом с чеком;
+// без такого подтверждения needs_review, чтобы владелец привязал вручную.
 func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int, received time.Time, media []byte, ext string) bool {
-	if b.assistant == nil {
-		return false
+	saved, _ := b.importReceiptReadSilent(ctx, chat, rawID, received, media, ext)
+	return saved
+}
+
+// complete means either a saved receipt or an explicit non-receipt verdict.
+// API failures, malformed extraction, and missing amounts must remain open.
+func (b *Bot) importReceiptReadSilent(ctx context.Context, chat types.JID, rawID int, received time.Time, media []byte, ext string) (saved, complete bool) {
+	if b.holdUnverifiedPDF(ctx, chat, "", "", rawID, media, ext, true) {
+		return false, false
 	}
-	rec, ok, _ := b.aiVisionReceiptConsensus(ctx, media, ext, "")
-	if !ok || rec.Kind == "cash" || rec.Kind == "other" || rec.Kind == "" {
-		return false // не чек (или наличка/не распозналось) — молча пропускаем
+	if b.assistant == nil {
+		return false, false
+	}
+	rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, ext, "")
+	if reachable && (rec.Kind == "cash" || rec.Kind == "other") {
+		return false, true
+	}
+	if !ok || rec.Kind != "receipt" {
+		return false, false
 	}
 	var rd parser.ReceiptData
 	applyAIReceiptAuthoritative(&rd, rec)
 	if rd.Amount <= 0 {
-		return false
+		return false, false
 	}
 	txDate := received
 	if rd.HasTxTime {
@@ -308,15 +364,29 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 	}
 	// Клиент — ФИО рядом с чеком (подпись или сообщение сотрудника прямо перед
 	// чеком), как вживую; печатный получатель — это владелец карты, не клиент.
-	body, _, _ := b.db.RawBodyByID(ctx, rawID)
-	sender, _ := b.db.SenderJIDByRawID(ctx, rawID)
+	body, senderName, err := b.db.RawBodyByID(ctx, rawID)
+	if err != nil {
+		return false, false
+	}
+	sender, err := b.db.SenderJIDByRawID(ctx, rawID)
+	if err != nil {
+		return false, false
+	}
 	cands := []string{body}
-	if before, err := b.db.SenderTextsBefore(ctx, chat.String(), sender, received, 15*time.Minute); err == nil {
+	if sender != "" {
+		before, err := b.db.SenderTextsBefore(ctx, chat.String(), sender, received, 15*time.Minute)
+		if err != nil {
+			return false, false
+		}
 		cands = append(cands, before...)
 	}
 	client := ""
 	for _, c := range cands {
-		if n := importNameOf(c); n != "" {
+		n, _ := b.payerFromCaption(ctx, c)
+		if n == "" {
+			n = importNameOf(c)
+		}
+		if n != "" {
 			if canonical, ok := b.confirmClientName(ctx, n); ok {
 				client = canonical
 				break
@@ -327,10 +397,12 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 	recipient, cardOwner := rd.Recipient, ""
 	needsReview := true
 	if client != "" {
-		if cid, err := b.db.GetOrCreateContact(ctx, client); err == nil {
-			contactIDPtr = &cid
-			recipient, cardOwner, needsReview = client, rd.Recipient, false
+		cid, err := b.db.GetOrCreateContact(ctx, client)
+		if err != nil {
+			return false, false
 		}
+		contactIDPtr = &cid
+		recipient, cardOwner, needsReview = client, rd.Recipient, false
 	}
 	dateOnly := rd.HasTxTime && rd.TimeDefaulted
 	if dateOnly {
@@ -342,19 +414,55 @@ func (b *Bot) importReceiptSilent(ctx context.Context, chat types.JID, rawID int
 	isDup, _, err := b.db.FindDuplicateReceipt(ctx, chat.String(), rd.DocNumber, rd.AuthCode, contactIDPtr, recipient, rd.Amount, txDate, rd.TxTimeGuessed())
 	if err != nil {
 		fmt.Println("Импорт истории: ошибка проверки повтора чека:", err)
+		return false, false
 	}
 	if err := b.db.InsertBankReceipt(ctx, db.BankReceiptInput{
 		RawMessageID: rawID, Bank: rd.Bank, RecipientRaw: recipient, RecipientBank: rd.RecipientBank, CardOwner: cardOwner,
 		RecipientPhone: rd.RecipientPhone, SenderRaw: rd.Sender, SenderBank: rd.SenderBank, SenderAccount: rd.SenderAccount,
 		ContactID: contactIDPtr, Amount: rd.Amount, Commission: rd.Commission, DocNumber: rd.DocNumber, AuthCode: rd.AuthCode,
 		Status: rd.Status, NeedsReview: needsReview, IsDuplicate: isDup, GroupJID: chat.String(), TxDate: txDate,
-		ClientConfirmed: client != "", SubmittedBy: sender, TxTimeGuessed: !rd.HasTxTime, TxDateOnly: dateOnly,
+		ClientConfirmed: client != "", SubmittedBy: senderName, TxTimeGuessed: !rd.HasTxTime, TxDateOnly: dateOnly,
 	}); err != nil {
 		fmt.Println("Импорт истории: ошибка сохранения чека:", err)
-		return false
+		return false, false
 	}
 	if client == "" {
 		_ = b.db.MarkReceiptsAskedByRaw(ctx, rawID) // импорт молчит: про старые чеки не спрашиваем
+	}
+	return true, true
+}
+
+// importRevokeQuiet uses the same ledger deletion/undo machinery as live
+// events, without announcing historical changes or opening new group questions.
+func (b *Bot) importRevokeQuiet(ctx context.Context, chat types.JID, prot *waProto.ProtocolMessage, received time.Time) bool {
+	waID := prot.GetKey().GetID()
+	if waID == "" {
+		return false
+	}
+	if group := prot.GetKey().GetRemoteJID(); group != "" && group != chat.String() {
+		return false
+	}
+	if copyID, ok, err := b.db.CopyBySentID(ctx, waID); err == nil && ok {
+		waID = copyID
+	}
+	ref, err := b.db.RawMessageByWaID(ctx, waID)
+	if err != nil {
+		return false
+	}
+	if !ref.Found {
+		// History batches may arrive newest first: keep a tombstone so an
+		// older batch cannot resurrect a payment already deleted in WhatsApp.
+		if _, _, err := b.db.SaveRawMessage(ctx, waID, chat.String(), prot.GetKey().GetParticipant(), "", "", "", false, "", received); err != nil {
+			return false
+		}
+		ref, err = b.db.RawMessageByWaID(ctx, waID)
+	}
+	if err != nil || !ref.Found || ref.Deleted || ref.GroupJID != chat.String() {
+		return false
+	}
+	if _, _, err := b.db.MarkMessageDeleted(ctx, waID); err != nil {
+		fmt.Println("Импорт истории: не удалось применить удаление:", err)
+		return false
 	}
 	return true
 }

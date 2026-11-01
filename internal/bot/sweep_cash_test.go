@@ -154,7 +154,7 @@ func TestSweepAIDownFallback(t *testing.T) {
 		}
 		return aiReply{Text: ""}
 	}
-	e.retryAIText(context.Background())
+	e.retryAITextAfterBackoff(context.Background())
 	got := dayTotals(e, grp)
 	if got["Магомедов Ахмед"] != 15000 || sum(got) != 15000 {
 		t.Errorf("после возврата ИИ: %v, хочу только Магомедов Ахмед=15000", got)

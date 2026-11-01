@@ -413,6 +413,7 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 			}
 			// +1 к лимиту, чтобы понять, обрезан ли список (иначе «Итого по списку»
 			// читалось бы как итог за весь период, хотя это сумма лишь первых N).
+			readingNote := b.groupReadingNote(ctx, from, toDay.AddDate(0, 0, 1), groupJIDs)
 			rows, err := b.db.ReceiptsLedger(ctx, from, toDay.AddDate(0, 0, 1), strings.TrimSpace(args.Person), groupJIDs, args.Limit+1)
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
@@ -422,7 +423,7 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 				exNote = b.exclusionsNote(ctx, from, toDay.AddDate(0, 0, 1), groupJIDs, -1, false)
 			}
 			if len(rows) == 0 {
-				return fmt.Sprintf("Чеков за %s — %s (%s) не нашлось.%s", from.Format("02.01.2006"), toDay.Format("02.01.2006"), groupLabel, exNote), nil
+				return fmt.Sprintf("Чеков за %s — %s (%s) не нашлось.%s%s", from.Format("02.01.2006"), toDay.Format("02.01.2006"), groupLabel, exNote, readingNote), nil
 			}
 			truncated := len(rows) > args.Limit
 			if truncated {
@@ -473,6 +474,7 @@ func (b *Bot) receiptsLedgerTool() ai.Tool {
 				fmt.Fprintf(&sb, "Итого по списку: %.0f ₽.", total)
 			}
 			sb.WriteString(exNote)
+			sb.WriteString(readingNote)
 			return sb.String(), nil
 		},
 	}

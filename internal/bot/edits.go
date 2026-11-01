@@ -262,7 +262,7 @@ func (b *Bot) keepEditedSplitTotals(ctx context.Context, ref db.RawMessageRef, s
 		}
 		n := same[0]
 		used[n.ID] = true
-		if math.Abs(n.Amount-st.text.Amount) < 0.01 {
+		if sameMoneyCents(n.Amount, st.text.Amount) {
 			continue // сумма итога та же
 		}
 		picks = append(picks, pick{st, n})
@@ -807,7 +807,7 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 	if q := extractQuotedStanzaID(msg); q != "" {
 		ts, _ := b.db.CorrTargetsOfMessage(ctx, q)
 		for _, t := range ts {
-			if c.Old == 0 || math.Abs(t.Amount-c.Old) < 1 {
+			if c.Old == 0 || sameMoneyCents(t.Amount, c.Old) {
 				targets = append(targets, t)
 			}
 		}
@@ -840,10 +840,10 @@ func (b *Bot) applyAmountCorrection(ctx context.Context, msg *events.Message, te
 	}
 	// Остальные записи того же платежа (текст-пара чека, чек текста) — тоже.
 	g := append(groups[0].ts, groups[0].twins...)
-	if math.Abs(g[0].Amount-c.New) < 0.01 {
+	if sameMoneyCents(g[0].Amount, c.New) {
 		return done() // «правильно 5000» — подтверждение, менять нечего
 	}
-	if st := groups[0].split; st != nil && math.Abs(st.sum()-c.New) >= 0.5 {
+	if st := groups[0].split; st != nil && !sameMoneyCents(st.sum(), c.New) {
 		// Итог платежа частями — сумма его чеков. Другой итог с чеками не
 		// сойдётся: текст посчитался бы отдельным платежом сверх них, а на
 		// какой-то из чеков новую сумму не перенести. Ничего не меняем — спрашиваем.

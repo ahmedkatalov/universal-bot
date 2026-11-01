@@ -21,7 +21,8 @@ func (d *DB) MarkReceiptForRetry(ctx context.Context, rawMessageID int, errDetai
 			recognition_status     = 'pending',
 			recognition_attempts   = 0,
 			next_retry_at          = $2::timestamptz,
-			last_recognition_error = $3
+			last_recognition_error = $3,
+			recognition_provisional = COALESCE(recognition_provisional,false) OR $3 = 'vision verdict unavailable'
 		WHERE raw_message_id = $1 AND ignored = false AND recognition_status = 'ok'
 	`, rawMessageID, nextAt, errDetail)
 	return err
@@ -88,17 +89,22 @@ type RecognizedReceipt struct {
 // номер документа.
 func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedReceipt) error {
 	_, err := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET
+		UPDATE bank_receipts AS br SET
 			bank          = COALESCE(NULLIF($2,''), bank),
 			recipient_raw = CASE WHEN client_confirmed THEN recipient_raw ELSE COALESCE(NULLIF($3,''), recipient_raw) END,
 			sender_raw    = COALESCE(NULLIF($4,''), sender_raw),
 			doc_number    = COALESCE(NULLIF($5,''), doc_number),
 			auth_code     = COALESCE(NULLIF($6,''), auth_code),
 			status        = COALESCE(NULLIF($7,''), status),
-			-- Сумму заполняем ТОЛЬКО если её ещё нет (amount = 0). Никогда не
-			-- перезаписываем уже известную сумму — иначе автоповтор мог бы откатить
-			-- ручную правку владельца (manually supplied correction outranks AI).
-			amount        = CASE WHEN amount > 0 THEN amount
+			-- Непроверенный OCR не является известной суммой: после настоящего
+			-- consensus заменяем его. Активная ручная поправка сильнее модели.
+			-- Для обычных известных сумм сохраняем прежнее поведение.
+			amount        = CASE WHEN recognition_provisional AND EXISTS (
+			                       SELECT 1 FROM amount_corrections ac
+			                       WHERE ac.kind = 'receipt' AND ac.target_id = br.id AND NOT ac.reverted
+			                     ) THEN amount
+			                     WHEN recognition_provisional AND $8::numeric > 0 THEN $8::numeric
+			                     WHEN amount > 0 THEN amount
 			                     WHEN $8::numeric > 0 THEN $8::numeric ELSE amount END,
 			commission    = CASE WHEN commission > 0 THEN commission
 			                     WHEN $9::numeric > 0 THEN $9::numeric ELSE commission END,
@@ -110,6 +116,7 @@ func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedRecei
 			-- того же перевода его не заменит, и перевод посчитается дважды.
 			collapsed     = collapsed AND NOT ($11 OR NULLIF($3,'') IS NOT NULL OR NULLIF($5,'') IS NOT NULL),
 			recognition_status = 'ok',
+			recognition_provisional = false,
 			next_retry_at      = NULL,
 			ignored       = ignored OR $12,
 			needs_review  = CASE WHEN $12 THEN false
@@ -149,4 +156,27 @@ func (d *DB) ResolveReceiptRetry(ctx context.Context, id int, status string, ign
 		WHERE id = $1
 	`, id, status, ignore)
 	return err
+}
+
+// HoldMediaForReview keeps unsupported/ambiguous files visible without a
+// repeated first-page-only recognition attempt.
+func (d *DB) HoldMediaForReview(ctx context.Context, rawID int, reason string) (bool, error) {
+	tx, err := d.pool.Begin(ctx)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback(context.Background())
+	tag, err := tx.Exec(ctx, `UPDATE raw_messages SET handled_as=$2,parsed=false,media_next_at=NULL
+		WHERE id=$1 AND handled_as IS DISTINCT FROM $2`, rawID, reason)
+	if err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `UPDATE bank_receipts SET needs_review=true,recognition_status='failed'
+		WHERE raw_message_id=$1 AND NOT ignored`, rawID); err != nil {
+		return false, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }

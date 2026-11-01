@@ -77,7 +77,7 @@ func (d *DB) DayTransferTexts(ctx context.Context, amount float64, day, before t
 		FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
 		LEFT JOIN contacts c ON c.id = t.contact_id
-		WHERE abs(t.amount - $1::numeric) < 1 AND t.is_cash = false AND t.ignored = false
+		WHERE abs(t.amount - $1::numeric) < 0.005 AND t.is_cash = false AND t.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
 		  AND rm.received_at >= $2::timestamptz AND rm.received_at <= $3::timestamptz
 		ORDER BY rm.received_at, t.id`, amount, from, to)

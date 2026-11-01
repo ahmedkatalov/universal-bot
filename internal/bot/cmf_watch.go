@@ -482,7 +482,7 @@ func (b *Bot) consumeQueuedSameName(ctx context.Context, chat types.JID, senderJ
 // amount — сумма из того же сообщения (0, если её не было). Порядок — по времени
 // сообщения WhatsApp (msg.Info.Timestamp), не по времени обработки.
 func (b *Bot) enqueuePendingName(ctx context.Context, msg *events.Message, name string, amount float64, rawID int) {
-	if err := b.db.EnqueuePendingName(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(),
+	if err := b.db.EnqueuePendingName(ctx, msg.Info.Chat.String(), b.senderActorKey(ctx, msg.Info),
 		name, amount, rawID, msg.Info.Timestamp); err != nil {
 		fmt.Println("Очередь имён: ошибка сохранения:", err)
 	}
@@ -511,7 +511,7 @@ func (b *Bot) consumePendingNameCash(ctx context.Context, chat types.JID, sender
 func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text string, rawID int) bool {
 	text = strings.TrimSpace(parser.StripPaymentReferences(text))
 	chat := msg.Info.Chat
-	sender := msg.Info.Sender.String()
+	sender := b.senderActorKey(ctx, msg.Info)
 	quotedID := extractQuotedStanzaID(msg)
 	since := time.Now().Add(-b.pairWindow)
 	amount := parser.ExtractAmount(text) // сумма из того же сообщения, если была
@@ -655,7 +655,7 @@ func (b *Bot) handleNameMessage(ctx context.Context, msg *events.Message, text s
 	if amount > 0 {
 		// «ФИО + сумма» рядом с ждущим чеком на ТУ ЖЕ сумму — подпись к нему.
 		if hasUnconfirmed {
-			if checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since); ok && (checkAmt <= 0 || math.Abs(checkAmt-amount) < 1 || amountLinesMatch(text, checkAmt)) {
+			if checkAmt, ok, _ := b.db.OldestUnconfirmedReceiptAmount(ctx, chat.String(), sender, since); ok && (checkAmt <= 0 || sameMoneyCents(checkAmt, amount) || amountLinesMatch(text, checkAmt)) {
 				if found, _, checkRaw, err := b.db.ReattributeOldestUnconfirmedReceiptFrom(ctx, chat.String(), sender, since, canonical, contact(), rawID, 0); err == nil && found {
 					_ = b.db.MarkMessageParsed(ctx, rawID)
 					fmt.Printf("Чек переатрибутирован на клиента %q (ФИО+сумма рядом с чеком)\n", canonical)
@@ -1040,7 +1040,7 @@ func countAmountLines(text string) int {
 }
 
 // nearAmount — суммы совпадают (с точностью до рубля).
-func nearAmount(a, b float64) bool { return a > 0 && b > 0 && math.Abs(a-b) < 1 }
+func nearAmount(a, b float64) bool { return a > 0 && b > 0 && sameMoneyCents(a, b) }
 
 // balanceLine — строка начинается с пометки остатка или итога перед первой
 // суммой, без ФИО: «остаток 30000», «итого 35000», «из 45000».
@@ -1447,7 +1447,7 @@ func isCardOwner(name, cardOwner string) bool {
 // caption — сообщение целиком подпись чека (его платежи — это сам чек, второй
 // раз их не записываем).
 func (b *Bot) labelCheckFromLines(ctx context.Context, msg *events.Message, text string, rawID int, since time.Time) (labeled []float64, caption bool) {
-	chat, sender := msg.Info.Chat, msg.Info.Sender.String()
+	chat, sender := msg.Info.Chat, b.senderActorKey(ctx, msg.Info)
 	// ФИО со строки — клиент, только если он известен или его подтвердил ИИ
 	// (заголовок «Карта Хадижат», «Карта Сбер» — не клиент), и это не владелец
 	// карты, напечатанный на чеке. Иначе чек не подписываем — бот спросит.
@@ -1646,7 +1646,7 @@ func (b *Bot) enqueueListPayers(ctx context.Context, msg *events.Message, text s
 // ещё один чек в очереди имён, иначе следующий чек той же суммы молча уйдёт
 // этому клиенту, а не тому, чьё имя напишут рядом.
 func (b *Bot) checkedAlready(ctx context.Context, msg *events.Message, name string, amount float64, rawID int) int {
-	n, err := b.db.ConfirmedReceiptCountFrom(ctx, msg.Info.Chat.String(), msg.Info.Sender.String(),
+	n, err := b.db.ConfirmedReceiptCountFrom(ctx, msg.Info.Chat.String(), b.senderActorKey(ctx, msg.Info),
 		time.Now().Add(-b.pairWindow), name, amount, rawID)
 	if err != nil {
 		return 0
@@ -2504,7 +2504,7 @@ func (b *Bot) cmfResolveTool(chat types.JID) ai.Tool {
 					if w.GroupJID != chat.String() {
 						continue
 					}
-					if args.Amount > 0 && math.Abs(args.Amount-w.Amount) >= 1 {
+					if args.Amount > 0 && !sameMoneyCents(args.Amount, w.Amount) {
 						continue
 					}
 					if p := strings.TrimSpace(args.Payer); p != "" && !sameClientName(p, w.ClientText) && !nameCovers(p, w.ClientText) {

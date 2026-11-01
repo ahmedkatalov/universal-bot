@@ -132,7 +132,7 @@ func TestR2_04_EditsEditDuringAIOutageLosesPayment(t *testing.T) {
 	e.mu.Lock()
 	e.ai = up // ИИ вернулся
 	e.mu.Unlock()
-	e.retryAIText(context.Background())
+	e.retryAITextAfterBackoff(context.Background())
 	if got := dayTotals(e, grp); got["Сугаипов Иса"] != 5000 {
 		var bot []string
 		for _, s := range e.sentSince(n) {
@@ -476,7 +476,7 @@ func TestR2_15_AIDownListKnownLineDropsRest(t *testing.T) {
 		}
 		return aiReply{Text: ""}
 	}
-	e.retryAIText(context.Background())
+	e.retryAITextAfterBackoff(context.Background())
 	got := dayTotals(e, grp)
 	if got["Исаев Харон"] != 10000 || sum(got) != 25000 {
 		t.Errorf("пока ИИ лежал: %v; после возврата ИИ: %v — хочу Магомедов Ахмед=15000 и Исаев Харон=10000", down, got)
@@ -522,7 +522,7 @@ func TestR2_16_NalLineCountedAsKnownClient(t *testing.T) {
 		}
 		return aiReply{Text: ""}
 	}
-	e.retryAIText(context.Background())
+	e.retryAITextAfterBackoff(context.Background())
 	if got := dayTotals(e, g2); got["Магомедов Ахмед"] != 27000 || sum(got) != 27000 {
 		t.Errorf("(b) пока ИИ лежал: %v; после возврата ИИ: %v — хочу Магомедов Ахмед=27000", down, got)
 	}
@@ -882,8 +882,8 @@ func TestR2_28_LaterCompletedCheckNeverReconciled(t *testing.T) {
 		e.ai = aiNamesAndPayments("Каталов Ахмед")
 		ocr := "СберБанк\nЧек по операции\nДата операции " + day.Format("02.01.2006") + " 10:00:00\nСумма перевода\n14000.00 ₽\nНомер операции в СБП\n" + e2eID("OP")
 		ck := e.sendReceipt(grp, emp, "Сафаи", ocr, "")
-		q := e.lastWith("ЧЕЙ он")
-		if q.ID == "" {
+		q := e.lastWith("Чей чек на 14000 ₽")
+		if q.ID == "" || q.Quoted != ck || !strings.Contains(q.Text, "ФИО") {
 			t.Fatalf("бот не спросил, чей чек: %+v", e.sent())
 		}
 		e.sendGroup(groupReply(grp, emp, "Сафаи", "Каталов Ахмед", q.ID, e.botJID(), q.Text))
@@ -1075,8 +1075,8 @@ func TestR2_34_ForwardCopyOfUnreadableGetsAmount(t *testing.T) {
 		"\nНомер операции в СБП\n" + e2eID("OP")
 	waID := e.sendReceipt(src, emp, "Сафаи", ocr, "")
 	e.applyForwardRules(ctx, src.String(), "Сафаи", waID, []byte("jpeg"), ".jpg", ocr, time.Now())
-	q := e.lastWith("Не смог разобрать")
-	if q.ID == "" {
+	q := e.lastWith("Не разобрал чек")
+	if q.ID == "" || q.Quoted != waID || q.Chat != src.String() || !strings.Contains(q.Text, "ФИО клиента и сумму") {
 		t.Fatalf("бот не спросил про нераспознанный чек: %+v", e.sent())
 	}
 	e.sendGroup(groupReply(src, owner, "Ахмед", "Магомедов Ахмед 15000", q.ID, e.botJID(), q.Text))

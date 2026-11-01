@@ -33,12 +33,14 @@ type senderReportArgs struct {
 	Descending  bool     `json:"descending"`
 	Limit       int      `json:"limit"`
 	Offset      int      `json:"offset"`
+	ReadingNote string   `json:"-"`
 }
 
 var employeeColumnLabels = map[string]string{
 	"date": "Прислан в чат", "operation_date": "Дата операции", "client": "ФИО клиента",
 	"amount": "Сумма, ₽", "employee": "Сотрудник", "kind": "Вид платежа",
 	"bank_payer": "Плательщик на чеке", "collector": "Кто забрал", "group": "Группа", "status": "Статус",
+	"posted_by": "Кто отправил исходное сообщение",
 }
 
 func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
@@ -51,7 +53,8 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 			"Дубли, удалённые и исключённые платежи не увеличивают сбор. Непроверенные чеки видны отдельно: " +
 			"их количество и известная сумма не скрываются и не подмешиваются в подтверждённый сбор. " +
 			"Клиент — ФИО из подписи/сообщения рядом с чеком; банковский отправитель — отдельное поле bank_payer. " +
-			"sender — имя сотрудника или его телефон в любом формате; несколько совпадений показываются раздельно. " +
+			"sender — имя сотрудника или его полный телефон; российские 7/8/local форматы равнозначны, разные страны не смешиваются. " +
+			"Название сборщика или подпись при дозагрузке без подтверждённого номера не доказывают личность: такие строки явно отмечены и не наследуют телефон загрузчика. " +
 			"PDF содержит весь список; текст — страницы с полными итогами и next_offset. " +
 			"Для произвольной таблицы выбери columns; для группировки по плательщикам используй результаты в make_custom_pdf.",
 		InputSchema: map[string]any{
@@ -66,7 +69,7 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 				"attribution": map[string]any{"type": "string", "enum": []string{"submitter", "collector"}, "description": "submitter по умолчанию — кто прислал. collector — кто забрал деньги (по явной пометке, иначе отправитель)"},
 				"kind":        map[string]any{"type": "string", "enum": []string{"all", "checks", "cash", "transfers"}, "description": "checks — только чеки; cash — только наличка; all (по умолчанию) — все виды с отдельными количествами и суммами"},
 				"view":        map[string]any{"type": "string", "enum": []string{"summary", "payments"}, "description": "summary — сводка по сотрудникам. payments — сводка И подробный список ФИО/сумм. По умолчанию для конкретного сотрудника payments, для всех summary"},
-				"columns":     map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"date", "operation_date", "client", "amount", "employee", "kind", "bank_payer", "collector", "group", "status"}}, "description": "Колонки подробного списка в нужном порядке; по умолчанию дата, ФИО клиента, сумма, вид, сотрудник, статус"},
+				"columns":     map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": []string{"date", "operation_date", "client", "amount", "employee", "kind", "bank_payer", "collector", "posted_by", "group", "status"}}, "description": "Колонки подробного списка в нужном порядке; posted_by — кто действительно отправил исходное сообщение, отдельно от указанного сборщика"},
 				"sort_by":     map[string]any{"type": "string", "enum": []string{"date", "operation_date", "amount", "client", "employee"}},
 				"descending":  map[string]any{"type": "boolean", "description": "Сортировать по убыванию; по умолчанию по возрастанию даты"},
 				"limit":       map[string]any{"type": "integer", "minimum": 1, "maximum": 200, "description": "Строк на странице текста (по умолчанию 50); PDF всегда полный"},
@@ -87,6 +90,7 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 			if err != nil {
 				return "", err
 			}
+			args.ReadingNote = b.groupReadingNote(ctx, from, toDay.AddDate(0, 0, 1), groups)
 			data, err := b.db.EmployeePayments(ctx, from, toDay.AddDate(0, 0, 1), db.EmployeeReportOptions{
 				Groups: groups, Sender: strings.TrimSpace(args.Sender), DateBasis: args.DateBasis, Attribution: args.Attribution, Kind: args.Kind,
 			})
@@ -108,16 +112,18 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 			}
 			if len(data.Rows) == 0 {
 				out.WriteString("За выбранный период и фильтры платежей не нашёл.")
+				out.WriteString(args.ReadingNote)
 				return out.String(), nil
 			}
 			for _, s := range data.Stats {
-				fmt.Fprintf(&out, "• %s: %s\n", employeeLabel(s.Name, s.Phone), employeeStatText(s))
+				fmt.Fprintf(&out, "• %s: %s\n", employeeStatLabel(s), employeeStatText(s))
 			}
 			total := employeeTotals(data.Stats)
+			out.WriteString(args.ReadingNote + "\n")
 			fmt.Fprintf(&out, "ИТОГО за ВЕСЬ период: %s\n", employeeStatText(total))
 			out.WriteString("Один чек считается один раз. Удалённые и исключённые платежи не учитываются.\n")
 			if args.Sender != "" && len(data.Stats) > 1 {
-				out.WriteString("По имени найдены несколько сотрудников — показаны раздельно; для одного укажи телефон.\n")
+				out.WriteString("Найдены разные участники или неподтверждённые подписи — показаны раздельно. Одно имя не доказывает, что это один человек; уточни номер или исходное сообщение.\n")
 			}
 			if args.Format == "pdf" {
 				if err := b.sendEmployeePDF(ctx, chat, args, data, period, groupLabel, basis); err != nil {
@@ -239,6 +245,38 @@ func employeeLabel(name, phone string) string {
 	return name
 }
 
+func employeeAttributionLabel(name, phone, key, reason, rawName, rawPhone string) string {
+	label := employeeLabel(name, phone)
+	if reason != "" {
+		detail := "привязка отправителя не подтверждена"
+		if reason == "collector_name" {
+			detail = "сборщик назван в сообщении; номер не подтверждён"
+		}
+		if reason == "submitted_label" {
+			detail = "подпись при загрузке; номер сотрудника не подтверждён"
+		}
+		if rawName != "" || rawPhone != "" {
+			detail += "; исходное сообщение: " + employeeLabel(rawName, rawPhone)
+		}
+		return label + " (" + detail + ")"
+	}
+	if phone == "" && strings.HasPrefix(key, "jid:") {
+		ref := strings.TrimPrefix(key, "jid:")
+		if p := strings.IndexByte(ref, '@'); p >= 0 {
+			ref = ref[:p]
+		}
+		if len(ref) > 6 {
+			ref = ref[len(ref)-6:]
+		}
+		return label + " (номер скрыт; участник …" + ref + ")"
+	}
+	return label
+}
+
+func employeeStatLabel(s db.EmployeeStat) string {
+	return employeeAttributionLabel(s.Name, s.Phone, s.IdentityKey, s.AttributionReason, s.RawSenderName, s.RawSenderPhone)
+}
+
 func employeeStatText(s db.EmployeeStat) string {
 	text := fmt.Sprintf("чеки %d шт. на %s ₽", s.Checks, employeeMoney(s.ChecksSum))
 	if s.Cash > 0 {
@@ -265,14 +303,14 @@ func employeeTotals(stats []db.EmployeeStat) db.EmployeeStat {
 		t.Checks += s.Checks
 		t.Cash += s.Cash
 		t.Transfers += s.Transfers
-		t.Total += s.Total
-		t.ChecksSum += s.ChecksSum
-		t.CashSum += s.CashSum
-		t.TransfersSum += s.TransfersSum
+		t.Total = math.Round((t.Total+s.Total)*100) / 100
+		t.ChecksSum = math.Round((t.ChecksSum+s.ChecksSum)*100) / 100
+		t.CashSum = math.Round((t.CashSum+s.CashSum)*100) / 100
+		t.TransfersSum = math.Round((t.TransfersSum+s.TransfersSum)*100) / 100
 		t.PendingChecks += s.PendingChecks
 		t.PendingCash += s.PendingCash
 		t.PendingTransfers += s.PendingTransfers
-		t.PendingSum += s.PendingSum
+		t.PendingSum = math.Round((t.PendingSum+s.PendingSum)*100) / 100
 		t.UnknownAmounts += s.UnknownAmounts
 	}
 	return t
@@ -315,13 +353,20 @@ func (b *Bot) employeeCells(ctx context.Context, r db.EmployeePayment, columns [
 	}
 	kind := map[string]string{"checks": "чек", "cash": "наличка", "transfers": "перевод"}[r.Kind]
 	status := map[string]string{"counted": "учтён", "review": "ждёт уточнения клиента/чека", "no_amount": "сумма не прочитана", "held": "возможный повтор, ждёт уточнения"}[r.Status]
+	if r.ReviewReason != "" {
+		status += "; " + r.ReviewReason
+	}
 	amount := employeeMoney(r.Amount)
 	if r.Amount <= 0 {
 		amount = "не прочитана"
 	}
 	values := map[string]string{
 		"date": r.PostedAt.In(time.Local).Format("02.01.2006 15:04"), "operation_date": r.OperationAt.In(time.Local).Format("02.01.2006 15:04"),
-		"client": client, "bank_payer": r.BankPayer, "amount": amount, "employee": employeeLabel(r.Employee, r.EmployeePhone), "kind": kind, "collector": r.Collector, "group": r.GroupJID, "status": status,
+		"client": client, "bank_payer": r.BankPayer, "amount": amount, "employee": employeeAttributionLabel(r.Employee, r.EmployeePhone, r.IdentityKey, r.AttributionReason, r.RawSenderName, r.RawSenderPhone), "kind": kind, "collector": r.Collector, "group": r.GroupJID, "status": status,
+		"posted_by": employeeLabel(r.RawSenderName, r.RawSenderPhone),
+	}
+	if r.OperationDateUncertain {
+		values["operation_date"] = "дата требует уточнения"
 	}
 	var out []string
 	for _, c := range columns {
@@ -344,11 +389,14 @@ func (b *Bot) employeeCells(ctx context.Context, r db.EmployeePayment, columns [
 func (b *Bot) sendEmployeePDF(ctx context.Context, chat types.JID, args senderReportArgs, data db.EmployeeReport, period, groupLabel, basis string) error {
 	section := report.Section{Title: "Сводка по сотрудникам. Ожидающие не входят в учтённый сбор.", Columns: []string{"Сотрудник", "Чеки, шт.", "Чеки, ₽", "Нал., ₽", "Перев., ₽", "Учтено, ₽", "Ждут, шт.", "Ждут, ₽"}}
 	for _, s := range data.Stats {
-		section.Rows = append(section.Rows, []string{employeeLabel(s.Name, s.Phone), strconv.Itoa(s.Checks), employeeMoney(s.ChecksSum), employeeMoney(s.CashSum), employeeMoney(s.TransfersSum), employeeMoney(s.Total), strconv.Itoa(s.PendingChecks + s.PendingCash + s.PendingTransfers), employeeMoney(s.PendingSum)})
+		section.Rows = append(section.Rows, []string{employeeStatLabel(s), strconv.Itoa(s.Checks), employeeMoney(s.ChecksSum), employeeMoney(s.CashSum), employeeMoney(s.TransfersSum), employeeMoney(s.Total), strconv.Itoa(s.PendingChecks + s.PendingCash + s.PendingTransfers), employeeMoney(s.PendingSum)})
 	}
 	t := employeeTotals(data.Stats)
 	section.TotalRow = []string{"ИТОГО", strconv.Itoa(t.Checks), employeeMoney(t.ChecksSum), employeeMoney(t.CashSum), employeeMoney(t.TransfersSum), employeeMoney(t.Total), strconv.Itoa(t.PendingChecks + t.PendingCash + t.PendingTransfers), employeeMoney(t.PendingSum)}
 	sections := []report.Section{section}
+	if args.ReadingNote != "" {
+		sections = append([]report.Section{{Title: "Предварительный отчёт", Columns: []string{"Статус чтения группы"}, Rows: [][]string{{strings.TrimSpace(strings.ReplaceAll(args.ReadingNote, "⚠️", ""))}}}}, sections...)
+	}
 	if args.View == "payments" {
 		detail := report.Section{Title: fmt.Sprintf("Полный список: %d платежей. Ожидающие не входят в учтённый сбор.", len(data.Rows))}
 		for _, c := range args.Columns {

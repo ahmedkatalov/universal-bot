@@ -63,7 +63,7 @@ func UserMessage(err error) string {
 	if errors.As(err, &pe) && pe.User != "" {
 		return pe.User
 	}
-	return "Не получилось ответить — что-то с ИИ-сервисом. Попробуй ещё раз через минуту."
+	return "Сейчас не получается ответить. Попробуй ещё раз через минуту."
 }
 
 // classifyProviderError разбирает ответ провайдера в категорию и человеческое
@@ -85,21 +85,21 @@ func classifyProviderError(status int, providerMsg string, transportErr error) *
 	}
 	switch {
 	case transportErr != nil:
-		return &ProviderError{"timeout", "Сеть подвисла, не достучался до ИИ. Попробуй ещё раз через минуту.", transportErr.Error()}
+		return &ProviderError{"timeout", "Не удалось получить ответ. Попробуй ещё раз через минуту.", transportErr.Error()}
 	case status == http.StatusTooManyRequests || has("rate limit", "rate-limit", "too many requests"):
-		return &ProviderError{"rate_limit", "Слишком много запросов к ИИ подряд — чуть перегружено. Повтори через минуту.", detail}
+		return &ProviderError{"rate_limit", "Слишком много запросов сразу. Подожди минуту и повтори.", detail}
 	case status == http.StatusPaymentRequired || has("credit", "insufficient", "quota", "billing", "payment"):
-		return &ProviderError{"credits", "Не могу ответить: на балансе ИИ-сервиса закончились средства — нужно пополнить баланс.", detail}
+		return &ProviderError{"credits", "Закончились деньги на оплату ИИ. Пополни баланс и повтори запрос.", detail}
 	case has("maximum context", "context length", "context_length", "too long") || (status == http.StatusBadRequest && has("token")):
-		return &ProviderError{"context", "Слишком длинный запрос для ИИ. Сформулируй короче или разбей на части.", detail}
+		return &ProviderError{"context", "Слишком много текста за раз. Сократи запрос или отправь по частям.", detail}
 	case status == http.StatusNotFound || has("no endpoints", "no allowed providers", "model not found", "unavailable", "not a valid model"):
-		return &ProviderError{"model", "Модель ИИ сейчас недоступна. Попробуй позже.", detail}
+		return &ProviderError{"model", "Выбранная модель недоступна. Проверь её название в настройках бота или попробуй позже.", detail}
 	case status >= 500:
-		return &ProviderError{"server", "ИИ-сервис сейчас недоступен (это на их стороне). Попробуй чуть позже.", detail}
+		return &ProviderError{"server", "Сейчас не получается получить ответ. Попробуй через минуту.", detail}
 	case has("parse", "malformed", "unexpected"):
-		return &ProviderError{"malformed", "ИИ вернул непонятный ответ. Повтори запрос.", detail}
+		return &ProviderError{"malformed", "Пришёл непонятный ответ. Попробуй ещё раз.", detail}
 	default:
-		return &ProviderError{"other", "Не получилось ответить — что-то с ИИ-сервисом. Попробуй ещё раз.", detail}
+		return &ProviderError{"other", "Не получилось ответить. Попробуй ещё раз.", detail}
 	}
 }
 
@@ -214,7 +214,7 @@ func (a *Assistant) breakerCheck() error {
 		if a.brLastErr != nil {
 			return a.brLastErr
 		}
-		return &ProviderError{"timeout", "ИИ-сервис сейчас не отвечает. Попробуй через минуту.", "breaker open"}
+		return &ProviderError{"timeout", "Сейчас не могу ответить. Попробуй через минуту.", "breaker open"}
 	}
 	return nil
 }
@@ -230,7 +230,7 @@ func (a *Assistant) breakerNote(err error) {
 	var pe *ProviderError
 	if !errors.As(err, &pe) {
 		if errors.Is(err, context.DeadlineExceeded) {
-			pe = &ProviderError{"timeout", "ИИ-сервис отвечает слишком долго. Попробуй через минуту.", err.Error()}
+			pe = &ProviderError{"timeout", "Не дождался ответа. Попробуй через минуту.", err.Error()}
 		} else {
 			return
 		}
@@ -701,7 +701,7 @@ func interpretChat(body []byte, status int, transportErr error) (chatMessage, st
 		return chatMessage{}, "", classifyProviderError(status, snippet(body), nil)
 	}
 	if len(parsed.Choices) == 0 {
-		return chatMessage{}, "", &ProviderError{Category: "malformed", User: "ИИ вернул пустой ответ. Повтори запрос.", Detail: "empty choices"}
+		return chatMessage{}, "", &ProviderError{Category: "malformed", User: "Ответ пришёл пустым. Попробуй ещё раз.", Detail: "empty choices"}
 	}
 	choice := parsed.Choices[0]
 	return choice.Message, choice.FinishReason, nil

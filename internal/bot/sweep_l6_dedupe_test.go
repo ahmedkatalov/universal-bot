@@ -491,15 +491,29 @@ func TestL6dedupe_R3_NameWithoutCheckAnswersCross(t *testing.T) {
 	e := newE2E(t, e2eOpts{WithAI: true, Admins: []string{ownerPhone}, Groups: map[string]string{sb.String(): "СБ оплата", mg.String(): "Оплата клиентов"}})
 	e.ai = aiNamesAndPayments("Магомедов Ахмед", "Исаев Харон")
 	ocr := sberCheck("15000.00", l5collapsedPastHMS())
-	e.sendReceipt(sb, user("79001116831"), "Сафаи", ocr, "Магомедов Ахмед")
+	first := e.sendReceipt(sb, user("79001116831"), "Сафаи", ocr, "Магомедов Ахмед")
 	emp := user("79001116832")
-	e.sendReceipt(mg, emp, "Ислам", ocr, "Исаев Харон")
+	second := e.sendReceipt(mg, emp, "Ислам", ocr, "Исаев Харон")
 	if q := e.lastWith("Чей он"); q.ID == "" {
 		t.Fatalf("нет вопроса «чей он?»: %v", e.sent())
 	}
 	e.sendGroup(groupText(mg, emp, "Ислам", "Исаев Харон"))
-	if s := dayTotals(e, sb); s["Магомедов Ахмед"] != 15000 {
-		t.Fatalf("ФИО без свайпа сразу переложило копию в СБ (а это могло быть имя перед следующим чеком): СБ %v", s)
+	// Until that ambiguous name is resolved, neither contradictory caption
+	// may win just because it was posted first. Preserve both original labels
+	// as evidence and keep the physical receipt pending in both groups.
+	if s, m := dayTotals(e, sb), dayTotals(e, mg); sum(s) != 0 || sum(m) != 0 {
+		t.Fatalf("спорный клиент попал в подтверждённый сбор до разрешения ответа: СБ %v, основная %v", s, m)
+	}
+	if a, b := e.db.TestReceiptByMessage(ctx, first), e.db.TestReceiptByMessage(ctx, second); a.Recipient != "Магомедов Ахмед" || b.Recipient != "Исаев Харон" {
+		t.Fatalf("ФИО без свайпа сразу переписало исходные подписи (а это могло быть имя перед следующим чеком): %q / %q", a.Recipient, b.Recipient)
+	}
+	from := time.Now().Truncate(24 * time.Hour).Add(-24 * time.Hour)
+	book, err := e.db.LoadBook(ctx, from, from.Add(3*24*time.Hour), "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(book.Payments) != 1 || !book.Payments[0].ReviewRequired() || len(book.Payments[0].Conflicts) == 0 {
+		t.Fatalf("чек должен сохраниться единой спорной уликой, а не пропасть: %+v", book.Payments)
 	}
 	// Окно очереди «имя перед чеком» прошло, чека не было.
 	e.clarify.mu.Lock()

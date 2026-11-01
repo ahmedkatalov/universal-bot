@@ -27,6 +27,9 @@ CREATE TABLE IF NOT EXISTS raw_messages (
     media_path    TEXT,               -- путь к сохранённому фото чека, если есть
     received_at   TIMESTAMPTZ NOT NULL,
     parsed        BOOLEAN NOT NULL DEFAULT false,
+	text_attempts INT NOT NULL DEFAULT 0,
+	text_next_at TIMESTAMPTZ,
+	cash_hint BOOLEAN NOT NULL DEFAULT false,
     deleted       BOOLEAN NOT NULL DEFAULT false, -- сообщение удалили в WhatsApp; его платежи/чеки не считаются
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -69,6 +72,7 @@ CREATE TABLE IF NOT EXISTS bank_receipts (
     auth_code       TEXT,
     status          TEXT,
     needs_review    BOOLEAN NOT NULL DEFAULT false, -- true если сумму/получателя не удалось распознать уверенно
+	recognition_provisional BOOLEAN NOT NULL DEFAULT false, -- OCR ждёт подтверждённого чтения изображения
     is_duplicate    BOOLEAN NOT NULL DEFAULT false, -- true если это повторно присланный чек (см. FindDuplicateReceipt)
     -- Группа, к которой относится чек. Обычно совпадает с raw_messages.wa_group_jid,
     -- но для чеков, дозагруженных владельцем через личку ("бота не было в группе
@@ -159,3 +163,38 @@ ON CONFLICT (alias) DO NOTHING;
 INSERT INTO contact_aliases (contact_id, alias)
 SELECT id, 'хадижа' FROM contacts WHERE canonical_name = 'Хадижат'
 ON CONFLICT (alias) DO NOTHING;
+
+
+-- Устойчивое чтение группы: входящие события и применённые этапы разбора.
+CREATE TABLE IF NOT EXISTS group_inbox (
+	id BIGSERIAL PRIMARY KEY,
+	event_key TEXT NOT NULL UNIQUE,
+	wa_message_id TEXT NOT NULL,
+	group_jid TEXT NOT NULL,
+	kind TEXT NOT NULL CHECK (kind IN ('message','edit','revoke')),
+	command BOOLEAN NOT NULL DEFAULT false,
+	metadata JSONB NOT NULL,
+	payload BYTEA NOT NULL,
+	received_at TIMESTAMPTZ NOT NULL,
+	state TEXT NOT NULL DEFAULT 'pending' CHECK (state IN ('pending','processing','done','review')),
+	attempts INT NOT NULL DEFAULT 0,
+	lease_until TIMESTAMPTZ,
+	note TEXT NOT NULL DEFAULT '',
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_group_inbox_work ON group_inbox (state, id) WHERE state IN ('pending','processing');
+CREATE INDEX IF NOT EXISTS idx_group_inbox_chat ON group_inbox (group_jid, id);
+CREATE INDEX IF NOT EXISTS idx_group_inbox_period ON group_inbox (group_jid, received_at) WHERE state <> 'done';
+
+
+-- Устойчивое чтение группы: входящие события и применённые этапы разбора.
+CREATE TABLE IF NOT EXISTS parsed_payment_batches (
+	raw_message_id INT NOT NULL REFERENCES raw_messages(id) ON DELETE CASCADE,
+	revision INT NOT NULL,
+	phase TEXT NOT NULL,
+	fingerprint TEXT NOT NULL,
+	item_count INT NOT NULL,
+	created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+	PRIMARY KEY (raw_message_id, revision, phase)
+);

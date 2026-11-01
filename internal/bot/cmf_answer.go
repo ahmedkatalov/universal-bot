@@ -14,7 +14,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"sort"
 	"strconv"
 	"strings"
@@ -1625,7 +1624,7 @@ func (b *Bot) pickWatchFromReply(ctx context.Context, refs []db.CmfAskRef, text 
 		if err != nil || !ok {
 			continue
 		}
-		match := (amount > 0 && math.Abs(amount-w.Amount) < 1)
+		match := (amount > 0 && sameMoneyCents(amount, w.Amount))
 		if !match && w.ClientName != "" {
 			for _, t := range answerTokens(low) {
 				if len([]rune(t)) >= 3 && nameCoversStrict(t, w.ClientName) {

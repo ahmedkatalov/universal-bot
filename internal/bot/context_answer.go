@@ -9,7 +9,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -239,7 +238,7 @@ func (b *Bot) contextReceiptAnswer(ctx context.Context, chat types.JID, a openAs
 	case a.needName && !a.needAmount:
 		// Нужно только ФИО — принимаем голое имя; с суммой — только если она
 		// равна сумме этого чека («Хасанов Ислам 15000» на вопрос о 15000).
-		if name == "" || (amount > 0 && (a.amount <= 0 || math.Abs(amount-a.amount) >= 1)) {
+		if name == "" || (amount > 0 && (a.amount <= 0 || !sameMoneyCents(amount, a.amount))) {
 			return false
 		}
 	default:
@@ -285,7 +284,7 @@ func (b *Bot) pickReceiptAsk(groupJID string, amount float64) openAsk {
 	b.clarify.receiptAsks[groupJID] = fresh
 	if amount > 0 {
 		for _, q := range fresh {
-			if q.amount > 0 && math.Abs(q.amount-amount) < 1 {
+			if q.amount > 0 && sameMoneyCents(q.amount, amount) {
 				return q
 			}
 		}

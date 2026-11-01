@@ -128,10 +128,30 @@ func TestEmployeeReportHistoryNamesAndAmbiguity(t *testing.T) {
 	})
 	day := time.Now().Format("2006-01-02")
 	out := e.tool("senders_report", grp, fmt.Sprintf(`{"from_date":%q,"to_date":%q,"sender":"Мансур","kind":"cash","view":"payments"}`, day, day))
-	for _, want := range []string{"Мансур Первый", "Мансур Второй", "5000", "7000", "несколько сотрудников"} {
+	for _, want := range []string{"Мансур Первый", "Мансур Второй", "5000", "7000", "Одно имя не доказывает"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("history name/ambiguity %q: %s", want, out)
 		}
+	}
+}
+
+func TestEmployeeReportTotalsAndUnverifiedLabels(t *testing.T) {
+	stats := []db.EmployeeStat{{SenderStat: db.SenderStat{Total: 0.10, ChecksSum: 0.10}, PendingSum: 0.10}, {SenderStat: db.SenderStat{Total: 0.20, ChecksSum: 0.20}, PendingSum: 0.20}}
+	total := employeeTotals(stats)
+	if total.Total != 0.30 || total.ChecksSum != 0.30 || total.PendingSum != 0.30 {
+		t.Fatalf("fractional kopecks drifted in totals: %+v", total)
+	}
+	label := employeeAttributionLabel("Мансур", "", "collector-label:mansur", "collector_name", "Ахмед", "79280000001")
+	if !strings.Contains(label, "номер не подтверждён") || !strings.Contains(label, "Ахмед") {
+		t.Fatalf("unverified collector presented as observed identity: %s", label)
+	}
+	label = employeeAttributionLabel("Мансур", "", "jid:123456789012345@lid", "", "", "")
+	if strings.Contains(label, "+123456789012345") || !strings.Contains(label, "номер скрыт") {
+		t.Fatalf("LID rendered as phone: %s", label)
+	}
+	cells := (&Bot{}).employeeCells(context.Background(), db.EmployeePayment{OperationAt: time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC), OperationDateUncertain: true}, []string{"operation_date"})
+	if len(cells) != 1 || cells[0] != "дата требует уточнения" {
+		t.Fatalf("disputed operation date presented as confirmed: %v", cells)
 	}
 }
 

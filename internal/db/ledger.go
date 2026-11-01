@@ -20,15 +20,16 @@ import (
 const ledgerPad = 4 * 24 * time.Hour
 
 // LoadBook — книга платежей по всем группам для периода [from, to) (по дате
-// операции или присылки — с запасом), client — необязательный фильтр (подстрока
-// имени клиента; пусто — все).
-func (d *DB) LoadBook(ctx context.Context, from, to time.Time, client string) (*ledger.Book, error) {
+// операции или присылки — с запасом). Имя фильтруется после сборки книги:
+// иначе другая подпись к тому же чеку исчезнет вместе с конфликтом атрибуции.
+// Последний параметр сохранён для совместимости существующих вызовов.
+func (d *DB) LoadBook(ctx context.Context, from, to time.Time, _ string) (*ledger.Book, error) {
 	lo, hi := from.Add(-ledgerPad), to.Add(ledgerPad)
-	checks, err := d.loadLedgerChecks(ctx, lo, hi, client)
+	checks, err := d.loadLedgerChecks(ctx, lo, hi, "")
 	if err != nil {
 		return nil, err
 	}
-	texts, err := d.loadLedgerTexts(ctx, lo, hi, client)
+	texts, err := d.loadLedgerTexts(ctx, lo, hi, "")
 	if err != nil {
 		return nil, err
 	}
@@ -50,7 +51,7 @@ func (d *DB) LoadBook(ctx context.Context, from, to time.Time, client string) (*
 		ends = append(ends, c.OpDate.Add(ledger.TwinWindow+24*time.Hour))
 	}
 	if len(starts) > 0 {
-		more, err := d.loadLedgerTextsAround(ctx, starts, ends, client)
+		more, err := d.loadLedgerTextsAround(ctx, starts, ends, "")
 		if err != nil {
 			return nil, err
 		}
@@ -127,7 +128,7 @@ func (d *DB) loadLedgerChecks(ctx context.Context, from, to time.Time, client st
 		}
 	}
 	if len(docs) > 0 {
-		more, err := d.loadLedgerChecksByDocs(ctx, docs, lo, hi)
+		more, err := d.loadLedgerChecksByDocs(ctx, docs)
 		if err != nil {
 			return nil, err
 		}
@@ -188,8 +189,9 @@ const ledgerCheckCols = `br.id, COALESCE(br.raw_message_id, 0), COALESCE(rm.wa_m
 		       COALESCE(br.collector, ''),
 		       br.ignored, br.is_duplicate, COALESCE(rm.deleted, false), br.created_at`
 
-// loadLedgerChecksByDocs — чеки с теми же номерами документов (в пределах ±60 дней).
-func (d *DB) loadLedgerChecksByDocs(ctx context.Context, docs []string, from, to time.Time) ([]ledger.Check, error) {
+// A repost can arrive years after the operation. A matching document number
+// must bring its original evidence into the book regardless of report dates.
+func (d *DB) loadLedgerChecksByDocs(ctx context.Context, docs []string) ([]ledger.Check, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT `+ledgerCheckCols+`
 		FROM bank_receipts br
@@ -197,9 +199,8 @@ func (d *DB) loadLedgerChecksByDocs(ctx context.Context, docs []string, from, to
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE br.doc_number IS NOT NULL AND br.doc_number <> ''
-		  AND br.tx_date >= $2 AND br.tx_date < $3
 		  AND regexp_replace(translate(upper(br.doc_number), 'АВСЕЁНКМОРТХУ', 'ABCEEHKMOPTXY'), '[^0-9A-ZА-Я]', '', 'g') = ANY($1)`,
-		docs, from, to)
+		docs)
 	if err != nil {
 		return nil, err
 	}
@@ -333,9 +334,9 @@ func summarize(ps []*ledger.Payment) []ContactSummary {
 			byName[key] = cs
 			order = append(order, key)
 		}
-		cs.Total += p.Amount
+		cs.Total = moneyAdd(cs.Total, p.Amount)
 		cs.Count++
-		cs.ByCard[p.Card()] += p.Amount
+		cs.ByCard[p.Card()] = moneyAdd(cs.ByCard[p.Card()], p.Amount)
 	}
 	out := make([]ContactSummary, 0, len(order))
 	for _, k := range order {
@@ -370,7 +371,7 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 			ct.Bank = c.CardBank
 		}
 		ct.Count++
-		ct.Total += amount
+		ct.Total = moneyAdd(ct.Total, amount)
 	}
 	pays := book.Counted(f)
 	sortByOp(pays)
@@ -383,6 +384,9 @@ func (d *DB) CardTotals(ctx context.Context, from, to time.Time, groupJIDs []str
 	// чек, присланный в две группы, — один раз.
 	seen := map[*ledger.Check]bool{}
 	for _, e := range book.Left(f) {
+		if e.Into != nil && (e.Into.DateConflict || e.Into.AmountConflict) {
+			continue // no authoritative operation period or amount
+		}
 		if e.Check != nil && e.Reason == ledger.ReasonReview && e.Check.Amount > 0 && !seen[e.Root()] {
 			seen[e.Root()] = true
 			add(e.Check, e.Check.Amount)
@@ -451,17 +455,17 @@ func senderStats(ps []*ledger.Payment, q string) []SenderStat {
 			st.Name = name
 		}
 		st.Count++
-		st.Total += p.Amount
+		st.Total = moneyAdd(st.Total, p.Amount)
 		switch {
 		case p.Main() != nil:
 			st.Checks++
-			st.ChecksSum += p.Amount
+			st.ChecksSum = moneyAdd(st.ChecksSum, p.Amount)
 		case p.Cash:
 			st.Cash++
-			st.CashSum += p.Amount
+			st.CashSum = moneyAdd(st.CashSum, p.Amount)
 		default:
 			st.Transfers++
-			st.TransfersSum += p.Amount
+			st.TransfersSum = moneyAdd(st.TransfersSum, p.Amount)
 		}
 	}
 	out := make([]SenderStat, 0, len(order))
@@ -490,14 +494,31 @@ func phoneDigits(s string) string {
 	return string(d)
 }
 
-// phoneMatch — номера совпадают по последним 10 цифрам (российские номера:
-// 8928…, +7928…, 7928…, 928… — один и тот же). q — уже только цифры.
+// phoneMatch compares full canonical numbers. Only Russian 8/7/local spelling
+// variants are equivalent; international country codes are significant.
 func phoneMatch(qDigits, phone string) bool {
-	p := phoneDigits(phone)
-	if p == "" || qDigits == "" {
-		return false
+	p, q := canonicalPhoneNumber(phone), canonicalPhoneNumber(qDigits)
+	return p != "" && q != "" && p == q
+}
+
+// Russian 8/7/local forms are equivalent. Other country codes stay intact:
+// two international numbers sharing the last ten digits are different people.
+func canonicalPhoneNumber(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, "@") {
+		if !strings.HasSuffix(value, "@s.whatsapp.net") {
+			return ""
+		}
+		value = strings.TrimSuffix(value, "@s.whatsapp.net")
 	}
-	return tail10(p) == tail10(qDigits)
+	digits := phoneDigits(value)
+	if len(digits) == 10 {
+		return "7" + digits
+	}
+	if len(digits) == 11 && digits[0] == '8' {
+		return "7" + digits[1:]
+	}
+	return digits
 }
 
 func tail10(d string) string {
@@ -576,10 +597,10 @@ func (d *DB) PersonReport(ctx context.Context, personQuery string, from, to *tim
 		}
 		if p.Main() != nil {
 			st.ReceiptCount++
-			st.ReceiptTotal += p.Amount
+			st.ReceiptTotal = moneyAdd(st.ReceiptTotal, p.Amount)
 		} else {
 			st.PaymentCount++
-			st.PaymentTotal += p.Amount
+			st.PaymentTotal = moneyAdd(st.PaymentTotal, p.Amount)
 		}
 		op := p.OpDate
 		if st.FirstOp == nil || op.Before(*st.FirstOp) {
@@ -627,15 +648,18 @@ func (d *DB) ReportExclusionsBasis(ctx context.Context, from, to time.Time, grou
 			}
 			seen[e.Root()] = true
 			ex.NeedsReviewCount++
-			ex.NeedsReviewSum += c.Amount
+			ex.NeedsReviewSum = moneyAdd(ex.NeedsReviewSum, c.Amount)
 		case ledger.ReasonHeld:
 			if e.Text.Cash {
 				ex.HeldCashCount++
-				ex.HeldCashSum += e.Text.Amount
+				ex.HeldCashSum = moneyAdd(ex.HeldCashSum, e.Text.Amount)
 			}
 		case ledger.ReasonTwin, ledger.ReasonSplit:
+			if e.Into != nil && e.Into.ReviewRequired() {
+				continue // linked evidence is pending, not already counted income
+			}
 			ex.TextDupCount++
-			ex.TextDupSum += e.Text.Amount
+			ex.TextDupSum = moneyAdd(ex.TextDupSum, e.Text.Amount)
 		}
 	}
 	return ex, nil

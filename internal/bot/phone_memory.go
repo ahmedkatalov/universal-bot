@@ -127,27 +127,22 @@ func (b *Bot) phoneMemoryTool(chat types.JID) ai.Tool {
 // настоящий номер не известен — его просто НЕ называем (id сообщения даём
 // всегда, по нему всё равно можно сослаться на чек).
 func (b *Bot) quotedSenderPhoneNote(ctx context.Context, msg *events.Message) string {
-	ext := msg.Message.GetExtendedTextMessage()
-	if ext == nil {
-		return ""
-	}
-	ci := ext.GetContextInfo()
+	ci := contextInfoOf(msg)
 	if ci == nil {
 		return ""
 	}
 	var parts []string
 	phone := ""
-	if participant := ci.GetParticipant(); participant != "" {
-		if jid, err := types.ParseJID(participant); err == nil && jid.Server == types.DefaultUserServer && jid.User != "" {
-			phone = jid.User // уже телефон (@s.whatsapp.net)
-		}
-	}
 	stanza := ci.GetStanzaID()
-	if phone == "" && stanza != "" && b.db != nil {
-		// participant был LID (или пуст) — пробуем достать реальный номер,
-		// пойманный при приёме исходного сообщения (SenderAlt).
-		if p, err := b.db.SenderPhoneByMessageID(ctx, stanza); err == nil {
-			phone = p
+	ref, known, sourceErr := b.trustedQuoteSource(ctx, msg)
+	if sourceErr != nil {
+		return "\n\n[Источник цитаты не подтверждён: не меняй привязку человека или платежа по этой цитате; попроси уточнить сообщение.]"
+	}
+	if known {
+		_, phone, _ = b.db.RawSenderIdentity(ctx, ref.ID)
+	} else if participant := ci.GetParticipant(); participant != "" {
+		if jid, err := types.ParseJID(participant); err == nil && jid.Server == types.DefaultUserServer {
+			phone = jid.User
 		}
 	}
 	if phone != "" {

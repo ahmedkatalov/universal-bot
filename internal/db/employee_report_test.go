@@ -1,6 +1,7 @@
 package db
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -59,6 +60,199 @@ func TestEmployeeReportPostingDatesIdentityAndKinds(t *testing.T) {
 	otherPeriod := employeeReport(book, to, to.AddDate(0, 0, 1), EmployeeReportOptions{})
 	if len(otherPeriod.Rows) != 0 {
 		t.Fatalf("period boundary: %+v", otherPeriod)
+	}
+}
+
+func TestEmployeeReportFullPhonesAndRussianAliases(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	var texts []ledger.Text
+	for i, phone := range []string{"79280000001", "89280000001", "9280000001", "12025550123", "442025550123"} {
+		texts = append(texts, ledger.Text{ID: i + 1, Group: "g", Sender: "Мансур", Phone: phone, ContactID: i + 1, Client: "Клиент", Amount: float64(i+1) + 0.01, Cash: true, OpDate: day, PostedAt: day.Add(time.Duration(i) * time.Minute)})
+	}
+	book := ledger.Build(nil, texts)
+	r := employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{Sender: "+7 (928) 000-00-01"})
+	if len(r.Stats) != 1 || r.Stats[0].Count != 3 || r.Stats[0].Total != 6.03 || r.Stats[0].Phone != "79280000001" {
+		t.Fatalf("one Russian phone split into workers: %+v", r)
+	}
+	for _, q := range []string{"12025550123", "+1 (202) 555-0123"} {
+		r = employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{Sender: q})
+		if len(r.Stats) != 1 || r.Stats[0].Phone != "12025550123" || r.Stats[0].Total != 4.01 {
+			t.Fatalf("international suffix collision for %s: %+v", q, r)
+		}
+	}
+}
+
+func TestEmployeeReportCollectorNameDoesNotProvePosterIdentity(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	book := ledger.Build(nil, []ledger.Text{
+		{ID: 1, Group: "g", Sender: "Мансур", Phone: "79280000001", ContactID: 1, Client: "Клиент Один", Amount: 1000, Cash: true, Collector: "Мансур", OpDate: day, PostedAt: day},
+		{ID: 2, Group: "g", Sender: "Мансур", Phone: "79280000002", ContactID: 2, Client: "Клиент Два", Amount: 2000, Cash: true, Collector: "Мансур", OpDate: day, PostedAt: day},
+	})
+	r := employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{Attribution: "collector", Sender: "Мансур"})
+	if len(r.Stats) != 2 {
+		t.Fatalf("same collector labels silently merged into one person: %+v", r)
+	}
+	for _, row := range r.Rows {
+		if row.EmployeePhone != "" || row.AttributionReason != "collector_name" || row.RawSenderPhone == "" {
+			t.Fatalf("collector inherited a poster phone: %+v", row)
+		}
+	}
+	byPhone := employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{Attribution: "collector", Sender: "79280000001"})
+	if len(byPhone.Rows) != 0 {
+		t.Fatalf("full-phone filter attributed named collector without proof: %+v", byPhone)
+	}
+}
+
+func TestEmployeeReportUnknownLIDIsNotAPhone(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	book := ledger.Build(nil, []ledger.Text{{ID: 1, RawID: 1, Group: "g", Sender: "Мансур", Phone: "123456789012345", ContactID: 1, Client: "Клиент", Amount: 1000, Cash: true, OpDate: day, PostedAt: day}})
+	opts := EmployeeReportOptions{sources: map[int]employeeSource{1: {SenderIdentity: SenderIdentity{ActorJID: "123456789012345@lid"}, Name: "Мансур", GroupJID: "g@g.us"}}}
+	r := employeeReport(book, day, day.AddDate(0, 0, 1), opts)
+	if len(r.Stats) != 1 || r.Stats[0].Phone != "" || r.Rows[0].EmployeePhone != "" || r.Rows[0].IdentityKey != "jid:123456789012345@lid" {
+		t.Fatalf("LID fabricated as a phone: %+v", r)
+	}
+	opts.Sender = "123456789012345"
+	if r := employeeReport(book, day, day.AddDate(0, 0, 1), opts); len(r.Rows) != 0 {
+		t.Fatalf("same digits are not observed PN↔LID proof: %+v", r)
+	}
+}
+
+func TestEmployeeReportReviewConflictsAndUnknownCopies(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	base := ledger.Check{ID: 1, Group: "a", Sender: "Мансур", Phone: "79280000001", ContactID: 1, Client: "Клиент Один", Confirmed: true, Amount: 10000, OpDate: day, PostedAt: day, Doc: "CONFLICT-EMPLOYEE-001"}
+	copy := base
+	copy.ID = 2
+	copy.Group = "b"
+	copy.Sender = "Умар"
+	copy.Phone = "79280000002"
+	copy.ContactID = 2
+	copy.Client = "Клиент Два"
+	copy.PostedAt = day.Add(time.Minute)
+	book := ledger.Build([]ledger.Check{base, copy}, nil)
+	r := employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{})
+	if len(r.Rows) != 1 || r.Rows[0].Status == "counted" || r.Rows[0].Client != "" || r.Stats[0].Count != 0 || r.Stats[0].PendingChecks != 1 || r.Stats[0].PendingSum != 10000 {
+		t.Fatalf("conflicting clients attributed to first client: %+v", r)
+	}
+	local := employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{Groups: []string{"b"}})
+	if len(local.Rows) != 1 || local.Rows[0].Client != "" || local.Rows[0].SubmittedBy != "Умар" {
+		t.Fatalf("local group inherited foreign payer: %+v", local)
+	}
+	base.Amount, copy.Amount = 0, 0
+	base.Review, copy.Review = true, true
+	book = ledger.Build([]ledger.Check{base, copy}, nil)
+	r = employeeReport(book, day, day.AddDate(0, 0, 1), EmployeeReportOptions{})
+	if len(r.Rows) != 1 || r.Stats[0].PendingChecks != 1 || r.Stats[0].UnknownAmounts != 1 || r.Stats[0].PendingSum != 0 {
+		t.Fatalf("unknown same-doc copies counted twice: %+v", r)
+	}
+}
+
+func TestEmployeeReportObservedIdentityAndPrivateUpload(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	group, _ := uniqueScope("employee-identity")
+	group += "@g.us"
+	at := time.Now()
+	from := at.Add(-time.Hour)
+	to := at.Add(time.Hour)
+	contact, err := d.GetOrCreateContact(ctx, "Клиент "+group)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addCash := func(wa, jid, phone, name string, amount float64) {
+		raw, _, err := d.SaveRawMessage(ctx, wa, group, jid, phone, name, "Клиент наличка", false, "", at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := d.InsertTransaction(ctx, TransactionInput{RawMessageID: raw, ContactID: contact, RawName: "Клиент " + group, Amount: amount, IsCash: true, TxDate: at}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	addCash(group+"lid", "123456789012345@lid", "", "Мансур", 5000)
+	addCash(group+"pn", "79280000101@s.whatsapp.net", "79280000101", "Mansur", 7000)
+	if err := d.RememberSenderIdentity(ctx, "123456789012345@lid", "79280000101@s.whatsapp.net"); err != nil {
+		t.Fatal(err)
+	}
+	r, err := d.EmployeePayments(ctx, from, to, EmployeeReportOptions{Groups: []string{group}, Sender: "Мансур", Kind: "cash"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Stats) != 1 || r.Stats[0].Count != 2 || r.Stats[0].Total != 12000 || r.Stats[0].Phone != "79280000101" {
+		t.Fatalf("observed PN/LID split or lost alias: %+v", r)
+	}
+	owner := "79280000102"
+	if err := d.SetPhoneOwner(ctx, owner, "Владелец"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := d.SaveRawMessage(ctx, group+"private", owner+"@s.whatsapp.net", owner+"@s.whatsapp.net", owner, "Владелец", "Клиент "+group, true, "", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.pool.Exec(ctx, `INSERT INTO bank_receipts(raw_message_id,group_jid,contact_id,client_confirmed,recipient_raw,submitted_by,amount,tx_date,sender_raw) VALUES($1,$2,$3,true,$4,'Расул',9000,$5,'Банковский Плательщик')`, raw, group, contact, "Клиент "+group, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r, err = d.EmployeePayments(ctx, from, to, EmployeeReportOptions{Groups: []string{group}, Sender: "Расул", Kind: "checks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 1 || r.Rows[0].EmployeePhone != "" || r.Rows[0].AttributionReason != "submitted_label" || r.Rows[0].RawSenderPhone != owner || r.Rows[0].BankPayer != "Банковский Плательщик" || r.Stats[0].Total != 9000 {
+		t.Fatalf("upload owner/worker/payer mixed: %+v", r)
+	}
+	r, err = d.EmployeePayments(ctx, from, to, EmployeeReportOptions{Groups: []string{group}, Sender: owner, Kind: "checks"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Rows) != 0 {
+		t.Fatalf("manual worker label inherited uploader phone: %+v", r)
+	}
+}
+
+func TestEmployeeReportUncertainDatesRemainVisibleForEachCandidatePeriod(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	a := ledger.Check{ID: 1, Group: "a", Sender: "Мансур", Phone: "79280000001", ContactID: 1, Client: "Клиент", Confirmed: true, Amount: 10000, Doc: "EMPLOYEE-DATE-CONFLICT", OpDate: day, PostedAt: day.Add(time.Hour)}
+	b := a
+	b.ID = 2
+	b.Group = "b"
+	b.OpDate = day.AddDate(0, 0, 1)
+	b.PostedAt = day.Add(2 * time.Hour)
+	book := ledger.Build([]ledger.Check{a, b}, nil)
+	for i := 0; i < 2; i++ {
+		from := day.AddDate(0, 0, i)
+		r := employeeReport(book, from, from.AddDate(0, 0, 1), EmployeeReportOptions{DateBasis: "operation"})
+		if len(r.Rows) != 1 || r.Rows[0].Status == "counted" || !r.Rows[0].OperationDateUncertain || r.Stats[0].PendingChecks != 1 {
+			t.Fatalf("candidate operation day %d hid uncertain receipt: %+v", i, r)
+		}
+	}
+}
+
+func TestEmployeeReportDictatedSourceIsNotAnEmployee(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	book := ledger.Build(nil, []ledger.Text{
+		{ID: 1, RawID: 1, Group: "g", Sender: "Клиент Один", ContactID: 1, Client: "Клиент Один", Amount: 1000, Cash: true, Collector: "Мансур", OpDate: day, PostedAt: day},
+		{ID: 2, RawID: 2, Group: "g", Sender: "Клиент Два", ContactID: 2, Client: "Клиент Два", Amount: 2000, Cash: true, Collector: "Умар", OpDate: day, PostedAt: day},
+	})
+	opts := EmployeeReportOptions{sources: map[int]employeeSource{
+		1: {SenderIdentity: SenderIdentity{ActorJID: "dictated@c.us"}, Name: "Клиент Один", GroupJID: "g@g.us"},
+		2: {SenderIdentity: SenderIdentity{ActorJID: "dictated@c.us"}, Name: "Клиент Два", GroupJID: "g@g.us"},
+	}}
+	r := employeeReport(book, day, day.AddDate(0, 0, 1), opts)
+	if len(r.Stats) != 2 {
+		t.Fatalf("synthetic actor merged unrelated named sources: %+v", r)
+	}
+	for _, row := range r.Rows {
+		if row.Employee != "" || row.EmployeePhone != "" || row.AttributionReason != "unknown_sender" {
+			t.Fatalf("payer assigned as posting employee: %+v", row)
+		}
+	}
+	opts.Attribution = "collector"
+	r = employeeReport(book, day, day.AddDate(0, 0, 1), opts)
+	if len(r.Stats) != 2 {
+		t.Fatalf("named collectors merged through synthetic source: %+v", r)
+	}
+	for _, row := range r.Rows {
+		if row.AttributionReason != "collector_name" || row.EmployeePhone != "" {
+			t.Fatalf("collector lacks uncertainty label: %+v", row)
+		}
 	}
 }
 

@@ -386,7 +386,7 @@ func TestL6collapsed_R0_AnswerToNewerCheckAskNotTakenByHeldScreen(t *testing.T) 
 	grp, emp := e2eGroup("l6r0"), user("79001126009")
 	screen := l6rHeldScreen(t, e, grp, emp, op)
 	ck := l4intakePhoto(e, grp, emp, "Сафаи", "СберБанк\nЧек по операции\nДата операции "+op2.Format("02.01.2006 15:04:05")+"\nСумма перевода\n7000.00 ₽", "", "")
-	if q := e.lastWith("ЧЕЙ он"); q.ID == "" {
+	if q := e.lastWith("Чей чек на 7000 ₽"); q.ID == "" || q.Quoted != ck || !strings.Contains(q.Text, "ФИО") {
 		t.Fatalf("бот не спросил про чек 7000: %v", e.sent())
 	}
 	n := len(e.sent())

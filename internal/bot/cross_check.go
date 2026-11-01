@@ -8,7 +8,6 @@ package bot
 import (
 	"context"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -17,6 +16,7 @@ import (
 	"go.mau.fi/whatsmeow/types/events"
 
 	"whatsapp-bot/internal/db"
+	"whatsapp-bot/internal/ledger"
 )
 
 // crossCheckNamed — чек сообщения waID (или, если waID пусто, сообщения rawID)
@@ -105,7 +105,7 @@ type crossPairedText struct {
 // одним платежом с чеком сообщений was (его копиями), а клиент в них — не
 // canonical. Поправим клиента чека — их пара по клиенту пропадёт, и текст
 // со старым ФИО стал бы вторым платежом.
-func (b *Bot) crossPairedTexts(ctx context.Context, was []string, groups map[string]bool, canonical string, cid *int) []crossPairedText {
+func (b *Bot) crossPairedTexts(ctx context.Context, was []string, groups map[string]bool, canonical string, cid *int, explicitResolution bool) []crossPairedText {
 	if len(was) == 0 {
 		return nil
 	}
@@ -113,6 +113,7 @@ func (b *Bot) crossPairedTexts(ctx context.Context, was []string, groups map[str
 	// старый чек присылают через неделю после операции, а текст «ФИО сумма»
 	// пишут, когда его прислали.
 	var from, to time.Time
+	sources := map[int]bool{}
 	widen := func(t time.Time) {
 		if t.IsZero() {
 			return
@@ -131,6 +132,9 @@ func (b *Bot) crossPairedTexts(ctx context.Context, was []string, groups map[str
 		}
 		widen(c.TxDate)
 		widen(c.ReceivedAt)
+		if c.SourceRawID > 0 {
+			sources[c.SourceRawID] = true
+		}
 	}
 	if from.IsZero() {
 		return nil
@@ -144,9 +148,20 @@ func (b *Bot) crossPairedTexts(ctx context.Context, was []string, groups map[str
 	for _, w := range was {
 		isCopy[w] = true
 	}
+	return crossPairedTextsForResolutionOfBook(book, isCopy, groups, canonical, cid, sources, explicitResolution)
+}
+
+func crossPairedTextsOfBook(book *ledger.Book, isCopy, groups map[string]bool, canonical string, cid *int) []crossPairedText {
+	return crossPairedTextsForResolutionOfBook(book, isCopy, groups, canonical, cid, nil, false)
+}
+
+func crossPairedTextsForResolutionOfBook(book *ledger.Book, isCopy, groups map[string]bool, canonical string, cid *int, sources map[int]bool, explicitResolution bool) []crossPairedText {
 	var out []crossPairedText
 	seen := map[int]bool{}
 	for _, p := range book.Payments {
+		if p.ReviewRequired() && (!explicitResolution || p.AmountConflict || p.DateConflict) {
+			continue
+		} // an uncertain pairing cannot reassign another person's text
 		hit := false
 		for _, ch := range p.Checks {
 			if isCopy[ch.WaID] {
@@ -158,7 +173,13 @@ func (b *Bot) crossPairedTexts(ctx context.Context, was []string, groups map[str
 			continue
 		}
 		for _, t := range p.Texts {
-			if t.Cash || seen[t.ID] || !groups[t.Group] || math.Abs(t.Amount-p.Amount) >= 0.5 {
+			// A validated answer resolves the client conflict, but only a
+			// persisted source link proves this text named that receipt before
+			// the conflict. Similar names/amounts alone cannot authorize a move.
+			if p.ReviewRequired() && !sources[t.RawID] {
+				continue
+			}
+			if t.Cash || seen[t.ID] || !groups[t.Group] || !sameMoneyCents(t.Amount, p.Amount) {
 				continue
 			}
 			if (cid != nil && t.ContactID == *cid) || sameClientMoney(t.Client, canonical) || clientNamePartMoney(t.Client, canonical) {
@@ -285,7 +306,7 @@ func (b *Bot) tryCrossAnswerNoSwipe(ctx context.Context, msg *events.Message, te
 	if b.db == nil || !shortPlainReply(text, 4) {
 		return false
 	}
-	group, sender := msg.Info.Chat.String(), msg.Info.Sender.String()
+	group, sender := msg.Info.Chat.String(), b.senderActorKey(ctx, msg.Info)
 	admin := b.isReportAdmin(msg.Info)
 	asks := b.openCrossAsks(group, sender, admin)
 	if len(asks) == 0 {
@@ -314,7 +335,7 @@ func (b *Bot) tryCrossAnswerNoSwipe(ctx context.Context, msg *events.Message, te
 // отправителя только что спросили «Чей он?», и это одно из двух названных ФИО:
 // запоминаем — может оказаться ответом (см. crossCandidate).
 func (b *Bot) noteCrossCandidate(msg *events.Message, text, name string, rawID int) {
-	group, sender := msg.Info.Chat.String(), msg.Info.Sender.String()
+	group, sender := msg.Info.Chat.String(), b.senderActorKey(context.Background(), msg.Info)
 	for _, x := range b.openCrossAsks(group, sender, false) {
 		answer := name
 		if !crossNamesOne(x.a, name) {
@@ -370,7 +391,7 @@ func (b *Bot) crossCandidateResolved(ctx context.Context, chat types.JID, cand c
 // true — чек перепривязан, вопрос «Чей он?» отвечен.
 func (b *Bot) crossCandidateNextName(ctx context.Context, msg *events.Message, canonical string, cid *int, rawID int) bool {
 	chat := msg.Info.Chat
-	group, sender := chat.String(), msg.Info.Sender.String()
+	group, sender := chat.String(), b.senderActorKey(ctx, msg.Info)
 	cand, ok := b.crossCandidateOf(group, sender)
 	if !ok || b.db == nil {
 		return false

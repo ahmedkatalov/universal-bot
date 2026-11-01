@@ -266,7 +266,7 @@ func TestL4intake_17_AmountAnswerKeepsCaptionClient(t *testing.T) {
 	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
 	waID := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", "")
 	q := e.last()
-	if !strings.Contains(q.Text, "СУММУ") {
+	if !strings.Contains(strings.ToLower(q.Text), "сумму") {
 		t.Fatalf("нет вопроса про сумму: %q", q.Text)
 	}
 	e.sendGroup(groupReply(grp, emp, "Сафаи", "5000", q.ID, e.botJID(), q.Text))
@@ -305,7 +305,7 @@ func TestL4intake_16_NamingAnswerDedupesLateReadCopy(t *testing.T) {
 	}
 	blurred := strings.Replace(l4intakeVTB("13:02", "Харон Исаевич И.", "7 000"), "7 000 ₽", "S OOO P", 1)
 	first := l4intakePhoto(e, grp, emp, "Сафаи", blurred, "", path)
-	q := e.lastWith("СУММУ")
+	q := e.lastWith("не разобрал сумму")
 	if q.ID == "" {
 		t.Fatalf("нет вопроса про сумму: %+v", e.sent())
 	}
@@ -388,7 +388,7 @@ func TestL4intake_R0_AmountAnswerDoesNotDoubleCount(t *testing.T) {
 		ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
 		first := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", "")
 		q := e.last()
-		if !strings.Contains(q.Text, "СУММУ") {
+		if !strings.Contains(strings.ToLower(q.Text), "сумму") {
 			t.Fatalf("нет вопроса про сумму: %q", q.Text)
 		}
 		clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Add(-time.Minute).Format("02.01.2006 15:04:05") +
@@ -782,7 +782,7 @@ func TestL4intake_R0_RetryWithoutDateAsksSameOrOther(t *testing.T) {
 	_ = os.WriteFile(path, []byte("\xff\xd8\xff\xe0 check photo"), 0o644)
 	ocr := "C6EP6AHK\nЧek no onepaции\nФИO получателя\nХадижат Ибрагимовна И.\nСумма перевода\nS OOO,OO P"
 	first := l4intakePhoto(e, grp, emp, "Сафаи", ocr, "Исаев Харон", path)
-	q := e.lastWith("СУММУ")
+	q := e.lastWith("не разобрал сумму")
 	clear := "СберБанк\nЧек по операции\nДата операции " + time.Now().Add(-3*time.Minute).Format("02.01.2006 15:04:05") +
 		"\nФИО получателя\nХадижат Ибрагимовна И.\nСумма перевода\n5000.00 ₽\nНомер документа\n" + e2eID("DOC")
 	e.sendReceipt(grp, emp, "Сафаи", clear, "Исаев Харон")

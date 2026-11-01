@@ -8,7 +8,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"math"
 	"os"
 	"regexp"
 	"strconv"
@@ -1047,7 +1046,7 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 		if len(lines) > 1 && amount <= 0 {
 			return false
 		}
-		if amount > 0 && (pa.amount <= 0 && !swipe && len(live) == 0 || pa.amount > 0 && math.Abs(pa.amount-amount) >= 1) {
+		if amount > 0 && (pa.amount <= 0 && !swipe && len(live) == 0 || pa.amount > 0 && !sameMoneyCents(pa.amount, amount)) {
 			return false // названа другая сумма — это новый платёж, а не ответ
 		}
 		// Только настоящее ФИО («Мансур знает», «Позже скажу» — не клиент).
@@ -1073,7 +1072,7 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 			// Платёж уже записан без имени — даём клиента ему (не добавляем второй).
 			var cand []db.TxRef
 			for _, tx := range live {
-				if usedTx[tx.ID] || amount > 0 && math.Abs(tx.Amount-amount) >= 1 {
+				if usedTx[tx.ID] || amount > 0 && !sameMoneyCents(tx.Amount, amount) {
 					continue
 				}
 				if whoPlaceholders[tx.Name] || len(live) == 1 {
@@ -1083,7 +1082,7 @@ func (b *Bot) applyPaymentWhoAnswer(ctx context.Context, chat types.JID, askID s
 			if len(cand) > 1 {
 				same := true // несколько одинаковых заглушек — берём первую
 				for _, c := range cand {
-					if math.Abs(c.Amount-cand[0].Amount) >= 1 {
+					if !sameMoneyCents(c.Amount, cand[0].Amount) {
 						same = false
 					}
 				}
@@ -1194,7 +1193,7 @@ func notPaymentAnswer(text string, asked float64, swipe bool) bool {
 	if !swipe && (!notPaymentCashRe.MatchString(low) || strings.Contains(low, "чек")) {
 		return false
 	}
-	if a := parser.ExtractAmount(low); a > 0 && (asked <= 0 || math.Abs(a-asked) >= 1) {
+	if a := parser.ExtractAmount(low); a > 0 && (asked <= 0 || !sameMoneyCents(a, asked)) {
 		return false
 	}
 	return !answerNamesClient(text)
@@ -1256,7 +1255,7 @@ func clientSurnameLike(w string) bool {
 func (b *Bot) dropNotPayment(ctx context.Context, chat types.JID, pa paymentAsk, live []db.TxRef) bool {
 	var drop []db.TxRef
 	for _, tx := range live {
-		if whoPlaceholders[tx.Name] && (pa.amount <= 0 || math.Abs(tx.Amount-pa.amount) < 1) {
+		if whoPlaceholders[tx.Name] && (pa.amount <= 0 || sameMoneyCents(tx.Amount, pa.amount)) {
 			drop = append(drop, tx)
 		}
 	}

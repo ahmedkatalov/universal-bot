@@ -457,7 +457,10 @@ func (b *Bot) applyCrossClientAnswer(ctx context.Context, chat types.JID, askID 
 			groups[cp.group] = true
 		}
 	}
-	texts := b.crossPairedTexts(ctx, was, groups, canonical, cid)
+	// This validated reply names the client of the identified physical
+	// receipt. Preserve previously established source-text links through the
+	// resolution; no automatic path gets this explicit-resolution authority.
+	texts := b.crossPairedTexts(ctx, was, groups, canonical, cid, true)
 	fixed := 0
 	for _, cp := range copies {
 		if cp.wa == "" {

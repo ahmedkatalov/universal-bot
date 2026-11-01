@@ -2,7 +2,7 @@ package bot
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"go.mau.fi/whatsmeow/types"
 	"math"
@@ -60,7 +60,12 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	// должны записать платёж дважды).
 	// Правка сообщения во время разбора — новый текст ждёт, пока старый разбор
 	// закончится (он свой итог не запишет), и разбирается сам.
-	myEdits, _ := b.db.MessageEditCount(ctx, rawID)
+	myEdits, err := b.db.MessageEditCount(ctx, rawID)
+	if err != nil {
+		b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+			txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
+		return
+	}
 	for wait := 0; ; wait++ {
 		b.aiRetryMu.Lock()
 		if b.aiInFlight == nil {
@@ -102,6 +107,8 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	defer func() {
 		if r := recover(); r != nil {
 			fmt.Println("ИИ-доразбор: паника, оставляю сообщение на пересчёт:", r)
+			b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+				txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
 			return
 		}
 		if staleResult {
@@ -114,6 +121,21 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		}
 		_ = b.db.MarkMessageParsed(ctx, rawID)
 	}()
+	if cashHint {
+		err = b.db.RememberCashHint(ctx, rawID, myEdits)
+	} else {
+		cashHint, err = b.db.CashHint(ctx, rawID)
+	}
+	if err != nil {
+		if errors.Is(err, db.ErrMessageRevisionChanged) {
+			staleResult = true
+			return
+		}
+		keepUnparsed = true
+		b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+			txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
+		return
+	}
 	system := "Ты — модуль разбора платежей в WhatsApp-боте учёта финансов. " +
 		"Тебе дают сообщение из рабочей группы — в нём могут быть платежи (переводы и/или наличка) в ЛЮБОМ формате. " +
 		"Разбери их по СМЫСЛУ, как понял бы человек, а не по шаблону. " +
@@ -196,20 +218,12 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 				ch <- runResult{}
 				return
 			}
-			block := extractJSONBlock(out)
-			if block == "" {
+			payments, clarify, valid := decodePaymentExtraction(out)
+			if !valid {
 				ch <- runResult{}
 				return
 			}
-			var p struct {
-				Payments []aiPayment `json:"payments"`
-				Clarify  string      `json:"clarify"`
-			}
-			if err := json.Unmarshal([]byte(block), &p); err != nil {
-				ch <- runResult{}
-				return
-			}
-			ch <- runResult{payments: p.Payments, clarify: strings.TrimSpace(p.Clarify), ok: true}
+			ch <- runResult{payments: payments, clarify: clarify, ok: true}
 		}()
 	}
 	var runs [][]aiPayment
@@ -230,13 +244,13 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		staleResult = true
 		return
 	}
-	if okRuns == 0 {
-		// Ни одно чтение не удалось (ИИ недоступен) — вердикта НЕТ. Откат к парсеру,
+	if okRuns < n/2+1 {
+		// Корректных чтений меньше кворума — вердикта НЕТ. Откат к парсеру,
 		// но если он ничего не записал — оставляем сообщение на пересчёт (не помечаем
 		// разобранным): реальный платёж не должен пропасть только потому, что ИИ лежал.
 		// Без ИИ записываем только явные платежи ИЗВЕСТНЫМ клиентам; остальное
 		// ждёт повторного разбора, когда ИИ снова доступен (textRetryLoop).
-		fmt.Println("ИИ-доразбор: ни одно чтение не удалось, откат к обычному парсеру")
+		fmt.Printf("ИИ-доразбор: корректных чтений %d из %d, кворума нет; откат к обычному парсеру\n", okRuns, n)
 		// Если хоть одну строку без ИИ не понять (неизвестный клиент, «Нал» без
 		// имени) — не пишем ничего: ИИ потом прочтёт сообщение целиком (иначе
 		// записанная часть закрыла бы сообщение и остальное пропало бы).
@@ -342,6 +356,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 
 	saved := 0
 	insertFailed := false
+	var inputs []db.TransactionInput
 	for _, p := range payments {
 		name := strings.TrimSpace(p.Name)
 		if p.Amount <= 0 || name == "" {
@@ -367,7 +382,7 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			card = "наличные"
 		}
 
-		err = b.db.InsertTransaction(ctx, db.TransactionInput{
+		inputs = append(inputs, db.TransactionInput{
 			ContactID:    contactID,
 			RawName:      name,
 			Amount:       p.Amount,
@@ -379,12 +394,6 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			TxDate:       txDate,
 			DupCheck:     b.cashDupCheckOn(),
 		})
-		if err != nil {
-			fmt.Println("ИИ-доразбор: ошибка сохранения транзакции:", err)
-			insertFailed = true
-			continue
-		}
-		saved++
 	}
 	for _, sl := range slots {
 		if insertFailed {
@@ -396,16 +405,39 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 			name, card = "Наличка", "наличные"
 		}
 		contactID, err := b.db.GetOrCreateContact(ctx, name)
-		if err == nil {
-			err = b.db.InsertTransaction(ctx, db.TransactionInput{ContactID: contactID, RawName: name, Amount: sl.Amount,
-				CardTo: card, IsCash: isCash, RawMessageID: rawID, TxDate: txDate, DupCheck: b.cashDupCheckOn()})
-		}
 		if err != nil {
-			fmt.Println("ИИ-доразбор: ошибка сохранения спорного платежа:", err)
+			fmt.Println("ИИ-доразбор: ошибка контакта спорного платежа:", err)
 			insertFailed = true
 			break
 		}
-		saved++
+		inputs = append(inputs, db.TransactionInput{ContactID: contactID, RawName: name, Amount: sl.Amount,
+			CardTo: card, IsCash: isCash, RawMessageID: rawID, TxDate: txDate, DupCheck: b.cashDupCheckOn()})
+	}
+	if !insertFailed && len(inputs) > 0 {
+		var err error
+		saved, err = b.db.ApplyParsedPaymentBatch(ctx, rawID, edits0, "ai", inputs)
+		if err != nil {
+			keepUnparsed = true
+			if errors.Is(err, db.ErrMessageRevisionChanged) {
+				staleResult = true
+				return
+			}
+			if errors.Is(err, db.ErrPaymentBatchChanged) {
+				_ = b.db.MarkAIDisputed(ctx, rawID)
+				b.aiRetryMu.Lock()
+				delete(b.aiRetry, rawID)
+				b.aiRetryMu.Unlock()
+				return // a different saved plan requires review, not an automatic rewrite
+			}
+			fmt.Println("ИИ-доразбор: не удалось сохранить весь набор платежей:", err)
+			insertFailed = true
+		}
+	}
+	if insertFailed {
+		keepUnparsed = true
+		b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+			txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
+		return
 	}
 	if question != "" && !insertFailed {
 		// ИИ спросил, чей платёж. Деньги до ответа держим в сборе: суммы без
@@ -413,8 +445,14 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// «Наличка» (ответ даст ей клиента), а если ИИ не записал ничего — и
 		// строки с ФИО из текста. Потом спрашиваем.
 		keep, placeholders, phAmount := b.heldWhileAsking(joined, question, payments, slots, saved, cashHint)
-		dsaved, _ := b.recordParsedLines(ctx, keep, joined, rawID, txDate, cashHint)
+		dsaved, dfailed := b.recordParsedLinesPhase(ctx, keep, joined, rawID, txDate, cashHint, "question")
 		saved += dsaved
+		if dfailed {
+			keepUnparsed = true
+			b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+				txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
+			return
+		}
 		if (placeholders > 0 || saved == 0 || dsaved > 0 || len(slots) > 0) && !b.groupSilent(chat) {
 			if id := b.askAboutMessage(ctx, chat, rawID, "❓ "+question); id != "" {
 				amt := 0.0
@@ -438,10 +476,6 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 	}
 	if saved > 0 {
 		fmt.Printf("ИИ-доразбор: сообщение %d — извлечено и сохранено %d платеж(ей), которые не понял обычный парсер\n", rawID, saved)
-	} else if insertFailed {
-		// ИИ ПОНЯЛ платежи, но ни один не записался (БД недоступна). Не теряем:
-		// оставляем на пересчёт. Детерминированно не дублируем — ИИ уже всё понял.
-		keepUnparsed = true
 	} else {
 		// ИИ был ДОСТУПЕН и вернул ПУСТО — это осознанный вердикт «не платёж»
 		// (обсуждение/план: «сказал взять 5000»). Доверяем ему и НЕ пишем мусор.
@@ -450,6 +484,10 @@ func (b *Bot) aiRescueUnparsed(ctx context.Context, chat types.JID, senderName s
 		// Заглушку «Наличка» (итог дня «Наличка 50000») без вопроса ИИ не пишем.
 		dsaved, dfailed := b.recordDeterministicPaymentsMode(ctx, joined, rawID, txDate, cashHint, detKnown)
 		keepUnparsed = dsaved == 0 && dfailed
+		if keepUnparsed {
+			b.queueAIRetry(aiRetryItem{chat: chat, senderName: senderName, lines: lines, rawID: rawID,
+				txDate: txDate, cashHint: cashHint, paymentLikely: paymentLikely, at: time.Now()})
+		}
 	}
 }
 
@@ -791,7 +829,7 @@ func (b *Bot) uncoveredLines(text string, agreed []aiPayment, cashHint bool) []a
 		}
 		covered := false
 		for k, a := range left {
-			if math.Abs(a-tr.Amount) < 1 {
+			if sameMoneyCents(a, tr.Amount) {
 				left = append(left[:k], left[k+1:]...)
 				covered = true
 				break
@@ -839,7 +877,7 @@ func (b *Bot) heldWhileAsking(text, question string, agreed, slots []aiPayment, 
 	}
 	take := func(pool []*cover, amount float64, ok func(c *cover) bool) bool {
 		for _, c := range pool {
-			if !c.used && math.Abs(c.amount-amount) < 1 && ok(c) {
+			if !c.used && sameMoneyCents(c.amount, amount) && ok(c) {
 				c.used = true
 				return true
 			}
@@ -886,7 +924,7 @@ func (b *Bot) heldWhileAsking(text, question string, agreed, slots []aiPayment, 
 	asked := moneyTokens(question)
 	askedAmount := func(a float64) bool {
 		for _, q := range asked {
-			if math.Abs(q-a) < 1 {
+			if sameMoneyCents(q, a) {
 				return true
 			}
 		}
@@ -942,7 +980,7 @@ func (b *Bot) heldWhileAsking(text, question string, agreed, slots []aiPayment, 
 					others += o.tr.Amount
 				}
 			}
-			if !whoQ && !askedAmount(e.tr.Amount) || math.Abs(others-e.tr.Amount) < 1 {
+			if !whoQ && !askedAmount(e.tr.Amount) || sameMoneyCents(others, e.tr.Amount) {
 				continue // итог / сдача уже записанных денег
 			}
 		}
@@ -1131,13 +1169,8 @@ func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, b
 		fmt.Println("ИИ-доразбор чека не удался:", err)
 		return aiReceipt{}, false
 	}
-	block := extractJSONBlock(out)
-	if block == "" {
-		return aiReceipt{}, false
-	}
-	var rec aiReceipt
-	if err := json.Unmarshal([]byte(block), &rec); err != nil {
-		fmt.Printf("ИИ-доразбор чека: не удалось разобрать JSON (%v): %s\n", err, block)
+	rec, valid := decodeReceiptExtraction(out)
+	if !valid || rec.Kind != "receipt" {
 		return aiReceipt{}, false
 	}
 	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" {
@@ -1153,7 +1186,7 @@ func (b *Bot) aiRescueReceipt(ctx context.Context, ocrText string) (aiReceipt, b
 // зрения НЕ дала вердикт (нет ассистента, не отрендерился PDF, ошибка вызова) —
 // тогда нельзя заключать «это не чек»: вызывающий не должен помечать сообщение
 // обработанным, иначе реальный чек потеряется при сбое API. reachable=true —
-// модель ответила (в т.ч. «это не чек / other»), вердикту можно верить.
+// получен корректный ответ по контракту (в т.ч. явное «это не чек / other»).
 func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool, bool) {
 	if b.assistant == nil || len(media) == 0 {
 		return aiReceipt{}, false, false
@@ -1192,24 +1225,22 @@ func (b *Bot) aiVisionReceipt(ctx context.Context, media []byte, ext, hint strin
 		fmt.Println("Вижн-разбор чека не удался:", err)
 		return aiReceipt{}, false, false // модель недоступна — вердикта нет
 	}
-	// Дальше модель ОТВЕТИЛА — вердикту можно верить (reachable=true), даже если
-	// она сказала «это не чек» или вернула кашу.
-	block := extractJSONBlock(out)
-	if block == "" {
-		return aiReceipt{}, false, true
+	// Malformed output is no verdict. Only an explicit, validated "other"
+	// classification may close a message as a non-receipt.
+	rec, valid := decodeReceiptExtraction(out)
+	if !valid {
+		return aiReceipt{}, false, false
 	}
-	var rec aiReceipt
-	if err := json.Unmarshal([]byte(block), &rec); err != nil {
-		fmt.Printf("Вижн-разбор: не удалось разобрать JSON (%v): %s\n", err, block)
-		return aiReceipt{}, false, true
+	if rec.Kind == "other" {
+		return rec, false, true
 	}
 	// Фото наличных — это валидный результат (наличка), даже без суммы/получателя.
 	if rec.Kind == "cash" {
 		fmt.Printf("Вижн-разбор: на фото НАЛИЧНЫЕ деньги (сумма с фото: %.0f)\n", rec.Amount)
 		return rec, true, true
 	}
-	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" {
-		return aiReceipt{}, false, true
+	if rec.Amount <= 0 && strings.TrimSpace(rec.Recipient) == "" && strings.TrimSpace(rec.DocNumber) == "" {
+		return aiReceipt{}, false, false
 	}
 	fmt.Printf("Вижн-разбор: GPT прочитал чек с изображения (получатель %q, сумма %.0f)\n", rec.Recipient, rec.Amount)
 	return rec, true, true
@@ -1230,12 +1261,16 @@ func receiptVisionReads() int {
 
 // aiVisionReceiptConsensus читает чек несколькими независимыми прогонами вижна
 // ПАРАЛЛЕЛЬНО (задержка ≈ одного запроса) и выбирает согласованный результат:
-// сумму, которая совпала в большинстве прочтений, а если все разные — медианную
-// (устойчивую к одному выбросу). Так разовая ошибка распознавания не проходит.
+// сумму, которая совпала в большинстве ЗАПРОШЕННЫХ прочтений. Неопределённый
+// результат остаётся на повтор; медиана разных сумм не подтверждает платёж.
 func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, hint string) (aiReceipt, bool, bool) {
 	n := receiptVisionReads()
 	if n <= 1 {
-		return b.aiVisionReceipt(ctx, media, ext, hint)
+		rec, ok, reachable := b.aiVisionReceipt(ctx, media, ext, hint)
+		if ok && rec.Kind == "receipt" && receiptPendingRe.MatchString(rec.Status) {
+			return aiReceipt{}, false, false
+		}
+		return rec, ok, reachable
 	}
 
 	type res struct {
@@ -1252,38 +1287,48 @@ func (b *Bot) aiVisionReceiptConsensus(ctx context.Context, media []byte, ext, h
 	}
 
 	var recs []aiReceipt
-	var cash *aiReceipt
-	cashVotes := 0
-	anyReachable := false
+	var cashAmounts []float64
+	otherVotes := 0
 	for i := 0; i < n; i++ {
 		r := <-ch
-		if r.reachable {
-			anyReachable = true
-		}
 		if !r.ok {
+			if r.reachable && r.rec.Kind == "other" {
+				otherVotes++
+			}
 			continue
 		}
 		if r.rec.Kind == "cash" {
-			c := r.rec
-			cash = &c
-			cashVotes++
+			cashAmounts = append(cashAmounts, r.rec.Amount)
 			continue
 		}
 		recs = append(recs, r.rec)
 	}
 
-	// Фото наличных побеждает, только если «наличкой» его назвало СТРОГО больше
-	// прочтений, чем «чеком» (и когда чеков не вышло вовсе — тогда len(recs)=0).
-	// На РАВЕНСТВЕ голосов доверяем чеку: одно случайное «наличка»-прочтение не
-	// должно выкинуть реальный банковский перевод.
-	if cash != nil && cashVotes > len(recs) {
-		return *cash, true, true
+	quorum := n/2 + 1
+	if otherVotes >= quorum {
+		return aiReceipt{Kind: "other"}, false, true
 	}
-	if len(recs) == 0 {
-		return aiReceipt{}, false, anyReachable
+	if len(cashAmounts) >= quorum {
+		// Banknotes can be recognized without knowing their amount. A lone
+		// amount must not turn a cash photo into invented cash income.
+		amount := 0.0
+		counts := map[float64]int{}
+		for _, a := range cashAmounts {
+			counts[a]++
+		}
+		for a, votes := range counts {
+			if votes >= quorum {
+				amount = a
+				break
+			}
+		}
+		return aiReceipt{Kind: "cash", Amount: amount}, true, true
 	}
-
-	pick := pickConsensusReceipt(recs)
+	pick, agreed := verifiedReceipt(recs, quorum)
+	if !agreed {
+		fmt.Printf("Вижн-консенсус (%d чтений): нет согласованного вердикта, оставляю на повтор\n", n)
+		return aiReceipt{}, false, false
+	}
 	fmt.Printf("Вижн-консенсус (%d чтений): выбрана сумма %.0f ₽ (получатель %q)\n", n, pick.Amount, pick.Recipient)
 	return pick, true, true
 }
@@ -1575,13 +1620,25 @@ type aiRetryItem struct {
 }
 
 func (b *Bot) queueAIRetry(it aiRetryItem) {
+	if b.db != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		retry, err := b.db.ScheduleTextReadingRetry(ctx, it.rawID)
+		cancel()
+		if err != nil {
+			fmt.Println("ИИ-доразбор: не удалось сохранить срок повтора:", err)
+		} else if !retry {
+			b.aiRetryMu.Lock()
+			delete(b.aiRetry, it.rawID)
+			b.aiRetryMu.Unlock()
+			return // resolved, disputed or exhausted; the raw message remains visible
+		}
+	}
+	// This is only context (e.g. the adjacent cash photo). Eligibility and
+	// retry timing live in PostgreSQL and survive a process restart.
 	b.aiRetryMu.Lock()
 	defer b.aiRetryMu.Unlock()
 	if b.aiRetry == nil {
 		b.aiRetry = map[int]aiRetryItem{}
-	}
-	if old, ok := b.aiRetry[it.rawID]; ok {
-		it.at, it.attempts = old.at, old.attempts
 	}
 	b.aiRetry[it.rawID] = it
 }
@@ -1601,75 +1658,78 @@ func (b *Bot) textRetryLoop() {
 }
 
 func (b *Bot) retryAIText(ctx context.Context) {
-	// Очередь в памяти теряется при перезапуске бота — добираем из базы тексты,
-	// которые так и не разобрали (ИИ лежал), за последнюю неделю.
-	if ms, err := b.db.UnparsedTextMessagesSince(ctx, time.Now().AddDate(0, 0, -7), 50); err == nil {
+	if b.db == nil {
+		return
+	}
+	messages, err := b.db.DueTextReadingRetries(ctx, time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC), 50)
+	if err != nil {
+		return
+	}
+	for _, m := range messages {
+		fresh := !b.startedAt.IsZero() && !m.ReceivedAt.Before(b.startedAt) && time.Since(m.ReceivedAt) < 2*time.Minute
 		b.aiRetryMu.Lock()
-		if b.aiRetry == nil {
-			b.aiRetry = map[int]aiRetryItem{}
-		}
-		for _, m := range ms {
-			fresh := !b.startedAt.IsZero() && !m.ReceivedAt.Before(b.startedAt) && time.Since(m.ReceivedAt) < 2*time.Minute
-			_, flying := b.aiInFlight[m.ID]
-			// Чтения разошлись и спросить было нельзя — сообщение оставлено для
-			// «пересчитай»; по кругу каждые 3 минуты его не перечитываем.
-			disputed := b.aiDisputed[m.ID] > 0 || m.Disputed
-			if _, ok := b.aiRetry[m.ID]; ok || fresh || flying || disputed {
-				continue // ещё разбирается, уже в очереди или ждёт пересчёта
-			}
-			jid, err := types.ParseJID(m.GroupJID)
-			if err != nil {
-				continue
-			}
-			res := parser.ParseMessage(m.Body)
-			b.aiRetry[m.ID] = aiRetryItem{chat: jid, senderName: m.SenderName, lines: []string{m.Body}, rawID: m.ID,
-				txDate: m.ReceivedAt, paymentLikely: len(res.Transactions) > 0 || parser.LooksMessyPayment(m.Body, res), at: time.Now()}
-		}
+		_, flying := b.aiInFlight[m.ID]
+		// A first conflicting read may deliberately schedule another attempt.
+		// Only the persisted manual-review flag forbids it; the in-memory
+		// disagreement counter also tracks these retryable first conflicts.
+		disputed := m.Disputed
 		b.aiRetryMu.Unlock()
+		if fresh || flying || disputed {
+			continue
+		}
+		// Retry recognition shares the same ordering as messages, edits and
+		// revokes. Reload the row inside that queue before reading any text.
+		done := make(chan struct{})
+		rawID, group := m.ID, m.GroupJID
+		b.enqueueChat(group, func() {
+			defer close(done)
+			if ctx.Err() != nil {
+				return
+			}
+			b.retryOneAIText(ctx, rawID, group)
+		})
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		if b.assistant != nil && b.assistant.LastProblem() != "" {
+			break
+		}
+	}
+}
+
+func (b *Bot) retryOneAIText(ctx context.Context, rawID int, group string) {
+	m, eligible, err := b.db.DueTextReadingRetryByID(ctx, rawID)
+	if err != nil || !eligible || m.GroupJID != group {
+		return
 	}
 	b.aiRetryMu.Lock()
-	var due []aiRetryItem
-	for id, it := range b.aiRetry {
-		if time.Since(it.at) > 7*24*time.Hour {
-			delete(b.aiRetry, id)
-			continue
-		}
-		it.attempts++
-		b.aiRetry[id] = it
-		due = append(due, it)
+	_, flying := b.aiInFlight[rawID]
+	cached, hadContext := b.aiRetry[rawID]
+	if !flying {
+		delete(b.aiRetry, rawID)
 	}
 	b.aiRetryMu.Unlock()
-	if len(due) == 0 {
+	if flying {
 		return
 	}
-	// Только то, что всё ещё не разобрано (не удалено, не записано пересчётом).
-	open := map[int]bool{}
-	if ms, err := b.db.UnparsedTextMessagesSince(ctx, time.Now().AddDate(0, 0, -8), 500); err == nil {
-		for _, m := range ms {
-			open[m.ID] = true
-		}
-	} else {
+	jid, err := types.ParseJID(m.GroupJID)
+	if err != nil {
 		return
 	}
-	sort.Slice(due, func(i, j int) bool { return due[i].rawID < due[j].rawID })
-	for _, it := range due {
-		b.aiRetryMu.Lock()
-		delete(b.aiRetry, it.rawID)
-		b.aiRetryMu.Unlock()
-		if !open[it.rawID] {
-			continue
-		}
-		// Если ИИ всё ещё лежит, разбор сам вернёт сообщение в очередь.
-		b.aiRescueUnparsed(ctx, it.chat, it.senderName, it.lines, it.rawID, it.txDate, it.cashHint, it.paymentLikely)
-		b.aiRetryMu.Lock()
-		if again, ok := b.aiRetry[it.rawID]; ok {
-			again.at, again.attempts = it.at, it.attempts
-			b.aiRetry[it.rawID] = again
-			b.aiRetryMu.Unlock()
-			break // ИИ всё ещё недоступен — остальные подождут следующего круга
-		}
-		b.aiRetryMu.Unlock()
+	res := parser.ParseMessage(m.Body)
+	it := aiRetryItem{chat: jid, senderName: m.SenderName, lines: []string{m.Body}, rawID: m.ID,
+		txDate: m.ReceivedAt, paymentLikely: len(res.Transactions) > 0 || parser.LooksMessyPayment(m.Body, res)}
+	if hadContext && strings.Join(cached.lines, "\n") == m.Body {
+		it.cashHint, it.paymentLikely = cached.cashHint, cached.paymentLikely
 	}
+	// queueAIRetry persists failure timing; a malformed individual message
+	// does not starve readable messages in other chats.
+	b.aiRescueUnparsed(ctx, it.chat, it.senderName, it.lines, it.rawID, it.txDate, it.cashHint, it.paymentLikely)
 }
 
 // aiHealthAlert — ИИ-сервис подряд не отвечает (нет баланса, сбой, лимиты):

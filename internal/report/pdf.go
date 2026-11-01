@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/jung-kurt/gofpdf"
@@ -15,13 +16,14 @@ import (
 // Generate строит PDF-отчёт и сохраняет его по указанному пути.
 // fontDir должен содержать DejaVuSans.ttf и DejaVuSans-Bold.ttf (для кириллицы,
 // т.к. встроенные шрифты gofpdf кириллицу не поддерживают).
-func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath string) error {
+func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath string, notes ...string) error {
 	pdf := gofpdf.New("P", "mm", "A4", fontDir)
 	pdf.AddUTF8Font("DejaVu", "", "DejaVuSans.ttf")
 	pdf.AddUTF8Font("DejaVu", "B", "DejaVuSans-Bold.ttf")
 	pdf.AddPage()
 
 	drawHeaderBanner(pdf, "Финансовый отчёт", "Период: "+periodLabel)
+	drawReportNotes(pdf, notes)
 
 	// ===== Таблица по картам/наличным (сводная) =====
 	cardTotals := map[string]float64{}
@@ -41,13 +43,12 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 
 	cardKeys := sortedKeys(cardTotals)
 	fill := false
-	// Итог = сумма ПОКАЗАННЫХ (округлённых) строк, а не полной суммы, — иначе
-	// при копейках строки не сходились бы с «Итого» на рубль-другой.
+	// Preserve kopecks in every row and in both independent breakdowns.
 	var cardSum float64
 	for _, card := range cardKeys {
-		r := math.RoundToEven(cardTotals[card])
+		r := math.Round(cardTotals[card]*100) / 100
 		drawRow(pdf, []string{card, formatMoney(r)}, []float64{130, 40}, fill)
-		cardSum += r
+		cardSum = math.Round((cardSum+r)*100) / 100
 		fill = !fill
 	}
 	drawTotalRow(pdf, "ИТОГО", formatMoney(cardSum), []float64{130, 40})
@@ -70,9 +71,9 @@ func Generate(summaries []db.ContactSummary, periodLabel, fontDir, outPath strin
 	})
 	var peopleSum float64
 	for _, s := range sortedSummaries {
-		r := math.RoundToEven(s.Total)
+		r := math.Round(s.Total*100) / 100
 		drawRow(pdf, []string{s.CanonicalName, fmt.Sprintf("%d", s.Count), formatMoney(r)}, []float64{90, 40, 40}, fill)
-		peopleSum += r
+		peopleSum = math.Round((peopleSum+r)*100) / 100
 		fill = !fill
 	}
 	drawTotalRow(pdf, "ИТОГО", formatMoney(peopleSum), []float64{130, 40})
@@ -95,13 +96,14 @@ type Section struct {
 // GenerateCustom строит PDF из произвольных секций-таблиц. Первая колонка
 // выравнивается влево, остальные вправо (обычно там числа). Ширины колонок
 // распределяются автоматически по ширине страницы.
-func GenerateCustom(title, subtitle string, sections []Section, fontDir, outPath string) error {
+func GenerateCustom(title, subtitle string, sections []Section, fontDir, outPath string, notes ...string) error {
 	pdf := gofpdf.New("P", "mm", "A4", fontDir)
 	pdf.AddUTF8Font("DejaVu", "", "DejaVuSans.ttf")
 	pdf.AddUTF8Font("DejaVu", "B", "DejaVuSans-Bold.ttf")
 	pdf.AddPage()
 
 	drawHeaderBanner(pdf, title, subtitle)
+	drawReportNotes(pdf, notes)
 
 	for i, sec := range sections {
 		if len(sec.Columns) == 0 {
@@ -129,6 +131,20 @@ func GenerateCustom(title, subtitle string, sections []Section, fontDir, outPath
 	}
 
 	return pdf.OutputFileAndClose(outPath)
+}
+
+func drawReportNotes(pdf *gofpdf.Fpdf, notes []string) {
+	for _, note := range notes {
+		note = strings.TrimSpace(strings.ReplaceAll(note, "⚠️", ""))
+		if note == "" {
+			continue
+		}
+		pdf.SetFont("DejaVu", "", 9)
+		pdf.SetTextColor(135, 65, 15)
+		pdf.MultiCell(0, 4.5, note, "", "L", false)
+		pdf.Ln(3)
+	}
+	pdf.SetTextColor(0, 0, 0)
 }
 
 // drawHeaderBanner рисует тёмную скруглённую шапку с заголовком и бейджем
@@ -252,12 +268,12 @@ func drawTotalRow(pdf *gofpdf.Fpdf, label, total string, widths []float64) {
 }
 
 func formatMoney(v float64) string {
-	// Разбивка на разряды пробелом: 583000 -> "583 000"
-	neg := v < 0
+	minor := int64(math.Round(v * 100))
+	neg := minor < 0
 	if neg {
-		v = -v
+		minor = -minor
 	}
-	s := fmt.Sprintf("%.0f", v)
+	s := fmt.Sprintf("%d", minor/100)
 	var out []byte
 	for i, c := range []byte(s) {
 		if i > 0 && (len(s)-i)%3 == 0 {
@@ -266,6 +282,9 @@ func formatMoney(v float64) string {
 		out = append(out, c)
 	}
 	res := string(out)
+	if cents := minor % 100; cents != 0 {
+		res += fmt.Sprintf(",%02d", cents)
+	}
 	if neg {
 		res = "-" + res
 	}

@@ -52,11 +52,11 @@ func TestR3_01_F1_EditedAnswerAmountOrDecisionIgnored(t *testing.T) {
 		e.ai = aiNamesAndPayments("Магомедов Ахмед")
 		unreadable := "СберБанк\nЧек по операции\nДата операции " + time.Now().Format("02.01.2006") + " 12:10:00" +
 			"\nНомер операции в СБП\n" + e2eID("OP")
-		e.sendReceipt(grp, emp, "Сафаи", unreadable, "")
+		ck := e.sendReceipt(grp, emp, "Сафаи", unreadable, "")
 		e.age(grp.String())
 		e.clarifyTick(ctx)
-		q := e.lastWith("Не смог разобрать")
-		if q.ID == "" {
+		q := e.lastWith("Не разобрал чек")
+		if q.ID == "" || q.Quoted != ck || !strings.Contains(q.Text, "ФИО клиента и сумму") {
 			t.Fatalf("(a) бот не спросил про нечитаемый чек: %+v", e.sent())
 		}
 		ans := groupReply(grp, emp, "Сафаи", "Магомедов Ахмед 150000", q.ID, e.botJID(), q.Text)
@@ -524,8 +524,8 @@ func TestR3_13_EditAnswerAmount(t *testing.T) {
 	ck := e.sendReceipt(grp, emp, "Сафаи", unreadable, "")
 	e.age(grp.String())
 	e.clarifyTick(ctx)
-	q := e.lastWith("Не смог разобрать")
-	if q.ID == "" {
+	q := e.lastWith("Не разобрал чек")
+	if q.ID == "" || q.Quoted != ck || !strings.Contains(q.Text, "ФИО клиента и сумму") {
 		t.Fatalf("нет вопроса: %+v", e.sent())
 	}
 	ans := groupReply(grp, emp, "Сафаи", "Хасанов Ислам 15000", q.ID, e.botJID(), q.Text)
@@ -807,7 +807,7 @@ func TestR3_21_AIDownDeferredLostOnRestart(t *testing.T) {
 	e.aiRetryMu.Unlock()
 	e.assistant = e.fakeAI()
 	e.ai = aiNamesAndPayments("Исаев Харон")
-	e.retryAIText(context.Background())
+	e.retryAITextAfterBackoff(context.Background())
 	e.clarifyTick(context.Background())
 	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
 		t.Errorf("после перезапуска и возврата ИИ «Исаев Харон 10000» так и не записан: %v", got)

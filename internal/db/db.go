@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math"
 	"sort"
 	"strings"
 	"time"
@@ -84,12 +83,21 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return lerr
 	}
 	defer lockConn.Exec(context.Background(), `SELECT pg_advisory_unlock(734200118)`)
+	if _, err := lockConn.Exec(ctx, groupInboxSchema); err != nil {
+		return fmt.Errorf("журнал входящих событий: %w", err)
+	}
+	if _, err := lockConn.Exec(ctx, senderIdentitySchema); err != nil {
+		return fmt.Errorf("привязки отправителей WhatsApp: %w", err)
+	}
+	if _, err := lockConn.Exec(ctx, paymentBatchSchema); err != nil {
+		return fmt.Errorf("журнал сохранённых разборов: %w", err)
+	}
 	// tx_date раньше был DATE (только дата, без времени операции). Теперь
 	// нужно точное время — для отчётов "чеки за такое-то число" и для
 	// детекта дублей. Меняем тип только если он ещё не TIMESTAMPTZ, чтобы
 	// не перезаписывать таблицу на каждом рестарте бота без необходимости.
 	var txDateType string
-	err := pool.QueryRow(ctx, `
+	err := lockConn.QueryRow(ctx, `
 		SELECT data_type FROM information_schema.columns
 		WHERE table_name = 'bank_receipts' AND column_name = 'tx_date'
 	`).Scan(&txDateType)
@@ -97,34 +105,34 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		return fmt.Errorf("проверка типа tx_date: %w", err)
 	}
 	if txDateType != "timestamp with time zone" {
-		if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ALTER COLUMN tx_date TYPE TIMESTAMPTZ USING tx_date::timestamptz`); err != nil {
+		if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ALTER COLUMN tx_date TYPE TIMESTAMPTZ USING tx_date::timestamptz`); err != nil {
 			return fmt.Errorf("миграция tx_date в TIMESTAMPTZ: %w", err)
 		}
 	}
 
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS is_duplicate BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки is_duplicate: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_duplicate ON bank_receipts(is_duplicate)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_duplicate ON bank_receipts(is_duplicate)`); err != nil {
 		return fmt.Errorf("создание индекса is_duplicate: %w", err)
 	}
 
 	// Привязка чека к группе и (для дозагруженных через личку) к отправителю.
 	// Старые строки дозаполняем группой из исходного сообщения.
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS group_jid TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS group_jid TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки group_jid: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS submitted_by TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS submitted_by TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки submitted_by: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		UPDATE bank_receipts br SET group_jid = rm.wa_group_jid
 		FROM raw_messages rm
 		WHERE br.group_jid IS NULL AND rm.id = br.raw_message_id
 	`); err != nil {
 		return fmt.Errorf("дозаполнение group_jid: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_group ON bank_receipts(group_jid)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_bank_receipts_group ON bank_receipts(group_jid)`); err != nil {
 		return fmt.Errorf("создание индекса group_jid: %w", err)
 	}
 
@@ -144,7 +152,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS client_confirmed BOOLEAN NOT NULL DEFAULT false",
 		"ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS clarify_asked BOOLEAN NOT NULL DEFAULT false",
 	} {
-		if _, err := pool.Exec(ctx, col); err != nil {
+		if _, err := lockConn.Exec(ctx, col); err != nil {
 			return fmt.Errorf("добавление колонки чека: %w", err)
 		}
 	}
@@ -152,7 +160,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// Поддержка удалённых сообщений и ручных корректировок: платёж/чек из
 	// удалённого в WhatsApp сообщения исключается из отчётов; ignored —
 	// ручное исключение через ассистента ("не считай тот чек на 5000").
-	if _, err := pool.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS deleted BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки deleted: %w", err)
 	}
 	// Реальный телефон отправителя (в форме <номер>@s.whatsapp.net). При новой
@@ -162,59 +170,59 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// даже когда sender_jid — LID. Пусто/NULL = номер не известен (старые строки,
 	// пересланные ботом копии, надиктованные платежи). sender_jid НЕ трогаем —
 	// на нём держатся ключи спаривания (pending_client_names, cmf_watch и т.п.).
-	if _, err := pool.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS sender_phone TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS sender_phone TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки sender_phone: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.ignored: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS ignored BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки bank_receipts.ignored: %w", err)
 	}
 	// Наличка: кто ФИЗИЧЕСКИ забрал деньги (ответственный). Если не указан —
 	// бот спрашивает «у кого наличка», collector_asked помечает, что уже спросил.
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.collector: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.collector_asked: %w", err)
 	}
 	// Наличка-повтор: та же сумма тому же клиенту за 30 дней может быть случайным
 	// дублем (кто-то скинул одну и ту же наличку дважды). dup_pending — платёж
 	// придержан из сбора, пока владелец не подтвердит «новый»; dup_asked — уже
 	// спросили. У чеков от дублей защищает номер операции, у налички номера нет.
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_pending BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_pending BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.dup_pending: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_asked BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.dup_asked: %w", err)
 	}
 	// id сообщения-вопроса «новый или тот же?» — чтобы ответ владельца привязался
 	// к нужной транзакции ДАЖЕ после перезапуска бота (иначе связь жила только в
 	// памяти и придержанный платёж навсегда выпадал из сбора).
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_ask_msg_id TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dup_ask_msg_id TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.dup_ask_msg_id: %w", err)
 	}
 	// id вопроса «у кого наличка?» — чтобы ответ владельца привязался к наличке
 	// ДАЖЕ после перезапуска бота (связь cashAskMap в памяти теряется).
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_ask_msg_id TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS collector_ask_msg_id TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.collector_ask_msg_id: %w", err)
 	}
 	// id вопроса «чей чек / какая сумма?» — чтобы ответ владельца на вопрос по
 	// чеку нашёл чек ДАЖЕ после перезапуска бота (askMap живёт только в памяти).
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS clarify_ask_msg_id TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS clarify_ask_msg_id TEXT`); err != nil {
 		return fmt.Errorf("добавление колонки bank_receipts.clarify_ask_msg_id: %w", err)
 	}
 	// Свёрнутый чек (экран «Перевод выполнен» без даты/номера/получателя). Помечаем
 	// флагом, чтобы пришедший следом ПОЛНЫЙ чек на ту же сумму мог заменить его
 	// (SupersedeCollapsedReceipt) даже если владелец уже успел привязать к нему
 	// клиента — иначе один платёж посчитался бы дважды.
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS collapsed BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS collapsed BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки bank_receipts.collapsed: %w", err)
 	}
 
 	// Правила пересылки чеков между чатами ("все чеки из X скидывай в Y").
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS forward_rules (
 			id          SERIAL PRIMARY KEY,
 			source      TEXT NOT NULL UNIQUE,
@@ -231,7 +239,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// становится "наблюдением" — бот следит, внесли ли платёж в программу,
 	// и напоминает о забытых. bot_settings — простые настройки (например,
 	// к какой точке относить чеки, не найденные в программе).
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS cmf_watch (
 			id             SERIAL PRIMARY KEY,
 			raw_message_id INT REFERENCES raw_messages(id),
@@ -250,17 +258,17 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	`); err != nil {
 		return fmt.Errorf("создание таблицы cmf_watch: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_status ON cmf_watch(status)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_status ON cmf_watch(status)`); err != nil {
 		return fmt.Errorf("индекс cmf_watch: %w", err)
 	}
 	// Ключ человека у контакта (без регистра/порядка слов) — для склейки.
-	if _, err := pool.Exec(ctx, `ALTER TABLE contacts ADD COLUMN IF NOT EXISTS name_key TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE contacts ADD COLUMN IF NOT EXISTS name_key TEXT`); err != nil {
 		return fmt.Errorf("колонка contacts.name_key: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_contacts_name_key ON contacts(name_key)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_contacts_name_key ON contacts(name_key)`); err != nil {
 		return fmt.Errorf("индекс contacts.name_key: %w", err)
 	}
-	if rows, err := pool.Query(ctx, `SELECT id, canonical_name FROM contacts WHERE name_key IS NULL`); err == nil {
+	if rows, err := lockConn.Query(ctx, `SELECT id, canonical_name FROM contacts WHERE name_key IS NULL`); err == nil {
 		type kv struct {
 			id  int
 			key string
@@ -275,25 +283,25 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		}
 		rows.Close()
 		for _, x := range todo {
-			_, _ = pool.Exec(ctx, `UPDATE contacts SET name_key = $2 WHERE id = $1`, x.id, x.key)
+			_, _ = lockConn.Exec(ctx, `UPDATE contacts SET name_key = $2 WHERE id = $1`, x.id, x.key)
 		}
 	}
 	// Какое сообщение назвало клиента чека (имя после чека): удалят его —
 	// привязку откатываем, чек снова ждёт клиента.
-	if _, err := pool.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS client_source_raw_id INT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS client_source_raw_id INT`); err != nil {
 		return fmt.Errorf("колонка bank_receipts.client_source_raw_id: %w", err)
 	}
 	// id вопроса бота «за кого этот платёж?» — чтобы ответ свайпом на вопрос нашёл
 	// своё наблюдение даже после перезапуска бота.
-	if _, err := pool.Exec(ctx, `ALTER TABLE cmf_watch ADD COLUMN IF NOT EXISTS ask_msg_id TEXT`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE cmf_watch ADD COLUMN IF NOT EXISTS ask_msg_id TEXT`); err != nil {
 		return fmt.Errorf("колонка cmf_watch.ask_msg_id: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_ask ON cmf_watch(ask_msg_id)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_cmf_watch_ask ON cmf_watch(ask_msg_id)`); err != nil {
 		return fmt.Errorf("индекс cmf_watch.ask_msg_id: %w", err)
 	}
 	// Все сообщения бота по наблюдению (вопрос, переспросы, «как в прошлый раз»):
 	// свайп на ЛЮБОЕ из них — ответ по этому чеку.
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS cmf_watch_asks (
 			ask_msg_id TEXT NOT NULL,
 			watch_id   INT NOT NULL,
@@ -308,11 +316,11 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		`ALTER TABLE cmf_watch_asks ADD COLUMN IF NOT EXISTS options TEXT`,
 		`CREATE UNIQUE INDEX IF NOT EXISTS idx_cmf_watch_asks_pair ON cmf_watch_asks(ask_msg_id, watch_id)`,
 	} {
-		if _, err := pool.Exec(ctx, q); err != nil {
+		if _, err := lockConn.Exec(ctx, q); err != nil {
 			return fmt.Errorf("cmf_watch_asks: %w", err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS bot_settings (
 			key   TEXT PRIMARY KEY,
 			value TEXT NOT NULL
@@ -324,7 +332,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// Память номеров: телефон (кто прислал чек) -> имя ответственного,
 	// который "забрал" деньги. Редактируется владельцем через чат и
 	// переживает рестарты.
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS phone_owners (
 			phone      TEXT PRIMARY KEY,
 			name       TEXT NOT NULL,
@@ -339,7 +347,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// перезапуск, а порядок выдачи идёт по времени сообщения WhatsApp (received_at),
 	// а не по времени обработки, поэтому FIFO чек↔имя не зависит от того, какая
 	// горутина/OCR закончилась первой. Съеденные/протухшие записи чистит уборщик.
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS pending_client_names (
 			id             SERIAL PRIMARY KEY,
 			group_jid      TEXT NOT NULL,
@@ -355,7 +363,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	`); err != nil {
 		return fmt.Errorf("создание таблицы pending_client_names: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_pending_names_queue
 		ON pending_client_names (group_jid, sender_jid, received_at)
 		WHERE consumed = false
@@ -367,7 +375,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// еженедельно) задания. Переживают рестарт; выполнение идемпотентно (задание
 	// «сдвигается» на следующий срок атомарно перед отправкой, поэтому после
 	// перезапуска одно и то же не уходит дважды).
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS scheduled_jobs (
 			id           SERIAL PRIMARY KEY,
 			created_by   TEXT NOT NULL,
@@ -387,7 +395,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	`); err != nil {
 		return fmt.Errorf("создание таблицы scheduled_jobs: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_scheduled_jobs_due
 		ON scheduled_jobs (next_run_at) WHERE active = true
 	`); err != nil {
@@ -404,11 +412,11 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ`,
 		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS last_recognition_error TEXT`,
 	} {
-		if _, err := pool.Exec(ctx, ddl); err != nil {
+		if _, err := lockConn.Exec(ctx, ddl); err != nil {
 			return fmt.Errorf("миграция recognition-полей чеков: %w", err)
 		}
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE INDEX IF NOT EXISTS idx_receipts_retry
 		ON bank_receipts (next_retry_at) WHERE recognition_status = 'pending'
 	`); err != nil {
@@ -419,10 +427,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// (а не переписанный текстом чек), чтобы отчёты считали их в сбор. Флаг
 	// проставляется при вставке; для уже накопленных данных — разовый backfill
 	// по тексту сообщения (наличка/нал/кэш/офис/«у ‹имя›») и по card_to.
-	if _, err := pool.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_cash BOOLEAN NOT NULL DEFAULT false`); err != nil {
+	if _, err := lockConn.Exec(ctx, `ALTER TABLE transactions ADD COLUMN IF NOT EXISTS is_cash BOOLEAN NOT NULL DEFAULT false`); err != nil {
 		return fmt.Errorf("добавление колонки transactions.is_cash: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		UPDATE transactions t SET is_cash = true
 		FROM raw_messages rm
 		WHERE rm.id = t.raw_message_id
@@ -439,7 +447,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// каждом рестарте контейнера — бот «забывал» разговор. Теперь пишем в БД,
 	// поэтому память переживает перезапуски. Ключ chat_key — JID отправителя
 	// (личка) или JID группы (обращение по имени в группе).
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS assistant_history (
 			id         BIGSERIAL PRIMARY KEY,
 			chat_key   TEXT NOT NULL,
@@ -450,13 +458,13 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	`); err != nil {
 		return fmt.Errorf("создание таблицы assistant_history: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_assistant_history_key ON assistant_history(chat_key, id)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_assistant_history_key ON assistant_history(chat_key, id)`); err != nil {
 		return fmt.Errorf("индекс assistant_history: %w", err)
 	}
 
 	// Расходы: владелец пишет «сделал расход 5000 на бензин» — бот записывает
 	// сюда; по запросу «скинь мои расходы» строит PDF. Отдельно от сбора.
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS expenses (
 			id         SERIAL PRIMARY KEY,
 			amount     NUMERIC NOT NULL,
@@ -468,7 +476,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	`); err != nil {
 		return fmt.Errorf("создание таблицы expenses: %w", err)
 	}
-	if _, err := pool.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_expenses_spent_at ON expenses(spent_at)`); err != nil {
+	if _, err := lockConn.Exec(ctx, `CREATE INDEX IF NOT EXISTS idx_expenses_spent_at ON expenses(spent_at)`); err != nil {
 		return fmt.Errorf("индекс expenses: %w", err)
 	}
 
@@ -477,7 +485,7 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	// Снимаем флаг с чеков, у которых нет оригинала в ТОЙ ЖЕ группе.
 	// Идемпотентно: у настоящих внутригрупповых дублей оригинал есть, флаг
 	// остаётся. Запускается при каждом старте, на малых объёмах это дёшево.
-	if _, err := pool.Exec(ctx, `
+	if _, err := lockConn.Exec(ctx, `
 		UPDATE bank_receipts br SET is_duplicate = false
 		WHERE br.is_duplicate = true
 		  AND NOT EXISTS (
@@ -516,6 +524,10 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		// истории, пересчёт, болтовня с цифрой, группа на «молчи»): фоновый
 		// повтор его не перечитывает и после перезапуска — только «пересчитай».
 		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS ai_disputed BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS text_attempts INT NOT NULL DEFAULT 0`,
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS text_next_at TIMESTAMPTZ`,
+		`ALTER TABLE raw_messages ADD COLUMN IF NOT EXISTS cash_hint BOOLEAN NOT NULL DEFAULT false`,
+		`ALTER TABLE bank_receipts ADD COLUMN IF NOT EXISTS recognition_provisional BOOLEAN NOT NULL DEFAULT false`,
 		// Поправки суммы «не 5000 а 6000»: удалят/изменят поправку — откатим.
 		`CREATE TABLE IF NOT EXISTS amount_corrections (
 			id SERIAL PRIMARY KEY,
@@ -619,9 +631,12 @@ func runMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 		`CREATE TRIGGER trg_mirror_forward_copies AFTER UPDATE ON bank_receipts
 			FOR EACH ROW WHEN (OLD.* IS DISTINCT FROM NEW.*) EXECUTE FUNCTION mirror_forward_copies()`,
 	} {
-		if _, err := pool.Exec(ctx, q); err != nil {
+		if _, err := lockConn.Exec(ctx, q); err != nil {
 			return fmt.Errorf("миграция (%s…): %w", strings.Fields(q)[0]+" "+strings.Fields(q)[1], err)
 		}
+	}
+	if _, err := pool.Exec(ctx, senderIdentityBackfillSQL); err != nil {
+		return fmt.Errorf("восстановление известных отправителей: %w", err)
 	}
 	return nil
 }
@@ -743,7 +758,9 @@ func (d *DB) DueMediaRetries(ctx context.Context, limit int) ([]MediaRetry, erro
 		FROM raw_messages rm
 		WHERE rm.has_media AND NOT rm.parsed AND NOT COALESCE(rm.deleted, false)
 		  AND COALESCE(rm.wa_group_jid, '') LIKE '%@g.us' AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
-		  AND rm.received_at >= now() - interval '7 days' AND rm.received_at < now() - interval '3 minutes'
+		  AND rm.received_at < now() - interval '3 minutes'
+          AND rm.handled_as IS NULL
+          AND NOT EXISTS (SELECT 1 FROM group_inbox gi WHERE gi.wa_message_id=rm.wa_message_id AND gi.group_jid=rm.wa_group_jid AND gi.state='processing' AND gi.lease_until>now())
 		  AND (rm.media_next_at IS NULL OR rm.media_next_at <= now()) AND rm.media_attempts < 8
 		  AND (COALESCE(rm.media_path, '') <> '' OR rm.media_proto IS NOT NULL)
 		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
@@ -1244,6 +1261,9 @@ func (d *DB) contactName(ctx context.Context, contactID int) string {
 }
 
 func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
+	if !validMoneyValue(tx.Amount, false) {
+		return fmt.Errorf("сумма платежа должна быть положительной и содержать не больше двух знаков после запятой")
+	}
 	dupPending := false
 	if tx.IsCash && tx.DupCheck && tx.ContactID != 0 && tx.Amount > 0 {
 		// Есть ли уже засчитанная наличка тому же клиенту (или то же имя с
@@ -1258,7 +1278,10 @@ func (d *DB) InsertTransaction(ctx context.Context, tx TransactionInput) error {
 		if name := d.contactName(ctx, tx.ContactID); !cashPlaceholder(name) {
 			_, held, err := d.cashRepeatPrev(ctx, cashRepeatProbe{ContactID: tx.ContactID, Name: name,
 				Amount: tx.Amount, TxDate: tx.TxDate, RawID: tx.RawMessageID})
-			dupPending = held && err == nil // при ошибке не придерживаем — лучше засчитать, чем потерять
+			if err != nil {
+				return err
+			}
+			dupPending = held
 		}
 	}
 	_, err := d.pool.Exec(ctx, `
@@ -1513,7 +1536,7 @@ func (d *DB) MarkLatestPaymentCash(ctx context.Context, groupJID, senderJID stri
 		UPDATE transactions t SET is_cash = true
 		FROM raw_messages rm
 		WHERE rm.id = t.raw_message_id
-		  AND rm.sender_jid = $1
+		  AND `+senderIdentitySQL("rm.sender_jid", "$1")+`
 		  AND rm.wa_group_jid = $2
 		  AND t.is_cash = false
 		  AND t.ignored = false
@@ -1521,7 +1544,7 @@ func (d *DB) MarkLatestPaymentCash(ctx context.Context, groupJID, senderJID stri
 		  AND t.id = (
 			SELECT t2.id FROM transactions t2
 			JOIN raw_messages rm2 ON rm2.id = t2.raw_message_id
-			WHERE rm2.sender_jid = $1 AND rm2.wa_group_jid = $2
+			WHERE `+senderIdentitySQL("rm2.sender_jid", "$1")+` AND rm2.wa_group_jid = $2
 			  AND t2.is_cash = false AND t2.ignored = false AND rm2.received_at >= $3
 			  AND NOT EXISTS (
 				SELECT 1 FROM bank_receipts brd
@@ -1581,6 +1604,9 @@ type BankReceiptInput struct {
 }
 
 func (d *DB) InsertBankReceipt(ctx context.Context, r BankReceiptInput) error {
+	if !validMoneyValue(r.Amount, true) || !validMoneyValue(r.Commission, true) {
+		return fmt.Errorf("неверная сумма или комиссия чека")
+	}
 	_, err := d.pool.Exec(ctx, `
 		INSERT INTO bank_receipts
 			(raw_message_id, bank, recipient_raw, recipient_bank, recipient_phone, sender_raw, sender_bank, sender_account,
@@ -1652,7 +1678,7 @@ func (d *DB) SupersedeCollapsedReceipt(ctx context.Context, groupJID, senderJID 
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.amount = $3::numeric
 		  AND br.collapsed = true
 		  AND br.is_duplicate = false AND br.ignored = false
@@ -1739,7 +1765,7 @@ func (d *DB) CountedCheckOfCollapsedScreen(ctx context.Context, groupJID, sender
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.amount = $3::numeric
 		  AND br.collapsed = false AND br.tx_time_guessed = false
 		  AND br.is_duplicate = false AND br.ignored = false AND br.needs_review = false
@@ -1860,7 +1886,7 @@ func (d *DB) UnconfirmedReceiptsOrdered(ctx context.Context, groupJID string, ol
 func (d *DB) RecentSenderTexts(ctx context.Context, groupJID, senderJID string, since time.Time, limit int) ([]string, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT body FROM raw_messages
-		WHERE wa_group_jid = $1 AND sender_jid = $2
+		WHERE wa_group_jid = $1 AND `+senderIdentitySQL("sender_jid", "$2")+`
 		  AND received_at >= $3 AND COALESCE(deleted, false) = false
 		  AND COALESCE(body, '') <> ''
 		  -- Только текстовые сообщения: подпись к фото/OCR-текст чека — не ФИО клиента.
@@ -2132,7 +2158,7 @@ func (d *DB) ClientAlreadyAttributedFrom(ctx context.Context, groupJID, senderJI
 			SELECT 1 FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-			  AND rm.sender_jid = $2
+			  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 			  AND br.contact_id = $3
 			  AND COALESCE(rm.wa_message_id, '') <> $4
 			  AND rm.received_at >= $5
@@ -2154,11 +2180,11 @@ func (d *DB) ClientChecksOfAmountFrom(ctx context.Context, groupJID, senderJID s
 		SELECT count(*) FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.contact_id = $3
 		  AND COALESCE(rm.wa_message_id, '') <> $4
 		  AND rm.received_at >= $5
-		  AND abs(br.amount - $6::float8) < 1
+		  AND abs(br.amount - $6::float8) < 0.005
 		  AND br.is_duplicate = false AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
 	`, groupJID, senderJID, contactID, exceptWaMessageID, since, amount).Scan(&n)
@@ -2889,7 +2915,7 @@ func (d *DB) CorrTargetsOfMessage(ctx context.Context, waID string) ([]CorrTarge
 // CorrTargetsFromSender — свежие платежи сотрудника на сумму amount (поправка
 // без свайпа).
 func (d *DB) CorrTargetsFromSender(ctx context.Context, groupJID, senderJID string, amount float64, since time.Time) ([]CorrTarget, error) {
-	rows, err := d.pool.Query(ctx, corrTargetsSQL+`WHERE x.g = $1 AND x.snd = $2 AND abs(x.amount - $3) < 1 AND x.at >= $4 ORDER BY x.at DESC`,
+	rows, err := d.pool.Query(ctx, corrTargetsSQL+`WHERE x.g = $1 AND x.snd = $2 AND abs(x.amount - $3) < 0.005 AND x.at >= $4 ORDER BY x.at DESC`,
 		groupJID, senderJID, amount, since)
 	if err != nil {
 		return nil, err
@@ -2899,6 +2925,9 @@ func (d *DB) CorrTargetsFromSender(ctx context.Context, groupJID, senderJID stri
 
 // SetReceiptAmount — поправить сумму чека (сверка ждёт новую сумму).
 func (d *DB) SetReceiptAmount(ctx context.Context, receiptID int, amount float64) error {
+	if !validMoneyValue(amount, false) {
+		return fmt.Errorf("неверная сумма чека")
+	}
 	if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET amount = $2::numeric WHERE id = $1`, receiptID, amount); err != nil {
 		return err
 	}
@@ -3263,36 +3292,9 @@ func (d *DB) CarryOverEditedTx(ctx context.Context, rawID int, old []TxState) er
 	if err != nil {
 		return err
 	}
-	used := map[int]bool{}
-	pair := func(n TxState) (TxState, bool) {
-		// Сначала тот же клиент и сумма, потом тот же клиент, потом по порядку.
-		for _, pass := range []int{0, 1, 2} {
-			for i, o := range old {
-				if used[i] {
-					continue
-				}
-				switch pass {
-				case 0:
-					if o.ContactID != n.ContactID && o.RawName != n.RawName || math.Abs(o.Amount-n.Amount) >= 1 {
-						continue
-					}
-				case 1:
-					if o.ContactID != n.ContactID && o.RawName != n.RawName {
-						continue
-					}
-				case 2:
-					if len(old) != len(cur) {
-						continue
-					}
-				}
-				used[i] = true
-				return o, true
-			}
-		}
-		return TxState{}, false
-	}
+	matched := matchEditedTxStates(old, cur)
 	for _, n := range cur {
-		o, ok := pair(n)
+		o, ok := matched[n.ID]
 		if !ok {
 			continue
 		}
@@ -3311,7 +3313,7 @@ func (d *DB) CarryOverEditedTx(ctx context.Context, rawID int, old []TxState) er
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1`, n.ID, corrNew)
 			n.Amount = corrNew
 		}
-		if o.DupDecided && n.Cash && n.ContactID == o.ContactID && math.Abs(n.Amount-o.Amount) < 1 {
+		if o.DupDecided && n.Cash && n.ContactID == o.ContactID && sameMoneyCents(n.Amount, o.Amount) {
 			_, _ = d.pool.Exec(ctx, `UPDATE transactions SET dup_pending = false, dup_asked = true WHERE id = $1`, n.ID)
 		}
 	}
@@ -3369,20 +3371,20 @@ func (d *DB) carryCorrections(ctx context.Context, oldID, newID int, cur, amount
 		switch {
 		case c.follow:
 			base -= c.new - c.old
-		case math.Abs(base-c.new) < 0.01:
+		case sameMoneyCents(base, c.new):
 			base = c.old
 		default:
 			known = false // сумму с тех пор меняли иначе — по цепочке
 		}
 	}
-	if known && math.Abs(base-amount) < 0.01 {
-		return cur, math.Abs(cur-amount) >= 0.01
+	if known && sameMoneyCents(base, amount) {
+		return cur, !sameMoneyCents(cur, amount)
 	}
 	changed, last := false, 0
 	for {
 		pick := -1
 		for i, c := range cs {
-			if !c.follow && c.id > last && math.Abs(c.old-amount) < 0.01 {
+			if !c.follow && c.id > last && sameMoneyCents(c.old, amount) {
 				pick = i // по возрастанию id: последняя подходящая
 			}
 		}
@@ -3584,7 +3586,7 @@ func (d *DB) PrepareMessageEdit(ctx context.Context, rawID int, body string) (Ed
 	}
 	d.releaseMessageLinks(ctx, rawID)
 	_, err = d.pool.Exec(ctx, `
-		UPDATE raw_messages SET body = $2, edit_count = edit_count + 1, ai_disputed = false,
+		UPDATE raw_messages SET body = $2, edit_count = edit_count + 1, ai_disputed = false, text_attempts=0, text_next_at=NULL, cash_hint=false,
 			parsed = CASE WHEN handled_as IS NULL THEN false ELSE true END
 		WHERE id = $1`, rawID, body)
 	return u, err
@@ -3726,14 +3728,14 @@ func (d *DB) RevertCorrections(ctx context.Context, rawID int) ([]CorrectionRef,
 		}
 		switch c.Kind {
 		case "tx":
-			tag, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.01`, c.TargetID, c.Old, c.New)
+			tag, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.005`, c.TargetID, c.Old, c.New)
 			if err != nil {
 				return out, err
 			}
 			partsBack = partsBack || tag.RowsAffected() > 0
 			_ = d.RecheckCashRepeat(ctx, c.TargetID)
 		case "receipt":
-			tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.01`, c.TargetID, c.Old, c.New)
+			tag, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET amount = $2 WHERE id = $1 AND abs(amount - $3) < 0.005`, c.TargetID, c.Old, c.New)
 			if err != nil {
 				return out, err
 			}
@@ -3856,8 +3858,8 @@ func (d *DB) LatestTxFromSenderWithAmount(ctx context.Context, groupJID, senderJ
 	err := d.pool.QueryRow(ctx, `
 		SELECT t.id, COALESCE(t.raw_name,''), t.amount::float8 FROM transactions t
 		JOIN raw_messages rm ON rm.id = t.raw_message_id
-		WHERE rm.wa_group_jid = $1 AND rm.sender_jid = $2 AND t.ignored = false
-		  AND COALESCE(rm.deleted, false) = false AND abs(t.amount - $3) < 1 AND t.created_at >= $4
+		WHERE rm.wa_group_jid = $1 AND `+senderIdentitySQL("rm.sender_jid", "$2")+` AND t.ignored = false
+		  AND COALESCE(rm.deleted, false) = false AND abs(t.amount - $3) < 0.005 AND t.created_at >= $4
 		ORDER BY t.created_at DESC LIMIT 1`, groupJID, senderJID, amount, since).Scan(&r.ID, &r.Name, &r.Amount)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return r, nil
@@ -3871,6 +3873,9 @@ func (d *DB) LatestTxFromSenderWithAmount(ctx context.Context, groupJID, senderJ
 
 // SetTxAmount — поправить сумму платежа.
 func (d *DB) SetTxAmount(ctx context.Context, txID int, amount float64) error {
+	if !validMoneyValue(amount, false) {
+		return fmt.Errorf("неверная сумма платежа")
+	}
 	_, err := d.pool.Exec(ctx, `UPDATE transactions SET amount = $2 WHERE id = $1`, txID, amount)
 	return err
 }
@@ -3884,7 +3889,6 @@ func (d *DB) UnparsedTextMessagesSince(ctx context.Context, since time.Time, lim
 		WHERE rm.parsed = false AND rm.has_media = false AND rm.deleted = false AND rm.handled_as IS NULL
 		  AND COALESCE(rm.body, '') <> '' AND rm.received_at >= $1
 		  AND COALESCE(rm.wa_group_jid, '') LIKE '%@g.us'
-		  AND NOT EXISTS (SELECT 1 FROM transactions t WHERE t.raw_message_id = rm.id AND t.ignored = false)
 		ORDER BY rm.received_at
 		LIMIT $2`, since, limit)
 	if err != nil {
@@ -4100,7 +4104,7 @@ func (d *DB) SimilarPayment(ctx context.Context, groupJID string, contactID int,
 			FROM transactions t
 			JOIN raw_messages rm ON rm.id = t.raw_message_id
 			LEFT JOIN contacts c ON c.id = t.contact_id
-			WHERE t.contact_id = $2 AND abs(t.amount - $3) < 1 AND t.ignored = false
+			WHERE t.contact_id = $2 AND abs(t.amount - $3) < 0.005 AND t.ignored = false
 			  AND COALESCE(rm.deleted, false) = false AND rm.wa_group_jid = $1
 			  AND t.is_cash = $5
 			  AND t.tx_date::timestamptz BETWEEN $4::timestamptz - make_interval(days => $6) AND $4::timestamptz + make_interval(days => $6)
@@ -4109,7 +4113,7 @@ func (d *DB) SimilarPayment(ctx context.Context, groupJID string, contactID int,
 			FROM bank_receipts br
 			LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 			LEFT JOIN contacts c ON c.id = br.contact_id
-			WHERE NOT $5 AND br.contact_id = $2 AND abs(br.amount - $3) < 1
+			WHERE NOT $5 AND br.contact_id = $2 AND abs(br.amount - $3) < 0.005
 			  AND br.ignored = false AND br.is_duplicate = false AND COALESCE(rm.deleted, false) = false
 			  AND br.group_jid = $1
 			  AND br.tx_date BETWEEN $4::timestamptz - interval '2 days' AND $4::timestamptz + interval '2 days'
@@ -4284,7 +4288,7 @@ func (d *DB) HasUnconfirmedReceiptFrom(ctx context.Context, groupJID, senderJID 
 		SELECT 1 FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
@@ -4304,7 +4308,7 @@ func (d *DB) UnconfirmedReceiptAmountsFrom(ctx context.Context, groupJID, sender
 		SELECT br.amount::float8 FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
@@ -4336,7 +4340,7 @@ func (d *DB) IgnoreTextTxOfRaw(ctx context.Context, rawID int, amounts []float64
 	tag, err := d.pool.Exec(ctx, `
 		UPDATE transactions SET ignored = true, dup_same_as = NULL
 		WHERE raw_message_id = $1 AND ignored = false AND is_cash = false
-		  AND EXISTS (SELECT 1 FROM unnest($2::float8[]) a WHERE abs(transactions.amount - a) < 1)`, rawID, amounts)
+		  AND EXISTS (SELECT 1 FROM unnest($2::float8[]) a WHERE abs(transactions.amount - a) < 0.005)`, rawID, amounts)
 	if err != nil {
 		return 0, err
 	}
@@ -4380,7 +4384,7 @@ func (d *DB) UnconfirmedReceiptCardsFrom(ctx context.Context, groupJID, senderJI
 		SELECT br.amount::float8, COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), '') FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
@@ -4413,12 +4417,12 @@ func (d *DB) ConfirmedReceiptCountFrom(ctx context.Context, groupJID, senderJID 
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = true
 		  AND br.is_duplicate = false AND br.ignored = false
 		  AND COALESCE(rm.deleted, false) = false
-		  AND abs(br.amount - $5::float8) < 1
+		  AND abs(br.amount - $5::float8) < 0.005
 		  AND (lower(c.canonical_name) = lower($4) OR lower(br.recipient_raw) = lower($4))
 		  AND COALESCE(br.client_source_raw_id, 0) <> $6
 	`, groupJID, senderJID, since, name, amount, exceptSourceRaw).Scan(&n)
@@ -4450,7 +4454,7 @@ func (d *DB) OldestUnconfirmedReceiptCard(ctx context.Context, groupJID, senderJ
 		SELECT br.amount::float8, COALESCE(NULLIF(br.card_owner, ''), NULLIF(br.recipient_raw, ''), '') FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-		  AND rm.sender_jid = $2
+		  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND br.created_at >= $3::timestamptz
 		  AND br.client_confirmed = false
 		  AND br.is_duplicate = false AND br.ignored = false
@@ -4502,7 +4506,7 @@ func (d *DB) ReattributeOldestUnconfirmedReceiptFrom(ctx context.Context, groupJ
 			SELECT br.id FROM bank_receipts br
 			JOIN raw_messages rm ON rm.id = br.raw_message_id
 			WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1
-			  AND rm.sender_jid = $2
+			  AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 			  -- Окно (право на спаривание) — по времени ПОЯВЛЕНИЯ строки (created_at):
 			  -- при офлайн-догрузке пачка чеков с ОЧЕНЬ старым временем сообщения всё
 			  -- равно только что вставлена и должна париться. Порядок FIFO — по
@@ -4511,7 +4515,7 @@ func (d *DB) ReattributeOldestUnconfirmedReceiptFrom(ctx context.Context, groupJ
 			  AND br.client_confirmed = false
 			  AND br.is_duplicate = false AND br.ignored = false
 			  AND COALESCE(rm.deleted, false) = false
-			  AND ($7::float8 <= 0 OR abs(br.amount - $7::float8) < 1)
+			  AND ($7::float8 <= 0 OR abs(br.amount - $7::float8) < 0.005)
 			ORDER BY rm.received_at ASC, br.id ASC
 			LIMIT 1
 		)
@@ -4584,7 +4588,7 @@ func (d *DB) EnqueuePendingName(ctx context.Context, groupJID, senderJID, name s
 		UPDATE pending_client_names SET consumed = true, consumed_at = now()
 		WHERE id IN (
 			SELECT id FROM pending_client_names
-			WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false
+			WHERE group_jid = $1 AND `+senderIdentitySQL("sender_jid", "$2")+` AND consumed = false
 			ORDER BY received_at DESC, id DESC OFFSET 20
 		)
 	`, groupJID, senderJID)
@@ -4624,9 +4628,9 @@ func (d *DB) TakePendingNameFor(ctx context.Context, groupJID, senderJID string,
 		UPDATE pending_client_names SET consumed = true, consumed_at = now()
 		WHERE id = (
 			SELECT pn.id FROM pending_client_names pn
-			WHERE pn.group_jid = $1 AND pn.sender_jid = $2 AND pn.consumed = false
+			WHERE pn.group_jid = $1 AND `+senderIdentitySQL("pn.sender_jid", "$2")+` AND pn.consumed = false
 			  AND pn.created_at >= $3::timestamptz
-			  AND (pn.amount = 0 OR ($4::float8 > 0 AND abs(pn.amount - $4::float8) < 1))
+			  AND (pn.amount = 0 OR ($4::float8 > 0 AND abs(pn.amount - $4::float8) < 0.005))
 			  AND NOT EXISTS (SELECT 1 FROM raw_messages rm WHERE rm.id = pn.raw_message_id AND rm.deleted)
 			ORDER BY pn.received_at ASC, pn.id ASC
 			FOR UPDATE SKIP LOCKED
@@ -4650,7 +4654,7 @@ func (d *DB) TakePendingNameFor(ctx context.Context, groupJID, senderJID string,
 func (d *DB) PendingNamesOf(ctx context.Context, groupJID, senderJID string, since time.Time) ([]PendingName, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, name, amount, COALESCE(raw_message_id, 0) FROM pending_client_names
-		WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false AND created_at >= $3::timestamptz
+		WHERE group_jid = $1 AND `+senderIdentitySQL("sender_jid", "$2")+` AND consumed = false AND created_at >= $3::timestamptz
 		ORDER BY received_at ASC, id ASC`, groupJID, senderJID, since)
 	if err != nil {
 		return nil, err
@@ -4687,7 +4691,7 @@ func (d *DB) takePendingName(ctx context.Context, groupJID, senderJID string, si
 		UPDATE pending_client_names SET consumed = true, consumed_at = now()
 		WHERE id = (
 			SELECT id FROM pending_client_names
-			WHERE group_jid = $1 AND sender_jid = $2 AND consumed = false
+			WHERE group_jid = $1 AND `+senderIdentitySQL("sender_jid", "$2")+` AND consumed = false
 			  AND created_at >= $3::timestamptz `+amountCond+`
 			ORDER BY received_at ASC, id ASC
 			FOR UPDATE SKIP LOCKED
@@ -5637,7 +5641,7 @@ func (d *DB) OpenWatchesForClientAmount(ctx context.Context, clientID string, am
 		       COALESCE(rm.wa_message_id, '')
 		FROM cmf_watch cw
 		LEFT JOIN raw_messages rm ON rm.id = cw.raw_message_id
-		WHERE cw.client_id = $1 AND abs(cw.amount - $2) < 1 AND cw.status IN ('watch', 'reminded')
+		WHERE cw.client_id = $1 AND abs(cw.amount - $2) < 0.005 AND cw.status IN ('watch', 'reminded')
 		  AND NOT COALESCE(rm.deleted, false)
 		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = cw.raw_message_id
 		                  AND (br.ignored OR br.is_duplicate))
@@ -5883,7 +5887,7 @@ func (d *DB) UnnamedReceiptOfSenderBefore(ctx context.Context, groupJID, senderJ
 	var wa string
 	err := d.pool.QueryRow(ctx, `
 		SELECT rm.wa_message_id FROM bank_receipts br JOIN raw_messages rm ON rm.id = br.raw_message_id
-		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1 AND rm.sender_jid = $2
+		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1 AND `+senderIdentitySQL("rm.sender_jid", "$2")+`
 		  AND rm.received_at <= $3 AND rm.received_at >= $3::timestamptz - make_interval(secs => $4)
 		  AND br.client_confirmed = false AND br.is_duplicate = false AND br.ignored = false
 		  AND NOT COALESCE(rm.deleted, false)
@@ -5898,7 +5902,7 @@ func (d *DB) UnnamedReceiptOfSenderBefore(ctx context.Context, groupJID, senderJ
 func (d *DB) SenderTextsBefore(ctx context.Context, groupJID, senderJID string, at time.Time, window time.Duration) ([]string, error) {
 	rows, err := d.pool.Query(ctx, `
 		SELECT COALESCE(body, '') FROM raw_messages
-		WHERE wa_group_jid = $1 AND sender_jid = $2 AND has_media = false AND handled_as IS NULL
+		WHERE wa_group_jid = $1 AND `+senderIdentitySQL("sender_jid", "$2")+` AND has_media = false AND handled_as IS NULL
 		  AND NOT COALESCE(deleted, false) AND received_at < $3 AND received_at >= $3::timestamptz - make_interval(secs => $4)
 		ORDER BY received_at DESC LIMIT 3`, groupJID, senderJID, at, int(window.Seconds()))
 	if err != nil {
@@ -6081,7 +6085,7 @@ func (d *DB) TestCmfWatchState(ctx context.Context, waID string) (status, client
 func (d *DB) TestResetAll(ctx context.Context) error {
 	_, err := d.pool.Exec(ctx, `TRUNCATE transactions, bank_receipts, raw_messages, pending_client_names,
 		cmf_watch, cmf_watch_asks, contacts, contact_aliases, expenses, forward_rules, phone_owners,
-		scheduled_jobs, assistant_history, bot_settings, amount_corrections RESTART IDENTITY CASCADE`)
+		scheduled_jobs, assistant_history, bot_settings, amount_corrections, group_inbox, whatsapp_sender_aliases RESTART IDENTITY CASCADE`)
 	return err
 }
 
@@ -6216,7 +6220,7 @@ func (d *DB) LatestNonameWatch(ctx context.Context, groupJID, senderJID string, 
 	var id int
 	err := d.pool.QueryRow(ctx, `
 		SELECT id FROM cmf_watch
-		WHERE group_jid = $1 AND sender_jid = $2 AND status = 'noname' AND created_at > $3
+		WHERE group_jid = $1 AND `+senderIdentitySQL("sender_jid", "$2")+` AND status = 'noname' AND created_at > $3
 		ORDER BY created_at DESC
 		LIMIT 1
 	`, groupJID, senderJID, since).Scan(&id)

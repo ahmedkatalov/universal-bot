@@ -124,8 +124,8 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 				return "", fmt.Errorf("не удалось разобрать аргументы: %w", err)
 			}
 			client := strings.TrimSpace(args.Client)
-			if client == "" || args.Amount <= 0 {
-				return "", fmt.Errorf("нужны и клиент, и сумма (>0)")
+			if client == "" || !validExtractedMoney(args.Amount, false) {
+				return "", fmt.Errorf("нужны ФИО клиента и положительная сумма с точностью до копейки")
 			}
 
 			// Группа: указана -> используем; ЗАПОМИНАЕМ как рабочую только при
@@ -181,16 +181,16 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 			// дней, перевод с чеком) — не записываем молча второй раз.
 			if !args.Confirm {
 				if prev, found, err := b.db.SimilarPayment(ctx, groupJID, contactID, args.Amount, txDate, isCash); err == nil && found {
-					return fmt.Sprintf("ПОХОЖЕ НА ПОВТОР: уже есть %s — %.0f ₽ (%s, %s). Не записал. Спроси владельца: "+
+					return fmt.Sprintf("ПОХОЖЕ НА ПОВТОР: уже есть %s — %s ₽ (%s, %s). Не записал. Спроси владельца: "+
 						"это тот же платёж или отдельный? Если отдельный — вызови record_payment ещё раз с confirm_duplicate=true.",
-						prev.Name, prev.Amount, prev.Kind, prev.When.Format("02.01.2006")), nil
+						prev.Name, moneyText(prev.Amount), prev.Kind, prev.When.Format("02.01.2006")), nil
 				}
 			}
 
 			// Синтетическое сырое сообщение, чтобы платёж лёг в нужную группу и
 			// «кто собрал» засчитался ответственному (по sender_name).
 			waMsgID := fmt.Sprintf("dictated-%d", time.Now().UnixNano())
-			body := fmt.Sprintf("%s %.0f", client, args.Amount)
+			body := fmt.Sprintf("%s %s", client, moneyText(args.Amount))
 			if isCash {
 				body += " наличка"
 			}
@@ -233,7 +233,7 @@ func (b *Bot) recordPaymentTool() ai.Tool {
 					groupName = name
 				}
 			}
-			out := fmt.Sprintf("Записал: %s — %.0f ₽ (%s), группа %s, %s.", canonical, args.Amount, kindLabel, groupName, txDate.Format("02.01.2006"))
+			out := fmt.Sprintf("Записал: %s — %s ₽ (%s), группа %s, %s.", canonical, moneyText(args.Amount), kindLabel, groupName, txDate.Format("02.01.2006"))
 			if collector != "" {
 				out += " Собрал: " + collector + "."
 			}
@@ -286,7 +286,7 @@ func (b *Bot) recordExpenseTool() ai.Tool {
 			if note != "" {
 				note = " на " + note
 			}
-			return fmt.Sprintf("Записал расход: %.0f ₽%s (%s).", args.Amount, note, spentAt.Format("02.01.2006")), nil
+			return fmt.Sprintf("Записал расход: %s ₽%s (%s).", moneyText(args.Amount), note, spentAt.Format("02.01.2006")), nil
 		},
 	}
 }
@@ -331,10 +331,10 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 			if len(items) == 0 {
 				return fmt.Sprintf("Расходов за %s не найдено.", periodLabel), nil
 			}
-			// Итог = сумма ПОКАЗАННЫХ (округлённых) строк, чтобы строки сходились с «Итого».
+			// Keep the same kopecks in rows and totals.
 			var total float64
 			for _, e := range items {
-				total += math.RoundToEven(e.Amount)
+				total = math.Round((total+e.Amount)*100) / 100
 			}
 
 			if strings.EqualFold(args.Format, "pdf") {
@@ -344,12 +344,12 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 					if what == "" {
 						what = "—"
 					}
-					rows = append(rows, []string{e.SpentAt.Format("02.01.2006"), what, formatRub(e.Amount) + " ₽"})
+					rows = append(rows, []string{e.SpentAt.Format("02.01.2006"), what, formatMoney(e.Amount) + " ₽"})
 				}
 				section := report.Section{
 					Columns:  []string{"Дата", "На что", "Сумма"},
 					Rows:     rows,
-					TotalRow: []string{"ИТОГО", "", formatRub(total) + " ₽"},
+					TotalRow: []string{"ИТОГО", "", formatMoney(total) + " ₽"},
 				}
 				outPath := fmt.Sprintf("%s/expenses_%s.pdf", b.reportDir, time.Now().Format("2006-01-02_15-04-05"))
 				if err := report.GenerateCustom("Мои расходы", "Период: "+periodLabel, []report.Section{section}, b.fontDir, outPath); err != nil {
@@ -358,7 +358,7 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 				if err := b.sendDocument(chat, outPath, "Расходы_"+from.Format("2006-01-02")+"_"+toDay.Format("2006-01-02")+".pdf"); err != nil {
 					return "", fmt.Errorf("не удалось отправить PDF с расходами: %w", err)
 				}
-				return fmt.Sprintf("Отправил PDF с расходами за %s. Итого: %.0f ₽.", periodLabel, total), nil
+				return fmt.Sprintf("Отправил PDF с расходами за %s. Итого: %s ₽.", periodLabel, moneyText(total)), nil
 			}
 
 			var sb strings.Builder
@@ -368,9 +368,9 @@ func (b *Bot) expensesReportTool(chat types.JID) ai.Tool {
 				if what != "" {
 					what = " — " + what
 				}
-				fmt.Fprintf(&sb, "• %s: %.0f ₽%s\n", e.SpentAt.Format("02.01.2006"), e.Amount, what)
+				fmt.Fprintf(&sb, "• %s: %s ₽%s\n", e.SpentAt.Format("02.01.2006"), moneyText(e.Amount), what)
 			}
-			fmt.Fprintf(&sb, "Итого: %.0f ₽.", total)
+			fmt.Fprintf(&sb, "Итого: %s ₽.", moneyText(total))
 			return sb.String(), nil
 		},
 	}
