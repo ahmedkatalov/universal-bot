@@ -5,8 +5,34 @@ import (
 	"fmt"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
+	"time"
 	"whatsapp-bot/internal/db"
 )
+
+// WhatsApp does not repeat SenderAlt on every message. Permission checks may
+// use a previously observed PN/LID relationship, but never the bare LID digits
+// or a display name. A known mapping remains authoritative over a fallback.
+func (b *Bot) verifiedSenderInSet(set map[string]bool, info types.MessageInfo) bool {
+	if phone, known := senderPhoneJID(info); known {
+		return set[normalizePhone(phone.User)]
+	}
+	if info.Sender.Server != types.HiddenUserServer || len(set) == 0 {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if b.db != nil {
+		if _, phone, err := b.db.ResolveSenderIdentity(ctx, info.Sender.String()); err == nil && phone != "" {
+			return set[normalizePhone(phone)]
+		}
+	}
+	if b.client != nil && b.client.Store != nil && b.client.Store.LIDs != nil {
+		if pn, err := b.client.Store.LIDs.GetPNForLID(ctx, info.Sender.ToNonAD()); err == nil && pn.Server == types.DefaultUserServer {
+			return set[normalizePhone(pn.User)]
+		}
+	}
+	return false
+}
 
 func sameAccountJID(a, b types.JID) bool {
 	return !a.IsEmpty() && !b.IsEmpty() && a.ToNonAD() == b.ToNonAD()

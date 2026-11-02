@@ -171,6 +171,9 @@ func (s *GroupReadingStatus) add(m groupReadingMessage, limit int) {
 		if m.Handled == "pdf_pages_unknown" {
 			issue.Reasons = append(issue.Reasons, "число страниц PDF не проверено: требуется отдельный читаемый чек")
 		}
+		if m.Handled == "receipt_candidate_other" {
+			issue.Reasons = append(issue.Reasons, "подпись клиента или банковский текст противоречат распознаванию изображения; вложение на проверке, сумма не засчитана")
+		}
 	}
 	if !m.HasMedia && !m.Parsed && m.Handled == "" && strings.TrimSpace(m.Body) != "" {
 		s.UnreadTexts++

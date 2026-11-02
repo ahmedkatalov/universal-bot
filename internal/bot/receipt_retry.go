@@ -73,22 +73,57 @@ func (b *Bot) retryDueReceipts() {
 
 func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 	max := maxReceiptRetries()
-	if it.MediaPath == "" {
-		// Нечего перечитывать (нет файла) — снимаем с очереди, оставляем человеку.
-		_ = b.db.ResolveReceiptRetry(ctx, it.ID, "failed", false)
-		return
-	}
-	data, err := os.ReadFile(it.MediaPath)
-	if err != nil {
-		_ = b.db.ResolveReceiptRetry(ctx, it.ID, "failed", false)
-		fmt.Printf("Повтор чека #%d: файл недоступен (%v) — оставляю на ручную проверку\n", it.ID, err)
-		return
+	if it.ReceiptVersion == "" {
+		current, err := b.db.ReceiptRetryByID(ctx, it.ID)
+		if err != nil {
+			return
+		}
+		it = current
 	}
 	ext := filepath.Ext(it.MediaPath)
+	data, err := os.ReadFile(it.MediaPath)
+	if err != nil {
+		if len(it.Proto) == 0 {
+			_ = b.db.ResolveReceiptRetryIfCurrent(ctx, it, "failed", false)
+			fmt.Printf("Повтор чека #%d: файл недоступен (%v), исходника для загрузки нет — оставляю на ручную проверку\n", it.ID, err)
+			return
+		}
+		var m waProto.Message
+		if err := proto.Unmarshal(it.Proto, &m); err != nil {
+			_ = b.db.ResolveReceiptRetryIfCurrent(ctx, it, "failed", false)
+			return
+		}
+		// A pending receipt must retain the same recovery path as raw media:
+		// losing its local file does not mean the WhatsApp source is gone.
+		switch {
+		case m.GetImageMessage() != nil:
+			ext = ".jpg"
+			data, err = b.download(ctx, m.GetImageMessage())
+		case m.GetDocumentMessage() != nil:
+			doc := m.GetDocumentMessage()
+			ext = ".jpg"
+			if isPDFDocument(doc.GetMimetype(), doc.GetFileName()) {
+				ext = ".pdf"
+			}
+			data, err = b.download(ctx, doc)
+		default:
+			_ = b.db.ResolveReceiptRetryIfCurrent(ctx, it, "failed", false)
+			return
+		}
+		if err != nil {
+			_ = b.db.BumpReceiptRetryIfCurrent(ctx, it, "файл недоступен, повтор загрузки не удался", time.Now().Add(retryBackoff(it.Attempts)), max)
+			return
+		}
+		if path := b.saveMediaFile(it.WaID, data, ext); path != "" {
+			if err := b.db.SetMediaPath(ctx, it.RawID, path); err != nil {
+				fmt.Printf("Повтор чека #%d: не удалось сохранить путь к файлу: %v\n", it.ID, err)
+			}
+		}
+	}
 	rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, data, ext, "")
 	if !reachable {
 		next := time.Now().Add(retryBackoff(it.Attempts))
-		_ = b.db.BumpReceiptRetry(ctx, it.ID, "зрение всё ещё недоступно", next, max)
+		_ = b.db.BumpReceiptRetryIfCurrent(ctx, it, "зрение всё ещё недоступно", next, max)
 		return
 	}
 	// ВАЖНО: ok=false у vision означает «не смог прочитать поля», а НЕ «это точно
@@ -104,17 +139,21 @@ func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 	declined := ok && rec.Kind != "cash" && receiptDeclined(rd.Status)
 	if !declined && (!ok || rec.Kind == "cash" || rd.Amount <= 0) {
 		next := time.Now().Add(retryBackoff(it.Attempts))
-		_ = b.db.BumpReceiptRetry(ctx, it.ID, "перечитал, но чек не распознался", next, max)
+		_ = b.db.BumpReceiptRetryIfCurrent(ctx, it, "перечитал, но чек не распознался", next, max)
 		return
 	}
-	if err := b.db.FillReceiptFromRetry(ctx, it.ID, db.RecognizedReceipt{
+	applied, err := b.db.FillReceiptFromRetryIfCurrent(ctx, it, db.RecognizedReceipt{
 		Bank: rd.Bank, Recipient: rd.Recipient, Sender: rd.Sender,
 		DocNumber: rd.DocNumber, AuthCode: rd.AuthCode, Status: rd.Status,
 		Amount: rd.Amount, Commission: rd.Commission,
 		TxDate: rd.TxTime, HasTxDate: rd.HasTxTime, TimeDefaulted: rd.TimeDefaulted, Declined: declined,
-	}); err != nil {
+	})
+	if err != nil {
 		fmt.Printf("Повтор чека #%d: ошибка сохранения: %v\n", it.ID, err)
 		return
+	}
+	if !applied {
+		return // the receipt/source changed while the file was downloaded/read
 	}
 	if rd.HasTxTime && rd.TimeDefaulted {
 		b.anchorStoredDateOnly(ctx, it.ID) // на чеке только дата — время по копии/тексту платежа

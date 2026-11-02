@@ -36,6 +36,10 @@ func (e *APIError) Transient() bool {
 
 // Human — короткая причина простыми словами для владельца (без секретов).
 func Human(err error) string {
+	var config *ConfigurationError
+	if errors.As(err, &config) {
+		return config.Error()
+	}
 	var ae *APIError
 	if !errors.As(err, &ae) {
 		if err == nil {
@@ -49,7 +53,9 @@ func Human(err error) string {
 	case ae.Op == "вход" && (ae.Status == 401 || ae.Status == 403 || ae.Status == 400 || ae.Status == 422):
 		return "программа не пускает: неверный логин или пароль бота (CMF_EMAIL / CMF_PASSWORD)"
 	case ae.Op == "вход" && ae.Status == 200:
-		return "вход прошёл, но программа не выдала токен — похоже, CMF_API_URL указывает не на тот сервис"
+		return "программа не выдала токен входа; проверь CMF_API_URL и формат ответа авторизации"
+	case ae.Status == 200:
+		return "программа вернула неверный формат данных; проверь CMF_API_URL и совместимость API"
 	case ae.Status == 401 || ae.Status == 403:
 		return "программа отказала в доступе — у пользователя бота нет прав на клиентов/договоры"
 	case ae.Status == 404:
@@ -79,5 +85,6 @@ func IsOutage(err error) bool {
 	if !errors.As(err, &ae) {
 		return true // таймаут контекста и прочие — до программы не достучались
 	}
-	return ae.Status == 0 || ae.Op == "вход" || ae.Status == 401 || ae.Status == 403 || ae.Status == 429 || ae.Status >= 500
+	invalidRead := ae.Status == 200 && (ae.Op == "поиск клиента" || ae.Op == "договоры" || ae.Op == "платежи")
+	return invalidRead || ae.Status == 0 || ae.Op == "вход" || ae.Status == 401 || ae.Status == 403 || ae.Status == 429 || ae.Status >= 500
 }

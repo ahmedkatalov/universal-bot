@@ -38,6 +38,12 @@ func TestHistoryReliabilityDownloadFailureKeepsEveryMediaFormat(t *testing.T) {
 		{ImageMessage: &waProto.ImageMessage{Caption: proto.String("Магомедов Ахмед 15000")}},
 		{DocumentMessage: &waProto.DocumentMessage{Mimetype: proto.String("image/png"), FileName: proto.String("receipt.png")}},
 		{DocumentMessage: &waProto.DocumentMessage{Mimetype: proto.String("application/pdf"), FileName: proto.String("receipt.pdf")}},
+		{EphemeralMessage: &waProto.FutureProofMessage{Message: &waProto.Message{
+			ImageMessage: &waProto.ImageMessage{Caption: proto.String("Магомедов Ахмед 15000"), ContextInfo: &waProto.ContextInfo{IsForwarded: proto.Bool(true)}},
+		}}},
+		{DocumentWithCaptionMessage: &waProto.FutureProofMessage{Message: &waProto.Message{
+			DocumentMessage: &waProto.DocumentMessage{Mimetype: proto.String("image/jpeg"), FileName: proto.String("forwarded.jpg"), Caption: proto.String("Ханатаев акраман")},
+		}}},
 	}
 	var messages []*waHistorySync.HistorySyncMsg
 	for i, content := range contents {
@@ -45,7 +51,7 @@ func TestHistoryReliabilityDownloadFailureKeepsEveryMediaFormat(t *testing.T) {
 	}
 	data := reliableHistoryBatch(grp, messages...)
 	seen, receipts, payments := e.importHistorySync(data)
-	if seen != 3 || receipts != 0 || payments != 0 {
+	if seen != len(contents) || receipts != 0 || payments != 0 {
 		t.Fatalf("wrong classification: %d %d %d", seen, receipts, payments)
 	}
 	for _, message := range messages {
@@ -58,7 +64,7 @@ func TestHistoryReliabilityDownloadFailureKeepsEveryMediaFormat(t *testing.T) {
 		}
 	}
 	items, err := e.db.GroupMediaToReread(ctx, grp.String(), time.Now().Add(-time.Hour), 10)
-	if err != nil || len(items) != 3 {
+	if err != nil || len(items) != len(contents) {
 		t.Fatalf("retry queue lost media: %+v / %v", items, err)
 	}
 	for _, item := range items {
@@ -66,10 +72,16 @@ func TestHistoryReliabilityDownloadFailureKeepsEveryMediaFormat(t *testing.T) {
 		if len(item.Proto) == 0 || proto.Unmarshal(item.Proto, &message) != nil {
 			t.Fatal("original media download descriptor was not persisted")
 		}
+		if message.GetImageMessage() == nil && message.GetDocumentMessage() == nil {
+			t.Fatal("history wrapper was persisted without extracting its downloadable media")
+		}
+		if doc := message.GetDocumentMessage(); doc != nil && doc.GetFileName() == "forwarded.jpg" && item.Caption != "Ханатаев акраман" {
+			t.Fatalf("document receipt lost its client caption: %+v", item)
+		}
 	}
 	e.importHistorySync(data)
 	items, err = e.db.GroupMediaToReread(ctx, grp.String(), time.Now().Add(-time.Hour), 10)
-	if err != nil || len(items) != 3 {
+	if err != nil || len(items) != len(contents) {
 		t.Fatalf("duplicate history changed failed media: %+v / %v", items, err)
 	}
 	if len(e.sent()) != 0 {
@@ -151,6 +163,76 @@ func TestHistoryReliabilityExplicitOtherIsCompleted(t *testing.T) {
 	e.importHistorySync(reliableHistoryBatch(grp, reliableHistoryMessage(grp, worker, waID, "Мансур", at, &waProto.Message{ImageMessage: &waProto.ImageMessage{}})))
 	if e.db.NeedsMediaReread(context.Background(), raw) {
 		t.Fatal("explicit non-receipt was left in endless recognition retry")
+	}
+}
+
+func TestHistoryReliabilityForwardedSberPhotoStaysPendingUntilRecognized(t *testing.T) {
+	t.Setenv("RECEIPT_VISION_READS", "3")
+	ctx := context.Background()
+	grp, worker := e2eGroup("forwarded-sber-nov1"), user("79280000705")
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.aliases.Add("Ханатаев Акраман", "Ханатаев Акраман")
+	at := time.Date(2026, time.November, 1, 14, 24, 0, 0, time.FixedZone("MSK", 3*60*60))
+	waID := e2eID("FORWARDED-SBER")
+	caption := "Ханатаев акраман"
+	localBytes := []byte("forwarded-photo-of-sber-receipt-fixture")
+	path := filepath.Join(t.TempDir(), "receipt.jpg")
+	if err := os.WriteFile(path, localBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	rawID, _, err := e.db.SaveRawMessage(ctx, waID, grp.String(), worker.String(), worker.String(), "~M", caption, true, path, at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	content := &waProto.Message{EphemeralMessage: &waProto.FutureProofMessage{Message: &waProto.Message{
+		DocumentWithCaptionMessage: &waProto.FutureProofMessage{Message: &waProto.Message{DocumentMessage: &waProto.DocumentMessage{
+			Mimetype: proto.String("image/jpeg"), FileName: proto.String("receipt.jpg"), Caption: proto.String(caption),
+			DirectPath: proto.String("/receipt?test=1"), MediaKey: []byte("test-media-key"),
+			ContextInfo: &waProto.ContextInfo{IsForwarded: proto.Bool(true)},
+		}}},
+	}}}
+	history := reliableHistoryBatch(grp, reliableHistoryMessage(grp, worker, waID, "~M", at, content))
+	e.ai = func(c aiCall) aiReply { return aiReply{Text: `{}`} }
+	_, receipts, _ := e.importHistorySync(history)
+	if receipts != 0 || !e.db.NeedsMediaReread(ctx, rawID) {
+		t.Fatal("unreadable forwarded receipt must remain pending")
+	}
+	items, err := e.db.GroupMediaToReread(ctx, grp.String(), at.Add(-time.Minute), 10)
+	if err != nil || len(items) != 1 || items[0].Caption != caption || len(items[0].Proto) == 0 {
+		t.Fatalf("forwarded receipt lost retry evidence: %+v / %v", items, err)
+	}
+	// If the local copy disappears, its WhatsApp source is still available.
+	// Without a connected client the download fails and the message stays open.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	if e.rereadMedia(ctx, items[0]) || !e.db.NeedsMediaReread(ctx, rawID) {
+		t.Fatal("failed redownload closed the pending forwarded receipt")
+	}
+	if err := os.WriteFile(path, localBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	e.ai = func(c aiCall) aiReply {
+		return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Милана Нажудовна К.","sender":"Элина Зилаудиевна Г.","amount":30000,"commission":0,"doc_number":"1000000006086701079","auth_code":"024307","datetime":"2026-11-01 14:23:06"}`}
+	}
+	_, receipts, _ = e.importHistorySync(history)
+	if receipts != 1 || e.db.NeedsMediaReread(ctx, rawID) {
+		t.Fatal("recognized receipt was not recovered")
+	}
+	r := e.db.TestReceiptByMessage(ctx, waID)
+	if !r.Found || r.Amount != 30000 || r.Recipient != "Ханатаев Акраман" || !r.Confirmed || r.NeedsReview || r.Duplicate {
+		t.Fatalf("recovered receipt lost the client or money: %+v", r)
+	}
+	details, err := e.db.ReceiptDetailsForPerson(ctx, "Ханатаев", 10)
+	if err != nil || len(details) != 1 || details[0].DocNumber != "1000000006086701079" || details[0].AuthCode != "024307" || details[0].CardOwner != "Милана Нажудовна К." {
+		t.Fatalf("recovered bank identity: %+v / %v", details, err)
+	}
+	e.importHistorySync(history)
+	if details, err = e.db.ReceiptDetailsForPerson(ctx, "Ханатаев", 10); err != nil || len(details) != 1 {
+		t.Fatalf("repeated history duplicated receipt: %+v / %v", details, err)
+	}
+	if len(e.sent()) != 0 {
+		t.Fatalf("historical recovery sent messages: %+v", e.sent())
 	}
 }
 

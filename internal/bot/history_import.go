@@ -144,6 +144,13 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 			if content == nil {
 				continue
 			}
+			// History contains raw WhatsApp envelopes, unlike live events that
+			// whatsmeow unwraps before dispatch. Read the same inner message so
+			// disappearing messages and documents with captions are not skipped.
+			content = (&events.Message{RawMessage: content}).UnwrapRaw().Message
+			if content == nil {
+				continue
+			}
 			// Match whatsmeow.ParseWebMessage precedence. The top-level
 			// participant is authoritative; a group itself is never an employee.
 			participant := wmi.GetParticipant()
@@ -347,7 +354,13 @@ func (b *Bot) importReceiptReadSilent(ctx context.Context, chat types.JID, rawID
 		return false, false
 	}
 	rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, ext, "")
+	if reachable && rec.Kind == "other" && b.holdContradictoryNonReceipt(ctx, chat, "", "", rawID, "", "", true) {
+		return false, false
+	}
 	if reachable && (rec.Kind == "cash" || rec.Kind == "other") {
+		if err := b.db.ReleaseMediaReview(ctx, rawID, receiptCandidateOtherHold); err != nil {
+			return false, false
+		}
 		return false, true
 	}
 	if !ok || rec.Kind != "receipt" {
@@ -356,6 +369,9 @@ func (b *Bot) importReceiptReadSilent(ctx context.Context, chat types.JID, rawID
 	var rd parser.ReceiptData
 	applyAIReceiptAuthoritative(&rd, rec)
 	if rd.Amount <= 0 {
+		return false, false
+	}
+	if err := b.db.ReleaseMediaReview(ctx, rawID, receiptCandidateOtherHold); err != nil {
 		return false, false
 	}
 	txDate := received

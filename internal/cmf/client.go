@@ -7,13 +7,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"math"
 	"net/http"
 	"net/url"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,27 +45,6 @@ const lookupCacheTTL = 3 * time.Minute
 // перегрузка, 5xx). Запись платежа НЕ повторяем: при таймауте платёж мог уже
 // записаться, и повтор задвоил бы его в программе.
 const readRetries = 3
-
-// NewFromEnv создаёт клиента из CMF_API_URL / CMF_EMAIL / CMF_PASSWORD.
-// Возвращает nil, если переменные не заданы (интеграция выключена).
-func NewFromEnv() *Client {
-	base := strings.TrimRight(strings.TrimSpace(os.Getenv("CMF_API_URL")), "/")
-	// Пути запросов уже начинаются с /api. Если адрес задали с хвостом «/api»
-	// (частая ошибка), получилось бы /api/api/... → 404 на КАЖДЫЙ запрос.
-	base = strings.TrimRight(strings.TrimSuffix(base, "/api"), "/")
-	email := strings.TrimSpace(os.Getenv("CMF_EMAIL"))
-	pass := strings.TrimSpace(os.Getenv("CMF_PASSWORD"))
-	if base == "" || email == "" || pass == "" {
-		return nil
-	}
-	return &Client{
-		baseURL:     base,
-		email:       email,
-		password:    pass,
-		http:        &http.Client{Timeout: 30 * time.Second},
-		lookupCache: map[string]lookupEntry{},
-	}
-}
 
 // loginResponse покрывает оба режима ответа /login: сразу токен, либо
 // mode=select_profile со списком профилей (если у аккаунта их несколько).
@@ -296,32 +273,89 @@ func (c *Client) Ping(ctx context.Context) error {
 	q := url.Values{}
 	q.Set("full_name", "ива")
 	q.Set("limit", "1")
-	_, err := c.get(ctx, "поиск клиента", "/api/clients/lookup", q, "")
-	var ae *APIError
-	if errors.As(err, &ae) && (ae.Status == http.StatusBadRequest || ae.Status == http.StatusUnprocessableEntity) {
-		return nil // сервер ответил (формат пробного запроса не понравился) — связь есть
+	body, err := c.get(ctx, "поиск клиента", "/api/clients/lookup", q, "")
+	if err != nil {
+		return err
 	}
+	_, err = decodeClientItems(body)
 	return err
+}
+
+func invalidListResponse(op string) error {
+	return &APIError{Op: op, Status: http.StatusOK, Body: fmt.Sprintf("программа вернула неверный формат списка (%s), требуется проверить CMF_API_URL и версию API", op)}
 }
 
 // looseItems достаёт массив объектов из ответа, который может быть голым
 // массивом или обёрткой {"items": [...]} / {"data": [...]}.
 func looseItems(body []byte) []json.RawMessage {
-	var arr []json.RawMessage
-	if err := json.Unmarshal(body, &arr); err == nil {
-		return arr
+	items, _ := decodeListItems(body)
+	return items
+}
+
+// HTTP 200 can be an HTML login page, an error envelope or the wrong backend.
+// Such a reply must never become an empty list of clients or unpaid receipts.
+func decodeListItems(body []byte) ([]json.RawMessage, bool) {
+	body = bytes.TrimSpace(body)
+	decodeArray := func(raw []byte) ([]json.RawMessage, bool) {
+		raw = bytes.TrimSpace(raw)
+		var arr []json.RawMessage
+		if len(raw) == 0 || raw[0] != '[' || json.Unmarshal(raw, &arr) != nil {
+			return nil, false
+		}
+		for _, item := range arr {
+			var object map[string]json.RawMessage
+			if json.Unmarshal(item, &object) != nil || object == nil || responseHasError(object) {
+				return nil, false
+			}
+		}
+		return arr, true
+	}
+	if arr, valid := decodeArray(body); valid {
+		return arr, true
 	}
 	var wrapped map[string]json.RawMessage
-	if err := json.Unmarshal(body, &wrapped); err == nil {
+	if err := json.Unmarshal(body, &wrapped); err == nil && wrapped != nil && !responseHasError(wrapped) {
 		for _, key := range []string{"items", "data", "clients", "results"} {
 			if raw, ok := wrapped[key]; ok {
-				if err := json.Unmarshal(raw, &arr); err == nil {
-					return arr
+				if arr, valid := decodeArray(raw); valid {
+					return arr, true
 				}
 			}
 		}
 	}
-	return nil
+	return nil, false
+}
+
+func responseHasError(object map[string]json.RawMessage) bool {
+	if success, ok := object["success"]; ok && bytes.Equal(bytes.TrimSpace(success), []byte("false")) {
+		return true
+	}
+	for _, key := range []string{"error", "errors"} {
+		if raw, ok := object[key]; ok {
+			switch string(bytes.TrimSpace(raw)) {
+			case "null", "false", "0", `""`, "[]", "{}":
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func decodeClientItems(body []byte) ([]ClientInfo, error) {
+	items, valid := decodeListItems(body)
+	if !valid {
+		return nil, invalidListResponse("поиск клиента")
+	}
+	var out []ClientInfo
+	for _, raw := range items {
+		var ci ClientInfo
+		if json.Unmarshal(raw, &ci) != nil || ci.ID == "" {
+			return nil, invalidListResponse("поиск клиента")
+		}
+		out = append(out, ci)
+	}
+	return out, nil
 }
 
 // --- Толерантный разбор ответов программы ---
@@ -490,12 +524,9 @@ func (c *Client) LookupClients(ctx context.Context, fullName string) ([]ClientIn
 	if err != nil {
 		return nil, err
 	}
-	var out []ClientInfo
-	for _, raw := range looseItems(body) {
-		var ci ClientInfo
-		if err := json.Unmarshal(raw, &ci); err == nil && ci.ID != "" {
-			out = append(out, ci)
-		}
+	out, err := decodeClientItems(body)
+	if err != nil {
+		return nil, err
 	}
 	c.cacheMu.Lock()
 	if c.lookupCache == nil || len(c.lookupCache) > 2000 {
@@ -534,12 +565,17 @@ func (c *Client) ClientContracts(ctx context.Context, clientID string) ([]Contra
 	if err != nil {
 		return nil, err
 	}
+	items, valid := decodeListItems(body)
+	if !valid {
+		return nil, invalidListResponse("договоры")
+	}
 	var out []ContractRef
-	for _, raw := range looseItems(body) {
+	for _, raw := range items {
 		var cr ContractRef
-		if err := json.Unmarshal(raw, &cr); err == nil && cr.ID != "" {
-			out = append(out, cr)
+		if json.Unmarshal(raw, &cr) != nil || cr.ID == "" {
+			return nil, invalidListResponse("договоры")
 		}
+		out = append(out, cr)
 	}
 	return out, nil
 }
@@ -590,8 +626,12 @@ func (c *Client) ContractPayments(ctx context.Context, contractID, branchID stri
 	if err != nil {
 		return nil, err
 	}
+	items, valid := decodeListItems(body)
+	if !valid {
+		return nil, invalidListResponse("платежи")
+	}
 	var out []Payment
-	for _, raw := range looseItems(body) {
+	for _, raw := range items {
 		var p Payment
 		if err := json.Unmarshal(raw, &p); err == nil {
 			out = append(out, p)

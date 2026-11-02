@@ -101,13 +101,26 @@ func TestL5dedupe_3_TwoRealChecksMinutesApart(t *testing.T) {
 			"\nФИО получателя\nХадижат Ибрагимовна И.\nФИО отправителя\nХарон Исаевич И.\nСумма перевода\n18000.00 ₽"
 	}
 	base := time.Now().Add(-30 * time.Minute).Truncate(time.Second)
+	// The two operations may be yesterday just after midnight. Check their
+	// operation period, rather than silently excluding them with "today".
+	totalsForChecks := func(e *e2eBot, group string) map[string]float64 {
+		summaries, err := e.db.SummaryForPeriod(ctx, base.Add(-time.Hour), base.Add(time.Hour), []string{group})
+		if err != nil {
+			t.Fatal(err)
+		}
+		out := map[string]float64{}
+		for _, s := range summaries {
+			out[s.CanonicalName] = s.Total
+		}
+		return out
+	}
 	for name, mk := range map[string]func(time.Time) string{"РСХБ": rshb, "Сбер без номера": sberNoDoc} {
 		e := newE2E(t, e2eOpts{WithAI: true})
 		e.ai = aiNamesAndPayments("Исаев Харон")
 		grp, emp := e2eGroup("l5lim"), user("79001115925")
 		e.sendReceipt(grp, emp, "Сафаи", mk(base), "Исаев Харон")
 		e.sendReceipt(grp, emp, "Сафаи", mk(base.Add(150*time.Second)), "Исаев Харон")
-		if got := dayTotals(e, grp); got["Исаев Харон"] != 36000 {
+		if got := totalsForChecks(e, grp.String()); got["Исаев Харон"] != 36000 {
 			t.Errorf("%s: два перевода (время на чеках %s и %s): сбор %v, ожидали Исаев Харон 36000; бот: %q",
 				name, base.Format("15:04:05"), base.Add(150*time.Second).Format("15:04:05"), got, e.last().Text)
 		}

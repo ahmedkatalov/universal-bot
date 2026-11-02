@@ -17,6 +17,7 @@ import (
 type EmployeeReportOptions struct {
 	Groups      []string
 	Sender      string
+	Client      string              // confirmed client from the caption, never a posting employee
 	DateBasis   string              // chat (default), operation
 	Attribution string              // submitter (default), collector
 	Kind        string              // all (default), checks, cash, transfers
@@ -332,12 +333,34 @@ func employeeMatches(q, name, phone string) bool {
 	return true
 }
 
+func employeeClientMatches(query, client string) bool {
+	if strings.TrimSpace(query) == "" {
+		return true
+	}
+	words := strings.Fields(contactKey(query))
+	clientWords := " " + contactKey(client) + " "
+	if len(words) == 0 {
+		return false
+	}
+	for _, word := range words {
+		if !strings.Contains(clientWords, " "+word+" ") {
+			return false
+		}
+	}
+	return true
+}
+
 func employeeReport(book *ledger.Book, from, to time.Time, opts EmployeeReportOptions) EmployeeReport {
 	groups := groupSet(opts.Groups)
 	inGroup := func(g string) bool { return len(groups) == 0 || groups[g] }
 	var candidates []EmployeePayment
 	add := func(r EmployeePayment) {
 		if !inGroup(r.GroupJID) {
+			return
+		}
+		// Client and posting employee are independent identities. In particular,
+		// a printed bank payer/recipient is not evidence of a captioned client.
+		if !employeeClientMatches(opts.Client, r.Client) {
 			return
 		}
 		at := r.PostedAt

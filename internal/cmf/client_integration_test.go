@@ -40,7 +40,7 @@ func mockCMF(t *testing.T) (*httptest.Server, *[]string) {
 			return
 		}
 		name := strings.ToLower(r.URL.Query().Get("full_name"))
-		var items []map[string]any
+		items := []map[string]any{}
 		if strings.Contains(name, "милана") || strings.Contains(name, "саралиева") {
 			items = append(items, map[string]any{"id": "cli-milana", "full_name": "Саралиева Милана", "phone": "79380187222"})
 		}
@@ -81,7 +81,7 @@ func mockCMF(t *testing.T) (*httptest.Server, *[]string) {
 			return
 		}
 		contract := r.URL.Query().Get("contract_id")
-		var payments []map[string]any
+		payments := []map[string]any{}
 		// У Миланы платёж на 25000 уже ВНЕСЁН, у Ахмеда — платежей нет.
 		if contract == "contract-milana-1" {
 			payments = append(payments, map[string]any{"amount": 25000, "paid_at": "2026-07-01T18:25:00Z"})

@@ -224,12 +224,12 @@ func (d *DB) DedupeCompletedReceiptWeak(ctx context.Context, receiptID int, amou
 		oTx             time.Time
 		oScreen         bool
 	)
-	err = d.pool.QueryRow(ctx, `
+	err = d.pool.QueryRow(ctx, receiptIdentityCTE+`
 		SELECT br.id, COALESCE(rm.wa_message_id, ''), (br.client_confirmed AND br.contact_id IS NOT NULL), br.contact_id,
 		       COALESCE(c.canonical_name, br.recipient_raw, ''), br.tx_date,
-		       COALESCE(($3 <> '' AND br.doc_number = $3) OR ($4 <> '' AND br.auth_code = $4), false) AS strong,
-		       (br.tx_time_guessed AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = '')
-		FROM bank_receipts br
+		       COALESCE(($3 <> '' AND br.document_key = $3) OR ($4 <> '' AND br.authorization_key = $4), false) AS strong,
+		       (br.tx_time_guessed AND COALESCE(br.document_key, '') = '' AND COALESCE(br.authorization_key, '') = '')
+		FROM receipt_identity br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE COALESCE(br.group_jid, rm.wa_group_jid) = $1 AND br.id <> $2
@@ -238,19 +238,19 @@ func (d *DB) DedupeCompletedReceiptWeak(ctx context.Context, receiptID int, amou
 		  AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
 		  AND br.amount = $5::numeric
 		  AND (
-		    ($3 <> '' AND br.doc_number = $3)
-		    OR ($4 <> '' AND br.auth_code = $4
+		    ($3 <> '' AND br.document_key = $3)
+		    OR ($4 <> '' AND br.authorization_key = $4
 		        AND br.tx_date BETWEEN $6::timestamptz - interval '3 days' AND $6::timestamptz + interval '3 days')
 		    OR ($7 AND $8::int IS NOT NULL AND br.contact_id = $8
 		        AND br.tx_date BETWEEN $6::timestamptz - interval '5 minutes' AND $6::timestamptz + interval '5 minutes'
 		        AND `+sameOpTimeSQL("br.tx_date", "br.tx_time_guessed", "$6::timestamptz", "false")+`
-		        AND (COALESCE(br.doc_number, '') = '' OR $3 = '' OR br.doc_number = $3)
-		        AND (COALESCE(br.auth_code, '') = '' OR $4 = '' OR br.auth_code = $4)
+		        AND (COALESCE(br.document_key, '') = '' OR $3 = '' OR br.document_key = $3)
+		        AND (COALESCE(br.authorization_key, '') = '' OR $4 = '' OR br.authorization_key = $4)
 		        AND (COALESCE(br.sender_raw, '') = '' OR $9 = ''
 		             OR lower(split_part(trim(br.sender_raw), ' ', 1)) = lower(split_part(trim($9), ' ', 1))))
 		  )
 		ORDER BY 7 DESC, br.tx_time_guessed, rm.received_at, br.id
-		LIMIT 1`, r.groupJID, receiptID, r.p.DocNumber, r.p.AuthCode, r.p.Amount, r.p.TxDate, heur, r.contactID, r.p.Sender).
+		LIMIT 1`, r.groupJID, receiptID, receiptDocumentKey(r.p.DocNumber), receiptDocumentKey(r.p.AuthCode), r.p.Amount, r.p.TxDate, heur, r.contactID, r.p.Sender).
 		Scan(&oID, &oWa, &oNamed, &oContact, &oClient, &oTx, &oStrong, &oScreen)
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):

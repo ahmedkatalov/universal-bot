@@ -2183,6 +2183,13 @@ func (b *Bot) cmfConnectionTool() ai.Tool {
 		InputSchema: map[string]any{"type": "object", "properties": map[string]any{}, "required": []string{}},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			if b.cmf == nil {
+				configured, err := cmf.NewFromEnvChecked()
+				if err != nil {
+					return "Программа НЕ подключена: " + cmf.Human(err) + ". После исправления .env пересоздай контейнер бота, чтобы применить настройки.", nil
+				}
+				if configured != nil {
+					return "Параметры CMF заданы, но текущий процесс бота запущен без подключения к программе. Пересоздай контейнер бота, чтобы применить настройки; затем повтори проверку.", nil
+				}
 				return "Программа НЕ подключена: в настройках бота не заданы CMF_API_URL / CMF_EMAIL / CMF_PASSWORD.", nil
 			}
 			pctx, cancel := context.WithTimeout(ctx, 40*time.Second)

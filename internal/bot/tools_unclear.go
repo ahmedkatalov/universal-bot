@@ -1011,9 +1011,7 @@ func (b *Bot) rereadGroupMedia(ctx context.Context, groupJID string, since time.
 		b.enqueueChat(it.GroupJID, func() {
 			if rid, amt, ok, _ := b.db.ReceiptOfRaw(ctx, it.RawID); ok {
 				// Чек есть, но сумма не прочиталась / повторы кончились — читаем ещё раз.
-				if it.MediaPath != "" {
-					b.retryOneReceipt(ctx, db.ReceiptRetry{ID: rid, MediaPath: it.MediaPath, GroupJID: it.GroupJID})
-				}
+				b.retryOneReceipt(ctx, db.ReceiptRetry{ID: rid})
 				_, amt2, _, _ := b.db.ReceiptOfRaw(ctx, it.RawID)
 				done <- amt <= 0 && amt2 > 0
 				return

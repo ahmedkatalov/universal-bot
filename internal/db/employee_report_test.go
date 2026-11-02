@@ -264,3 +264,64 @@ func TestEmployeeReportUsesReceiptPostingTimeInsteadOfCaption(t *testing.T) {
 		t.Fatalf("receipt lost because caption posted yesterday: %+v", r)
 	}
 }
+
+// Regression for the November 1 Сбор СБ ЧЕКИ report: the two 30,000 receipts
+// belong to different clients and different bank operations, and cash is
+// separate. A client mentioned in a follow-up is not the posting employee.
+func TestEmployeeReportNovemberFirstScreenshot(t *testing.T) {
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.FixedZone("MSK", 3*3600))
+	checks := []ledger.Check{
+		{ID: 1, Group: "sb", Sender: "Мансур", Phone: "79280000001", ContactID: 1, Client: "Эстамиров Ибрагим Муслимович", Confirmed: true, Amount: 50000, OpDate: day, PostedAt: day.Add(10 * time.Minute), Doc: "NOV1-ESTAMIROV-001"},
+		{ID: 2, Group: "sb", Sender: "Мовлид", Phone: "79280000002", ContactID: 2, Client: "Хасуев Ислам", Confirmed: true, Amount: 30000, OpDate: day.Add(time.Hour), PostedAt: day.Add(2*time.Hour + 54*time.Minute), Doc: "A630-NOV1-HASUEV-002", Bank: "ВТБ", Printed: "Тамила"},
+		{ID: 3, Group: "sb", Sender: "~ M", Phone: "79280000003", ContactID: 3, Client: "Ханатаев Акраман", Confirmed: true, Amount: 30000, OpDate: day.Add(12 * time.Hour), PostedAt: day.Add(14*time.Hour + 24*time.Minute), Doc: "1000000006086701079", Auth: "024307", Bank: "Сбер", Payer: "Элина Зилаудиевна Г.", Printed: "Милана Нажудовна К."},
+		{ID: 4, Group: "sb", Sender: "Мухаммед", Phone: "79280000004", ContactID: 4, Client: "Мусаев Рахман", Confirmed: true, Amount: 65000, OpDate: day.Add(19 * time.Hour), PostedAt: day.Add(20*time.Hour + 33*time.Minute), Doc: "NOV1-MUSAEV-004"},
+	}
+	texts := []ledger.Text{{ID: 1, Group: "sb", Sender: "Сафаи", Phone: "79280000005", ContactID: 5, Client: "Идрисов Абузар", Amount: 15000, Cash: true, OpDate: day, PostedAt: day.Add(13*time.Hour + 18*time.Minute)}}
+	book := ledger.Build(checks, texts)
+	to := day.AddDate(0, 0, 1)
+	full := employeeReport(book, day, to, EmployeeReportOptions{Groups: []string{"sb"}})
+	var sum, cash float64
+	var count int
+	for _, s := range full.Stats {
+		count += s.Checks
+		sum += s.ChecksSum
+		cash += s.CashSum
+	}
+	if len(full.Rows) != 5 || count != 4 || sum != 175000 || cash != 15000 {
+		t.Fatalf("lost receipt or mixed cash into checks: %+v", full)
+	}
+	for _, query := range []string{"Ханатаев Акраман", "акраман ХАНАТАЕВ", "Ханатаев"} {
+		r := employeeReport(book, day, to, EmployeeReportOptions{Groups: []string{"sb"}, Client: query, Kind: "checks"})
+		if len(r.Rows) != 1 || r.Rows[0].Client != "Ханатаев Акраман" || r.Rows[0].Employee != "~ M" || r.Rows[0].BankPayer != "Элина Зилаудиевна Г." || r.Stats[0].ChecksSum != 30000 {
+			t.Fatalf("client %q mixed with worker, bank payer or other 30,000 receipt: %+v", query, r)
+		}
+	}
+	for _, query := range []string{"Элина Зилаудиевна Г.", "Милана Нажудовна К.", "Хан", "Ханатаев Ислам"} {
+		if r := employeeReport(book, day, to, EmployeeReportOptions{Client: query}); len(r.Rows) != 0 {
+			t.Fatalf("unrelated/incomplete client query %q matched: %+v", query, r)
+		}
+	}
+	if r := employeeReport(book, day, to, EmployeeReportOptions{Sender: "Ханатаев Акраман"}); len(r.Rows) != 0 {
+		t.Fatalf("client was treated as posting employee: %+v", r)
+	}
+	if r := employeeReport(book, day, to, EmployeeReportOptions{Sender: "Мухаммед", Client: "Ханатаев Акраман"}); len(r.Rows) != 0 {
+		t.Fatalf("missing client reassigned to Musaev's posting employee: %+v", r)
+	}
+	checks[2].Confirmed, checks[2].Review = false, true
+	checks[2].Client = "Милана Нажудовна К."
+	book = ledger.Build(checks, texts)
+	if r := employeeReport(book, day, to, EmployeeReportOptions{Client: "Милана Нажудовна К."}); len(r.Rows) != 0 {
+		t.Fatalf("unconfirmed bank recipient treated as captioned client: %+v", r)
+	}
+	unconfirmed := employeeReport(book, day, to, EmployeeReportOptions{Kind: "checks"})
+	if len(unconfirmed.Rows) != 4 {
+		t.Fatalf("unconfirmed fourth receipt silently omitted: %+v", unconfirmed)
+	}
+	var pending int
+	for _, s := range unconfirmed.Stats {
+		pending += s.PendingChecks
+	}
+	if pending != 1 {
+		t.Fatalf("fourth receipt should remain visibly pending: %+v", unconfirmed)
+	}
+}

@@ -23,6 +23,7 @@ type senderReportArgs struct {
 	ToDate      string   `json:"to_date"`
 	Group       string   `json:"group"`
 	Sender      string   `json:"sender"`
+	Client      string   `json:"client"`
 	Format      string   `json:"format"`
 	DateBasis   string   `json:"date_basis"`
 	Attribution string   `json:"attribution"`
@@ -53,6 +54,8 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 			"Дубли, удалённые и исключённые платежи не увеличивают сбор. Непроверенные чеки видны отдельно: " +
 			"их количество и известная сумма не скрываются и не подмешиваются в подтверждённый сбор. " +
 			"Клиент — ФИО из подписи/сообщения рядом с чеком; банковский отправитель — отдельное поле bank_payer. " +
+			"client ищет ФИО клиента отдельно от sender. На уточнение «а как насчёт Ханатаев Акраман?» после списка платежей ищи client=Ханатаев Акраман; sender оставь пустым, если сотрудник явно не указан. " +
+			"Отсутствие по фильтру sender не означает отсутствие чека клиента. Не угадывай другого сотрудника, клиента или платёж по похожей сумме. " +
 			"sender — имя сотрудника или его полный телефон; российские 7/8/local форматы равнозначны, разные страны не смешиваются. " +
 			"Название сборщика или подпись при дозагрузке без подтверждённого номера не доказывают личность: такие строки явно отмечены и не наследуют телефон загрузчика. " +
 			"PDF содержит весь список; текст — страницы с полными итогами и next_offset. " +
@@ -64,6 +67,7 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 				"to_date":     map[string]any{"type": "string", "description": "Конец периода YYYY-MM-DD включительно"},
 				"group":       map[string]any{"type": "string", "description": "Группа или несколько через запятую; пусто — все рабочие группы"},
 				"sender":      map[string]any{"type": "string", "description": "Имя сотрудника в именительном падеже (Мансур) или телефон. Пусто — все сотрудники"},
+				"client":      map[string]any{"type": "string", "description": "ФИО клиента из подписи к чеку; ищется независимо от сотрудника, без подмены банковским плательщиком/получателем. На вопрос о пропущенном клиенте заполни client и оставь sender пустым, если сотрудник не указан явно"},
 				"format":      map[string]any{"type": "string", "enum": []string{"text", "pdf"}},
 				"date_basis":  map[string]any{"type": "string", "enum": []string{"chat", "operation"}, "description": "chat по умолчанию — когда прислал в чат; operation только если просят по дате банковской операции"},
 				"attribution": map[string]any{"type": "string", "enum": []string{"submitter", "collector"}, "description": "submitter по умолчанию — кто прислал. collector — кто забрал деньги (по явной пометке, иначе отправитель)"},
@@ -92,7 +96,7 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 			}
 			args.ReadingNote = b.groupReadingNote(ctx, from, toDay.AddDate(0, 0, 1), groups)
 			data, err := b.db.EmployeePayments(ctx, from, toDay.AddDate(0, 0, 1), db.EmployeeReportOptions{
-				Groups: groups, Sender: strings.TrimSpace(args.Sender), DateBasis: args.DateBasis, Attribution: args.Attribution, Kind: args.Kind,
+				Groups: groups, Sender: strings.TrimSpace(args.Sender), Client: strings.TrimSpace(args.Client), DateBasis: args.DateBasis, Attribution: args.Attribution, Kind: args.Kind,
 			})
 			if err != nil {
 				return "", fmt.Errorf("ошибка выборки: %w", err)
@@ -105,13 +109,23 @@ func (b *Bot) sendersTool(_ context.Context, chat types.JID) ai.Tool {
 			}
 			var out strings.Builder
 			fmt.Fprintf(&out, "Отчёт по сотрудникам: %s (%s; %s).\n", period, groupLabel, basis)
+			out.WriteString("Источник: сохранённые сообщения и чеки бота.\n")
 			if args.Attribution == "collector" {
 				out.WriteString("Ответственный — кто забрал деньги; без пометки — отправитель.\n")
 			} else {
 				out.WriteString("Сотрудник — кто прислал сообщение в WhatsApp.\n")
 			}
+			if args.Sender != "" {
+				fmt.Fprintf(&out, "Фильтр сотрудника: %s.\n", args.Sender)
+			}
+			if args.Client != "" {
+				fmt.Fprintf(&out, "Фильтр ФИО клиента: %s.\n", args.Client)
+			}
 			if len(data.Rows) == 0 {
-				out.WriteString("За выбранный период и фильтры платежей не нашёл.")
+				out.WriteString("За выбранный период платежей, совпадающих с этими фильтрами, не нашёл.")
+				if args.Sender != "" {
+					out.WriteString(" Имя сотрудника проверяется отдельно от ФИО клиента; отсутствие в этой выборке не доказывает отсутствие чека клиента в группе.")
+				}
 				out.WriteString(args.ReadingNote)
 				return out.String(), nil
 			}
@@ -183,7 +197,7 @@ func (a *senderReportArgs) validate() (time.Time, time.Time, error) {
 	}
 	if a.View == "" {
 		a.View = "summary"
-		if strings.TrimSpace(a.Sender) != "" || len(a.Columns) > 0 {
+		if strings.TrimSpace(a.Sender) != "" || strings.TrimSpace(a.Client) != "" || len(a.Columns) > 0 {
 			a.View = "payments"
 		}
 	}
@@ -397,16 +411,16 @@ func (b *Bot) sendEmployeePDF(ctx context.Context, chat types.JID, args senderRe
 	if args.ReadingNote != "" {
 		sections = append([]report.Section{{Title: "Предварительный отчёт", Columns: []string{"Статус чтения группы"}, Rows: [][]string{{strings.TrimSpace(strings.ReplaceAll(args.ReadingNote, "⚠️", ""))}}}}, sections...)
 	}
-	if args.View == "payments" {
-		detail := report.Section{Title: fmt.Sprintf("Полный список: %d платежей. Ожидающие не входят в учтённый сбор.", len(data.Rows))}
-		for _, c := range args.Columns {
-			detail.Columns = append(detail.Columns, employeeColumnLabels[c])
-		}
-		for _, r := range data.Rows {
-			detail.Rows = append(detail.Rows, b.employeeCells(ctx, r, args.Columns))
-		}
-		sections = append(sections, detail)
+	// The tool promises the complete payment list in a PDF, including when the
+	// text view defaults to an all-employee summary.
+	detail := report.Section{Title: fmt.Sprintf("Полный список: %d платежей. Ожидающие не входят в учтённый сбор.", len(data.Rows))}
+	for _, c := range args.Columns {
+		detail.Columns = append(detail.Columns, employeeColumnLabels[c])
 	}
+	for _, r := range data.Rows {
+		detail.Rows = append(detail.Rows, b.employeeCells(ctx, r, args.Columns))
+	}
+	sections = append(sections, detail)
 	path := filepath.Join(b.reportDir, fmt.Sprintf("employees_%d.pdf", time.Now().UnixNano()))
 	if err := report.GenerateTables("Отчёт по сотрудникам", period+" | "+groupLabel+" | "+basis, sections, b.fontDir, path); err != nil {
 		return fmt.Errorf("ошибка генерации PDF: %w", err)

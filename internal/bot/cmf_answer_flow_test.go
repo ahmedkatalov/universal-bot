@@ -28,7 +28,7 @@ func fakeCMF(t *testing.T, clients []cmf.ClientInfo) *cmf.Client {
 			_ = json.NewEncoder(w).Encode(map[string]string{"token": "t"})
 		case "/api/clients/lookup":
 			q := strings.ToLower(r.URL.Query().Get("full_name"))
-			var out []map[string]string
+			out := []map[string]string{}
 			for _, c := range clients {
 				if strings.Contains(strings.ToLower(c.FullName), q) {
 					out = append(out, map[string]string{"id": c.ID, "full_name": c.FullName})

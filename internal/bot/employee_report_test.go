@@ -13,6 +13,7 @@ import (
 	waProto "go.mau.fi/whatsmeow/binary/proto"
 	"go.mau.fi/whatsmeow/proto/waHistorySync"
 	"go.mau.fi/whatsmeow/proto/waWeb"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 
 	"whatsapp-bot/internal/db"
@@ -180,5 +181,131 @@ func TestEmployeeReportNameLearnedAfterRequestedPeriod(t *testing.T) {
 	out := e.tool("senders_report", grp, fmt.Sprintf(`{"from_date":%q,"to_date":%q,"sender":"Мансур","kind":"checks"}`, day, day))
 	if !strings.Contains(out, "чеки 1 шт. на 15000 ₽") || !strings.Contains(out, "Каталов Ахмед") {
 		t.Fatalf("historical receipt lost when name learned later: %s", out)
+	}
+}
+
+func TestEmployeeReportClientLookupDefaultsToPaymentDetails(t *testing.T) {
+	a := senderReportArgs{FromDate: "2026-11-01", ToDate: "2026-11-01", Client: "Ханатаев Акраман"}
+	if _, _, err := a.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if a.View != "payments" || a.Sender != "" {
+		t.Fatalf("client lookup must show receipt details independently of employee: %+v", a)
+	}
+	tool := (&Bot{}).sendersTool(context.Background(), types.JID{})
+	properties := tool.InputSchema["properties"].(map[string]any)
+	if _, ok := properties["client"]; !ok {
+		t.Fatal("missing independent client filter in tool schema")
+	}
+}
+
+func TestEmployeeReportSummaryPDFIncludesEveryPayment(t *testing.T) {
+	extractor, err := exec.LookPath("pdftotext")
+	if err != nil {
+		t.Skip("pdftotext is required to inspect the generated PDF")
+	}
+	args := senderReportArgs{FromDate: "2026-11-01", ToDate: "2026-11-01", Format: "pdf", Limit: 1, Offset: 3}
+	if _, _, err := args.validate(); err != nil {
+		t.Fatal(err)
+	}
+	if args.View != "summary" {
+		t.Fatalf("test must cover the all-worker summary default: %+v", args)
+	}
+	data := db.EmployeeReport{Rows: []db.EmployeePayment{
+		{Client: "Эстамиров Ибрагим", Amount: 50000, Kind: "checks", Status: "counted", Employee: "Мансур"},
+		{Client: "Хасуев Ислам", Amount: 30000, Kind: "checks", Status: "counted", Employee: "Мовлид"},
+		{Client: "Ханатаев Акраман", Amount: 30000, Kind: "checks", Status: "counted", Employee: "~ M"},
+		{Client: "Мусаев Рахман", Amount: 65000, Kind: "checks", Status: "counted", Employee: "Мухаммед"},
+	}}
+	for _, row := range data.Rows {
+		data.Stats = append(data.Stats, db.EmployeeStat{SenderStat: db.SenderStat{Name: row.Employee, Count: 1, Checks: 1, Total: row.Amount, ChecksSum: row.Amount}})
+	}
+	b := &Bot{reportDir: t.TempDir(), fontDir: "../../assets/fonts", sendHook: func(types.JID, string, string) string { return "test-pdf" }}
+	if err := b.sendEmployeePDF(context.Background(), types.JID{}, args, data, "01.11.2026", "Сбор СБ ЧЕКИ", "по дате присылки в чат"); err != nil {
+		t.Fatal(err)
+	}
+	files, err := filepath.Glob(filepath.Join(b.reportDir, "employees_*.pdf"))
+	if err != nil || len(files) != 1 {
+		t.Fatalf("PDF missing: %v / %v", files, err)
+	}
+	content, err := exec.Command(extractor, "-layout", files[0], "-").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Полный список: 4 платежей", "Эстамиров Ибрагим", "Хасуев Ислам", "Ханатаев Акраман", "Мусаев Рахман", "175000"} {
+		if !strings.Contains(string(content), want) {
+			t.Errorf("summary PDF omitted %q: %s", want, content)
+		}
+	}
+}
+
+func TestEmployeeReportNovemberFirstStoredReceiptFollowup(t *testing.T) {
+	ctx := context.Background()
+	grp := e2eGroup("employee-nov1")
+	e := newE2E(t, e2eOpts{Groups: map[string]string{grp.String(): "Сбор СБ ЧЕКИ"}})
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.Local)
+	for i, receipt := range []struct {
+		client, sender, phone, bank, payer, cardOwner, doc, auth string
+		amount                                                   float64
+		posted                                                   time.Duration
+	}{
+		{"Эстамиров Ибрагим Муслимович", "Мансур", "79280001101", "Сбер", "", "", "NOV1-ESTAMIROV-001", "", 50000, 10 * time.Minute},
+		{"Хасуев Ислам", "Мовлид", "79280001102", "ВТБ", "", "Тамила", "A630-NOV1-HASUEV-002", "", 30000, 2*time.Hour + 54*time.Minute},
+		{"Ханатаев Акраман", "~ M", "79280001103", "Сбер", "Элина Зилаудиевна Г.", "Милана Нажудовна К.", "1000000006086701079", "024307", 30000, 14*time.Hour + 24*time.Minute},
+		{"Мусаев Рахман", "Мухаммед", "79280001104", "Сбер", "", "", "NOV1-MUSAEV-004", "", 65000, 20*time.Hour + 33*time.Minute},
+	} {
+		at := day.Add(receipt.posted)
+		contact, err := e.db.GetOrCreateContact(ctx, receipt.client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		raw, _, err := e.db.SaveRawMessage(ctx, e2eID(fmt.Sprintf("NOV1-%d", i)), grp.String(), user(receipt.phone).String(), receipt.phone, receipt.sender, receipt.client, true, "", at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.InsertBankReceipt(ctx, db.BankReceiptInput{RawMessageID: raw, ContactID: &contact, ClientConfirmed: true, RecipientRaw: receipt.client, Bank: receipt.bank, SenderRaw: receipt.payer, CardOwner: receipt.cardOwner, DocNumber: receipt.doc, AuthCode: receipt.auth, Amount: receipt.amount, TxDate: at, GroupJID: grp.String()}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cashAt := day.Add(13*time.Hour + 18*time.Minute)
+	cashClient, err := e.db.GetOrCreateContact(ctx, "Идрисов Абузар")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _, err := e.db.SaveRawMessage(ctx, e2eID("NOV1-CASH"), grp.String(), user("79280001105").String(), "79280001105", "Сафаи", "Идрисов Абузар 15т нал", false, "", cashAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.InsertTransaction(ctx, db.TransactionInput{RawMessageID: raw, ContactID: cashClient, RawName: "Идрисов Абузар", Amount: 15000, IsCash: true, TxDate: cashAt}); err != nil {
+		t.Fatal(err)
+	}
+	base := `"from_date":"2026-11-01","to_date":"2026-11-01","group":"Сбор СБ ЧЕКИ"`
+	full := e.tool("senders_report", grp, `{`+base+`,"kind":"checks","view":"payments"}`)
+	for _, want := range []string{"чеки 4 шт. на 175000 ₽", "Эстамиров", "Хасуев Ислам", "Ханатаев Акраман", "Мусаев Рахман", "строки 1–4 из 4", "Конец списка"} {
+		if !strings.Contains(full, want) {
+			t.Errorf("complete report lacks %q: %s", want, full)
+		}
+	}
+	if strings.Contains(full, "Идрисов") || strings.Contains(full, "15000 ₽") {
+		t.Errorf("cash mixed into receipt-only report: %s", full)
+	}
+	followup := e.tool("senders_report", grp, `{`+base+`,"client":"Ханатаев Акраман","kind":"checks","columns":["client","amount","employee","bank_payer","posted_by"]}`)
+	for _, want := range []string{"чеки 1 шт. на 30000 ₽", "Ханатаев Акраман", "~ M", "Элина Зилаудиевна Г.", "строки 1–1 из 1"} {
+		if !strings.Contains(followup, want) {
+			t.Errorf("client follow-up lacks %q: %s", want, followup)
+		}
+	}
+	for _, wrong := range []string{"Мусаев", "Мухаммед", "65000", "Хасуев"} {
+		if strings.Contains(followup, wrong) {
+			t.Errorf("client follow-up guessed unrelated payment %q: %s", wrong, followup)
+		}
+	}
+	wrongFilter := e.tool("senders_report", grp, `{`+base+`,"sender":"Ханатаев Акраман","kind":"checks"}`)
+	if !strings.Contains(wrongFilter, "отсутствие в этой выборке не доказывает отсутствие чека клиента") || strings.Contains(wrongFilter, "65000") {
+		t.Errorf("wrong worker filter made unsupported client claim: %s", wrongFilter)
+	}
+	all := e.tool("senders_report", grp, `{`+base+`,"view":"payments"}`)
+	if !strings.Contains(all, "чеки 4 шт. на 175000 ₽; наличка 1 платежей на 15000 ₽; учтено всего 190000 ₽") || !strings.Contains(all, "Идрисов Абузар") {
+		t.Errorf("cash not separated from receipt totals: %s", all)
 	}
 }

@@ -199,7 +199,7 @@ func (d *DB) loadLedgerChecksByDocs(ctx context.Context, docs []string) ([]ledge
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone, ''), rm.sender_jid, ''), '@', 1)
 		WHERE br.doc_number IS NOT NULL AND br.doc_number <> ''
-		  AND regexp_replace(translate(upper(br.doc_number), 'АВСЕЁНКМОРТХУ', 'ABCEEHKMOPTXY'), '[^0-9A-ZА-Я]', '', 'g') = ANY($1)`,
+		  AND `+receiptDocumentSQL("br.doc_number")+` = ANY($1)`,
 		docs)
 	if err != nil {
 		return nil, err

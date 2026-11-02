@@ -46,7 +46,24 @@ func parseGroupJIDs(raw string) []string {
 func main() {
 	ctx := context.Background()
 	checkAI := flag.Bool("check-ai", false, "проверить ИИ без подключения к WhatsApp и БД")
+	checkCMF := flag.Bool("check-cmf", false, "проверить настройки, вход и поиск CMF без подключения к WhatsApp и БД")
 	flag.Parse()
+	if *checkCMF {
+		c, err := cmf.NewFromEnvChecked()
+		if err != nil {
+			log.Fatal("Проверка CMF: ", cmf.Human(err))
+		}
+		if c == nil {
+			log.Fatal("Проверка CMF: задайте CMF_API_URL, CMF_EMAIL и CMF_PASSWORD в окружении")
+		}
+		checkCtx, cancel := context.WithTimeout(ctx, 45*time.Second)
+		defer cancel()
+		if err := c.Ping(checkCtx); err != nil {
+			log.Fatal("Проверка CMF: ", cmf.Human(err))
+		}
+		fmt.Println("CMF готова: вход и поиск клиентов проверены. Платежи не изменялись.")
+		return
+	}
 	if *checkAI {
 		a, err := ai.NewFromEnv()
 		if err != nil {
@@ -174,7 +191,7 @@ func main() {
 
 	// Интеграция с программой рассрочек (cmf): сверка чеков с внесёнными
 	// платежами. Выключена, если CMF_API_URL/CMF_EMAIL/CMF_PASSWORD не заданы.
-	cmfClient := cmf.NewFromEnv()
+	cmfClient, cmfConfigErr := cmf.NewFromEnvChecked()
 	if cmfClient != nil {
 		log.Println("Сверка с программой рассрочек (cmf) включена — проверяю связь...")
 		// Реальная проверка: вход + пробный поиск. Раньше «включена» значило лишь
@@ -189,6 +206,8 @@ func main() {
 				log.Println("Проверка CMF: вход и поиск клиентов работают ✔")
 			}
 		}(cmfClient)
+	} else if cmfConfigErr != nil {
+		log.Printf("Сверка с программой выключена: %s", cmf.Human(cmfConfigErr))
 	} else {
 		log.Println("CMF_API_URL/CMF_EMAIL/CMF_PASSWORD не заданы — сверка с программой выключена")
 	}

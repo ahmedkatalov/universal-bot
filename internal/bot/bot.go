@@ -511,7 +511,7 @@ func (b *Bot) handleEvent(evt interface{}) {
 		// и он не должен блокировать разбор сообщений из групп.
 		fmt.Printf("Личное сообщение от %s (chat=%s, fromMe=%v): %q\n",
 			msg.Info.Sender, msg.Info.Chat, msg.Info.IsFromMe, extractText(msg.Message))
-		if b.ownerNumbers != nil && !senderInSet(b.ownerNumbers, msg.Info) {
+		if b.ownerNumbers != nil && !b.verifiedSenderInSet(b.ownerNumbers, msg.Info) {
 			fmt.Println("Отправитель не в списке OWNER_NUMBERS — личка проигнорирована")
 			return
 		}
@@ -773,11 +773,17 @@ func (b *Bot) processGroupMessage(ctx context.Context, msg *events.Message) {
 		}
 	}
 	if hasMedia {
-		var keep []byte
-		if mr.dlErr != nil {
-			keep, _ = proto.Marshal(msg.Message) // перекачаем позже
+		// Keep the download descriptor even after a successful download. The
+		// local file can be lost before recognition/retry (restart, disk move).
+		keep, err := proto.Marshal(msg.Message)
+		if err != nil {
+			fmt.Println("Ошибка сохранения исходника фото/файла:", err)
+			return
 		}
-		_ = b.db.SetMediaInfo(ctx, rawID, caption, keep)
+		if err := b.db.SetMediaInfo(ctx, rawID, caption, keep); err != nil {
+			fmt.Println("Ошибка сохранения исходника фото/файла:", err)
+			return
+		}
 		if mr.dlErr != nil {
 			// Фото не скачалось — не теряем молча: повторим, а в группе скажем.
 			if !b.groupSilent(msg.Info.Chat) {
@@ -1499,7 +1505,7 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 
 	isAdmin := b.isReportAdmin(msg.Info)
 	staticSys, dynSys := b.buildAssistantSystemPromptFor(ctx, isAdmin)
-	tools, lastTool := trackTools(b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, false))
+	tools, lastTool, reportReply := b.trackReceiptReports(ctx, msg.Info, text, b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, false))
 
 	// Если это ответ (свайп) на чужое сообщение — подскажем номер его
 	// отправителя, чтобы сработали команды памяти ("запомни этот номер").
@@ -1509,12 +1515,20 @@ func (b *Bot) handlePrivateMessage(ctx context.Context, msg *events.Message) {
 		text = "[Переслано из другого чата — проверь, нет ли этого платежа уже в учёте, прежде чем записывать]\n" + text
 	}
 
-	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
+	reply, err := func() (string, error) {
+		if out, handled := b.receiptClientFollowup(ctx, msg.Info, text, isAdmin); handled {
+			return out, nil
+		}
+		return b.assistant.Reply(ctx, staticSys, dynSys, tools, history, text)
+	}()
 	if err != nil {
 		fmt.Println("Ошибка ответа ИИ:", err) // технические детали — только в лог
-		b.sendText(chat, ai.UserMessage(err)) // в чат — чистое человеческое сообщение
-		return
+		if !reportReply.available() {
+			b.sendText(chat, ai.UserMessage(err)) // в чат — чистое человеческое сообщение
+			return
+		}
 	}
+	reply = reportReply.apply(reply)
 
 	// Дописываем пару к ТЕКУЩЕЙ истории под одним локом (а не к снимку history,
 	// снятому до многосекундного вызова ИИ) — иначе два быстрых сообщения от
@@ -1562,7 +1576,7 @@ func (b *Bot) isReportAdmin(info types.MessageInfo) bool {
 	if len(b.reportAdmins) == 0 {
 		return true // список не задан — ограничение выключено
 	}
-	return senderInSet(b.reportAdmins, info)
+	return b.verifiedSenderInSet(b.reportAdmins, info)
 }
 
 // senderInSet проверяет, входит ли отправитель (по номеру телефона) в набор,
@@ -1888,16 +1902,24 @@ func (b *Bot) handleGroupAssistant(ctx context.Context, msg *events.Message, que
 	}
 	userText := senderName + ": " + query + b.quotedSenderPhoneNote(ctx, msg)
 
-	tools, lastTool := trackTools(b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, true))
+	tools, lastTool, reportReply := b.trackReceiptReports(ctx, msg.Info, query, b.assistantTools(ctx, chat, ownerPersonalJID(msg.Info), isAdmin, true))
 
-	reply, err := b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
+	reply, err := func() (string, error) {
+		if out, handled := b.receiptClientFollowup(ctx, msg.Info, query, isAdmin); handled {
+			return out, nil
+		}
+		return b.assistant.Reply(ctx, staticSys, dynSys, tools, history, userText)
+	}()
 	if err != nil {
 		fmt.Println("Ошибка ответа ассистента в группе:", err) // детали — в лог
-		if isAdmin {
-			b.sendText(chat, ai.UserMessage(err)) // владельцу — чистое сообщение; сотрудникам группу не засоряем
+		if !reportReply.available() {
+			if isAdmin {
+				b.sendText(chat, ai.UserMessage(err)) // владельцу — чистое сообщение; сотрудникам группу не засоряем
+			}
+			return
 		}
-		return
 	}
+	reply = reportReply.apply(reply)
 
 	// Дописываем пару к ТЕКУЩЕЙ истории под одним локом (не к снимку, снятому до
 	// вызова ИИ) — иначе два одновременных обращения к боту в группе затирают
@@ -2285,7 +2307,7 @@ func accessNote(isAdmin bool) string {
 func (b *Bot) buildAssistantSystemPromptFor(ctx context.Context, isAdmin bool) (staticPart, dynamicPart string) {
 	if isAdmin {
 		s, d := b.buildAssistantSystemPrompt(ctx)
-		return s + conversationStyle + talkRules + accessNote(true), d
+		return s + conversationStyle + talkRules + cmfAccessInstructions + receiptReportInstructions + accessNote(true), d
 	}
 
 	now := time.Now()
@@ -3856,17 +3878,26 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 		_ = b.db.SetMediaSha(ctx, rawID, sha)
 		if same, err := b.db.SameImageReceipt(ctx, chat.String(), sha, rawID); err != nil {
 			fmt.Println("Проверка повторной картинки чека:", err)
-		} else if same.Found {
-			who := same.Client
-			if who == "" {
-				who = "без имени"
+		} else if same.Found && (payerOverride == "" || nameKeyBot(payerOverride) == nameKeyBot(same.Client)) {
+			saved, err := b.db.SaveImageDuplicate(ctx, rawID, same.WaMessageID, chat.String())
+			if err != nil {
+				fmt.Println("Сохранение повторной картинки чека:", err)
+				return // retain the unparsed source for retry, never lose its journal entry
 			}
-			fmt.Printf("Чек (сообщение %d): та же картинка уже присылалась (%s, %.0f ₽) — повтор, в сбор не идёт\n", rawID, who, same.Amount)
-			if !b.groupSilent(chat) {
-				b.sendReply(chat, fmt.Sprintf("⚠️ Этот чек уже присылали (%s, %s ₽) — второй раз не считаю. Если это ДРУГОЙ перевод, пришлите другой чек или напишите «другой».", who, moneyText(same.Amount)), waMsgID, senderJID)
+			if !saved {
+				// The original changed/deleted since lookup; read this message
+				// normally instead of declaring a duplicate from stale evidence.
+			} else {
+				who := same.Client
+				if who == "" {
+					who = "без имени"
+				}
+				fmt.Printf("Чек (сообщение %d): та же картинка уже присылалась (%s, %.0f ₽) — повтор, в сбор не идёт\n", rawID, who, same.Amount)
+				if !b.groupSilent(chat) {
+					b.sendReply(chat, fmt.Sprintf("⚠️ Этот чек уже присылали (%s, %s ₽) — второй раз не считаю. Если это ДРУГОЙ перевод, пришли его чек.", who, moneyText(same.Amount)), waMsgID, senderJID)
+				}
+				return
 			}
-			_ = b.db.MarkMessageParsed(ctx, rawID)
-			return
 		}
 	}
 
@@ -3885,12 +3916,17 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	visionFirst := receiptVisionFirst() && media != nil && mediaExt != ".pdf" && b.assistant != nil
 	if visionFirst {
 		if rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
+			if err := b.db.ReleaseMediaReview(ctx, rawID, receiptCandidateOtherHold); err != nil {
+				return
+			}
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
 				applyAIReceiptAuthoritative(&rd, rec)
 				fmt.Printf("Чек (сообщение %d): прочитан GPT с изображения (получатель %q, сумма %.0f ₽)\n", rawID, rd.Recipient, rd.Amount)
 			}
+		} else if reachable && rec.Kind == "other" && b.holdContradictoryNonReceipt(ctx, chat, senderJID, waMsgID, rawID, text, payerOverride, false) {
+			return
 		} else if !reachable {
 			visionUnavailable = true
 		}
@@ -3912,6 +3948,9 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	weakOCR := rd.Amount == 0 || rd.Recipient == "" || (rd.DocNumber == "" && !rd.HasTxTime)
 	if !visionFirst && weakOCR && media != nil {
 		if rec, ok, reachable := b.aiVisionReceiptConsensus(ctx, media, mediaExt, text); ok {
+			if err := b.db.ReleaseMediaReview(ctx, rawID, receiptCandidateOtherHold); err != nil {
+				return
+			}
 			if rec.Kind == "cash" {
 				cashPhoto, cashAmount = true, rec.Amount
 			} else {
@@ -3920,6 +3959,8 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 				// сумма из текстового слоя оставалась бы вместо верной с картинки).
 				applyAIReceiptAuthoritative(&rd, rec)
 			}
+		} else if reachable && rec.Kind == "other" && b.holdContradictoryNonReceipt(ctx, chat, senderJID, waMsgID, rawID, text, payerOverride, false) {
+			return
 		} else if !reachable {
 			visionUnavailable = true
 		}
@@ -4366,6 +4407,13 @@ func (b *Bot) handleBankReceipt(ctx context.Context, chat types.JID, senderJID, 
 	if err != nil {
 		fmt.Println("Ошибка сохранения чека:", err)
 	}
+	if err == nil && !isDuplicate && !declined && !visionUnavailable {
+		if conflict, checkErr := b.db.ReceiptDocumentAmountConflict(ctx, rawID); checkErr != nil {
+			fmt.Println("Проверка расхождения сумм по номеру операции:", checkErr)
+		} else if conflict && !b.groupSilent(chat) {
+			b.sendReply(chat, "⚠️ Чек с этим номером операции уже есть, но суммы на копиях различаются. Платёж на проверке — уточни правильную сумму по оригиналу чека.", waMsgID, senderJID)
+		}
+	}
 	if err == nil && visionUnavailable && !declined && !isDuplicate {
 		_ = b.db.MarkReceiptForRetry(ctx, rawID, "vision verdict unavailable", time.Now().Add(retryBackoff(0)))
 		// OCR fields are evidence, not an automatic verdict after conflicting
@@ -4743,6 +4791,11 @@ func extractText(m *waProto.Message) string {
 	}
 	if img := m.GetImageMessage(); img != nil {
 		return img.GetCaption()
+	}
+	if doc := m.GetDocumentMessage(); doc != nil {
+		if isPDFDocument(doc.GetMimetype(), doc.GetFileName()) || strings.HasPrefix(strings.ToLower(doc.GetMimetype()), "image/") {
+			return doc.GetCaption()
+		}
 	}
 	return ""
 }

@@ -433,11 +433,11 @@ func TestL6collapsed_R0_NameThenCheckAfterHeldScreen(t *testing.T) {
 func TestL6collapsed_R0_TextPaymentSameAmountAfterHeldScreen(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
+	fromDay := now.Add(-2 * time.Hour)
+	from := time.Date(fromDay.Year(), fromDay.Month(), fromDay.Day(), 0, 0, 0, 0, time.Local)
+	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, 1)
 	opI := now.Add(-40 * time.Minute).Truncate(time.Second)
 	opA := now.Add(-2 * time.Minute).Truncate(time.Second)
-	if opI.Day() != now.Day() {
-		t.Skip("около полуночи")
-	}
 	for i, nm := range []string{"Алиев Ислам", "Магомедов Ахмед"} {
 		e := newE2E(t, e2eOpts{WithAI: true})
 		grp, emp := e2eGroup("l6r1"), user("7900112600"+string(rune('6'+i)))
@@ -449,13 +449,13 @@ func TestL6collapsed_R0_TextPaymentSameAmountAfterHeldScreen(t *testing.T) {
 		}
 		n := len(e.sent())
 		e.sendGroup(groupText(grp, emp, "Сафаи", nm+" 5000"))
-		mid := dayTotals(e, grp)
+		mid := periodTotals(e, grp, from, to)
 		if r := e.db.TestReceiptByMessage(ctx, screen); !r.Duplicate {
 			t.Errorf("«%s 5000» съеден как ответ про экран того же перевода: экран %+v, сбор %v", nm, r, mid)
 		}
 		e.ai = l6rAI(opA, nil)
 		ck := l4intakePhoto(e, grp, emp, "Сафаи", sberCheckOn(opA, "5000.00", opA.Format("15:04:05")), nm, "")
-		got := dayTotals(e, grp)
+		got := periodTotals(e, grp, from, to)
 		if got["Исаев Харон"] != 5000 || got[nm] != 5000 || sum(got) != 10000 {
 			t.Errorf("«%s 5000» + его чек с подписью: сбор %v (после текста %v), ожидали Исаев 5000 + %s 5000; чек: %+v; бот: %v",
 				nm, got, mid, nm, e.db.TestReceiptByMessage(ctx, ck), e.sentSince(n))
@@ -688,11 +688,11 @@ func TestL6collapsed_R3_DeleteImplausibleCheckKeepsOldScreenHeld(t *testing.T) {
 func TestL6collapsed_R4_TwoTransfersScreenPlusFullEach(t *testing.T) {
 	ctx := context.Background()
 	now := time.Now()
+	fromDay := now.Add(-2 * time.Hour)
+	from := time.Date(fromDay.Year(), fromDay.Month(), fromDay.Day(), 0, 0, 0, 0, time.Local)
+	to := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, 1)
 	opA := now.Add(-60 * time.Minute).Truncate(time.Second)
 	opB := now.Add(-30 * time.Minute).Truncate(time.Second)
-	if opA.Day() != now.Day() {
-		t.Skip("около полуночи")
-	}
 	at := func(m int) time.Time { return now.Add(time.Duration(-m) * time.Minute) }
 	ai := l6rVisionParse()
 	screen := "Перевод выполнен\n5 000 ₽\nСообщение получателю"
@@ -709,7 +709,7 @@ func TestL6collapsed_R4_TwoTransfersScreenPlusFullEach(t *testing.T) {
 		e.sendGroup(groupReply(grp, emp, "Сафаи", "другой", q.ID, e.botJID(), q.Text))
 	}
 	l5collapsedPhotoAt(e, grp, emp, sberCheckOn(opB, "5000.00", opB.Format("15:04:05")), "Исаев Харон", at(19))
-	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+	if got := periodTotals(e, grp, from, to); got["Исаев Харон"] != 10000 {
 		t.Errorf("два перевода по 5000, по каждому экран+полный чек: сбор %v, ожидали 10000 (экран2: %+v)", got, e.db.TestReceiptByMessage(ctx, s2))
 	}
 
@@ -726,12 +726,12 @@ func TestL6collapsed_R4_TwoTransfersScreenPlusFullEach(t *testing.T) {
 		t.Fatalf("экран после полного чека той же суммы: бот не спросил «тот же или другой?»: %v", e.sentSince(n))
 	}
 	e.sendGroup(groupReply(grp, emp, "Сафаи", "другой", q.ID, e.botJID(), q.Text))
-	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+	if got := periodTotals(e, grp, from, to); got["Исаев Харон"] != 10000 {
 		t.Fatalf("«другой» — экран2 отдельный платёж: сбор %v", got)
 	}
 	n = len(e.sent())
 	l5collapsedPhotoAt(e, grp, emp, sberCheckOn(opB, "5000.00", opB.Format("15:04:05")), "Исаев Харон", at(19))
-	if got := dayTotals(e, grp); got["Исаев Харон"] != 10000 {
+	if got := periodTotals(e, grp, from, to); got["Исаев Харон"] != 10000 {
 		t.Errorf("«другой» про экран2 (не перевод A) + полный чек B: сбор %v, ожидали 10000 (экран2: %+v, бот %v)", got, e.db.TestReceiptByMessage(ctx, s2), e.sentSince(n))
 	}
 	q = e.lastWith("ДРУГОЙ")
@@ -740,7 +740,7 @@ func TestL6collapsed_R4_TwoTransfersScreenPlusFullEach(t *testing.T) {
 	}
 	// И про B тоже «другой» — три платежа, как сказали.
 	e.sendGroup(groupReply(grp, emp, "Сафаи", "другой", q.ID, e.botJID(), q.Text))
-	if got := dayTotals(e, grp); got["Исаев Харон"] != 15000 {
+	if got := periodTotals(e, grp, from, to); got["Исаев Харон"] != 15000 {
 		t.Errorf("«другой» и про полный чек B: сбор %v, ожидали 15000", got)
 	}
 }

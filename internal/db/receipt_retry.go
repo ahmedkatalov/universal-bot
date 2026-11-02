@@ -8,9 +8,31 @@ import (
 // ReceiptRetry — чек, ожидающий повторного распознавания (зрение было недоступно).
 type ReceiptRetry struct {
 	ID        int
+	RawID     int
+	WaID      string
+	Proto     []byte
 	MediaPath string
 	GroupJID  string
 	Attempts  int
+	// In-flight results apply only to this receipt/source snapshot. The
+	// source fingerprint excludes local paths so redownloading is safe.
+	ReceiptVersion string
+	SourceVersion  string
+}
+
+const receiptRetrySourceVersion = `md5(jsonb_build_array(rm.edit_count, rm.body, rm.caption, encode(rm.media_proto, 'hex'), rm.handled_as)::text)`
+
+const receiptRetryCols = `br.id, rm.id, COALESCE(rm.wa_message_id, ''), rm.media_proto,
+       COALESCE(rm.media_path, ''), COALESCE(br.group_jid, rm.wa_group_jid, ''), br.recognition_attempts,
+       br.xmin::text, ` + receiptRetrySourceVersion
+
+func (d *DB) ReceiptRetryByID(ctx context.Context, id int) (ReceiptRetry, error) {
+	var r ReceiptRetry
+	err := d.pool.QueryRow(ctx, `SELECT `+receiptRetryCols+`
+		FROM bank_receipts br JOIN raw_messages rm ON rm.id=br.raw_message_id
+		WHERE br.id=$1 AND NOT br.ignored AND NOT COALESCE(rm.deleted,false)`, id).
+		Scan(&r.ID, &r.RawID, &r.WaID, &r.Proto, &r.MediaPath, &r.GroupJID, &r.Attempts, &r.ReceiptVersion, &r.SourceVersion)
+	return r, err
 }
 
 // MarkReceiptForRetry ставит чек(и) сообщения в очередь на повторное
@@ -35,7 +57,7 @@ func (d *DB) DueReceiptRetries(ctx context.Context, now time.Time, maxAttempts, 
 		limit = 10
 	}
 	rows, err := d.pool.Query(ctx, `
-		SELECT br.id, COALESCE(rm.media_path, ''), COALESCE(br.group_jid, rm.wa_group_jid, ''), br.recognition_attempts
+		SELECT `+receiptRetryCols+`
 		FROM bank_receipts br
 		JOIN raw_messages rm ON rm.id = br.raw_message_id
 		WHERE br.recognition_status = 'pending'
@@ -53,7 +75,7 @@ func (d *DB) DueReceiptRetries(ctx context.Context, now time.Time, maxAttempts, 
 	var out []ReceiptRetry
 	for rows.Next() {
 		var r ReceiptRetry
-		if err := rows.Scan(&r.ID, &r.MediaPath, &r.GroupJID, &r.Attempts); err != nil {
+		if err := rows.Scan(&r.ID, &r.RawID, &r.WaID, &r.Proto, &r.MediaPath, &r.GroupJID, &r.Attempts, &r.ReceiptVersion, &r.SourceVersion); err != nil {
 			return nil, err
 		}
 		out = append(out, r)
@@ -88,7 +110,21 @@ type RecognizedReceipt struct {
 // перестаёт быть свёрнутым, только если повтор прочитал дату, получателя или
 // номер документа.
 func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedReceipt) error {
-	_, err := d.pool.Exec(ctx, `
+	_, err := d.fillReceiptFromRetry(ctx, id, r, "", "")
+	return err
+}
+
+// FillReceiptFromRetryIfCurrent rejects stale image reads after a correction,
+// caption edit, another retry or a WhatsApp deletion during the network call.
+func (d *DB) FillReceiptFromRetryIfCurrent(ctx context.Context, it ReceiptRetry, r RecognizedReceipt) (bool, error) {
+	if it.ReceiptVersion == "" || it.SourceVersion == "" {
+		return false, nil
+	}
+	return d.fillReceiptFromRetry(ctx, it.ID, r, it.ReceiptVersion, it.SourceVersion)
+}
+
+func (d *DB) fillReceiptFromRetry(ctx context.Context, id int, r RecognizedReceipt, receiptVersion, sourceVersion string) (bool, error) {
+	tag, err := d.pool.Exec(ctx, `
 		UPDATE bank_receipts AS br SET
 			bank          = COALESCE(NULLIF($2,''), bank),
 			recipient_raw = CASE WHEN client_confirmed THEN recipient_raw ELSE COALESCE(NULLIF($3,''), recipient_raw) END,
@@ -124,37 +160,74 @@ func (d *DB) FillReceiptFromRetry(ctx context.Context, id int, r RecognizedRecei
 			                          AND client_confirmed AND contact_id IS NOT NULL
 			                     THEN false ELSE true END
 		WHERE id = $1
+		  AND ($14 = '' OR (br.xmin::text = $14 AND NOT br.ignored))
+		  AND ($15 = '' OR EXISTS (
+		    SELECT 1 FROM raw_messages rm WHERE rm.id=br.raw_message_id
+		      AND NOT COALESCE(rm.deleted,false) AND rm.handled_as IS NULL
+		      AND `+receiptRetrySourceVersion+` = $15))
 	`, id, r.Bank, r.Recipient, r.Sender, r.DocNumber, r.AuthCode, r.Status,
-		r.Amount, r.Commission, r.TxDate, r.HasTxDate, r.Declined, r.TimeDefaulted)
-	return err
+		r.Amount, r.Commission, r.TxDate, r.HasTxDate, r.Declined, r.TimeDefaulted, receiptVersion, sourceVersion)
+	return tag.RowsAffected() > 0, err
 }
 
 // BumpReceiptRetry — попытка не удалась (зрение всё ещё недоступно): +1 попытка,
 // новый срок; при исчерпании лимита помечаем 'failed' (останется needs_review для
 // ручной проверки, но повторять перестаём).
 func (d *DB) BumpReceiptRetry(ctx context.Context, id int, errDetail string, nextAt time.Time, maxAttempts int) error {
+	return d.bumpReceiptRetry(ctx, id, errDetail, nextAt, maxAttempts, "", "")
+}
+
+func (d *DB) BumpReceiptRetryIfCurrent(ctx context.Context, it ReceiptRetry, errDetail string, nextAt time.Time, maxAttempts int) error {
+	if it.ReceiptVersion == "" || it.SourceVersion == "" {
+		return nil
+	}
+	return d.bumpReceiptRetry(ctx, it.ID, errDetail, nextAt, maxAttempts, it.ReceiptVersion, it.SourceVersion)
+}
+
+func (d *DB) bumpReceiptRetry(ctx context.Context, id int, errDetail string, nextAt time.Time, maxAttempts int, receiptVersion, sourceVersion string) error {
 	_, err := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET
+		UPDATE bank_receipts AS br SET
 			recognition_attempts   = recognition_attempts + 1,
 			last_recognition_error = $2,
 			next_retry_at          = $3::timestamptz,
 			recognition_status     = CASE WHEN recognition_attempts + 1 >= $4 THEN 'failed' ELSE 'pending' END
 		WHERE id = $1
-	`, id, errDetail, nextAt, maxAttempts)
+		  AND ($5 = '' OR (br.xmin::text = $5 AND NOT br.ignored))
+		  AND ($6 = '' OR EXISTS (
+		    SELECT 1 FROM raw_messages rm WHERE rm.id=br.raw_message_id
+		      AND NOT COALESCE(rm.deleted,false) AND rm.handled_as IS NULL
+		      AND `+receiptRetrySourceVersion+` = $6))
+	`, id, errDetail, nextAt, maxAttempts, receiptVersion, sourceVersion)
 	return err
 }
 
 // ResolveReceiptRetry снимает чек с очереди с указанным статусом (напр.
 // 'not_receipt'); ignore=true дополнительно исключает его из учёта.
 func (d *DB) ResolveReceiptRetry(ctx context.Context, id int, status string, ignore bool) error {
+	return d.resolveReceiptRetry(ctx, id, status, ignore, "", "")
+}
+
+func (d *DB) ResolveReceiptRetryIfCurrent(ctx context.Context, it ReceiptRetry, status string, ignore bool) error {
+	if it.ReceiptVersion == "" || it.SourceVersion == "" {
+		return nil
+	}
+	return d.resolveReceiptRetry(ctx, it.ID, status, ignore, it.ReceiptVersion, it.SourceVersion)
+}
+
+func (d *DB) resolveReceiptRetry(ctx context.Context, id int, status string, ignore bool, receiptVersion, sourceVersion string) error {
 	_, err := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET
+		UPDATE bank_receipts AS br SET
 			recognition_status = $2,
 			next_retry_at      = NULL,
 			ignored      = CASE WHEN $3 THEN true  ELSE ignored END,
 			needs_review = CASE WHEN $3 THEN false ELSE needs_review END
 		WHERE id = $1
-	`, id, status, ignore)
+		  AND ($4 = '' OR (br.xmin::text = $4 AND NOT br.ignored))
+		  AND ($5 = '' OR EXISTS (
+		    SELECT 1 FROM raw_messages rm WHERE rm.id=br.raw_message_id
+		      AND NOT COALESCE(rm.deleted,false) AND rm.handled_as IS NULL
+		      AND `+receiptRetrySourceVersion+` = $5))
+	`, id, status, ignore, receiptVersion, sourceVersion)
 	return err
 }
 
@@ -179,4 +252,17 @@ func (d *DB) HoldMediaForReview(ctx context.Context, rawID int, reason string) (
 		return false, err
 	}
 	return tag.RowsAffected() > 0, nil
+}
+
+func (d *DB) MediaReviewEvidence(ctx context.Context, rawID int) (body, caption string, err error) {
+	err = d.pool.QueryRow(ctx, `SELECT COALESCE(body,''),COALESCE(caption,'') FROM raw_messages WHERE id=$1`, rawID).Scan(&body, &caption)
+	return
+}
+
+// A later verified read may resolve this specific review reason without
+// clearing unrelated holds (for example, an unsupported multipage PDF).
+func (d *DB) ReleaseMediaReview(ctx context.Context, rawID int, reason string) error {
+	_, err := d.pool.Exec(ctx, `UPDATE raw_messages SET handled_as=NULL
+		WHERE id=$1 AND handled_as=$2 AND NOT COALESCE(deleted,false)`, rawID, reason)
+	return err
 }

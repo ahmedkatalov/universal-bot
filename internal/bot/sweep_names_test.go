@@ -19,7 +19,11 @@ import (
 func dayTotals(e *e2eBot, g types.JID) map[string]float64 {
 	n := time.Now()
 	from := time.Date(n.Year(), n.Month(), n.Day(), 0, 0, 0, 0, n.Location())
-	ss, err := e.db.SummaryForPeriod(context.Background(), from, from.AddDate(0, 0, 1), []string{g.String()})
+	return periodTotals(e, g, from, from.AddDate(0, 0, 1))
+}
+
+func periodTotals(e *e2eBot, g types.JID, from, to time.Time) map[string]float64 {
+	ss, err := e.db.SummaryForPeriod(context.Background(), from, to, []string{g.String()})
 	if err != nil {
 		e.t.Fatal(err)
 	}

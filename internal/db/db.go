@@ -2249,20 +2249,21 @@ type DuplicateMatch struct {
 // напечатаны — одно и то же (до секунды; до минуты, если чек печатает только
 // минуты), иначе это разные переводы; угадано хоть одно — окно DuplicateWindow.
 func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, authCode string, contactID *int, recipientRaw, senderRaw string, amount float64, txDate time.Time, txGuessed bool) (DuplicateMatch, error) {
+	docNumber, authCode = receiptDocumentKey(docNumber), receiptDocumentKey(authCode)
 	var m DuplicateMatch
 	// Номера на чеке может не быть (NULL в базе) — «совпал номер» должен быть
 	// false, а не NULL: иначе Scan в bool падает и повтор не ловится вовсе.
-	err := d.pool.QueryRow(ctx, `
+	err := d.pool.QueryRow(ctx, receiptIdentityCTE+`
 		SELECT br.tx_date, COALESCE(c.canonical_name, br.recipient_raw, ''),
-		       COALESCE(($7 <> '' AND br.doc_number = $7) OR ($8 <> '' AND br.auth_code = $8), false),
+		       COALESCE(($7 <> '' AND br.document_key = $7) OR ($8 <> '' AND br.authorization_key = $8), false),
 		       COALESCE(rm.wa_message_id, ''), br.id,
-		       (br.tx_time_guessed AND COALESCE(br.doc_number, '') = '' AND COALESCE(br.auth_code, '') = ''
+		       (br.tx_time_guessed AND COALESCE(br.document_key, '') = '' AND COALESCE(br.authorization_key, '') = ''
 		        AND COALESCE(rm.sender_jid, '') <> 'bot-forward'
 		        -- «другой» про экран, а о каком чеке — неизвестно: заменять его не
 		        -- будем (см. replaceScreenWith), он — обычный «тот же чек».
 		        AND (NOT br.same_check_denied OR br.same_check_denied_vs IS NOT NULL)),
 		       (br.client_confirmed AND br.contact_id IS NOT NULL), COALESCE(rm.received_at, br.tx_date)
-		FROM bank_receipts br
+		FROM receipt_identity br
 		LEFT JOIN raw_messages rm ON rm.id = br.raw_message_id
 		LEFT JOIN contacts c ON c.id = br.contact_id
 		WHERE br.amount = $1
@@ -2274,8 +2275,8 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 		    -- Совпал сильный идентификатор — тот же чек, независимо от подписи и
 		    -- времени (дата могла не прочитаться на одной из копий). Код
 		    -- авторизации короткий — для него ограничиваем окно в несколько дней.
-		    ($7 <> '' AND br.doc_number = $7)
-		    OR ($8 <> '' AND br.auth_code = $8
+		    ($7 <> '' AND br.document_key = $7)
+		    OR ($8 <> '' AND br.authorization_key = $8
 		        AND br.tx_date BETWEEN $2::timestamptz - interval '3 days' AND $3::timestamptz + interval '3 days')
 		    -- Эвристика для чеков без номеров: тот же клиент, окно по времени,
 		    -- номера не противоречат и плательщик на чеке тот же.
@@ -2283,8 +2284,8 @@ func (d *DB) FindDuplicateReceiptEx(ctx context.Context, groupJID, docNumber, au
 		      (($4::int IS NOT NULL AND br.contact_id = $4) OR ($4::int IS NULL AND br.recipient_raw = $5))
 		      AND br.tx_date BETWEEN $2::timestamptz AND $3::timestamptz
 		      AND `+sameOpTimeSQL("br.tx_date", "br.tx_time_guessed", "$11::timestamptz", "$10::boolean")+`
-		      AND (COALESCE(br.doc_number, '') = '' OR $7 = '' OR br.doc_number = $7)
-		      AND (COALESCE(br.auth_code, '') = '' OR $8 = '' OR br.auth_code = $8)
+		      AND (COALESCE(br.document_key, '') = '' OR $7 = '' OR br.document_key = $7)
+		      AND (COALESCE(br.authorization_key, '') = '' OR $8 = '' OR br.authorization_key = $8)
 		      AND (COALESCE(br.sender_raw, '') = '' OR $9 = ''
 		           OR lower(split_part(trim(br.sender_raw), ' ', 1)) = lower(split_part(trim($9), ' ', 1)))
 		    )

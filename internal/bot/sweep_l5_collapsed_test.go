@@ -140,17 +140,15 @@ func TestL5collapsed_11_ScreenOfCountedTransferNotCountedTwice(t *testing.T) {
 // свёрнутый экран уже был в группе, — другой перевод: экран не заменяет и
 // клиента экрана молча не получает.
 func TestL5collapsed_14_LaterFullCheckKeepsEarlierCollapsed(t *testing.T) {
+	anchor := time.Now()
+	fromDay := anchor.Add(-6 * time.Hour)
+	from := time.Date(fromDay.Year(), fromDay.Month(), fromDay.Day(), 0, 0, 0, 0, time.Local)
+	to := time.Date(anchor.Year(), anchor.Month(), anchor.Day(), 0, 0, 0, 0, time.Local).AddDate(0, 0, 1)
 	for _, caption := range []string{"Исаев Харон", ""} {
 		e := newE2E(t, e2eOpts{WithAI: true})
 		now := time.Now()
 		morning := now.Add(-5 * time.Hour)
-		if morning.Day() != now.Day() {
-			morning = time.Date(now.Year(), now.Month(), now.Day(), 0, 5, 0, 0, time.Local)
-		}
 		op := now.Add(-5 * time.Minute).Truncate(time.Second)
-		if !op.After(morning.Add(3 * time.Minute)) {
-			t.Skip("слишком раннее время суток для сценария «утро/вечер»")
-		}
 		e.ai = l5collapsedVision(op)
 		grp, emp := e2eGroup("late"), user("79001115924")
 		l5collapsedPhotoAt(e, grp, emp, "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", morning)
@@ -159,12 +157,12 @@ func TestL5collapsed_14_LaterFullCheckKeepsEarlierCollapsed(t *testing.T) {
 			t.Fatalf("нет вопроса про свёрнутый: %v", e.sent())
 		}
 		e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаев Харон", q.ID, e.botJID(), q.Text))
-		if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 {
+		if got := periodTotals(e, grp, from, to); got["Исаев Харон"] != 5000 {
 			t.Fatalf("свёрнутый после ответа не засчитан: %v", got)
 		}
-		full := l5collapsedPhotoAt(e, grp, emp, sberCheck("5000.00", op.Format("15:04:05")), caption, now)
+		full := l5collapsedPhotoAt(e, grp, emp, sberCheckOn(op, "5000.00", op.Format("15:04:05")), caption, now)
 		r := e.db.TestReceiptByMessage(context.Background(), full)
-		got := dayTotals(e, grp)
+		got := periodTotals(e, grp, from, to)
 		if caption != "" && got["Исаев Харон"] != 10000 {
 			t.Errorf("подпись «%s»: Исаев Харон заплатил 5000 утром (экран прислан в %s) и 5000 вечером (операция %s): сбор %v, ожидали 10000",
 				caption, morning.Format("15:04"), op.Format("15:04"), got)
@@ -194,11 +192,11 @@ func TestL5collapsed_14_LaterFullCheckKeepsEarlierCollapsed(t *testing.T) {
 	l5collapsedPhotoAt(e, grp, emp, "Перевод выполнен\n5 000 ₽\nСообщение получателю", "", screenAt)
 	q := e.lastWith("НЕПОЛНЫМ")
 	e.sendGroup(groupReply(grp, emp, "Сафаи", "Исаев Харон", q.ID, e.botJID(), q.Text))
-	full := l5collapsedPhotoAt(e, grp, emp, sberCheck("5000.00", op.Format("15:04:05")), "", now)
+	full := l5collapsedPhotoAt(e, grp, emp, sberCheckOn(op, "5000.00", op.Format("15:04:05")), "", now)
 	if r := e.db.TestReceiptByMessage(context.Background(), full); r.Recipient != "Исаев Харон" {
 		t.Errorf("полный чек того же перевода не получил клиента экрана: %+v", r)
 	}
-	if got := dayTotals(e, grp); got["Исаев Харон"] != 5000 || sum(got) != 5000 {
+	if got := periodTotals(e, grp, from, to); got["Исаев Харон"] != 5000 || sum(got) != 5000 {
 		t.Errorf("экран + полный чек того же перевода: сбор %v, ожидали Исаев Харон 5000", got)
 	}
 }
