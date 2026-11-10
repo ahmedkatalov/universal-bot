@@ -52,6 +52,11 @@ func (b *Bot) applyDurableRevoke(ctx context.Context, msg *events.Message, p *wa
 		return fmt.Errorf("удаление затрагивает другую группу")
 	}
 	if before.Deleted {
+		// The deletion flag is written before the related cleanup. Replay it
+		// after a failure so a remaining copy can still be recovered.
+		if _, _, err := b.db.MarkMessageDeleted(ctx, waID); err != nil {
+			return err
+		}
 		return b.verifyDeletedDependencies(ctx, waID)
 	}
 	if !before.Found {

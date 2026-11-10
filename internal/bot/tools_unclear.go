@@ -766,21 +766,26 @@ func (b *Bot) rereadGroupTool(chat types.JID) ai.Tool {
 			"«возьми заново чеки из группы сб», «подтяни чеки заново», «пересмотри сообщения группы». Сначала заново " +
 			"разбирает уже сохранённые сообщения (ловит пропущенное), затем просит телефон прислать более старую " +
 			"историю группы — если телефон онлайн и там ещё есть сообщения, бот подтянет их в фоне и отчитается. " +
+			"Проверяет оставшиеся копии чеков после удаления оригинала: сам удалённый источник не восстанавливает. " +
+			"Для конкретного пропущенного чека укажи client=ФИО клиента: перечитывание сохранённых вложений выберет только этого клиента, включая старые фото, ошибочно помеченные обработанными. Не заменяй client именем сотрудника. " +
 			"Можно указать group (пусто = текущая группа, либо все, если пишут из лички).",
 		InputSchema: map[string]any{
 			"type": "object",
 			"properties": map[string]any{
-				"group": map[string]any{"type": "string", "description": "Название группы (пусто = эта группа; в личке без указания — все группы)"},
-				"days":  map[string]any{"type": "integer", "description": "За сколько дней перечитать (по умолчанию 7)"},
+				"group":  map[string]any{"type": "string", "description": "Название группы (пусто = эта группа; в личке без указания — все группы)"},
+				"days":   map[string]any{"type": "integer", "description": "За сколько дней перечитать (по умолчанию 7)"},
+				"client": map[string]any{"type": "string", "description": "ФИО клиента в подписи исходного фото. Пусто — все подходящие вложения; не банковский плательщик и не сотрудник"},
 			},
 			"required": []string{},
 		},
 		Handle: func(ctx context.Context, input json.RawMessage) (string, error) {
 			var args struct {
-				Group string `json:"group"`
-				Days  int    `json:"days"`
+				Group  string `json:"group"`
+				Days   int    `json:"days"`
+				Client string `json:"client"`
 			}
 			_ = json.Unmarshal(input, &args)
+			args.Client = strings.TrimSpace(args.Client)
 			if args.Days <= 0 || args.Days > 60 {
 				args.Days = 7
 			}
@@ -807,15 +812,24 @@ func (b *Bot) rereadGroupTool(chat types.JID) ai.Tool {
 					}
 				}
 			}
-			b.sendText(chat, fmt.Sprintf("🔄 Перечитываю группу за %d дн.: фото чеков, которые не прочитались, и непонятые сообщения. Это займёт до пары минут — напишу итог.", args.Days))
+			clientNote := ""
+			if args.Client != "" {
+				clientNote = " Клиент: " + args.Client + "."
+			}
+			b.sendText(chat, fmt.Sprintf("🔄 Перечитываю группу за %d дн.: сохранённые вложения на проверке и непонятые сообщения.%s Это займёт до пары минут — напишу итог.", args.Days, clientNote))
 
 			// 1) Фото/PDF чеков, которые так и не стали засчитанным чеком.
 			if b.assistant != nil {
 				b.assistant.ResetBreaker() // владелец явно просит — пробуем ИИ сразу
 			}
-			tried, recognized := 0, 0
+			tried, recognized, restoredCopies := 0, 0, 0
 			for _, jid := range targets {
-				t, r := b.rereadGroupMedia(ctx, jid.String(), since)
+				n, err := b.db.RepairReceiptDuplicatesAfterDeletion(ctx, jid.String(), since)
+				if err != nil {
+					return "", fmt.Errorf("не удалось проверить сохранившиеся копии чеков: %w", err)
+				}
+				restoredCopies += n
+				t, r := b.rereadGroupMediaForClient(ctx, jid.String(), since, args.Client)
 				tried, recognized = tried+t, recognized+r
 			}
 
@@ -837,11 +851,27 @@ func (b *Bot) rereadGroupTool(chat types.JID) ai.Tool {
 			}
 
 			var sb strings.Builder
+			if restoredCopies > 0 {
+				fmt.Fprintf(&sb, "Живых копий выведено из дублей после удаления оригинала: %d. В сбор входят только копии с подтверждёнными клиентом и суммой.\n", restoredCopies)
+			}
+			if args.Client != "" {
+				fmt.Fprintf(&sb, "Фильтр клиента для перечитывания вложений: %s.\n", args.Client)
+				if tried == 0 {
+					sb.WriteString("Доступных для перечитывания вложений по этому ФИО не нашёл. Это не доказывает отсутствие чека в WhatsApp: исходник мог не сохраниться или ожидать импорта истории.\n")
+				}
+			}
 			fmt.Fprintf(&sb, "Фото чеков перечитал: %d, из них стали чеками: %d.\n", tried, recognized)
 			if tried > recognized {
 				sb.WriteString("Не прочитались — посмотреть их: «скинь нераспознанные чеки».\n")
 			}
 			sb.WriteString(recountMsg)
+			var groupIDs []string
+			for _, jid := range targets {
+				groupIDs = append(groupIDs, jid.String())
+			}
+			if len(groupIDs) > 0 {
+				sb.WriteString(b.groupReadingNote(ctx, since, time.Now(), groupIDs))
+			}
 			if len(hist) > 0 {
 				sb.WriteString("\n\nИстория с телефона:\n- " + strings.Join(hist, "\n- "))
 			}
@@ -996,7 +1026,11 @@ func (b *Bot) groupLabel(ctx context.Context, jid types.JID) string {
 }
 
 func (b *Bot) rereadGroupMedia(ctx context.Context, groupJID string, since time.Time) (tried, recognized int) {
-	items, err := b.db.GroupMediaToReread(ctx, groupJID, since, 40)
+	return b.rereadGroupMediaForClient(ctx, groupJID, since, "")
+}
+
+func (b *Bot) rereadGroupMediaForClient(ctx context.Context, groupJID string, since time.Time, client string) (tried, recognized int) {
+	items, err := b.db.GroupMediaToRereadForClient(ctx, groupJID, since, client, 40)
 	if err != nil {
 		fmt.Println("Перечитать фото: ошибка выборки:", err)
 		return 0, 0
@@ -1009,6 +1043,7 @@ func (b *Bot) rereadGroupMedia(ctx context.Context, groupJID string, since time.
 		tried++
 		done := make(chan bool, 1)
 		b.enqueueChat(it.GroupJID, func() {
+			defer close(done)
 			if rid, amt, ok, _ := b.db.ReceiptOfRaw(ctx, it.RawID); ok {
 				// Чек есть, но сумма не прочиталась / повторы кончились — читаем ещё раз.
 				b.retryOneReceipt(ctx, db.ReceiptRetry{ID: rid})

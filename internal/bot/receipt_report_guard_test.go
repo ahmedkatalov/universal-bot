@@ -216,3 +216,35 @@ func TestReceiptReportGuardKeepsSelectionsAndPages(t *testing.T) {
 		t.Fatalf("stale snapshot of the same selection/page was retained: %s", out)
 	}
 }
+
+func TestReceiptRecoveryGuardReplacesStaleReportAndSurvivesAPIError(t *testing.T) {
+	b := &Bot{}
+	report := "Итого 3 чека на 145000 ₽"
+	tools, _, result := b.trackReceiptReports(context.Background(), privateText(user(ownerPhone), "Владелец", "").Info, "Перечитай пропущенный чек", []ai.Tool{
+		{Name: "senders_report", Handle: func(context.Context, json.RawMessage) (string, error) {
+			return report, nil
+		}},
+		{Name: "reread_group", Handle: func(context.Context, json.RawMessage) (string, error) {
+			return "Живых копий выведено из дублей после удаления оригинала: 1.", nil
+		}},
+	})
+	args := []byte(`{"from_date":"2026-11-01","to_date":"2026-11-01"}`)
+	for _, tool := range tools {
+		if _, err := tool.Handle(context.Background(), args); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !result.available() {
+		t.Fatal("completed recovery would be lost after a provider error")
+	}
+	if out := result.apply("Не удалось получить ответ"); strings.Contains(out, "145000") || !strings.Contains(out, "Живых копий") || strings.Contains(out, "Не удалось") {
+		t.Fatalf("stale report/API failure replaced completed recovery: %s", out)
+	}
+	report = "Итого 4 чека на 175000 ₽"
+	if _, err := tools[0].Handle(context.Background(), args); err != nil {
+		t.Fatal(err)
+	}
+	if out := result.apply("Готово"); strings.Contains(out, "145000") || !strings.Contains(out, "175000") || !strings.Contains(out, "Живых копий") {
+		t.Fatalf("fresh report or recovery confirmation was lost: %s", out)
+	}
+}

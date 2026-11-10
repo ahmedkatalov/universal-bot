@@ -21,6 +21,7 @@ type ReceiptRetry struct {
 }
 
 const receiptRetrySourceVersion = `md5(jsonb_build_array(rm.edit_count, rm.body, rm.caption, encode(rm.media_proto, 'hex'), rm.handled_as)::text)`
+const receiptNeedsRereadSQL = `(br.amount <= 0 OR br.recognition_status IN ('failed', 'pending'))`
 
 const receiptRetryCols = `br.id, rm.id, COALESCE(rm.wa_message_id, ''), rm.media_proto,
        COALESCE(rm.media_path, ''), COALESCE(br.group_jid, rm.wa_group_jid, ''), br.recognition_attempts,
@@ -30,7 +31,8 @@ func (d *DB) ReceiptRetryByID(ctx context.Context, id int) (ReceiptRetry, error)
 	var r ReceiptRetry
 	err := d.pool.QueryRow(ctx, `SELECT `+receiptRetryCols+`
 		FROM bank_receipts br JOIN raw_messages rm ON rm.id=br.raw_message_id
-		WHERE br.id=$1 AND NOT br.ignored AND NOT COALESCE(rm.deleted,false)`, id).
+		WHERE br.id=$1 AND NOT br.ignored AND NOT br.is_duplicate AND NOT COALESCE(rm.deleted,false)
+		  AND `+receiptNeedsRereadSQL, id).
 		Scan(&r.ID, &r.RawID, &r.WaID, &r.Proto, &r.MediaPath, &r.GroupJID, &r.Attempts, &r.ReceiptVersion, &r.SourceVersion)
 	return r, err
 }
@@ -64,6 +66,7 @@ func (d *DB) DueReceiptRetries(ctx context.Context, now time.Time, maxAttempts, 
 		  AND br.next_retry_at IS NOT NULL AND br.next_retry_at <= $1::timestamptz
 		  AND br.recognition_attempts < $2
 		  AND br.ignored = false
+		  AND NOT br.is_duplicate
 		  AND COALESCE(rm.deleted, false) = false
 		ORDER BY br.next_retry_at ASC
 		LIMIT $3

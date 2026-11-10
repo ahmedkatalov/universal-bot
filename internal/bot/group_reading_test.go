@@ -108,3 +108,129 @@ func TestGroupReadingNoteIncludesUnfinishedInboxWithoutAddingMoney(t *testing.T)
 		t.Fatalf("pending inbox falsely reported complete: %s", text)
 	}
 }
+
+func TestGroupReadingNoteDoesNotHideReviewHeldOrLegacySources(t *testing.T) {
+	for _, tc := range []struct {
+		name, detail string
+		status       db.GroupReadingStatus
+	}{
+		{"known-amount-receipt-review", "чеков на проверке: 2", db.GroupReadingStatus{UnresolvedMessages: 1, ReviewReceipts: 2}},
+		{"held-payment", "платежей ждут решения о повторе: 1", db.GroupReadingStatus{UnresolvedMessages: 1, HeldPayments: 1}},
+		{"legacy-parsed-media", "без записи чека или платежа: 1", db.GroupReadingStatus{UnresolvedMessages: 1, LegacyMediaCandidates: 1}},
+		{"future-source-reason", "сообщений требуют проверки: 1", db.GroupReadingStatus{UnresolvedMessages: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			note := groupReadingIncompleteNote(tc.status, db.GroupInboxCoverage{})
+			if !strings.Contains(note, "⚠️ Отчёт предварительный") || !strings.Contains(note, tc.detail) {
+				t.Errorf("unresolved evidence produced a clean money report: %s", note)
+			}
+			if tc.status.LegacyMediaCandidates > 0 && !strings.Contains(note, "сумма не установлена") {
+				t.Errorf("legacy source was treated as a receipt with a known amount: %s", note)
+			}
+		})
+	}
+}
+
+func TestGroupReadingLegacyNamedPhotoWarningAppearsInMoneyReport(t *testing.T) {
+	ctx := context.Background()
+	group := e2eGroup("reading-legacy-hanataev")
+	e := newE2E(t, e2eOpts{Groups: map[string]string{group.String(): "Сбор СБ ЧЕКИ"}})
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.Local)
+	raw, _, err := e.db.SaveRawMessage(ctx, e2eID("LEGACY-PHOTO"), group.String(), user("79280000003").String(), "79280000003", "~ M", "Ханатаев Акраман", true, "", day.Add(14*time.Hour+24*time.Minute))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.MarkMessageParsed(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	for i, receipt := range []struct {
+		client string
+		amount float64
+	}{
+		{"Эстамиров Ибрагим Муслимович", 50000},
+		{"Хасуев Ислам", 30000},
+		{"Мусаев Рахман", 65000},
+	} {
+		posted := day.Add(time.Duration(i+1) * time.Hour)
+		waID := e2eID("PARSED-CHECK")
+		checkRaw, _, err := e.db.SaveRawMessage(ctx, waID, group.String(), user("79280000004").String(), "79280000004", "Сотрудник", receipt.client, true, "", posted)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contact, err := e.db.GetOrCreateContact(ctx, receipt.client)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.InsertBankReceipt(ctx, db.BankReceiptInput{RawMessageID: checkRaw, GroupJID: group.String(), ContactID: &contact, RecipientRaw: receipt.client, Amount: receipt.amount, ClientConfirmed: true, DocNumber: waID, TxDate: posted}); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.MarkMessageParsed(ctx, checkRaw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	note := e.groupReadingNote(ctx, day, day.AddDate(0, 0, 1), []string{group.String()})
+	for _, want := range []string{"⚠️ Отчёт предварительный", "без записи чека или платежа: 1", "сумма не установлена"} {
+		if !strings.Contains(note, want) {
+			t.Errorf("parsed legacy photo disappeared from financial report warning %q: %s", want, note)
+		}
+	}
+	status, _, err := e.db.GroupReadingSnapshot(ctx, day, day.AddDate(0, 0, 1), []string{group.String()}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	formatted := formatGroupReadingStatus(status, day, day, "Сбор СБ ЧЕКИ")
+	if !strings.Contains(formatted, "помеченные разобранными без записи чека или платежа: 1") || strings.Contains(formatted, "нерешённых вопросов чтения не найдено") {
+		t.Errorf("detailed coverage claimed that named legacy photo was settled: %s", formatted)
+	}
+	report := e.tool("senders_report", group, `{"from_date":"2026-11-01","to_date":"2026-11-01","group":"Сбор СБ ЧЕКИ","kind":"checks","view":"payments"}`)
+	for _, want := range []string{"чеки 3 шт. на 145000 ₽", "⚠️ Отчёт предварительный", "без записи чека или платежа: 1", "сумма не установлена"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("145,000 report silently omitted the named legacy source %q: %s", want, report)
+		}
+	}
+	if strings.Contains(report, "175000") {
+		t.Errorf("coverage warning invented the missing receipt's amount: %s", report)
+	}
+}
+
+func TestGroupReadingWarnsMoneyReportAboutCopyOfDeletedReceipt(t *testing.T) {
+	ctx := context.Background()
+	group := e2eGroup("reading-deleted-receipt")
+	e := newE2E(t, e2eOpts{Groups: map[string]string{group.String(): "СБ"}})
+	posted := time.Date(2026, 11, 8, 12, 0, 0, 0, time.Local)
+	client := "Ханатаев Акраман"
+	contact, err := e.db.GetOrCreateContact(ctx, client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doc := e2eID("RECEIPT-DOC")
+	add := func(waID string, at time.Time, duplicate bool) {
+		t.Helper()
+		raw, _, err := e.db.SaveRawMessage(ctx, waID, group.String(), user("79280000004").String(), "79280000004", "Сотрудник", client, true, "", at)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.InsertBankReceipt(ctx, db.BankReceiptInput{RawMessageID: raw, GroupJID: group.String(), ContactID: &contact, RecipientRaw: client, Amount: 30000, ClientConfirmed: true, DocNumber: doc, TxDate: posted, IsDuplicate: duplicate}); err != nil {
+			t.Fatal(err)
+		}
+		if err := e.db.MarkMessageParsed(ctx, raw); err != nil {
+			t.Fatal(err)
+		}
+	}
+	original := e2eID("ORIGINAL")
+	add(original, posted.AddDate(0, 0, -1), false)
+	if _, _, err := e.db.MarkMessageDeleted(ctx, original); err != nil {
+		t.Fatal(err)
+	}
+	// A historically suppressed copy can appear after the original's revoke.
+	add(e2eID("COPY"), posted, true)
+	report := e.tool("senders_report", group, `{"from_date":"2026-11-08","to_date":"2026-11-08","group":"СБ","kind":"checks","view":"payments"}`)
+	for _, want := range []string{"⚠️ Отчёт предварительный", "копий чеков без действующей записи после удаления оригиналов: 1"} {
+		if !strings.Contains(report, want) {
+			t.Errorf("missing %q: %s", want, report)
+		}
+	}
+	if strings.Contains(report, "30000") {
+		t.Errorf("report treated suppressed evidence as a payment: %s", report)
+	}
+}

@@ -236,6 +236,67 @@ func TestHistoryReliabilityForwardedSberPhotoStaysPendingUntilRecognized(t *test
 	}
 }
 
+func TestHistoryReliabilityRestoresMissingEvidenceBeforeLegacyReread(t *testing.T) {
+	t.Setenv("RECEIPT_VISION_READS", "1")
+	ctx := context.Background()
+	grp, other, worker := e2eGroup("history-missing-evidence"), e2eGroup("history-unrelated"), user("79280000706")
+	e := newE2E(t, e2eOpts{WithAI: true})
+	e.aliases.Add("Ханатаев Акраман", "Ханатаев Акраман")
+	at := time.Date(2026, time.November, 1, 14, 24, 0, 0, time.FixedZone("MSK", 3*60*60))
+	waID := e2eID("HISTORY-RESTORES-MEDIA")
+	raw, _, err := e.db.SaveRawMessage(ctx, waID, grp.String(), worker.String(), worker.String(), "~M", "нечитаемый OCR", true, "", at)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.MarkMessageParsed(ctx, raw); err != nil {
+		t.Fatal(err)
+	}
+	caption := "Ханатаев акраман"
+	content := &waProto.Message{ImageMessage: &waProto.ImageMessage{
+		Caption: proto.String(caption), DirectPath: proto.String("/restore-receipt"), MediaKey: []byte("media-key-fixture"),
+	}}
+	message := reliableHistoryMessage(grp, worker, waID, "~M", at, content)
+	if seen, _, _ := e.importHistorySync(reliableHistoryBatch(other, message)); seen != 0 {
+		t.Fatalf("history accepted a message whose chat conflicts with its conversation: seen=%d", seen)
+	}
+	e.importHistorySync(reliableHistoryBatch(other, reliableHistoryMessage(other, worker, waID, "~M", at, content)))
+	if _, storedCaption, err := e.db.MediaReviewEvidence(ctx, raw); err != nil || storedCaption != "" {
+		t.Fatalf("history from another group updated attachment evidence: %q / %v", storedCaption, err)
+	}
+	message.GetMessage().GetKey().RemoteJID = nil // History can supply the group only on the conversation.
+	seen, receipts, payments := e.importHistorySync(reliableHistoryBatch(grp, message))
+	if seen != 1 || receipts != 0 || payments != 0 || !e.db.NeedsMediaReread(ctx, raw) {
+		t.Fatal("history with no local media must preserve the legacy candidate without recording a payment")
+	}
+	partial := reliableHistoryBatch(grp, reliableHistoryMessage(grp, worker, waID, "~M", at, &waProto.Message{ImageMessage: &waProto.ImageMessage{}}))
+	e.importHistorySync(partial)
+	items, err := e.db.GroupMediaToReread(ctx, grp.String(), at.Add(-time.Minute), 10)
+	var stored waProto.Message
+	if err != nil || len(items) != 1 || !items[0].RecoverParsed || items[0].Caption != caption || proto.Unmarshal(items[0].Proto, &stored) != nil || !proto.Equal(content, &stored) {
+		t.Fatalf("partial replay lost the restored caption or source: %+v / %v", items, err)
+	}
+	path := filepath.Join(t.TempDir(), "receipt.jpg")
+	if err := os.WriteFile(path, []byte("historical-receipt-fixture"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.db.SetMediaPath(ctx, raw, path); err != nil {
+		t.Fatal(err)
+	}
+	e.ai = func(aiCall) aiReply {
+		return aiReply{Text: `{"kind":"receipt","bank":"Сбербанк","recipient":"Милана Нажудовна К.","sender":"Элина Зилаудиевна Г.","amount":30000,"doc_number":"1000000006086701079","auth_code":"024307","datetime":"2026-11-01 14:23:06"}`}
+	}
+	if _, receipts, payments := e.importHistorySync(partial); receipts != 1 || payments != 0 {
+		t.Fatalf("restored evidence did not recover the receipt: receipts=%d payments=%d", receipts, payments)
+	}
+	if _, receipts, _ := e.importHistorySync(partial); receipts != 0 {
+		t.Fatalf("repeated history saved %d duplicate receipts", receipts)
+	}
+	r := e.db.TestReceiptByMessage(ctx, waID)
+	if !r.Found || r.Amount != 30000 || r.Recipient != "Ханатаев Акраман" || !r.Confirmed || r.NeedsReview || r.Duplicate || len(e.sent()) != 0 {
+		t.Fatalf("history recovery lost the verified receipt or sent a group message: %+v / %+v", r, e.sent())
+	}
+}
+
 func TestHistoryReliabilityRevocationIsAppliedQuietlyAndScoped(t *testing.T) {
 	ctx := context.Background()
 	grp, other, worker := e2eGroup("history-revoke"), e2eGroup("history-foreign"), user("79280000704")

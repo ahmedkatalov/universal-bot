@@ -119,6 +119,14 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 	var seen, receipts, payments int
 	aiBudget := 60 // столько текстов за импорт читает ИИ (дальше — только явные платежи)
 	for _, conv := range data.GetConversations() {
+		var conversationChat types.JID
+		if id := conv.GetID(); id != "" {
+			var err error
+			conversationChat, err = types.ParseJID(id)
+			if err != nil || conversationChat.User == "" || conversationChat.Server != types.GroupServer {
+				continue
+			}
+		}
 		msgs := conv.GetMessages()
 		// По времени сообщения (возрастание) — чтобы порядок совпадал с реальным.
 		sort.SliceStable(msgs, func(i, j int) bool {
@@ -130,11 +138,20 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 				continue
 			}
 			key := wmi.GetKey()
-			if key == nil || key.GetFromMe() {
+			if key.GetID() == "" || key.GetFromMe() {
 				continue // свои сообщения не учитываем
 			}
-			chat, err := types.ParseJID(key.GetRemoteJID())
-			if err != nil || chat.Server != types.GroupServer {
+			// The history conversation supplies the chat, as in ParseWebMessage.
+			// A present message chat must agree before we touch group accounting.
+			chat := conversationChat
+			if remote := key.GetRemoteJID(); remote != "" {
+				keyChat, err := types.ParseJID(remote)
+				if err != nil || (!chat.IsEmpty() && keyChat != chat) {
+					continue
+				}
+				chat = keyChat
+			}
+			if chat.User == "" || chat.Server != types.GroupServer {
 				continue // импортируем только рабочие группы, не личку
 			}
 			if !b.isAllowedGroup(chat) {
@@ -225,14 +242,17 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 				continue
 			}
 			if hasMedia {
-				if existed && !b.db.NeedsMediaReread(ctx, rawID) {
-					continue
-				}
 				payload, err := proto.Marshal(content)
 				if err != nil {
 					continue
 				}
-				if err := b.db.SetMediaInfo(ctx, rawID, text, payload); err != nil {
+				var attachment whatsmeow.DownloadableMessage = img
+				if img == nil {
+					attachment = doc
+				}
+				hasDownloadInfo := attachment.GetDirectPath() != "" && len(attachment.GetMediaKey()) != 0
+				stored, found, err := b.db.RecordHistoryMediaEvidence(ctx, rawID, chat.String(), text, payload, hasDownloadInfo)
+				if err != nil || !found || (existed && !b.db.NeedsMediaReread(ctx, rawID)) {
 					continue
 				}
 				var mediaBytes []byte
@@ -251,13 +271,17 @@ func (b *Bot) importHistorySync(data *waHistorySync.HistorySync) (seenN, receipt
 					}
 				}
 				if mediaBytes == nil {
-					var data []byte
-					var err error
-					if img != nil {
-						data, err = b.download(ctx, img)
-					} else {
-						data, err = b.download(ctx, doc)
+					if !hasDownloadInfo {
+						var original waProto.Message
+						if proto.Unmarshal(stored, &original) == nil {
+							if saved := original.GetImageMessage(); img != nil && saved != nil {
+								attachment = saved
+							} else if saved := original.GetDocumentMessage(); doc != nil && saved != nil {
+								attachment = saved
+							}
+						}
 					}
+					data, err := b.download(ctx, attachment)
 					if err != nil {
 						continue
 					}
@@ -361,6 +385,13 @@ func (b *Bot) importReceiptReadSilent(ctx context.Context, chat types.JID, rawID
 		if err := b.db.ReleaseMediaReview(ctx, rawID, receiptCandidateOtherHold); err != nil {
 			return false, false
 		}
+		if rec.Kind == "cash" {
+			// History/legacy recovery does not replay cash-payment side effects.
+			// Persist the known media kind so it is not reopened as an orphan.
+			if err := b.db.SetHandledAs(ctx, rawID, "cash_media"); err != nil {
+				return false, false
+			}
+		}
 		return false, true
 	}
 	if !ok || rec.Kind != "receipt" {
@@ -388,7 +419,11 @@ func (b *Bot) importReceiptReadSilent(ctx context.Context, chat types.JID, rawID
 	if err != nil {
 		return false, false
 	}
-	cands := []string{body}
+	_, caption, err := b.db.MediaReviewEvidence(ctx, rawID)
+	if err != nil {
+		return false, false
+	}
+	cands := []string{caption, body}
 	if sender != "" {
 		before, err := b.db.SenderTextsBefore(ctx, chat.String(), sender, received, 15*time.Minute)
 		if err != nil {

@@ -152,3 +152,146 @@ func TestGroupReadingDatabaseScopeAndUnknownAmounts(t *testing.T) {
 		t.Fatal("invalid range accepted")
 	}
 }
+
+func TestGroupReadingLegacyNamedMediaWithoutLedgerRowRemainsUnresolved(t *testing.T) {
+	d := testDB(t)
+	ctx := context.Background()
+	group, sender := uniqueScope("reading-legacy-named-media")
+	group += "@g.us"
+	day := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	add := func(label, body, caption string) int {
+		t.Helper()
+		raw, _, err := d.SaveRawMessage(ctx, group+"-"+label, group, sender, "", "~ M", body, true, "", day.Add(14*time.Hour+24*time.Minute))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := d.pool.Exec(ctx, "UPDATE raw_messages SET parsed=true,caption=NULLIF($2,'') WHERE id=$1", raw, caption); err != nil {
+			t.Fatal(err)
+		}
+		return raw
+	}
+	caption := add("hanataev-caption", "", "Ханатаев акраман")
+	body := add("legacy-body-name", "Ханатаев Акраман", "")
+	add("other-picture", "Фотография природы", "")
+	add("command", "", "Джарвис покажи отчёт")
+	cash := add("cash-photo", "", "Ханатаев Акраман")
+	if _, err := d.pool.Exec(ctx, "UPDATE raw_messages SET cash_hint=true WHERE id=$1", cash); err != nil {
+		t.Fatal(err)
+	}
+	transaction := add("transaction", "", "Ханатаев Акраман")
+	if _, err := d.pool.Exec(ctx, "INSERT INTO transactions(raw_message_id,raw_name,amount,tx_date,is_cash,ignored) VALUES($1,'Ханатаев Акраман',15000,$2,true,true)", transaction, day); err != nil {
+		t.Fatal(err)
+	}
+	receipt := add("ignored-receipt", "", "Ханатаев Акраман")
+	if err := d.InsertBankReceipt(ctx, BankReceiptInput{RawMessageID: receipt, GroupJID: group, RecipientRaw: "Ханатаев Акраман", Amount: 30000, TxDate: day, Ignored: true}); err != nil {
+		t.Fatal(err)
+	}
+	handled := add("known-other", "", "Ханатаев Акраман")
+	if _, err := d.pool.Exec(ctx, "UPDATE raw_messages SET handled_as='not_receipt' WHERE id=$1", handled); err != nil {
+		t.Fatal(err)
+	}
+	deleted := add("deleted", "", "Ханатаев Акраман")
+	if _, err := d.pool.Exec(ctx, "UPDATE raw_messages SET deleted=true WHERE id=$1", deleted); err != nil {
+		t.Fatal(err)
+	}
+	unread := add("unread", "", "Ханатаев Акраман")
+	if _, err := d.pool.Exec(ctx, "UPDATE raw_messages SET parsed=false WHERE id=$1", unread); err != nil {
+		t.Fatal(err)
+	}
+	status, err := d.GroupReading(ctx, day, day.AddDate(0, 0, 1), []string{group}, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if status.SavedMessages != 10 || status.DeletedMessages != 1 || status.SettledMessages != 6 || status.UnresolvedMessages != 3 || status.LegacyMediaCandidates != 2 || status.UnreadMedia != 1 {
+		t.Fatalf("legacy named photo was treated as settled, or other/cash photos reopened: %+v", status)
+	}
+	var legacyIssues int
+	for _, issue := range status.Issues {
+		if issue.RawID != caption && issue.RawID != body {
+			continue
+		}
+		legacyIssues++
+		reason := strings.Join(issue.Reasons, "; ")
+		if !strings.Contains(reason, "помечено разобранным") || !strings.Contains(reason, "файл и данные для повторного скачивания не сохранены") || issue.KnownPendingAmount != 0 || issue.UnknownAmounts != 0 {
+			t.Errorf("missing-file candidate hidden or invented receipt/amount: %+v", issue)
+		}
+	}
+	if legacyIssues != 2 {
+		t.Fatalf("caption-only or legacy-body FIO disappeared from issues: %+v", status.Issues)
+	}
+}
+
+func TestGroupReadingUnresolvedCopiesAfterOriginalWasDeleted(t *testing.T) {
+	for _, identity := range []string{"document", "explicit_link", "image", "legacy_image", "same_client_and_amount"} {
+		t.Run(identity, func(t *testing.T) {
+			d := testDB(t)
+			ctx := context.Background()
+			group, original, copies := deletedReceiptCopyFixture(t, d, 2)
+			var originalID int
+			var postedAt time.Time
+			if err := d.pool.QueryRow(ctx, `SELECT id, received_at FROM raw_messages WHERE wa_message_id=$1`, original).Scan(&originalID, &postedAt); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET tx_date=$2 WHERE group_jid=$1`, group, postedAt); err != nil {
+				t.Fatal(err)
+			}
+			if identity != "document" {
+				if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET doc_number=NULL WHERE group_jid=$1`, group); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if identity == "explicit_link" {
+				if _, err := d.pool.Exec(ctx, `UPDATE bank_receipts SET superseded_by_raw=$2 WHERE group_jid=$1 AND is_duplicate`, group, originalID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if identity == "image" || identity == "legacy_image" {
+				if _, err := d.pool.Exec(ctx, `UPDATE raw_messages SET media_sha=$1 WHERE wa_group_jid=$1`, group); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if identity == "legacy_image" {
+				if _, err := d.pool.Exec(ctx, `DELETE FROM bank_receipts WHERE group_jid=$1 AND is_duplicate`, group); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := d.pool.Exec(ctx, `UPDATE raw_messages SET parsed=true,caption=NULL,body='' WHERE wa_group_jid=$1`, group); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// The report period contains only the copies, but their original is
+			// still relevant when deciding whether these messages are settled.
+			from, to := postedAt.Add(time.Minute), postedAt.Add(3*time.Minute)
+			read := func() GroupReadingStatus {
+				t.Helper()
+				status, err := d.GroupReading(ctx, from, to, []string{group}, 1)
+				if err != nil {
+					t.Fatal(err)
+				}
+				return status
+			}
+			if s := read(); s.SettledMessages != 2 || s.UnresolvedMessages != 0 {
+				t.Fatalf("live original: %+v", s)
+			}
+			// Reproduce the historical deletion that left both copies suppressed.
+			if _, err := d.pool.Exec(ctx, `UPDATE raw_messages SET deleted=true WHERE id=$1`, originalID); err != nil {
+				t.Fatal(err)
+			}
+			if identity == "same_client_and_amount" {
+				if s := read(); s.SettledMessages != 2 || s.UnresolvedMessages != 0 {
+					t.Fatalf("matching amount and client alone identified a copy: %+v", s)
+				}
+				return
+			}
+			s := read()
+			if s.SettledMessages != 0 || s.UnresolvedMessages != 2 || s.UnresolvedReceiptCopies != 2 || !s.Truncated || len(s.Issues) != 1 || s.Issues[0].WaID != copies[0] {
+				t.Fatalf("surviving copies were hidden from coverage: %+v", s)
+			}
+			if n, err := d.RepairReceiptDuplicatesAfterDeletion(ctx, group, from); err != nil || n != 1 {
+				t.Fatalf("repair promoted %d: %v", n, err)
+			}
+			if s := read(); s.SettledMessages != 2 || s.UnresolvedMessages != 0 {
+				t.Fatalf("a repaired receipt still leaves a duplicate warning: %+v", s)
+			}
+		})
+	}
+}

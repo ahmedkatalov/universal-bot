@@ -15,7 +15,7 @@ import (
 const receiptReportInstructions = `
 
 ПОЛНОТА СПИСКА ЧЕКОВ.
-Сотрудник (sender) — автор сообщения WhatsApp. Клиент (client) — ФИО из подписи к чеку, банковский плательщик — отдельное поле bank_payer. На уточнение «а как насчёт <ФИО>» после отчёта по сотрудникам проверяй client в том же периоде и группе, очистив sender, если человек явно не назван сотрудником. Не заменяй отсутствующего клиента другим человеком или платежом на похожую сумму. Отсутствие строки в одном отчёте не доказывает, что чек не присылали: проверь сохранённые исходники и незавершённое чтение. Нельзя говорить «всё учтено» при непрочитанных вложениях или неполной истории. Для списка с ФИО вызывай senders_report с view=payments. Данные, итоги, предупреждения и отметка неполной страницы должны сохраняться полностью; не сокращай список при пересказе.
+Сотрудник (sender) — автор сообщения WhatsApp. Клиент (client) — ФИО из подписи к чеку, банковский плательщик — отдельное поле bank_payer. На уточнение «а как насчёт <ФИО>» после отчёта по сотрудникам проверяй client в том же периоде и группе, очистив sender, если человек явно не назван сотрудником. Не заменяй отсутствующего клиента другим человеком или платежом на похожую сумму. Отсутствие строки в одном отчёте не доказывает, что чек не присылали: проверь сохранённые исходники и незавершённое чтение. Если найдено удалённое сообщение, это ещё не доказывает отсутствие живой копии того же чека: при жалобе на потерянный чек используй reread_group для проверки сохранившихся копий, затем заново запроси отчёт. Удалённое сообщение само по себе не восстанавливай и сумму по догадке не добавляй. Для конкретного клиента при перечитывании передавай client=ФИО из подписи. Нельзя говорить «всё учтено» при непрочитанных вложениях или неполной истории. Для списка с ФИО вызывай senders_report с view=payments. Данные, итоги, предупреждения и отметка неполной страницы должны сохраняться полностью; не сокращай список при пересказе.
 `
 
 type savedReceiptReport struct {
@@ -49,6 +49,7 @@ type receiptReportReply struct {
 	mu         sync.Mutex
 	reportKeys map[string]int
 	reports    []string
+	recoveries []string
 	warnings   []string
 	other      []string
 }
@@ -56,14 +57,15 @@ type receiptReportReply struct {
 func (r *receiptReportReply) available() bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return len(r.reports) > 0
+	return len(r.reports)+len(r.recoveries) > 0
 }
 
 func (r *receiptReportReply) apply(reply string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if len(r.reports) > 0 {
-		reply = strings.Join(r.reports, "\n\n")
+	if len(r.reports)+len(r.recoveries) > 0 {
+		parts := append(append([]string{}, r.recoveries...), r.reports...)
+		reply = strings.Join(parts, "\n\n")
 		if len(r.other) > 0 {
 			reply += "\n\nДополнительные результаты:\n" + strings.Join(r.other, "\n\n")
 		}
@@ -109,7 +111,13 @@ func (b *Bot) trackReceiptReports(ctx context.Context, info types.MessageInfo, q
 			}
 			state.mu.Lock()
 			defer state.mu.Unlock()
-			if tool.Name == "senders_report" {
+			if tool.Name == "reread_group" {
+				// Recovery changes the ledger. Reports obtained before it are
+				// stale, while the completed recovery result survives API failure.
+				state.reports = nil
+				state.reportKeys = make(map[string]int)
+				state.recoveries = append(state.recoveries, out)
+			} else if tool.Name == "senders_report" {
 				if _, _, err := args.validate(); err == nil && b.db != nil {
 					stored, _ := json.Marshal(savedReceiptReport{Args: args, At: time.Now()})
 					if err := b.db.SettingSet(callCtx, b.receiptReportContextKey(ctx, info), string(stored)); err != nil {

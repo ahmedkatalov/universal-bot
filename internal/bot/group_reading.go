@@ -81,7 +81,13 @@ func formatGroupReadingStatus(s db.GroupReadingStatus, from, to time.Time, group
 	}
 	if s.UnresolvedMessages > 0 {
 		fmt.Fprintf(&out, "Неразобранные вложения: %d; тексты: %d; спорный разбор: %d.\n", s.UnreadMedia, s.UnreadTexts, s.DisputedMessages)
+		if s.LegacyMediaCandidates > 0 {
+			fmt.Fprintf(&out, "Вложения с подписью ФИО, помеченные разобранными без записи чека или платежа: %d; требуется перечитывание, сумма не установлена.\n", s.LegacyMediaCandidates)
+		}
 		fmt.Fprintf(&out, "Чеков на проверке: %d; с неизвестной суммой: %d; распознавание не завершено: %d; платежей ждут решения о повторе: %d.\n", s.ReviewReceipts, s.UnknownReceiptAmounts, s.RecognitionPending, s.HeldPayments)
+		if s.UnresolvedReceiptCopies > 0 {
+			fmt.Fprintf(&out, "Копии чеков без действующей записи после удаления оригиналов: %d. Требуется проверка.\n", s.UnresolvedReceiptCopies)
+		}
 		out.WriteString("Непрочитанное вложение может оказаться чеком или другим изображением. Неизвестные суммы нельзя считать нулём или прибавлять к сбору.\n")
 		for _, i := range s.Issues {
 			who := i.Sender
@@ -205,9 +211,6 @@ func groupSpoolReadingNote(s GroupSpoolStatus, err error) string {
 
 func groupReadingIncompleteNote(s db.GroupReadingStatus, inbox db.GroupInboxCoverage) string {
 	queueCount := inbox.Pending + inbox.Processing + inbox.Review
-	if s.UnreadMedia+s.UnreadTexts+s.DisputedMessages+s.UnknownReceiptAmounts+s.RecognitionPending+queueCount == 0 {
-		return ""
-	}
 	var parts []string
 	if s.UnreadMedia > 0 {
 		parts = append(parts, fmt.Sprintf("не разобраны вложения: %d (не все обязательно чеки)", s.UnreadMedia))
@@ -218,6 +221,18 @@ func groupReadingIncompleteNote(s db.GroupReadingStatus, inbox db.GroupInboxCove
 	if s.DisputedMessages > 0 {
 		parts = append(parts, fmt.Sprintf("спорных сообщений: %d", s.DisputedMessages))
 	}
+	if s.LegacyMediaCandidates > 0 {
+		parts = append(parts, fmt.Sprintf("вложений с подписью ФИО помечены разобранными без записи чека или платежа: %d; требуется перечитывание, сумма не установлена", s.LegacyMediaCandidates))
+	}
+	if s.ReviewReceipts > 0 {
+		parts = append(parts, fmt.Sprintf("чеков на проверке: %d", s.ReviewReceipts))
+	}
+	if s.HeldPayments > 0 {
+		parts = append(parts, fmt.Sprintf("платежей ждут решения о повторе: %d", s.HeldPayments))
+	}
+	if s.UnresolvedReceiptCopies > 0 {
+		parts = append(parts, fmt.Sprintf("копий чеков без действующей записи после удаления оригиналов: %d", s.UnresolvedReceiptCopies))
+	}
 	if s.UnknownReceiptAmounts > 0 {
 		parts = append(parts, fmt.Sprintf("чеков с неизвестной суммой: %d", s.UnknownReceiptAmounts))
 	}
@@ -226,6 +241,12 @@ func groupReadingIncompleteNote(s db.GroupReadingStatus, inbox db.GroupInboxCove
 	}
 	if queueCount > 0 {
 		parts = append(parts, fmt.Sprintf("не завершена обработка %d событий сообщений/правок/удалений", queueCount))
+	}
+	if len(parts) == 0 {
+		if s.UnresolvedMessages == 0 {
+			return ""
+		}
+		parts = append(parts, fmt.Sprintf("сообщений требуют проверки: %d", s.UnresolvedMessages))
 	}
 	return "\n⚠️ Отчёт предварительный: в выбранных группах за период " + strings.Join(parts, "; ") + ". Неизвестные суммы не равны нулю. Можно запросить список того, что ещё не разобрано; сверка с CMF выполняется отдельно."
 }

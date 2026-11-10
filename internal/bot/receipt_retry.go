@@ -73,13 +73,14 @@ func (b *Bot) retryDueReceipts() {
 
 func (b *Bot) retryOneReceipt(ctx context.Context, it db.ReceiptRetry) {
 	max := maxReceiptRetries()
-	if it.ReceiptVersion == "" {
-		current, err := b.db.ReceiptRetryByID(ctx, it.ID)
-		if err != nil {
-			return
-		}
-		it = current
+	current, err := b.db.ReceiptRetryByID(ctx, it.ID)
+	if err != nil {
+		return
 	}
+	if it.ReceiptVersion != "" && (it.ReceiptVersion != current.ReceiptVersion || it.SourceVersion != current.SourceVersion) {
+		return
+	}
+	it = current
 	ext := filepath.Ext(it.MediaPath)
 	data, err := os.ReadFile(it.MediaPath)
 	if err != nil {
@@ -210,7 +211,7 @@ func (b *Bot) retryDueMedia(ctx context.Context) {
 		done := make(chan struct{})
 		b.enqueueChat(it.GroupJID, func() {
 			defer close(done)
-			b.rereadMedia(ctx, it)
+			b.rereadCurrentMedia(ctx, it, true)
 		})
 		select {
 		case <-done:
@@ -223,6 +224,18 @@ func (b *Bot) retryDueMedia(ctx context.Context) {
 // rereadMedia — заново скачать (если нужно) и разобрать фото чека так же, как
 // при получении. Возвращает, стало ли фото чеком.
 func (b *Bot) rereadMedia(ctx context.Context, it db.MediaRetry) bool {
+	return b.rereadCurrentMedia(ctx, it, false)
+}
+
+func (b *Bot) rereadCurrentMedia(ctx context.Context, queued db.MediaRetry, automatic bool) bool {
+	it, found, err := b.db.CurrentRawMediaForReread(ctx, queued.RawID, queued.SourceVersion, automatic)
+	if err != nil {
+		fmt.Printf("Повтор вложения #%d: проверка источника: %v\n", queued.RawID, err)
+		return false
+	}
+	if !found || it.GroupJID != queued.GroupJID {
+		return false
+	}
 	chat, err := types.ParseJID(it.GroupJID)
 	if err != nil {
 		return false
@@ -253,6 +266,18 @@ func (b *Bot) rereadMedia(ctx context.Context, it db.MediaRetry) bool {
 	}
 	if ext == "" {
 		ext = ".jpg"
+	}
+	if it.RecoverParsed {
+		// Old "parsed" sources may also be cash photos. Read them through the
+		// silent receipt-only importer so recovery cannot replay cash effects.
+		saved, complete := b.importReceiptReadSilent(ctx, chat, it.RawID, it.ReceivedAt, data, ext)
+		if complete {
+			_ = b.db.MarkMessageParsed(ctx, it.RawID)
+		}
+		if !saved && !complete {
+			_ = b.db.BumpMediaRetry(ctx, it.RawID, time.Now().Add(retryBackoff(it.Attempts)))
+		}
+		return saved
 	}
 	payer, payerAmount := b.payerFromCaption(ctx, it.Caption)
 	b.handleBankReceipt(ctx, chat, it.SenderJID, it.WaID, text, it.RawID, it.ReceivedAt, data, ext, payer, payerAmount)

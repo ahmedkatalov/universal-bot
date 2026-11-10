@@ -19,8 +19,9 @@ type groupReadingQuerier interface {
 type GroupReadingStatus struct {
 	SavedMessages, DeletedMessages, SettledMessages, UnresolvedMessages int
 	UnreadMedia, UnreadTexts, DisputedMessages                          int
+	LegacyMediaCandidates                                               int
 	ReviewReceipts, UnknownReceiptAmounts, RecognitionPending           int
-	HeldPayments                                                        int
+	HeldPayments, UnresolvedReceiptCopies                               int
 	FirstSavedAt, LastSavedAt                                           time.Time
 	Issues                                                              []GroupReadingIssue
 	Truncated                                                           bool
@@ -41,11 +42,13 @@ type groupReadingMessage struct {
 	WaID, GroupJID, Sender                      string
 	ReceivedAt                                  time.Time
 	Parsed, Deleted, HasMedia, Disputed         bool
-	Handled, Body                               string
+	Handled, Body, Caption                      string
+	LegacyMediaCandidate, LegacyDeletedCopy     bool
 	MediaAvailable                              bool
 	MediaAttempts                               int
 	ReceiptRows, ReviewReceipts, UnknownAmounts int
 	RecognitionPending, HeldPayments            int
+	SuppressedReceiptCopies                     int
 	KnownPendingAmount                          float64
 }
 
@@ -88,14 +91,25 @@ func groupReading(ctx context.Context, q groupReadingQuerier, from, to time.Time
 	if limit > 200 {
 		limit = 200
 	}
+	noLiveCopy := `NOT EXISTS (
+		SELECT 1 FROM bank_receipts live JOIN raw_messages lrm ON lrm.id=live.raw_message_id
+		WHERE NOT lrm.deleted AND NOT live.is_duplicate AND NOT live.ignored
+		  AND COALESCE(live.group_jid,lrm.wa_group_jid,'')=COALESCE(orig.group_jid,orm.wa_group_jid,'')
+		  AND (` + deletedReceiptSamePhysicalSQL("live", "orig") + ` OR live.superseded_by_raw=orig.raw_message_id)
+	)`
 	rows, err := q.Query(ctx, `
 		WITH source AS MATERIALIZED (
 			SELECT rm.id, COALESCE(rm.wa_message_id,'') AS wa_id, COALESCE(rm.wa_group_jid,'') AS group_jid,
 			       COALESCE(NULLIF(po.name,''), NULLIF(rm.sender_name,''), split_part(COALESCE(NULLIF(rm.sender_phone,''),rm.sender_jid,''),'@',1)) AS sender,
 			       rm.received_at, rm.parsed, COALESCE(rm.deleted,false) AS deleted, rm.has_media,
 			       COALESCE(rm.ai_disputed,false) AS disputed, COALESCE(rm.handled_as,'') AS handled,
-			       CASE WHEN btrim(COALESCE(rm.body,'')) <> '' THEN 'nonempty' ELSE '' END AS body,
-			       (COALESCE(rm.media_path,'') <> '' OR rm.media_proto IS NOT NULL) AS media_available, rm.media_attempts
+			       COALESCE(rm.body,'') AS body,
+			       (COALESCE(rm.media_path,'') <> '' OR rm.media_proto IS NOT NULL) AS media_available, rm.media_attempts,
+			       COALESCE(rm.caption,'') AS caption, (`+legacyParsedMediaCandidateSQL+`) AS legacy_candidate,
+			       EXISTS (SELECT 1 FROM raw_messages orm JOIN bank_receipts orig ON orig.raw_message_id=orm.id
+			         WHERE orm.deleted AND NOT orig.is_duplicate AND NOT orig.ignored AND orig.amount>0
+			           AND `+deletedReceiptLegacyRawCopySQL+` AND `+noLiveCopy+`
+			       ) AS legacy_deleted_copy
 			FROM raw_messages rm
 			LEFT JOIN phone_owners po ON po.phone = split_part(COALESCE(NULLIF(rm.sender_phone,''),rm.sender_jid,''),'@',1)
 			WHERE COALESCE(rm.wa_group_jid,'') LIKE '%@g.us'
@@ -103,15 +117,21 @@ func groupReading(ctx context.Context, q groupReadingQuerier, from, to time.Time
 			  AND rm.received_at >= $1 AND rm.received_at < $2
 			  AND ($3::text[] IS NULL OR rm.wa_group_jid = ANY($3))
 		), br AS (
-			SELECT raw_message_id, COUNT(*)::int AS total,
+			SELECT r.raw_message_id, COUNT(*)::int AS total,
 			       COUNT(*) FILTER (WHERE NOT ignored AND NOT is_duplicate AND
 			         (needs_review OR NOT client_confirmed OR contact_id IS NULL OR COALESCE(amount,0) <= 0 OR recognition_status IN ('pending','failed')))::int AS review,
 			       COUNT(*) FILTER (WHERE NOT ignored AND NOT is_duplicate AND COALESCE(amount,0) <= 0)::int AS unknown_amounts,
 			       COUNT(*) FILTER (WHERE NOT ignored AND NOT is_duplicate AND recognition_status IN ('pending','failed'))::int AS pending_recognition,
 			       COALESCE(SUM(amount) FILTER (WHERE NOT ignored AND NOT is_duplicate AND amount > 0 AND
-			         (needs_review OR NOT client_confirmed OR contact_id IS NULL OR recognition_status IN ('pending','failed'))),0) AS known_pending
-			FROM bank_receipts JOIN source ON source.id = raw_message_id
-			GROUP BY raw_message_id
+			         (needs_review OR NOT client_confirmed OR contact_id IS NULL OR recognition_status IN ('pending','failed'))),0) AS known_pending,
+			       COUNT(*) FILTER (WHERE NOT r.ignored AND r.is_duplicate AND NOT source.deleted AND EXISTS (
+			         SELECT 1 FROM bank_receipts orig JOIN raw_messages orm ON orm.id=orig.raw_message_id
+			         WHERE orm.deleted AND NOT orig.is_duplicate AND NOT orig.ignored
+			           AND COALESCE(orig.group_jid,orm.wa_group_jid,'')=COALESCE(r.group_jid,source.group_jid)
+			           AND `+deletedReceiptIdentitySQL("r", "orig")+` AND `+noLiveCopy+`
+			       ))::int AS suppressed_copies
+			FROM bank_receipts r JOIN source ON source.id = r.raw_message_id
+			GROUP BY r.raw_message_id
 		), tx AS (
 			SELECT raw_message_id, COUNT(*) FILTER (WHERE NOT ignored AND dup_pending)::int AS held,
 			       COALESCE(SUM(amount) FILTER (WHERE NOT ignored AND dup_pending AND amount > 0),0) AS known_pending
@@ -119,7 +139,7 @@ func groupReading(ctx context.Context, q groupReadingQuerier, from, to time.Time
 			GROUP BY raw_message_id
 		)
 		SELECT source.*, COALESCE(br.total,0), COALESCE(br.review,0), COALESCE(br.unknown_amounts,0), COALESCE(br.pending_recognition,0),
-		       COALESCE(tx.held,0), (COALESCE(br.known_pending,0) + COALESCE(tx.known_pending,0))::float8
+		       COALESCE(tx.held,0), COALESCE(br.suppressed_copies,0), (COALESCE(br.known_pending,0) + COALESCE(tx.known_pending,0))::float8
 		FROM source
 		LEFT JOIN br ON br.raw_message_id = source.id
 		LEFT JOIN tx ON tx.raw_message_id = source.id
@@ -132,10 +152,11 @@ func groupReading(ctx context.Context, q groupReadingQuerier, from, to time.Time
 	for rows.Next() {
 		var m groupReadingMessage
 		if err := rows.Scan(&m.RawID, &m.WaID, &m.GroupJID, &m.Sender, &m.ReceivedAt, &m.Parsed, &m.Deleted, &m.HasMedia,
-			&m.Disputed, &m.Handled, &m.Body, &m.MediaAvailable, &m.MediaAttempts, &m.ReceiptRows, &m.ReviewReceipts,
-			&m.UnknownAmounts, &m.RecognitionPending, &m.HeldPayments, &m.KnownPendingAmount); err != nil {
+			&m.Disputed, &m.Handled, &m.Body, &m.MediaAvailable, &m.MediaAttempts, &m.Caption, &m.LegacyMediaCandidate, &m.LegacyDeletedCopy, &m.ReceiptRows, &m.ReviewReceipts,
+			&m.UnknownAmounts, &m.RecognitionPending, &m.HeldPayments, &m.SuppressedReceiptCopies, &m.KnownPendingAmount); err != nil {
 			return GroupReadingStatus{}, err
 		}
+		m.LegacyMediaCandidate = !m.LegacyDeletedCopy && m.LegacyMediaCandidate && legacyParsedMediaClientName(m.Caption, m.Body)
 		status.add(m, limit)
 	}
 	if err := rows.Err(); err != nil {
@@ -175,6 +196,14 @@ func (s *GroupReadingStatus) add(m groupReadingMessage, limit int) {
 			issue.Reasons = append(issue.Reasons, "подпись клиента или банковский текст противоречат распознаванию изображения; вложение на проверке, сумма не засчитана")
 		}
 	}
+	if m.LegacyMediaCandidate {
+		s.LegacyMediaCandidates++
+		reason := "вложение помечено разобранным, но запись чека или платежа отсутствует; подпись похожа на ФИО клиента, требуется перечитывание"
+		if !m.MediaAvailable {
+			reason += "; файл и данные для повторного скачивания не сохранены"
+		}
+		issue.Reasons = append(issue.Reasons, reason)
+	}
 	if !m.HasMedia && !m.Parsed && m.Handled == "" && strings.TrimSpace(m.Body) != "" {
 		s.UnreadTexts++
 		issue.Reasons = append(issue.Reasons, "текст ещё не разобран полностью")
@@ -198,6 +227,14 @@ func (s *GroupReadingStatus) add(m groupReadingMessage, limit int) {
 	if m.HeldPayments > 0 {
 		s.HeldPayments += m.HeldPayments
 		issue.Reasons = append(issue.Reasons, fmt.Sprintf("платежей, ожидающих решения о повторе: %d", m.HeldPayments))
+	}
+	if m.SuppressedReceiptCopies > 0 {
+		s.UnresolvedReceiptCopies += m.SuppressedReceiptCopies
+		issue.Reasons = append(issue.Reasons, fmt.Sprintf("копии чеков остаются помеченными как повторы после удаления оригинала: %d, требуется проверка", m.SuppressedReceiptCopies))
+	}
+	if m.LegacyDeletedCopy {
+		s.UnresolvedReceiptCopies++
+		issue.Reasons = append(issue.Reasons, "содержимое вложения совпадает с удалённым чеком, у копии отсутствует запись чека, требуется проверка")
 	}
 	if len(issue.Reasons) == 0 {
 		s.SettledMessages++

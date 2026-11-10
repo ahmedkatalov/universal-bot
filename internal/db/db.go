@@ -732,11 +732,15 @@ type MediaRetry struct {
 	Proto      []byte
 	ReceivedAt time.Time
 	Attempts   int
+	// Legacy raw-only sources were already marked parsed by older code.
+	// Explicit recovery must not repeat cash or other payment side effects.
+	RecoverParsed bool
+	SourceVersion string
 }
 
 const mediaRetryCols = `rm.id, COALESCE(rm.wa_message_id, ''), COALESCE(rm.wa_group_jid, ''), COALESCE(rm.sender_jid, ''),
 	COALESCE(rm.sender_name, ''), COALESCE(rm.body, ''), COALESCE(rm.caption, ''), COALESCE(rm.media_path, ''), rm.media_proto,
-	rm.received_at, rm.media_attempts`
+	rm.received_at, rm.media_attempts, (` + legacyParsedMediaCandidateSQL + `), ` + receiptRetrySourceVersion
 
 func scanMediaRetries(rows pgx.Rows) ([]MediaRetry, error) {
 	defer rows.Close()
@@ -744,7 +748,7 @@ func scanMediaRetries(rows pgx.Rows) ([]MediaRetry, error) {
 	for rows.Next() {
 		var m MediaRetry
 		if err := rows.Scan(&m.RawID, &m.WaID, &m.GroupJID, &m.SenderJID, &m.SenderName, &m.Body, &m.Caption,
-			&m.MediaPath, &m.Proto, &m.ReceivedAt, &m.Attempts); err != nil {
+			&m.MediaPath, &m.Proto, &m.ReceivedAt, &m.Attempts, &m.RecoverParsed, &m.SourceVersion); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -764,6 +768,7 @@ func (d *DB) DueMediaRetries(ctx context.Context, limit int) ([]MediaRetry, erro
 		  AND (rm.media_next_at IS NULL OR rm.media_next_at <= now()) AND rm.media_attempts < 8
 		  AND (COALESCE(rm.media_path, '') <> '' OR rm.media_proto IS NOT NULL)
 		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
+		  AND NOT EXISTS (SELECT 1 FROM transactions tx WHERE tx.raw_message_id = rm.id)
 		ORDER BY rm.received_at LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
@@ -771,9 +776,45 @@ func (d *DB) DueMediaRetries(ctx context.Context, limit int) ([]MediaRetry, erro
 	return scanMediaRetries(rows)
 }
 
+// CurrentRawMediaForReread is checked inside the chat queue. A queued read
+// must not write a second ledger row, replay cash, or use an obsolete caption.
+func (d *DB) CurrentRawMediaForReread(ctx context.Context, rawID int, sourceVersion string, automatic bool) (MediaRetry, bool, error) {
+	rows, err := d.pool.Query(ctx, `SELECT `+mediaRetryCols+`
+		FROM raw_messages rm
+		WHERE rm.id=$1 AND rm.has_media AND NOT rm.deleted
+		  AND (`+receiptRetrySourceVersion+`)=$2
+		  AND COALESCE(rm.wa_group_jid,'') LIKE '%@g.us' AND COALESCE(rm.sender_jid,'') <> 'bot-forward'
+		  AND (COALESCE(rm.media_path,'')<>'' OR octet_length(rm.media_proto)>0)
+		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id=rm.id)
+		  AND NOT EXISTS (SELECT 1 FROM transactions tx WHERE tx.raw_message_id=rm.id)
+		  AND (NOT rm.parsed OR (NOT $3 AND (`+legacyParsedMediaCandidateSQL+`)))
+		  AND (rm.handled_as IS NULL OR (NOT $3 AND rm.handled_as IN ('receipt_candidate_other','pdf_pages_unknown','pdf_multiple_pages')))
+		  AND (NOT $3 OR ((rm.media_next_at IS NULL OR rm.media_next_at<=now()) AND rm.media_attempts<8
+		    AND NOT EXISTS (SELECT 1 FROM group_inbox gi WHERE gi.wa_message_id=rm.wa_message_id
+		      AND gi.group_jid=rm.wa_group_jid AND gi.state='processing' AND gi.lease_until>now())))`, rawID, sourceVersion, automatic)
+	if err != nil {
+		return MediaRetry{}, false, err
+	}
+	items, err := scanMediaRetries(rows)
+	if err != nil || len(items) == 0 {
+		return MediaRetry{}, false, err
+	}
+	it := items[0]
+	if it.RecoverParsed && !legacyParsedMediaClientName(it.Caption, it.Body) {
+		return MediaRetry{}, false, nil
+	}
+	return it, true, nil
+}
+
 // GroupMediaToReread — для «перечитай группу»: фото/PDF группы за период без
 // засчитанного чека (не скачалось, не прочиталось, сумма не распознана).
 func (d *DB) GroupMediaToReread(ctx context.Context, groupJID string, since time.Time, limit int) ([]MediaRetry, error) {
+	return d.GroupMediaToRereadForClient(ctx, groupJID, since, "", limit)
+}
+
+// GroupMediaToRereadForClient matches a requested client before applying the
+// batch limit. Earlier failures for other clients must not hide this source.
+func (d *DB) GroupMediaToRereadForClient(ctx context.Context, groupJID string, since time.Time, client string, limit int) ([]MediaRetry, error) {
 	rows, err := d.pool.Query(ctx, `SELECT `+mediaRetryCols+`
 		FROM raw_messages rm
 		WHERE rm.has_media AND NOT COALESCE(rm.deleted, false) AND ($1 = '' OR rm.wa_group_jid = $1)
@@ -781,23 +822,50 @@ func (d *DB) GroupMediaToReread(ctx context.Context, groupJID string, since time
 		  AND rm.received_at >= $2
 		  AND (COALESCE(rm.media_path, '') <> '' OR rm.media_proto IS NOT NULL)
 		  AND (
-		    (NOT rm.parsed AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id))
+		    (NOT rm.parsed AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
+		     AND NOT EXISTS (SELECT 1 FROM transactions tx WHERE tx.raw_message_id = rm.id))
+		    OR (`+legacyParsedMediaCandidateSQL+`)
 		    OR EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id AND NOT br.ignored AND NOT br.is_duplicate
-		               AND (br.amount <= 0 OR br.recognition_status IN ('failed', 'pending')))
+		               AND `+receiptNeedsRereadSQL+`)
 		  )
-		ORDER BY rm.received_at LIMIT $3`, groupJID, since, limit)
+		ORDER BY rm.received_at,rm.id`, groupJID, since)
 	if err != nil {
 		return nil, err
 	}
-	return scanMediaRetries(rows)
+	items, err := scanMediaRetries(rows)
+	if err != nil {
+		return nil, err
+	}
+	var out []MediaRetry
+	for _, item := range items {
+		if item.RecoverParsed && !legacyParsedMediaClientName(item.Caption, item.Body) {
+			continue
+		}
+		if strings.TrimSpace(client) != "" && !employeeClientMatches(client, item.Caption) && !employeeClientMatches(client, item.Body) {
+			continue
+		}
+		out = append(out, item)
+		if limit > 0 && len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // NeedsMediaReread — фото сообщения так и не стало чеком (не скачалось/не прочиталось).
 func (d *DB) NeedsMediaReread(ctx context.Context, rawID int) bool {
-	var ok bool
-	_ = d.pool.QueryRow(ctx, `SELECT has_media AND NOT parsed AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id = rm.id)
-		FROM raw_messages rm WHERE id = $1`, rawID).Scan(&ok)
-	return ok
+	var unread, legacy bool
+	var caption, body string
+	if err := d.pool.QueryRow(ctx, `SELECT
+		rm.has_media AND NOT rm.parsed AND NOT COALESCE(rm.deleted,false)
+		  AND NOT EXISTS (SELECT 1 FROM bank_receipts br WHERE br.raw_message_id=rm.id)
+		  AND NOT EXISTS (SELECT 1 FROM transactions tx WHERE tx.raw_message_id=rm.id),
+		(`+legacyParsedMediaCandidateSQL+`) AND (COALESCE(rm.media_path,'')<>'' OR octet_length(rm.media_proto)>0),
+		COALESCE(rm.caption,''),COALESCE(rm.body,'')
+		FROM raw_messages rm WHERE rm.id=$1`, rawID).Scan(&unread, &legacy, &caption, &body); err != nil {
+		return false
+	}
+	return unread || (legacy && legacyParsedMediaClientName(caption, body))
 }
 
 // BumpMediaRetry — попытка не удалась: следующая позже.
@@ -2321,6 +2389,7 @@ func (d *DB) UnresolvedReceipts(ctx context.Context) ([]UnresolvedReceipt, error
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, recipient_raw FROM bank_receipts
 		WHERE needs_review = true AND recipient_raw IS NOT NULL AND amount > 0
+		  AND NOT client_confirmed AND NOT ignored AND NOT is_duplicate
 		  -- Ждёт вопроса «тот же перевод?» (группа молчала): клиент у него есть,
 		  -- в «НЕ вошло» его держит догадка — молча в сбор не возвращаем.
 		  AND NOT same_check_parked
@@ -2346,7 +2415,8 @@ func (d *DB) UnresolvedReceipts(ctx context.Context) ([]UnresolvedReceipt, error
 // при повторном проходе.
 func (d *DB) AssignReceiptContact(ctx context.Context, receiptID, contactID int) error {
 	_, err := d.pool.Exec(ctx, `
-		UPDATE bank_receipts SET contact_id = $2, needs_review = false WHERE id = $1
+		UPDATE bank_receipts SET contact_id = $2, needs_review = false
+		WHERE id = $1 AND NOT client_confirmed AND NOT ignored AND NOT is_duplicate
 	`, receiptID, contactID)
 	return err
 }
@@ -2392,51 +2462,8 @@ func (d *DB) MarkMessageDeleted(ctx context.Context, waMessageID string) (txCoun
 		}
 		rows.Close()
 	}
-	if _, e := d.pool.Exec(ctx, `
-		UPDATE bank_receipts u SET is_duplicate = false, superseded_by_raw = NULL,
-			needs_review = u.needs_review OR NOT u.client_confirmed
-		FROM (
-			SELECT DISTINCT ON (orig.id) dd.id
-			FROM bank_receipts orig
-			JOIN bank_receipts dd ON dd.id <> orig.id AND dd.is_duplicate = true AND dd.ignored = false
-				AND COALESCE(dd.group_jid, '') = COALESCE(orig.group_jid, '')
-				AND (
-					-- Свёрнутый экран, заменённый этим полным чеком (или чек, учтённый
-					-- им как «похоже, тот же перевод»).
-					dd.superseded_by_raw = orig.raw_message_id OR
-					-- Чек, учтённый ДРУГИМ полным чеком (superseded_by_raw — не этот), —
-					-- не его повтор: тот чек жив, оживлять нечего.
-					(dd.superseded_by_raw IS NULL AND (
-					(NULLIF(orig.doc_number, '') IS NOT NULL AND dd.doc_number = orig.doc_number) OR
-					(NULLIF(orig.auth_code, '') IS NOT NULL AND dd.auth_code = orig.auth_code) OR
-					(dd.contact_id = orig.contact_id AND dd.amount = orig.amount
-					 AND `+sameOpTimeSQL("dd.tx_date", "dd.tx_time_guessed", "orig.tx_date", "orig.tx_time_guessed")+`) OR
-					-- Тот же напечатанный чек (копия без ФИО при подписанном оригинале).
-					`+printedMatchSQL("dd", "orig")+` OR
-					-- Копия без прочитанного времени, признанная «похоже, тот же»
-					-- (DedupeCompletedReceipt, шаг 3) до того, как связь стали
-					-- запоминать (superseded_by_raw): тот же клиент и сумма, присланы
-					-- в пределах суток (как в шаге 3). Время операции оригинала позже
-					-- его присылки — по нему не судим (но сутки между присылками — всё
-					-- равно: без них ожил бы чужой старый экран).
-					(dd.tx_time_guessed
-					 AND dd.client_confirmed AND orig.client_confirmed
-					 AND dd.contact_id = orig.contact_id AND dd.amount = orig.amount
-					 AND (SELECT received_at FROM raw_messages WHERE id = orig.raw_message_id)
-					     BETWEEN (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '1 day'
-					         AND (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '1 day'
-					 AND (`+untrustedOpSQL("orig", "(SELECT received_at FROM raw_messages WHERE id = orig.raw_message_id)")+` OR
-					      (orig.tx_date <= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) + interval '2 minutes'
-					       AND orig.tx_date >= (SELECT received_at FROM raw_messages WHERE id = dd.raw_message_id) - interval '3 days')))
-					))
-				)
-			JOIN raw_messages drm ON drm.id = dd.raw_message_id AND COALESCE(drm.deleted, false) = false
-			WHERE orig.raw_message_id = $1 AND orig.is_duplicate = false AND orig.ignored = false
-			ORDER BY orig.id, dd.created_at DESC
-		) sel
-		WHERE u.id = sel.id
-	`, rawID); e != nil {
-		fmt.Println("Промоут дубля после удаления оригинала не удался:", e)
+	if _, e := d.promoteDeletedReceiptCopy(ctx, rawID); e != nil {
+		return 0, 0, fmt.Errorf("восстановление копии удалённого чека: %w", e)
 	}
 	// Чеки, ждавшие в «НЕ вошло» вопроса «тот же перевод, что этот чек?» (группа
 	// молчала), — догадки больше нет: в сбор, как присланы.
